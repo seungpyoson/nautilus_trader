@@ -30,16 +30,20 @@ use crate::common::{
     },
 };
 
-/// A signed limit order for submission to the CLOB exchange.
+/// A signed limit order for submission to the CLOB V2 exchange.
 ///
-/// References: <https://docs.polymarket.com/#create-and-place-an-order>
+/// References: <https://docs.polymarket.com/v2-migration>,
+/// <https://docs.polymarket.com/api-reference/trade/post-a-new-order>
+///
+/// `expiration` is part of the wire body but NOT part of the EIP-712 signed
+/// struct in V2 (the protocol enforces it server-side). `"0"` means no
+/// expiration. All other fields appear inside the signed struct.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PolymarketOrder {
     pub salt: u64,
     pub maker: String,
     pub signer: String,
-    pub taker: String,
     pub token_id: Ustr,
     #[serde(
         serialize_with = "serialize_decimal_as_str",
@@ -51,15 +55,19 @@ pub struct PolymarketOrder {
         deserialize_with = "deserialize_decimal_from_str"
     )]
     pub taker_amount: Decimal,
-    pub expiration: String,
-    pub nonce: String,
-    #[serde(
-        serialize_with = "serialize_decimal_as_str",
-        deserialize_with = "deserialize_decimal_from_str"
-    )]
-    pub fee_rate_bps: Decimal,
     pub side: PolymarketOrderSide,
     pub signature_type: SignatureType,
+    /// Unix seconds timestamp when a GTD order auto-expires. `"0"` for non-GTD.
+    /// Not included in the EIP-712 signed hash; protocol enforces this value.
+    pub expiration: String,
+    /// Order creation time in milliseconds. Replaces `nonce` from V1 for
+    /// per-address uniqueness (not an expiration).
+    pub timestamp: String,
+    /// Generic bytes32 metadata field. Zero bytes when unused.
+    pub metadata: String,
+    /// Builder code bytes32 attributing the order to a registered builder.
+    /// Zero bytes when the order is unattributed.
+    pub builder: String,
     pub signature: String,
 }
 
@@ -469,12 +477,18 @@ mod tests {
 
         assert_eq!(order.salt, 123456789);
         assert_eq!(order.maker, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
-        assert_eq!(order.taker, "0x0000000000000000000000000000000000000000");
         assert_eq!(order.maker_amount, dec!(100000000));
         assert_eq!(order.taker_amount, dec!(50000000));
-        assert_eq!(order.fee_rate_bps, dec!(0));
         assert_eq!(order.expiration, "0");
-        assert_eq!(order.nonce, "0");
+        assert_eq!(order.timestamp, "1713398400000");
+        assert_eq!(
+            order.metadata,
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            order.builder,
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+        );
         assert_eq!(order.side, PolymarketOrderSide::Buy);
         assert_eq!(order.signature_type, SignatureType::Eoa);
     }
@@ -496,8 +510,11 @@ mod tests {
         assert!(json.contains("\"tokenId\""));
         assert!(json.contains("\"makerAmount\""));
         assert!(json.contains("\"takerAmount\""));
-        assert!(json.contains("\"feeRateBps\""));
         assert!(json.contains("\"signatureType\""));
+        assert!(json.contains("\"expiration\""));
+        assert!(json.contains("\"timestamp\""));
+        assert!(json.contains("\"metadata\""));
+        assert!(json.contains("\"builder\""));
     }
 
     #[rstest]

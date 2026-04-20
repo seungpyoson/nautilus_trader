@@ -16,10 +16,12 @@
 import asyncio
 from functools import lru_cache
 
-from py_clob_client.client import ApiCreds
-from py_clob_client.client import ClobClient
-from py_clob_client.constants import POLYGON
+from py_clob_client_v2.client import ApiCreds
+from py_clob_client_v2.client import BuilderConfig
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.constants import POLYGON
 
+from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_NAUTILUS_BUILDER_CODE
 from nautilus_trader.adapters.polymarket.common.credentials import PolymarketWebSocketAuth
 from nautilus_trader.adapters.polymarket.common.credentials import get_polymarket_api_key
 from nautilus_trader.adapters.polymarket.common.credentials import get_polymarket_api_secret
@@ -72,7 +74,8 @@ def get_polymarket_http_client(
     private_key : str, optional
         The private key for the wallet on the **Polygon** network.
     funder : str, optional
-        The wallet address (public key) on the **Polygon** network used for funding USDC.
+        The wallet address (public key) on the **Polygon** network used for funding
+        Polymarket collateral.
 
     Returns
     -------
@@ -86,13 +89,15 @@ def get_polymarket_http_client(
     )
     key = private_key or get_polymarket_private_key()
     funder = funder or get_polymarket_funder()
+    # CLOB V2 preview host; flips to `https://clob.polymarket.com` at 2026-04-28 ~11:00 UTC cutover
     return ClobClient(
-        base_url or "https://clob.polymarket.com",
+        base_url or "https://clob-v2.polymarket.com",
         chain_id=chain_id,
         signature_type=signature_type,
         creds=creds,
         key=key,
         funder=funder,
+        builder_config=BuilderConfig(builder_code=POLYMARKET_NAUTILUS_BUILDER_CODE),
     )
 
 
@@ -109,7 +114,7 @@ def get_polymarket_instrument_provider(
 
     Parameters
     ----------
-    client : py_clob_client.client.ClobClient
+    client : py_clob_client_v2.client.ClobClient
         The client for the instrument provider.
     clock : LiveClock
         The clock for the instrument provider.

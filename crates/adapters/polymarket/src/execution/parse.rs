@@ -292,12 +292,12 @@ pub fn instrument_taker_fee(instrument: &InstrumentAny) -> Decimal {
     }
 }
 
-/// Computes a USDC commission using Polymarket's fee formula.
+/// Computes a pUSD commission using Polymarket's fee formula.
 ///
 /// `fee = C * feeRate * p * (1 - p)` where C is shares, feeRate is the effective
 /// taker rate from the market's `feeSchedule`, and p is the share price. Fees peak
 /// at p = 0.50 and decrease symmetrically toward the extremes. Only taker fills pay;
-/// maker fills always return zero. Rounded to 5 decimal places (0.00001 USDC minimum).
+/// maker fills always return zero. Rounded to 5 decimal places (0.00001 pUSD minimum).
 ///
 /// The `fee_rate` here is the effective rate from `feeSchedule.rate` (e.g. 0.03 for
 /// 3%), not the `fee_rate_bps` field on a trade or order. The latter is the maximum
@@ -320,20 +320,20 @@ pub fn compute_commission(
     rounded.to_string().parse().unwrap_or(0.0)
 }
 
-/// USDC scale factor: the Polymarket API returns balances in micro-USDC (10^6 units).
+/// pUSD scale factor: the Polymarket API returns balances in micro-pUSD (10^6 units).
 const USDC_SCALE: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
 
-/// Converts a raw micro-USDC balance from the Polymarket API into an [`AccountBalance`].
+/// Converts a raw micro-pUSD balance from the Polymarket API into an [`AccountBalance`].
 ///
-/// The API returns balances as integer micro-USDC (e.g. `20000000` = 20 USDC).
+/// The API returns balances as integer micro-pUSD (e.g. `20000000` = 20 pUSD).
 /// This divides by 10^6 and constructs Money via `Money::from_decimal`, matching
 /// the pattern used by dYdX, Deribit, OKX, and other adapters.
 pub fn parse_balance_allowance(
     balance_raw: Decimal,
     currency: Currency,
 ) -> anyhow::Result<AccountBalance> {
-    let balance_usdc = balance_raw / USDC_SCALE;
-    AccountBalance::from_total_and_locked(balance_usdc, Decimal::ZERO, currency)
+    let balance_pusd = balance_raw / USDC_SCALE;
+    AccountBalance::from_total_and_locked(balance_pusd, Decimal::ZERO, currency)
         .map_err(|e| anyhow::anyhow!("Failed to convert balance: {e}"))
 }
 
@@ -354,7 +354,7 @@ pub struct MarketPriceResult {
 ///
 /// This ensures correct results regardless of the CLOB API's response ordering.
 ///
-/// For BUY: walks asks best-first, accumulates `size * price` (USDC) until >= amount.
+/// For BUY: walks asks best-first, accumulates `size * price` (pUSD) until >= amount.
 ///          Also accumulates the exact shares at each level for precise base qty.
 /// For SELL: walks bids best-first, accumulates `size` (shares) until >= amount.
 ///
@@ -445,7 +445,6 @@ pub fn parse_timestamp(ts_str: &str) -> Option<UnixNanos> {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_model::enums::CurrencyType;
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
@@ -453,13 +452,13 @@ mod tests {
     use crate::common::enums::PolymarketOrderSide;
 
     #[rstest]
-    #[case(dec!(20_000_000), 20.0)] // 20 USDC
-    #[case(dec!(1_000_000), 1.0)] // 1 USDC
-    #[case(dec!(500_000), 0.5)] // 0.5 USDC
+    #[case(dec!(20_000_000), 20.0)] // 20 pUSD
+    #[case(dec!(1_000_000), 1.0)] // 1 pUSD
+    #[case(dec!(500_000), 0.5)] // 0.5 pUSD
     #[case(dec!(0), 0.0)] // zero
     #[case(dec!(123_456_789), 123.456789)] // fractional
     fn test_parse_balance_allowance(#[case] raw: Decimal, #[case] expected: f64) {
-        let currency = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
+        let currency = Currency::pUSD();
         let balance = parse_balance_allowance(raw, currency).unwrap();
         let total_f64: f64 = balance.total.as_decimal().to_string().parse().unwrap();
         assert!(
@@ -633,7 +632,7 @@ mod tests {
 
         let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
         let account_id = AccountId::from("POLYMARKET-001");
-        let currency = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
+        let currency = Currency::pUSD();
 
         let report = parse_fill_report(
             &trade,
@@ -663,9 +662,9 @@ mod tests {
 
         let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
         let account_id = AccountId::from("POLYMARKET-001");
-        let currency = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
+        let currency = Currency::pUSD();
 
-        // Sports rate: 25 shares * 0.03 * 0.5 * 0.5 = 0.1875 USDC
+        // Sports rate: 25 shares * 0.03 * 0.5 * 0.5 = 0.1875 pUSD
         let report = parse_fill_report(
             &trade,
             instrument_id,
@@ -784,7 +783,7 @@ mod tests {
         }];
         let result = calculate_market_price(&levels, dec!(50), PolymarketOrderSide::Buy).unwrap();
         assert_eq!(result.crossing_price, dec!(0.55));
-        // 50 USDC / 0.55 per share = ~90.909 shares
+        // 50 pUSD / 0.55 per share = ~90.909 shares
         assert!(result.expected_base_qty > dec!(90));
     }
 
@@ -806,7 +805,7 @@ mod tests {
             },
         ];
         // Sorted ascending: 0.50/10, 0.55/100, 0.60/200
-        // Walk: 0.50/10 → 5 USDC (10 shares), 0.55/100 → 15 USDC (27.27 shares)
+        // Walk: 0.50/10 → 5 pUSD (10 shares), 0.55/100 → 15 pUSD (27.27 shares)
         let result = calculate_market_price(&levels, dec!(20), PolymarketOrderSide::Buy).unwrap();
         assert_eq!(result.crossing_price, dec!(0.55));
         let expected = dec!(10) + dec!(15) / dec!(0.55);
@@ -831,7 +830,7 @@ mod tests {
             },
         ];
         // Sorted ascending: 0.20/72, 0.50/50, 0.999/100
-        // 5 USDC at best ask 0.20: 72 * 0.20 = 14.4 USDC available, fills entirely
+        // 5 pUSD at best ask 0.20: 72 * 0.20 = 14.4 pUSD available, fills entirely
         let result = calculate_market_price(&levels, dec!(5), PolymarketOrderSide::Buy).unwrap();
         assert_eq!(result.crossing_price, dec!(0.20));
         assert_eq!(result.expected_base_qty, dec!(25)); // 5 / 0.20 = 25 shares
@@ -886,7 +885,7 @@ mod tests {
             price: "0.55".to_string(),
             size: "10.0".to_string(),
         }];
-        // 10 * 0.55 = 5.5 USDC < 50 USDC needed, returns what's available
+        // 10 * 0.55 = 5.5 pUSD < 50 pUSD needed, returns what's available
         let result = calculate_market_price(&levels, dec!(50), PolymarketOrderSide::Buy).unwrap();
         assert_eq!(result.crossing_price, dec!(0.55));
         assert_eq!(result.expected_base_qty, dec!(10)); // only 10 shares available

@@ -22,11 +22,14 @@
 //! - Maker/taker amount computation
 //!
 //! Amounts are converted from human-readable decimals to on-chain base units
-//! (USDC 10^6 / CTF shares 10^6) by truncating to `USDC_DECIMALS` (6) decimal
+//! (pUSD 10^6 / CTF shares 10^6) by truncating to `USDC_DECIMALS` (6) decimal
 //! places and extracting the mantissa as an integer.
 //!
 //! The builder produces signed [`PolymarketOrder`] structs ready for HTTP submission.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce},
     orders::{Order, OrderAny},
@@ -36,20 +39,28 @@ use ustr::Ustr;
 
 use crate::{
     common::{
-        consts::{LOT_SIZE_SCALE, USDC_DECIMALS},
+        consts::{LOT_SIZE_SCALE, POLYMARKET_NAUTILUS_BUILDER_CODE, USDC_DECIMALS},
         enums::{PolymarketOrderSide, PolymarketOrderType, SignatureType},
     },
     http::models::PolymarketOrder,
     signing::eip712::OrderSigner,
 };
 
-/// Builds signed Polymarket orders for submission to the CLOB exchange.
+/// Zero `bytes32` used for the `metadata` field (reserved for future use).
+pub const ZERO_BYTES32: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Builds signed Polymarket orders for submission to the CLOB V2 exchange.
+///
+/// `last_timestamp_ms` backs a strictly-monotonic millisecond clock so that
+/// bursts of submissions landing in the same wall-clock millisecond still
+/// produce distinct `timestamp` values (the V2 per-address uniqueness field).
 #[derive(Debug)]
 pub struct PolymarketOrderBuilder {
     order_signer: OrderSigner,
     signer_address: String,
     maker_address: String,
     signature_type: SignatureType,
+    last_timestamp_ms: AtomicU64,
 }
 
 impl PolymarketOrderBuilder {
@@ -65,10 +76,33 @@ impl PolymarketOrderBuilder {
             signer_address,
             maker_address,
             signature_type,
+            last_timestamp_ms: AtomicU64::new(0),
+        }
+    }
+
+    // Returns a strictly-monotonic millisecond timestamp: the current wall
+    // time in ms, or `last_seen + 1` if that would be larger. Thread-safe.
+    fn next_timestamp_ms(&self) -> u64 {
+        let now_ms = get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000;
+
+        loop {
+            let prev = self.last_timestamp_ms.load(Ordering::Relaxed);
+            let candidate = prev.saturating_add(1).max(now_ms);
+
+            if self
+                .last_timestamp_ms
+                .compare_exchange_weak(prev, candidate, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return candidate;
+            }
         }
     }
 
     /// Builds and signs a limit order for submission.
+    ///
+    /// `expiration` is a unix-seconds timestamp (`"0"` for non-GTD orders).
+    /// It is carried in the wire body but excluded from the EIP-712 signed hash.
     #[expect(clippy::too_many_arguments)]
     pub fn build_limit_order(
         &self,
@@ -79,7 +113,6 @@ impl PolymarketOrderBuilder {
         expiration: &str,
         neg_risk: bool,
         tick_decimals: u32,
-        fee_rate_bps: Decimal,
     ) -> anyhow::Result<PolymarketOrder> {
         let (maker_amount, taker_amount) =
             compute_maker_taker_amounts(price, quantity, side, tick_decimals);
@@ -90,16 +123,16 @@ impl PolymarketOrderBuilder {
             taker_amount,
             expiration,
             neg_risk,
-            fee_rate_bps,
         )
     }
 
     /// Builds and signs a market order for submission.
     ///
     /// `amount` semantics differ by side:
-    /// - BUY: `amount` is USDC to spend
+    /// - BUY: `amount` is pUSD to spend
     /// - SELL: `amount` is shares to sell
-    #[expect(clippy::too_many_arguments)]
+    ///
+    /// Market orders never set an expiration.
     pub fn build_market_order(
         &self,
         token_id: &str,
@@ -108,20 +141,10 @@ impl PolymarketOrderBuilder {
         amount: Decimal,
         neg_risk: bool,
         tick_decimals: u32,
-        fee_rate_bps: Decimal,
     ) -> anyhow::Result<PolymarketOrder> {
         let (maker_amount, taker_amount) =
             compute_market_maker_taker_amounts(price, amount, side, tick_decimals);
-        // Market orders never expire
-        self.build_and_sign(
-            token_id,
-            side,
-            maker_amount,
-            taker_amount,
-            "0",
-            neg_risk,
-            fee_rate_bps,
-        )
+        self.build_and_sign(token_id, side, maker_amount, taker_amount, "0", neg_risk)
     }
 
     /// Validates a limit order before building, returning a denial reason if invalid.
@@ -178,13 +201,13 @@ impl PolymarketOrderBuilder {
             ));
         }
 
-        // BUY market orders must use quote_quantity (amount in USDC)
+        // BUY market orders must use quote_quantity (amount in pUSD)
         // SELL market orders must NOT use quote_quantity (amount in shares)
         match order.order_side() {
             OrderSide::Buy => {
                 if !order.is_quote_quantity() {
                     return Err(
-                        "Market BUY orders require quote_quantity=true (amount in USDC)"
+                        "Market BUY orders require quote_quantity=true (amount in pUSD)"
                             .to_string(),
                     );
                 }
@@ -205,7 +228,6 @@ impl PolymarketOrderBuilder {
         Ok(())
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn build_and_sign(
         &self,
         token_id: &str,
@@ -214,23 +236,23 @@ impl PolymarketOrderBuilder {
         taker_amount: Decimal,
         expiration: &str,
         neg_risk: bool,
-        fee_rate_bps: Decimal,
     ) -> anyhow::Result<PolymarketOrder> {
         let salt = generate_salt();
+        let timestamp_ms = self.next_timestamp_ms();
 
         let mut poly_order = PolymarketOrder {
             salt,
             maker: self.maker_address.clone(),
             signer: self.signer_address.clone(),
-            taker: "0x0000000000000000000000000000000000000000".to_string(),
             token_id: Ustr::from(token_id),
             maker_amount,
             taker_amount,
-            expiration: expiration.to_string(),
-            nonce: "0".to_string(),
-            fee_rate_bps,
             side,
             signature_type: self.signature_type,
+            expiration: expiration.to_string(),
+            timestamp: timestamp_ms.to_string(),
+            metadata: ZERO_BYTES32.to_string(),
+            builder: POLYMARKET_NAUTILUS_BUILDER_CODE.to_string(),
             signature: String::new(),
         };
 
@@ -255,8 +277,8 @@ fn to_fixed_decimal(d: Decimal) -> Decimal {
 /// - Direct amounts (quantity passed through): max `LOT_SIZE_SCALE` (2) decimal places
 /// - Computed amounts (quantity * price): max `tick_decimals + LOT_SIZE_SCALE` decimal places
 ///
-/// For BUY: paying USDC (maker, computed) to receive CTF shares (taker, direct)
-/// For SELL: paying CTF shares (maker, direct) to receive USDC (taker, computed)
+/// For BUY: paying pUSD (maker, computed) to receive CTF shares (taker, direct)
+/// For SELL: paying CTF shares (maker, direct) to receive pUSD (taker, computed)
 pub fn compute_maker_taker_amounts(
     price: Decimal,
     quantity: Decimal,
@@ -287,8 +309,8 @@ pub fn compute_maker_taker_amounts(
 /// position sizes from fills may have more decimal places than the CLOB allows).
 ///
 /// Unlike limit orders where quantity always means shares, market order semantics differ by side:
-/// - BUY: `amount` is USDC to spend, compute shares received
-/// - SELL: `amount` is shares to sell, compute USDC received
+/// - BUY: `amount` is pUSD to spend, compute shares received
+/// - SELL: `amount` is shares to sell, compute pUSD received
 pub fn compute_market_maker_taker_amounts(
     price: Decimal,
     amount: Decimal,
@@ -500,6 +522,101 @@ mod tests {
         let limit = make_limit(false, false, false, TimeInForce::Gtc);
         let err = PolymarketOrderBuilder::validate_market_order(&limit).unwrap_err();
         assert!(err.contains("Expected Market order"));
+    }
+
+    fn make_test_builder() -> PolymarketOrderBuilder {
+        use crate::{common::credential::EvmPrivateKey, signing::eip712::OrderSigner};
+        let pk = EvmPrivateKey::new(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap();
+        let signer = OrderSigner::new(&pk).unwrap();
+        let addr = format!("{:#x}", signer.address());
+        PolymarketOrderBuilder::new(signer, addr.clone(), addr, SignatureType::Eoa)
+    }
+
+    #[rstest]
+    fn test_next_timestamp_ms_is_strictly_monotonic() {
+        let builder = make_test_builder();
+        let mut prev = builder.next_timestamp_ms();
+        for _ in 0..1_000 {
+            let next = builder.next_timestamp_ms();
+            assert!(
+                next > prev,
+                "timestamp not strictly monotonic: {prev} >= {next}"
+            );
+            prev = next;
+        }
+    }
+
+    #[rstest]
+    fn test_build_orders_produce_unique_timestamps() {
+        let builder = make_test_builder();
+        let mut timestamps = ahash::AHashSet::new();
+
+        for _ in 0..50 {
+            let order = builder
+                .build_limit_order(
+                    "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+                    PolymarketOrderSide::Buy,
+                    dec!(0.50),
+                    dec!(10),
+                    "0",
+                    false,
+                    2,
+                )
+                .unwrap();
+            assert!(
+                timestamps.insert(order.timestamp.clone()),
+                "duplicate timestamp {} in burst",
+                order.timestamp,
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_built_order_carries_nautilus_builder_code() {
+        let builder = make_test_builder();
+        let order = builder
+            .build_limit_order(
+                "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+                PolymarketOrderSide::Buy,
+                dec!(0.50),
+                dec!(10),
+                "0",
+                false,
+                2,
+            )
+            .unwrap();
+        assert_eq!(order.builder, POLYMARKET_NAUTILUS_BUILDER_CODE);
+    }
+
+    #[rstest]
+    fn test_build_limit_order_expiration_passthrough() {
+        let builder = make_test_builder();
+        let order = builder
+            .build_limit_order(
+                "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+                PolymarketOrderSide::Buy,
+                dec!(0.50),
+                dec!(10),
+                "1735689600",
+                false,
+                2,
+            )
+            .unwrap();
+        assert_eq!(order.expiration, "1735689600");
+    }
+
+    #[rstest]
+    fn test_validate_limit_order_gtd_with_expire_accepted() {
+        // LimitOrder::new enforces GTD + expire_time upstream, so validate_limit_order
+        // only needs to accept the valid case and let the lower layer reject mismatched
+        // orders. Locking this behavior prevents a future regression where our
+        // validator rejects GTD outright (which would break V2 GTD flows, as the V2
+        // wire body carries expiration unsigned).
+        let order = make_limit(false, false, false, TimeInForce::Gtd);
+        assert!(PolymarketOrderBuilder::validate_limit_order(&order).is_ok());
     }
 
     #[rstest]

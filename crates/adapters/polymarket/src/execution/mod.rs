@@ -51,10 +51,7 @@ use nautilus_core::{
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{
-        AccountType, CurrencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
-        TimeInForce,
-    },
+    enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
     events::{OrderEventAny, OrderUpdated},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
@@ -83,7 +80,7 @@ use self::{
 };
 use crate::{
     common::{
-        consts::{BATCH_ORDER_LIMIT, POLYMARKET_VENUE, USDC},
+        consts::{BATCH_ORDER_LIMIT, POLYMARKET_VENUE},
         credential::Secrets,
         enums::SignatureType,
     },
@@ -190,13 +187,13 @@ impl PolymarketExecutionClient {
         );
 
         let clock = get_atomic_clock_realtime();
-        let usdc = get_usdc_currency();
+        let pusd = get_pusd_currency();
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
             core.account_id,
             AccountType::Cash,
-            Some(usdc),
+            Some(pusd),
         );
 
         Ok(Self {
@@ -656,7 +653,7 @@ impl PolymarketExecutionClient {
             account_id: self.core.account_id,
             user_address,
             api_key: self.secrets.credential.api_key().as_str(),
-            usdc: get_usdc_currency(),
+            pusd: get_pusd_currency(),
             clock: self.clock,
         }
     }
@@ -1761,7 +1758,7 @@ fn handle_order_response(
                                 account_id,
                                 &order_id,
                                 fallback_px,
-                                get_usdc_currency(),
+                                get_pusd_currency(),
                                 ts_now,
                                 ts_now,
                             ) {
@@ -1940,9 +1937,8 @@ async fn check_fok_status(
     emitter.send_order_status_report(report);
 }
 
-pub fn get_usdc_currency() -> Currency {
-    Currency::try_from_str(USDC)
-        .unwrap_or_else(|| Currency::new(USDC, 6, 0, USDC, CurrencyType::Crypto))
+pub fn get_pusd_currency() -> Currency {
+    Currency::pUSD()
 }
 
 async fn fetch_and_emit_account_state(
@@ -1964,13 +1960,13 @@ async fn fetch_and_emit_account_state(
         .await
         .context("failed to fetch balance allowance")?;
 
-    let usdc = get_usdc_currency();
-    let account_balance = parse_balance_allowance(balance_allowance.balance, usdc)
+    let pusd = get_pusd_currency();
+    let account_balance = parse_balance_allowance(balance_allowance.balance, pusd)
         .context("failed to parse balance allowance")?;
 
     let ts_event = clock.get_time_ns();
     log::info!(
-        "Account state updated: balance={} USDC",
+        "Account state updated: balance={} pUSD",
         account_balance.total
     );
     emitter.emit_account_state(vec![account_balance], vec![], true, ts_event);

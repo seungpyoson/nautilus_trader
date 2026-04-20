@@ -13,10 +13,10 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-from py_clob_client.client import BalanceAllowanceParams
-from py_clob_client.clob_types import AssetType
+from py_clob_client_v2.client import BalanceAllowanceParams
+from py_clob_client_v2.clob_types import AssetType
 
-from nautilus_trader.adapters.polymarket.common.conversion import usdce_from_units
+from nautilus_trader.adapters.polymarket.common.conversion import pusd_from_units
 from nautilus_trader.adapters.polymarket.factories import get_polymarket_http_client
 
 
@@ -28,7 +28,7 @@ def get_allowances() -> None:
         asset_type=AssetType.COLLATERAL,
     )
     response = http_client.get_balance_allowance(params)
-    balance_usdc = usdce_from_units(int(response["balance"]))
+    balance_usdc = pusd_from_units(int(response["balance"]))
     print(f"Wallet: {balance_usdc}")
 
     token_id = "3642309182816755995211647069086230404892359515361325090555875625429003317932"
@@ -37,7 +37,7 @@ def get_allowances() -> None:
         token_id=token_id,
     )
     response = http_client.get_balance_allowance(params)
-    balance_usdc = usdce_from_units(int(response["balance"]))
+    balance_usdc = pusd_from_units(int(response["balance"]))
     print(f"Balance {token_id}: {balance_usdc}")
 
 

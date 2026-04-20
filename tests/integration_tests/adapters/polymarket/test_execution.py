@@ -25,7 +25,8 @@ from unittest.mock import patch
 
 import msgspec
 import pytest
-from py_clob_client.client import ClobClient
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.client import OrderPayload
 
 from nautilus_trader.adapters.polymarket.common.cache import get_polymarket_trades_key
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_CANCEL_ALREADY_DONE
@@ -46,7 +47,7 @@ from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
 from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.model.currencies import USDC
-from nautilus_trader.model.currencies import USDC_POS
+from nautilus_trader.model.currencies import pUSD
 from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OrderSide
@@ -105,6 +106,7 @@ class TestPolymarketExecutionClient:
         mock_creds = MagicMock()
         mock_creds.api_key = "test_api_key"
         self.http_client.creds = mock_creds
+        self.http_client.get_balance_allowance.return_value = {"balance": str(1_000_000_000)}
 
         # Mock instrument provider
         self.provider = MagicMock(spec=PolymarketInstrumentProvider)
@@ -210,9 +212,9 @@ class TestPolymarketExecutionClient:
 
         # Mock account state
         balance = AccountBalance(
-            total=Money(1000, USDC_POS),
-            locked=Money(0, USDC_POS),
-            free=Money(1000, USDC_POS),
+            total=Money(1000, pUSD),
+            locked=Money(0, pUSD),
+            free=Money(1000, pUSD),
         )
         self.exec_client.generate_account_state(
             balances=[balance],
@@ -1231,6 +1233,7 @@ class TestPolymarketExecutionClient:
         assert call_args.side == "BUY"
         assert call_args.price == 0  # Market order should have price 0 (calculated server-side)
         assert call_args.order_type == "FOK"  # Market orders always use FOK
+        assert call_args.user_usdc_balance == 1000.0
 
         # Check that venue order ID was cached
         venue_order_id = VenueOrderId("test_market_order_id")
@@ -1622,7 +1625,7 @@ class TestPolymarketExecutionClient:
         filled_spy.assert_called_once()
         call_kwargs = filled_spy.call_args.kwargs
         # 100 * 0.03 * 0.50 * 0.50 = 0.75 USDC
-        assert call_kwargs["commission"] == Money(0.75, USDC_POS)
+        assert call_kwargs["commission"] == Money(0.75, pUSD)
         assert call_kwargs["liquidity_side"] == LiquiditySide.TAKER
 
     @pytest.mark.parametrize(
@@ -3473,7 +3476,7 @@ class TestPolymarketCancelAndPostOnly:
         # Arrange
         mock_create_order = mocker.patch.object(self.http_client, "create_order")
         mock_post_orders = mocker.patch.object(self.http_client, "post_orders")
-        mock_cancel = mocker.patch.object(self.http_client, "cancel")
+        mock_cancel = mocker.patch.object(self.http_client, "cancel_order")
 
         mock_create_order.return_value = {"signed_order": "mock_signed"}
         mock_post_orders.return_value = [
@@ -3523,7 +3526,7 @@ class TestPolymarketCancelAndPostOnly:
         await asyncio.sleep(0.1)
 
         # Assert
-        mock_cancel.assert_called_once_with(order_id="0xbatch_deferred_cancel")
+        mock_cancel.assert_called_once_with(OrderPayload(orderID="0xbatch_deferred_cancel"))
 
 
 class TestPolymarketGenerateCancelEvent:
@@ -3670,7 +3673,7 @@ class TestPolymarketGenerateCancelEvent:
         # Arrange
         mock_create_order = mocker.patch.object(self.http_client, "create_order")
         mock_post_order = mocker.patch.object(self.http_client, "post_order")
-        mock_cancel = mocker.patch.object(self.http_client, "cancel")
+        mock_cancel = mocker.patch.object(self.http_client, "cancel_order")
 
         mock_create_order.return_value = {"signed_order": "mock_signed"}
         mock_post_order.return_value = {"success": True, "orderID": "0xdeferred_cancel_id"}
@@ -3712,7 +3715,7 @@ class TestPolymarketGenerateCancelEvent:
         await asyncio.sleep(0.1)
 
         # Assert
-        mock_cancel.assert_called_once_with(order_id="0xdeferred_cancel_id")
+        mock_cancel.assert_called_once_with(OrderPayload(orderID="0xdeferred_cancel_id"))
 
     @pytest.mark.asyncio
     async def test_deferred_cancel_handles_rejection(self, mocker):
@@ -3722,7 +3725,7 @@ class TestPolymarketGenerateCancelEvent:
         # Arrange
         mock_create_order = mocker.patch.object(self.http_client, "create_order")
         mock_post_order = mocker.patch.object(self.http_client, "post_order")
-        mock_cancel = mocker.patch.object(self.http_client, "cancel")
+        mock_cancel = mocker.patch.object(self.http_client, "cancel_order")
         cancel_event_spy = mocker.spy(self.exec_client, "_generate_cancel_event")
 
         mock_create_order.return_value = {"signed_order": "mock_signed"}
@@ -3760,7 +3763,7 @@ class TestPolymarketGenerateCancelEvent:
         await asyncio.sleep(0.1)
 
         # Assert
-        mock_cancel.assert_called_once_with(order_id="0xdeferred_reject_id")
+        mock_cancel.assert_called_once_with(OrderPayload(orderID="0xdeferred_reject_id"))
         cancel_event_spy.assert_called_once()
 
     @pytest.mark.asyncio
@@ -3770,7 +3773,7 @@ class TestPolymarketGenerateCancelEvent:
         not yet available.
         """
         # Arrange
-        mock_cancel = mocker.patch.object(self.http_client, "cancel")
+        mock_cancel = mocker.patch.object(self.http_client, "cancel_order")
 
         order = self.strategy.order_factory.limit(
             instrument_id=ELECTION_INSTRUMENT.id,
@@ -3832,7 +3835,7 @@ class TestPolymarketGenerateCancelEvent:
             LiquiditySide.TAKER,
         )
 
-        assert result == Money(0.03240, USDC_POS)
+        assert result == Money(0.03240, pUSD)
 
     def test_calculate_commission_reconciliation_sell_fill(self):
         # Issue #3860 reconciliation EXTERNAL SELL fill:
@@ -3867,7 +3870,7 @@ class TestPolymarketGenerateCancelEvent:
         )
 
         # Was 0.002357 with old generic formula (qty * price * fee_rate)
-        assert result == Money(0.00005, USDC_POS)
+        assert result == Money(0.00005, pUSD)
 
     def test_calculate_commission_maker_returns_zero(self):
         result = self.exec_client.calculate_commission(
@@ -3877,4 +3880,4 @@ class TestPolymarketGenerateCancelEvent:
             LiquiditySide.MAKER,
         )
 
-        assert result == Money(0, USDC_POS)
+        assert result == Money(0, pUSD)

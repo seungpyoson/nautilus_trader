@@ -53,8 +53,8 @@ use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::{AccountAny, cash::CashAccount},
     enums::{
-        AccountType, AssetClass, CurrencyType, OmsType, OrderSide, OrderStatus, OrderType,
-        TimeInForce, TriggerType,
+        AccountType, AssetClass, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
+        TriggerType,
     },
     events::{AccountState, OrderEventAny, OrderPendingCancel},
     identifiers::{
@@ -670,11 +670,11 @@ async fn test_generate_account_state_emits_event() {
 
     client.start().unwrap();
 
-    let usdc = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
+    let pusd = Currency::pUSD();
     let balances = vec![AccountBalance::new(
-        Money::new(1000.0, usdc),
-        Money::new(0.0, usdc),
-        Money::new(1000.0, usdc),
+        Money::new(1000.0, pusd),
+        Money::new(0.0, pusd),
+        Money::new(1000.0, pusd),
     )];
     client
         .generate_account_state(balances, vec![], true, UnixNanos::default())
@@ -1338,7 +1338,7 @@ fn add_instrument_to_cache_with_symbol(
         instrument_id,
         raw_symbol,
         AssetClass::Alternative,
-        Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto),
+        Currency::pUSD(),
         UnixNanos::default(), // activation_ns
         UnixNanos::default(), // expiration_ns
         4,                    // price_precision
@@ -2011,175 +2011,6 @@ async fn test_submit_order_list_does_not_retry_batch_post_on_http_error() {
 
 #[rstest]
 #[tokio::test]
-async fn test_submit_order_list_prepare_failure_emits_submitted_then_rejected() {
-    let state = TestServerState::default();
-    *state.fee_rate_response_status.lock().await = StatusCode::INTERNAL_SERVER_ERROR;
-    *state.fee_rate_response.lock().await = Some(json!({"error": "fee rate failed"}));
-    let addr = start_mock_server(state.clone()).await;
-    let (mut client, mut rx, cache) = create_test_execution_client(addr);
-    client.start().unwrap();
-
-    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
-
-    let order1 = make_limit_order(
-        "O-LIST-PREP-1",
-        instrument_id,
-        OrderSide::Buy,
-        false,
-        false,
-        false,
-        TimeInForce::Gtc,
-    );
-    let order2 = make_limit_order(
-        "O-LIST-PREP-2",
-        instrument_id,
-        OrderSide::Sell,
-        false,
-        false,
-        false,
-        TimeInForce::Gtc,
-    );
-    cache
-        .borrow_mut()
-        .add_order(order1.clone(), None, None, false)
-        .unwrap();
-    cache
-        .borrow_mut()
-        .add_order(order2.clone(), None, None, false)
-        .unwrap();
-
-    let cmd = make_submit_order_list_cmd(instrument_id, &[order1, order2]);
-    client.submit_order_list(cmd).unwrap();
-
-    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
-    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
-    assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
-    assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
-
-    assert_eq!(*state.batch_order_post_count.lock().await, 0);
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_submit_order_list_fetches_fee_rate_once_per_token() {
-    let state = TestServerState::default();
-    *state.batch_order_response.lock().await = Some(json!([
-        {"success": true, "orderID": "0xone-token-1", "errorMsg": ""},
-        {"success": true, "orderID": "0xone-token-2", "errorMsg": ""},
-        {"success": true, "orderID": "0xone-token-3", "errorMsg": ""}
-    ]));
-    let addr = start_mock_server(state.clone()).await;
-    let (mut client, mut rx, cache) = create_test_execution_client(addr);
-    client.start().unwrap();
-
-    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
-
-    let orders: Vec<OrderAny> = (0..3)
-        .map(|i| {
-            let order = make_limit_order(
-                &format!("O-FEE-SAME-{i}"),
-                instrument_id,
-                if i % 2 == 0 {
-                    OrderSide::Buy
-                } else {
-                    OrderSide::Sell
-                },
-                false,
-                false,
-                false,
-                TimeInForce::Gtc,
-            );
-            cache
-                .borrow_mut()
-                .add_order(order.clone(), None, None, false)
-                .unwrap();
-            order
-        })
-        .collect();
-
-    let cmd = make_submit_order_list_cmd(instrument_id, &orders);
-    client.submit_order_list(cmd).unwrap();
-
-    for _ in 0..3 {
-        assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
-    }
-
-    for _ in 0..3 {
-        assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
-    }
-
-    assert_eq!(
-        *state.fee_rate_fetch_count.lock().await,
-        1,
-        "same-token batch must issue exactly one /fee-rate call"
-    );
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_submit_order_list_fetches_fee_rate_once_per_unique_token() {
-    let state = TestServerState::default();
-    *state.batch_order_response.lock().await = Some(json!([
-        {"success": true, "orderID": "0xmulti-a-1", "errorMsg": ""},
-        {"success": true, "orderID": "0xmulti-a-2", "errorMsg": ""},
-        {"success": true, "orderID": "0xmulti-b-1", "errorMsg": ""},
-        {"success": true, "orderID": "0xmulti-b-2", "errorMsg": ""}
-    ]));
-    let addr = start_mock_server(state.clone()).await;
-    let (mut client, mut rx, cache) = create_test_execution_client(addr);
-    client.start().unwrap();
-
-    let instrument_a = InstrumentId::from("TEST-TOKEN-A.POLYMARKET");
-    let instrument_b = InstrumentId::from("TEST-TOKEN-B.POLYMARKET");
-    add_instrument_to_cache_with_symbol(&cache, instrument_a, "11111111111111111111");
-    add_instrument_to_cache_with_symbol(&cache, instrument_b, "22222222222222222222");
-
-    let mut orders = Vec::new();
-
-    for (i, inst) in [instrument_a, instrument_a, instrument_b, instrument_b]
-        .iter()
-        .enumerate()
-    {
-        let order = make_limit_order(
-            &format!("O-FEE-MULTI-{i}"),
-            *inst,
-            OrderSide::Buy,
-            false,
-            false,
-            false,
-            TimeInForce::Gtc,
-        );
-        cache
-            .borrow_mut()
-            .add_order(order.clone(), None, None, false)
-            .unwrap();
-        orders.push(order);
-    }
-
-    // The aggregate OrderList is bound to a single instrument id but each entry
-    // carries its own; the execution client dispatches per-entry.
-    let cmd = make_submit_order_list_cmd(instrument_a, &orders);
-    client.submit_order_list(cmd).unwrap();
-
-    for _ in 0..4 {
-        assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
-    }
-
-    for _ in 0..4 {
-        assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
-    }
-
-    assert_eq!(
-        *state.fee_rate_fetch_count.lock().await,
-        2,
-        "two-token batch must issue exactly one /fee-rate call per unique token"
-    );
-}
-
-#[rstest]
-#[tokio::test]
 async fn test_submit_order_list_routes_market_order_through_single_path() {
     let state = TestServerState::default();
     *state.batch_order_response.lock().await = Some(json!([
@@ -2463,109 +2294,6 @@ async fn test_submit_order_list_filters_out_ineligible_entries(#[case] kind: &st
 
 #[rstest]
 #[tokio::test]
-async fn test_submit_order_list_isolates_fee_rate_failure_per_token() {
-    let state = TestServerState::default();
-    let instrument_a = InstrumentId::from("TEST-TOKEN-A.POLYMARKET");
-    let instrument_b = InstrumentId::from("TEST-TOKEN-B.POLYMARKET");
-    let symbol_a = "11111111111111111111";
-    let symbol_b = "22222222222222222222";
-
-    state.fee_rate_overrides.lock().await.insert(
-        symbol_b.to_string(),
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": "fee rate failed"}),
-        ),
-    );
-    *state.batch_order_response.lock().await = Some(json!([
-        {"success": true, "orderID": "0xisolate-a-1", "errorMsg": ""},
-        {"success": true, "orderID": "0xisolate-a-2", "errorMsg": ""}
-    ]));
-
-    let addr = start_mock_server(state.clone()).await;
-    let (mut client, mut rx, cache) = create_test_execution_client(addr);
-    client.start().unwrap();
-
-    add_instrument_to_cache_with_symbol(&cache, instrument_a, symbol_a);
-    add_instrument_to_cache_with_symbol(&cache, instrument_b, symbol_b);
-
-    let mut orders = Vec::new();
-
-    for (i, inst) in [instrument_a, instrument_b, instrument_a, instrument_b]
-        .iter()
-        .enumerate()
-    {
-        let order = make_limit_order(
-            &format!("O-ISO-{i}"),
-            *inst,
-            OrderSide::Buy,
-            false,
-            false,
-            false,
-            TimeInForce::Gtc,
-        );
-        cache
-            .borrow_mut()
-            .add_order(order.clone(), None, None, false)
-            .unwrap();
-        orders.push(order);
-    }
-
-    let cmd = make_submit_order_list_cmd(instrument_a, &orders);
-    client.submit_order_list(cmd).unwrap();
-
-    let mut submitted_ids = HashSet::new();
-
-    for _ in 0..4 {
-        let event = recv_execution_event(&mut rx).await;
-        match event {
-            ExecutionEvent::Order(OrderEventAny::Submitted(e)) => {
-                submitted_ids.insert(e.client_order_id.to_string());
-            }
-            other => panic!("Expected Submitted, was {other:?}"),
-        }
-    }
-    assert_eq!(submitted_ids.len(), 4);
-
-    let mut accepted = HashSet::new();
-    let mut rejected = HashSet::new();
-
-    for _ in 0..4 {
-        let event = recv_execution_event(&mut rx).await;
-        match event {
-            ExecutionEvent::Order(OrderEventAny::Accepted(e)) => {
-                accepted.insert(e.client_order_id.to_string());
-            }
-            ExecutionEvent::Order(OrderEventAny::Rejected(e)) => {
-                rejected.insert(e.client_order_id.to_string());
-            }
-            other => panic!("Expected Accepted/Rejected, was {other:?}"),
-        }
-    }
-
-    assert_eq!(accepted.len(), 2, "token A orders must accept");
-    assert!(accepted.contains("O-ISO-0"));
-    assert!(accepted.contains("O-ISO-2"));
-    assert_eq!(rejected.len(), 2, "token B orders must reject");
-    assert!(rejected.contains("O-ISO-1"));
-    assert!(rejected.contains("O-ISO-3"));
-
-    assert_eq!(
-        *state.fee_rate_fetch_count.lock().await,
-        2,
-        "each unique token must fetch fee rate exactly once"
-    );
-    assert_eq!(*state.batch_order_post_count.lock().await, 1);
-    let body = state.last_body.lock().await.clone().unwrap();
-    assert_eq!(
-        body.as_array().unwrap().len(),
-        2,
-        "only token A orders reach the batch body"
-    );
-}
-
-#[rstest]
-#[tokio::test]
 async fn test_submit_order_list_routes_remainder_singleton_through_single_order_path() {
     const TOTAL: usize = 16;
 
@@ -2670,11 +2398,6 @@ async fn test_submit_order_list_chunks_beyond_batch_order_limit() {
         *state.batch_order_post_count.lock().await,
         2,
         "17 orders must split into two POST /orders calls (15 + 2)"
-    );
-    assert_eq!(
-        *state.fee_rate_fetch_count.lock().await,
-        1,
-        "fee rate is shared across chunks for the same token"
     );
     // last_body reflects the most recent chunk; confirm it's the remainder.
     let body = state.last_body.lock().await.clone().unwrap();

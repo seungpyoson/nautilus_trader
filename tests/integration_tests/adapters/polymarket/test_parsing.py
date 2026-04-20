@@ -49,7 +49,7 @@ from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.model.currencies import USDC
-from nautilus_trader.model.currencies import USDC_POS
+from nautilus_trader.model.currencies import pUSD
 from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
@@ -989,7 +989,7 @@ def test_parse_empty_book_snapshot_returns_none():
         {
             "activation_ns": 0,
             "asset_class": "ALTERNATIVE",
-            "currency": "USDC.e",
+            "currency": "pUSD",
             "description": "Bitcoin Up or Down - September 3, 7PM ET",
             "expiration_ns": 1756944000000000000,
             "id": "0x22025ebf02ae8bf9aae999649b145ebe9b5db6e23a36acc7abe9ef5ca184ab57-46428986054832220603415781377952331535489217742718963672459046269597594860904.POLYMARKET",
@@ -1145,7 +1145,7 @@ def test_parse_user_trade_taker_commission_with_fees() -> None:
     )
 
     # Assert
-    assert fill_report.commission == Money(0.75, USDC_POS)
+    assert fill_report.commission == Money(0.75, pUSD)
 
 
 def test_parse_user_trade_maker_commission_is_zero() -> None:
@@ -1212,7 +1212,7 @@ def test_parse_user_trade_maker_commission_is_zero() -> None:
     )
 
     # Assert
-    assert fill_report.commission == Money(0, USDC_POS)
+    assert fill_report.commission == Money(0, pUSD)
 
 
 def test_parse_user_trade_zero_commission_with_no_fees() -> None:
@@ -1274,7 +1274,7 @@ def test_parse_user_trade_zero_commission_with_no_fees() -> None:
     )
 
     # Assert
-    assert fill_report.commission == Money(0.0, USDC_POS)
+    assert fill_report.commission == Money(0.0, pUSD)
 
 
 @pytest.mark.parametrize(
@@ -1360,7 +1360,7 @@ def test_parse_empty_book_snapshot_in_backtest_engine():
         {
             "activation_ns": 0,
             "asset_class": "ALTERNATIVE",
-            "currency": "USDC.e",
+            "currency": "pUSD",
             "description": "Bitcoin Up or Down - September 3, 7PM ET",
             "expiration_ns": 1756944000000000000,
             "id": "0x22025ebf02ae8bf9aae999649b145ebe9b5db6e23a36acc7abe9ef5ca184ab57-46428986054832220603415781377952331535489217742718963672459046269597594860904.POLYMARKET",

@@ -17,9 +17,9 @@ from decimal import Decimal
 
 import pytest
 
-from nautilus_trader.adapters.polymarket.common.conversion import usdce_from_units
+from nautilus_trader.adapters.polymarket.common.conversion import pusd_from_units
 from nautilus_trader.adapters.polymarket.http.conversion import convert_tif_to_polymarket_order_type
-from nautilus_trader.model.currencies import USDC_POS
+from nautilus_trader.model.currencies import pUSD
 from nautilus_trader.model.enums import TimeInForce
 
 
@@ -30,12 +30,12 @@ from nautilus_trader.model.enums import TimeInForce
         [1000000, Decimal("1.000000")],
     ],
 )
-def test_usdc_from_units(units: int, expected_amount: float) -> None:
+def test_pusd_from_units(units: int, expected_amount: float) -> None:
     # Arrange, Act
-    usdce = usdce_from_units(units)
+    usdce = pusd_from_units(units)
 
     # Assert
-    assert usdce.currency == USDC_POS
+    assert usdce.currency == pUSD
     assert usdce.as_decimal() == expected_amount
 
 
