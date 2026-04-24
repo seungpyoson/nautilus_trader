@@ -112,6 +112,7 @@ __all__ = [
     "BookAction",
     "BookType",
     "ContingencyType",
+    "ContinuousFutureAdjustmentType",
     "CurrencyType",
     "InstrumentClass",
     "InstrumentCloseType",
@@ -189,6 +190,29 @@ __all__ = [
     "trigger_type_from_str",
     "trigger_type_to_str",
 ]
+
+
+@unique
+class ContinuousFutureAdjustmentType(Enum):
+    BACKWARD_SPREAD = "backward_spread"
+    FORWARD_SPREAD = "forward_spread"
+    BACKWARD_RATIO = "backward_ratio"
+    FORWARD_RATIO = "forward_ratio"
+
+    @property
+    def is_ratio(self) -> bool:
+        return self in (
+            ContinuousFutureAdjustmentType.BACKWARD_RATIO,
+            ContinuousFutureAdjustmentType.FORWARD_RATIO,
+        )
+
+    @property
+    def is_backward(self) -> bool:
+        return self in (
+            ContinuousFutureAdjustmentType.BACKWARD_SPREAD,
+            ContinuousFutureAdjustmentType.BACKWARD_RATIO,
+        )
+
 
 # mypy: disable-error-code=no-redef
 
