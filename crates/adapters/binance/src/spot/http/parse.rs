@@ -2127,8 +2127,6 @@ mod tests {
         assert!(info.symbols.is_empty());
     }
 
-    #[rstest]
-
     /// Captured live GET /api/v3/exchangeInfo?symbol=BTCUSDT response
     /// (2026-07-10) with wire header schemaId=3 version=5. Proves the decoder
     /// accepts the vendor highest-compatible encoding when the request still
@@ -2136,8 +2134,9 @@ mod tests {
     /// VersionMismatch { expected: 4, actual: 5 }.
     #[rstest]
     fn test_decode_real_captured_exchange_info_schema_v5() {
+        // parse.rs lives at src/spot/http/ — three levels up is the crate root.
         let buf = include_bytes!(
-            "../../../../test_data/spot/sbe/exchange_info_btc_usdt_schema_3_5.bin"
+            "../../../test_data/spot/sbe/exchange_info_btc_usdt_schema_3_5.bin"
         );
         assert!(buf.len() >= 8);
         let schema_id = u16::from_le_bytes([buf[4], buf[5]]);
@@ -2158,6 +2157,7 @@ mod tests {
         );
     }
 
+    #[rstest]
     fn test_decode_exchange_info_wrong_template() {
         let header = create_header(0, PING_TEMPLATE_ID, SBE_SCHEMA_ID, SBE_SCHEMA_VERSION);
 
