@@ -29,7 +29,7 @@
 //!
 //! All requests include:
 //! - `Accept: application/sbe`
-//! - `X-MBX-SBE: 3:4` (schema ID:version)
+//! - `X-MBX-SBE: 3:5` (schema ID:version)
 
 use std::{collections::HashMap, fmt::Debug, num::NonZeroU32, sync::Arc};
 
@@ -104,8 +104,11 @@ use crate::{
     },
 };
 
-/// SBE schema header value for Spot API.
-pub const SBE_SCHEMA_HEADER: &str = "3:4";
+/// SBE schema header value (`X-MBX-SBE`) sent on Spot API requests.
+///
+/// Requests the current `3:5` schema. The decoder accepts any version within schema ID `3`
+/// (see `parse::MessageHeader::validate`), so compatible responses continue to decode.
+pub const SBE_SCHEMA_HEADER: &str = "3:5";
 
 use crate::common::consts::BINANCE_SPOT_API_PATH as SPOT_API_PATH;
 
@@ -2163,14 +2166,14 @@ mod tests {
     #[rstest]
     fn test_schema_constants() {
         assert_eq!(BinanceRawSpotHttpClient::schema_id(), 3);
-        assert_eq!(BinanceRawSpotHttpClient::schema_version(), 4);
+        assert_eq!(BinanceRawSpotHttpClient::schema_version(), 5);
         assert_eq!(BinanceSpotHttpClient::schema_id(), 3);
-        assert_eq!(BinanceSpotHttpClient::schema_version(), 4);
+        assert_eq!(BinanceSpotHttpClient::schema_version(), 5);
     }
 
     #[rstest]
     fn test_sbe_schema_header() {
-        assert_eq!(SBE_SCHEMA_HEADER, "3:4");
+        assert_eq!(SBE_SCHEMA_HEADER, "3:5");
     }
 
     #[rstest]
@@ -2178,7 +2181,7 @@ mod tests {
         let headers = BinanceRawSpotHttpClient::default_headers(&None);
 
         assert_eq!(headers.get("Accept"), Some(&"application/sbe".to_string()));
-        assert_eq!(headers.get("X-MBX-SBE"), Some(&"3:4".to_string()));
+        assert_eq!(headers.get("X-MBX-SBE"), Some(&"3:5".to_string()));
     }
 
     #[rstest]
