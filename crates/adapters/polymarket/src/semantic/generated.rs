@@ -166,7 +166,7 @@ impl SemanticLimits {
                 None => {
                     return Err(SemanticLimitError::Zero(
                         SemanticLimitKind::RequestBodyBytes,
-                    ))
+                    ));
                 }
             },
             request_items: match NonZeroUsize::new(values.request_items) {
@@ -178,7 +178,7 @@ impl SemanticLimits {
                 None => {
                     return Err(SemanticLimitError::Zero(
                         SemanticLimitKind::ResponseBodyBytes,
-                    ))
+                    ));
                 }
             },
             response_items: match NonZeroUsize::new(values.response_items) {
@@ -190,7 +190,7 @@ impl SemanticLimits {
                 None => {
                     return Err(SemanticLimitError::Zero(
                         SemanticLimitKind::TransactionHashes,
-                    ))
+                    ));
                 }
             },
             trade_ids: match NonZeroUsize::new(values.trade_ids) {
@@ -202,7 +202,7 @@ impl SemanticLimits {
                 None => {
                     return Err(SemanticLimitError::Zero(
                         SemanticLimitKind::AssociatedTrades,
-                    ))
+                    ));
                 }
             },
             string_bytes: match NonZeroUsize::new(values.string_bytes) {

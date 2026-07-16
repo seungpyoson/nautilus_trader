@@ -9,6 +9,13 @@
 
 mod collector;
 mod generated;
+mod hooks;
+mod sensitive;
 
 pub use collector::{CollectorError, CollectorKind, CollectorPlan, FixedCollector};
 pub use generated::*;
+pub use hooks::{FinalizedBlockRef, PreDispatchHook, PreSendHook, SemanticHookError};
+pub use sensitive::{
+    RedactedMetadata, SemanticCredential, SensitiveProviderBytes, SensitiveSignedRequest,
+    SensitiveValueError,
+};

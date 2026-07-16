@@ -205,7 +205,7 @@ def _render_limit_check(name: str) -> str:
             "                None => {\n"
             "                    return Err(SemanticLimitError::Zero(\n"
             f"                        SemanticLimitKind::{kind},\n"
-            "                    ))\n"
+            "                    ));\n"
             "                }\n"
         )
     return (

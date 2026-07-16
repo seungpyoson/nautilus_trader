@@ -13,7 +13,8 @@ use std::{
 };
 
 use nautilus_polymarket::semantic::{
-    CollectorKind, CollectorPlan, SemanticLimitValues, SemanticLimits,
+    CollectorKind, CollectorPlan, SemanticCredential, SemanticLimitValues, SemanticLimits,
+    SemanticRoute, SensitiveProviderBytes, SensitiveSignedRequest,
 };
 
 struct CountingAllocator;
@@ -71,14 +72,36 @@ fn rejected_capacity_checks_allocate_nothing() {
     let limits = SemanticLimits::checked(valid_values()).unwrap();
     let mut invalid_values = valid_values();
     invalid_values.response_body_bytes = 0;
+    let oversized_request = [0_u8; 129];
+    let oversized_response = [0_u8; 4097];
+    let oversized_credential = [0_u8; 257];
 
     ALLOCATIONS.store(0, Ordering::SeqCst);
     ENABLED.store(true, Ordering::SeqCst);
     let invalid_limits = SemanticLimits::checked(invalid_values);
     let invalid_plan = CollectorPlan::bounded(CollectorKind::TransactionHashes, 97, 4096, limits);
+    let invalid_request = SensitiveSignedRequest::checked(
+        SemanticRoute::PostOrder,
+        oversized_request.as_slice(),
+        limits,
+    );
+    let invalid_response = SensitiveProviderBytes::checked(
+        SemanticRoute::GetExactOrder,
+        oversized_response.as_slice(),
+        limits,
+    );
+    let invalid_credential = SemanticCredential::checked(
+        oversized_credential.as_slice(),
+        b"secret",
+        b"passphrase",
+        limits,
+    );
     ENABLED.store(false, Ordering::SeqCst);
 
     assert!(invalid_limits.is_err());
     assert!(invalid_plan.is_err());
+    assert!(invalid_request.is_err());
+    assert!(invalid_response.is_err());
+    assert!(invalid_credential.is_err());
     assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
 }

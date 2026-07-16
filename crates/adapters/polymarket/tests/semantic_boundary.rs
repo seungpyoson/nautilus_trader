@@ -8,8 +8,10 @@
 // -------------------------------------------------------------------------------------------------
 
 use nautilus_polymarket::semantic::{
-    CollectorError, CollectorKind, CollectorPlan, SemanticLimitError, SemanticLimitKind,
-    SemanticLimitValues, SemanticLimits,
+    CollectorError, CollectorKind, CollectorPlan, FinalizedBlockRef, PreDispatchHook, PreSendHook,
+    SemanticCredential, SemanticHookError, SemanticLimitError, SemanticLimitKind,
+    SemanticLimitValues, SemanticLimits, SemanticRoute, SensitiveProviderBytes,
+    SensitiveSignedRequest,
 };
 
 fn limit_values(transaction_hashes: usize) -> SemanticLimitValues {
@@ -172,4 +174,107 @@ fn collector_rejects_byte_addition_overflow() {
         Err(CollectorError::ArithmeticOverflow)
     );
     assert_eq!(collector.len(), 1);
+}
+
+#[test]
+fn sensitive_values_expose_only_redacted_metadata() {
+    let sentinel = b"credential-success-failure-malformed-sentinel";
+    let limits = limits(96);
+    let provider =
+        SensitiveProviderBytes::checked(SemanticRoute::GetExactOrder, sentinel.as_slice(), limits)
+            .expect("fixture is within caller-supplied limits");
+    let request =
+        SensitiveSignedRequest::checked(SemanticRoute::PostOrder, sentinel.as_slice(), limits)
+            .expect("fixture is within caller-supplied limits");
+    let _credential = SemanticCredential::checked(
+        b"credential-sentinel",
+        b"secret-sentinel",
+        b"passphrase-sentinel",
+        limits,
+    )
+    .expect("fixtures are within caller-supplied limits");
+
+    assert_eq!(provider.metadata().route(), SemanticRoute::GetExactOrder);
+    assert_eq!(provider.metadata().validated_len(), sentinel.len());
+    assert_eq!(provider.metadata().sha256().len(), 32);
+    assert_eq!(request.metadata().route(), SemanticRoute::PostOrder);
+    assert!(!format!("{:?}", provider.metadata()).contains("sentinel"));
+    assert!(!format!("{:?}", request.metadata()).contains("sentinel"));
+}
+
+#[test]
+fn sensitive_values_reject_oversized_input() {
+    let limits = limits(96);
+    let oversized_request = [0_u8; 129];
+    let oversized_response = [0_u8; 4097];
+    let oversized_credential = [0_u8; 257];
+
+    assert!(
+        SensitiveSignedRequest::checked(
+            SemanticRoute::PostOrder,
+            oversized_request.as_slice(),
+            limits,
+        )
+        .is_err()
+    );
+    assert!(
+        SensitiveProviderBytes::checked(
+            SemanticRoute::GetExactOrder,
+            oversized_response.as_slice(),
+            limits,
+        )
+        .is_err()
+    );
+    assert!(
+        SemanticCredential::checked(
+            oversized_credential.as_slice(),
+            b"secret",
+            b"passphrase",
+            limits,
+        )
+        .is_err()
+    );
+}
+
+struct RejectPreSend;
+
+impl PreSendHook for RejectPreSend {
+    fn before_send(&self, request: &SensitiveSignedRequest) -> Result<(), SemanticHookError> {
+        assert_eq!(request.metadata().route(), SemanticRoute::PostOrder);
+        Err(SemanticHookError::Denied)
+    }
+}
+
+struct RejectPreDispatch;
+
+impl PreDispatchHook for RejectPreDispatch {
+    fn before_dispatch(
+        &self,
+        request: &nautilus_polymarket::semantic::RedactedMetadata,
+        block: FinalizedBlockRef,
+    ) -> Result<(), SemanticHookError> {
+        assert_eq!(request.route(), SemanticRoute::PostOrder);
+        assert_eq!(block.number(), 42);
+        Err(SemanticHookError::Unavailable)
+    }
+}
+
+#[test]
+fn semantic_hooks_are_synchronous_and_fail_closed() {
+    let request = SensitiveSignedRequest::checked(
+        SemanticRoute::PostOrder,
+        b"signed-request-sentinel",
+        limits(96),
+    )
+    .unwrap();
+    let block = FinalizedBlockRef::new(42, [7_u8; 32]);
+
+    assert_eq!(
+        RejectPreSend.before_send(&request),
+        Err(SemanticHookError::Denied)
+    );
+    assert_eq!(
+        RejectPreDispatch.before_dispatch(request.metadata(), block),
+        Err(SemanticHookError::Unavailable)
+    );
 }
