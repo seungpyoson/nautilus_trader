@@ -200,6 +200,7 @@ const fn checked_bytes(bytes: &[u8], limit: usize) -> Result<(), SensitiveValueE
     if bytes.is_empty() {
         return Err(SensitiveValueError::Empty);
     }
+
     if bytes.len() > limit {
         return Err(SensitiveValueError::Capacity);
     }

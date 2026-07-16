@@ -16,6 +16,7 @@ use nautilus_polymarket::semantic::{
     CollectorKind, CollectorPlan, SemanticCredential, SemanticLimitValues, SemanticLimits,
     SemanticRoute, SensitiveProviderBytes, SensitiveSignedRequest,
 };
+use rstest::rstest;
 
 struct CountingAllocator;
 
@@ -67,7 +68,7 @@ fn valid_values() -> SemanticLimitValues {
     }
 }
 
-#[test]
+#[rstest]
 fn rejected_capacity_checks_allocate_nothing() {
     let limits = SemanticLimits::checked(valid_values()).unwrap();
     let mut invalid_values = valid_values();

@@ -80,7 +80,8 @@ Python 3 `tomllib`, Cargo integration tests.
 **Interfaces:**
 
 - Produces `SemanticRoute`, `PostOrderStatus`, `ExactOrderStatus`,
-  `AssociatedTradeStatus`, `SemanticLimitValues`, `SemanticLimits`,
+  `AssociatedTradeStatus`, `ProviderSide`, `ProviderOrderType`,
+  `ProviderTraderSide`, `SemanticLimitValues`, `SemanticLimits`,
   `SemanticLimitError`, `UnavailableCapability`, and
   `CURRENT_V2_UNAVAILABLE`.
 - `SemanticLimits::checked(SemanticLimitValues) -> Result<SemanticLimits,

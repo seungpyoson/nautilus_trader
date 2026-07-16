@@ -2,19 +2,13 @@
 
 from __future__ import annotations
 
-import sys
 import tempfile
 import textwrap
-import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from generate_polymarket_semantic_boundary import (  # noqa: E402
-    RegistryError,
-    load_registry,
-    render_rust,
-)
+from generate_polymarket_semantic_boundary import RegistryError
+from generate_polymarket_semantic_boundary import load_registry
+from generate_polymarket_semantic_boundary import render_rust
 
 
 VALID_REGISTRY = """
@@ -45,6 +39,19 @@ id = "get_associated_trades"
 method = "GET"
 path = "/data/trades"
 statuses = ["MATCHED"]
+
+[[vocabularies]]
+id = "side"
+source = "architecture"
+values = ["BUY", "SELL"]
+[[vocabularies]]
+id = "order_type"
+source = "architecture"
+values = ["GTC", "FOK", "GTD", "FAK"]
+[[vocabularies]]
+id = "trader_side"
+source = "architecture"
+values = ["TAKER", "MAKER"]
 
 [[limits]]
 id = "request_body_bytes"
@@ -96,50 +103,70 @@ reason = "no_competing_work_exclusion"
 """
 
 
-class GeneratorTests(unittest.TestCase):
-    def load(self, text: str = VALID_REGISTRY):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "registry.toml"
-            path.write_text(textwrap.dedent(text), encoding="utf-8")
-            return load_registry(path)
+def load(text: str = VALID_REGISTRY):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "registry.toml"
+        path.write_text(textwrap.dedent(text), encoding="utf-8")
+        return load_registry(path)
 
-    def test_valid_registry_renders_caller_supplied_limits(self) -> None:
-        rendered = render_rust(self.load())
-        self.assertIn("pub struct SemanticLimitValues", rendered)
-        self.assertIn("pub struct SemanticLimits", rendered)
-        self.assertNotIn("impl Default for SemanticLimits", rendered)
-        self.assertIn('"ORDER_STATUS_LIVE"', rendered)
-        self.assertIn("CURRENT_V2_UNAVAILABLE", rendered)
 
-    def test_numeric_operational_default_is_rejected(self) -> None:
-        invalid = VALID_REGISTRY.replace(
-            'id = "request_body_bytes"\nauthority = "caller"',
-            'id = "request_body_bytes"\nauthority = "caller"\ndefault = 64',
-        )
-        with self.assertRaisesRegex(RegistryError, "unknown key"):
-            self.load(invalid)
+def assert_rejected(text: str, message: str) -> None:
+    try:
+        load(text)
+    except RegistryError as e:
+        assert message in str(e)
+        return
+    raise AssertionError(f"registry unexpectedly accepted; expected {message}")
 
-    def test_cross_route_status_reuse_is_rejected(self) -> None:
-        invalid = VALID_REGISTRY.replace(
-            'statuses = ["ORDER_STATUS_LIVE"]', 'statuses = ["live"]'
-        )
-        with self.assertRaisesRegex(RegistryError, "status reused"):
-            self.load(invalid)
 
-    def test_available_current_v2_capability_is_rejected(self) -> None:
-        invalid = VALID_REGISTRY.replace(
-            'state = "unavailable"', 'state = "available"', 1
-        )
-        with self.assertRaisesRegex(RegistryError, "must be unavailable"):
-            self.load(invalid)
+def test_valid_registry_renders_caller_supplied_limits() -> None:
+    rendered = render_rust(load())
+    assert "pub struct SemanticLimitValues" in rendered
+    assert "pub struct SemanticLimits" in rendered
+    assert "impl Default for SemanticLimits" not in rendered
+    assert '"ORDER_STATUS_LIVE"' in rendered
+    assert "pub enum ProviderSide" in rendered
+    assert '"TAKER"' in rendered
+    assert "CURRENT_V2_UNAVAILABLE" in rendered
 
-    def test_missing_required_limit_is_rejected(self) -> None:
-        invalid = VALID_REGISTRY.replace(
-            '[[limits]]\nid = "request_items"\nauthority = "caller"\n', ""
-        )
-        with self.assertRaisesRegex(RegistryError, "required limits"):
-            self.load(invalid)
+
+def test_numeric_operational_default_is_rejected() -> None:
+    invalid = VALID_REGISTRY.replace(
+        'id = "request_body_bytes"\nauthority = "caller"',
+        'id = "request_body_bytes"\nauthority = "caller"\ndefault = 64',
+    )
+    assert_rejected(invalid, "unknown key")
+
+
+def test_cross_route_status_reuse_is_rejected() -> None:
+    invalid = VALID_REGISTRY.replace('statuses = ["ORDER_STATUS_LIVE"]', 'statuses = ["live"]')
+    assert_rejected(invalid, "status reused")
+
+
+def test_available_current_v2_capability_is_rejected() -> None:
+    invalid = VALID_REGISTRY.replace('state = "unavailable"', 'state = "available"', 1)
+    assert_rejected(invalid, "must be unavailable")
+
+
+def test_missing_required_limit_is_rejected() -> None:
+    invalid = VALID_REGISTRY.replace('[[limits]]\nid = "request_items"\nauthority = "caller"\n', "")
+    assert_rejected(invalid, "required limits")
+
+
+def test_provider_vocabulary_drift_is_rejected() -> None:
+    invalid = VALID_REGISTRY.replace('values = ["BUY", "SELL"]', 'values = ["BUY", "SIDEWAYS"]')
+    assert_rejected(invalid, "registered provider evidence")
 
 
 if __name__ == "__main__":
-    unittest.main()
+    tests = [
+        test_valid_registry_renders_caller_supplied_limits,
+        test_numeric_operational_default_is_rejected,
+        test_cross_route_status_reuse_is_rejected,
+        test_available_current_v2_capability_is_rejected,
+        test_missing_required_limit_is_rejected,
+        test_provider_vocabulary_drift_is_rejected,
+    ]
+    for test in tests:
+        test()
+    print(f"{len(tests)} generator tests passed")

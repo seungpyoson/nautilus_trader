@@ -112,6 +112,82 @@ impl TryFrom<&str> for AssociatedTradeStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemanticVocabulary {
+    Side,
+    OrderType,
+    TraderSide,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VocabularyValueError {
+    pub vocabulary: SemanticVocabulary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderSide {
+    Buy,
+    Sell,
+}
+
+impl TryFrom<&str> for ProviderSide {
+    type Error = VocabularyValueError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "BUY" => Ok(Self::Buy),
+            "SELL" => Ok(Self::Sell),
+            _ => Err(VocabularyValueError {
+                vocabulary: SemanticVocabulary::Side,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderOrderType {
+    Gtc,
+    Fok,
+    Gtd,
+    Fak,
+}
+
+impl TryFrom<&str> for ProviderOrderType {
+    type Error = VocabularyValueError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "GTC" => Ok(Self::Gtc),
+            "FOK" => Ok(Self::Fok),
+            "GTD" => Ok(Self::Gtd),
+            "FAK" => Ok(Self::Fak),
+            _ => Err(VocabularyValueError {
+                vocabulary: SemanticVocabulary::OrderType,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderTraderSide {
+    Taker,
+    Maker,
+}
+
+impl TryFrom<&str> for ProviderTraderSide {
+    type Error = VocabularyValueError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "TAKER" => Ok(Self::Taker),
+            "MAKER" => Ok(Self::Maker),
+            _ => Err(VocabularyValueError {
+                vocabulary: SemanticVocabulary::TraderSide,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SemanticLimitKind {
     RequestBodyBytes,
     RequestItems,
@@ -311,7 +387,7 @@ pub struct RegisteredSource {
     pub authority: &'static str,
 }
 
-pub const REGISTERED_SOURCES: [RegisteredSource; 9] = [
+pub const REGISTERED_SOURCES: [RegisteredSource; 10] = [
     RegisteredSource {
         id: "bolt_architecture",
         repository: "seungpyoson/bolt-v2",
@@ -334,6 +410,14 @@ pub const REGISTERED_SOURCES: [RegisteredSource; 9] = [
         commit: "ff5913f83132a141e01d403e505b6ccc003aa0f7",
         path: "src/types/clob.ts",
         blob: "7384b7727d9b73743b987ebaf0d95815b233c29d",
+        authority: "provider_schema_evidence",
+    },
+    RegisteredSource {
+        id: "typescript_side",
+        repository: "Polymarket/clob-client-v2",
+        commit: "ff5913f83132a141e01d403e505b6ccc003aa0f7",
+        path: "src/order-utils/model/side.ts",
+        blob: "4c1eccd3242b42ec5a0344673703cff27b72a355",
         authority: "provider_schema_evidence",
     },
     RegisteredSource {

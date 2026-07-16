@@ -5,16 +5,17 @@ from __future__ import annotations
 
 import argparse
 import re
-import subprocess
 import sys
 import tomllib
 from pathlib import Path
+
+from generate_polymarket_semantic_boundary import load_registry
+from generate_polymarket_semantic_boundary import render_rust
 
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / "crates/adapters/polymarket/provider-evidence/semantic-boundary.toml"
 SEMANTIC = ROOT / "crates/adapters/polymarket/src/semantic"
-GENERATOR = ROOT / "scripts/generate_polymarket_semantic_boundary.py"
 
 ROUTE_LITERAL = re.compile(r'"/[A-Za-z0-9_{}?=&./-]+"')
 STATUS_LIKE = re.compile(r'"(?:ORDER_STATUS_[A-Z_]+|[A-Z][A-Z_]{3,})"')
@@ -46,19 +47,18 @@ def registered_literals() -> tuple[set[str], set[str]]:
     with REGISTRY.open("rb") as handle:
         data = tomllib.load(handle)
     routes = {row["path"] for row in data["routes"]}
-    statuses = {
-        status
-        for row in data["routes"]
-        for status in row.get("statuses", [])
-    }
-    return routes, statuses
+    statuses = {status for row in data["routes"] for status in row.get("statuses", [])}
+    vocabulary_values = {value for row in data["vocabularies"] for value in row.get("values", [])}
+    return routes, statuses | vocabulary_values
 
 
-def check_source(name: str, source: str, routes: set[str], statuses: set[str]) -> None:
+def _check_effects(name: str, source: str) -> None:
     for token, description in FORBIDDEN_EFFECTS.items():
         if token in source:
             raise FenceError(f"{name}: forbidden {description}: {token}")
 
+
+def _check_literals(name: str, source: str, routes: set[str], statuses: set[str]) -> None:
     route_literals = {match.group(0)[1:-1] for match in ROUTE_LITERAL.finditer(source)}
     if route_literals:
         literal = sorted(route_literals)[0]
@@ -74,6 +74,8 @@ def check_source(name: str, source: str, routes: set[str], statuses: set[str]) -
     if match:
         raise FenceError(f"{name}: unregistered status-like literal: {match.group(0)}")
 
+
+def _check_sensitive_traits(name: str, source: str) -> None:
     for sensitive in SENSITIVE_TYPES:
         for trait in FORBIDDEN_TRAITS:
             impl_pattern = re.compile(rf"impl(?:<[^>]+>)?\s+{trait}\s+for\s+{sensitive}\b")
@@ -89,6 +91,20 @@ def check_source(name: str, source: str, routes: set[str], statuses: set[str]) -
                 if forbidden:
                     found = sorted(forbidden)[0]
                     raise FenceError(f"{name}: forbidden {found} derive for {sensitive}")
+
+
+def check_source(name: str, source: str, routes: set[str], statuses: set[str]) -> None:
+    _check_effects(name, source)
+    _check_literals(name, source, routes, statuses)
+    _check_sensitive_traits(name, source)
+
+
+def check_generated() -> None:
+    registry = load_registry(REGISTRY)
+    expected = render_rust(registry)
+    generated = SEMANTIC / "generated.rs"
+    if generated.read_text() != expected:
+        raise FenceError("generated semantic boundary is stale")
 
 
 def check_tree() -> None:
@@ -138,11 +154,7 @@ def main() -> int:
     if not args.check and not args.self_test:
         raise FenceError("at least one of --check or --self-test is required")
     if args.check:
-        subprocess.run(
-            [sys.executable, str(GENERATOR), "--check"],
-            cwd=ROOT,
-            check=True,
-        )
+        check_generated()
         check_tree()
         print("semantic boundary source fence passed")
     if args.self_test:
@@ -154,6 +166,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (FenceError, subprocess.CalledProcessError) as error:
-        print(f"semantic boundary source fence failed: {error}", file=sys.stderr)
+    except FenceError as e:
+        print(f"semantic boundary source fence failed: {e}", file=sys.stderr)
         raise SystemExit(1)

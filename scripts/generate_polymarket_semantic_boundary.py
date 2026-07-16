@@ -13,24 +13,16 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = (
-    ROOT
-    / "crates"
-    / "adapters"
-    / "polymarket"
-    / "provider-evidence"
-    / "semantic-boundary.toml"
+    ROOT / "crates" / "adapters" / "polymarket" / "provider-evidence" / "semantic-boundary.toml"
 )
-DEFAULT_OUTPUT = (
-    ROOT
-    / "crates"
-    / "adapters"
-    / "polymarket"
-    / "src"
-    / "semantic"
-    / "generated.rs"
-)
+DEFAULT_OUTPUT = ROOT / "crates" / "adapters" / "polymarket" / "src" / "semantic" / "generated.rs"
 
 REQUIRED_ROUTES = {"post_order", "get_exact_order", "get_associated_trades"}
+REQUIRED_VOCABULARIES = {
+    "side": ["BUY", "SELL"],
+    "order_type": ["GTC", "FOK", "GTD", "FAK"],
+    "trader_side": ["TAKER", "MAKER"],
+}
 REQUIRED_LIMITS = {
     "request_body_bytes",
     "request_items",
@@ -85,28 +77,7 @@ def _require_rows(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
     return rows
 
 
-def load_registry(path: Path) -> Registry:
-    try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise RegistryError(f"unable to load registry: {exc}") from exc
-
-    _reject_unknown(
-        data,
-        {
-            "schema_version",
-            "issue_url",
-            "sources",
-            "routes",
-            "limits",
-            "protocol_widths",
-            "capabilities",
-        },
-        "registry",
-    )
-    if data.get("schema_version") != 1:
-        raise RegistryError("registry: schema_version must be 1")
-
+def _validate_sources(data: dict[str, Any]) -> list[dict[str, Any]]:
     sources = _require_rows(data, "sources")
     _validate_unique_ids(sources, "sources")
     for row in sources:
@@ -121,11 +92,13 @@ def load_registry(path: Path) -> Registry:
         for field in ("commit", "blob"):
             if not isinstance(row.get(field), str) or not HEX_40.fullmatch(row[field]):
                 raise RegistryError(f"source {row['id']}: invalid {field}")
+    return sources
 
+
+def _validate_routes(data: dict[str, Any]) -> None:
     routes = _require_rows(data, "routes")
     _validate_unique_ids(routes, "routes")
-    route_ids = {row["id"] for row in routes}
-    if route_ids != REQUIRED_ROUTES:
+    if {row["id"] for row in routes} != REQUIRED_ROUTES:
         raise RegistryError(f"routes: required routes are {sorted(REQUIRED_ROUTES)}")
     paths: set[str] = set()
     statuses: set[str] = set()
@@ -139,20 +112,44 @@ def load_registry(path: Path) -> Registry:
         if route_path in paths:
             raise RegistryError(f"route {row['id']}: duplicate path")
         paths.add(route_path)
-        wire_values = row.get("statuses")
-        if not isinstance(wire_values, list) or not wire_values:
-            raise RegistryError(f"route {row['id']}: statuses must be non-empty")
-        local: set[str] = set()
-        for wire in wire_values:
-            if not isinstance(wire, str) or not wire:
-                raise RegistryError(f"route {row['id']}: invalid status")
-            if wire in local:
-                raise RegistryError(f"route {row['id']}: duplicate status {wire!r}")
-            if wire in statuses:
-                raise RegistryError(f"route {row['id']}: status reused across routes: {wire!r}")
-            local.add(wire)
-            statuses.add(wire)
+        _validate_statuses(row, statuses)
 
+
+def _validate_statuses(row: dict[str, Any], statuses: set[str]) -> None:
+    wire_values = row.get("statuses")
+    if not isinstance(wire_values, list) or not wire_values:
+        raise RegistryError(f"route {row['id']}: statuses must be non-empty")
+    local: set[str] = set()
+    for wire in wire_values:
+        if not isinstance(wire, str) or not wire:
+            raise RegistryError(f"route {row['id']}: invalid status")
+        if wire in local:
+            raise RegistryError(f"route {row['id']}: duplicate status {wire!r}")
+        if wire in statuses:
+            raise RegistryError(f"route {row['id']}: status reused across routes: {wire!r}")
+        local.add(wire)
+        statuses.add(wire)
+
+
+def _validate_vocabularies(data: dict[str, Any], sources: list[dict[str, Any]]) -> None:
+    vocabularies = _require_rows(data, "vocabularies")
+    _validate_unique_ids(vocabularies, "vocabularies")
+    if {row["id"] for row in vocabularies} != set(REQUIRED_VOCABULARIES):
+        raise RegistryError(
+            f"vocabularies: required vocabularies are {sorted(REQUIRED_VOCABULARIES)}"
+        )
+    source_ids = {row["id"] for row in sources}
+    for row in vocabularies:
+        _reject_unknown(row, {"id", "source", "values"}, f"vocabulary {row['id']}")
+        if row.get("source") not in source_ids:
+            raise RegistryError(f"vocabulary {row['id']}: source is not registered")
+        if row.get("values") != REQUIRED_VOCABULARIES[row["id"]]:
+            raise RegistryError(
+                f"vocabulary {row['id']}: values must match registered provider evidence"
+            )
+
+
+def _validate_limits(data: dict[str, Any]) -> None:
     limits = _require_rows(data, "limits")
     _validate_unique_ids(limits, "limits")
     for row in limits:
@@ -162,11 +159,15 @@ def load_registry(path: Path) -> Registry:
     if {row["id"] for row in limits} != REQUIRED_LIMITS:
         raise RegistryError(f"limits: required limits are {sorted(REQUIRED_LIMITS)}")
 
+
+def _validate_widths(data: dict[str, Any]) -> None:
     widths = _require_rows(data, "protocol_widths")
     _validate_unique_ids(widths, "protocol_widths")
     if widths != [{"id": "transaction_hash_bytes", "value": 32}]:
         raise RegistryError("protocol_widths: expected transaction_hash_bytes = 32")
 
+
+def _validate_capabilities(data: dict[str, Any]) -> None:
     capabilities = _require_rows(data, "capabilities")
     _validate_unique_ids(capabilities, "capabilities")
     if {row["id"] for row in capabilities} != REQUIRED_CAPABILITIES:
@@ -179,6 +180,37 @@ def load_registry(path: Path) -> Registry:
             raise RegistryError(f"capability {row['id']}: current V2 must be unavailable")
         if not isinstance(row.get("reason"), str) or not IDENTIFIER.fullmatch(row["reason"]):
             raise RegistryError(f"capability {row['id']}: invalid reason")
+
+
+def load_registry(path: Path) -> Registry:
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise RegistryError(f"unable to load registry: {e}") from e
+
+    _reject_unknown(
+        data,
+        {
+            "schema_version",
+            "issue_url",
+            "sources",
+            "routes",
+            "vocabularies",
+            "limits",
+            "protocol_widths",
+            "capabilities",
+        },
+        "registry",
+    )
+    if data.get("schema_version") != 1:
+        raise RegistryError("registry: schema_version must be 1")
+
+    sources = _validate_sources(data)
+    _validate_routes(data)
+    _validate_vocabularies(data, sources)
+    _validate_limits(data)
+    _validate_widths(data)
+    _validate_capabilities(data)
 
     return Registry(data)
 
@@ -195,8 +227,7 @@ def _status_variant(wire: str) -> str:
 def _render_limit_check(name: str) -> str:
     kind = _camel(name)
     compact_none = (
-        "                None => return "
-        f"Err(SemanticLimitError::Zero(SemanticLimitKind::{kind})),"
+        f"                None => return Err(SemanticLimitError::Zero(SemanticLimitKind::{kind})),"
     )
     if len(kind) < 16:
         none_arm = f"{compact_none}\n"
@@ -219,8 +250,7 @@ def _render_limit_check(name: str) -> str:
 def _render_status_enum(name: str, route_variant: str, statuses: list[str]) -> str:
     variants = "\n".join(f"    {_status_variant(wire)}," for wire in statuses)
     matches = "\n".join(
-        f'            "{wire}" => Ok(Self::{_status_variant(wire)}),'
-        for wire in statuses
+        f'            "{wire}" => Ok(Self::{_status_variant(wire)}),' for wire in statuses
     )
     return f"""#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum {name} {{
@@ -242,10 +272,36 @@ impl TryFrom<&str> for {name} {{
 """
 
 
+def _render_vocabulary_enum(name: str, vocabulary_variant: str, values: list[str]) -> str:
+    variants = "\n".join(f"    {_camel(wire.lower())}," for wire in values)
+    matches = "\n".join(
+        f'            "{wire}" => Ok(Self::{_camel(wire.lower())}),' for wire in values
+    )
+    return f"""#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum {name} {{
+{variants}
+}}
+
+impl TryFrom<&str> for {name} {{
+    type Error = VocabularyValueError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {{
+        match value {{
+{matches}
+            _ => Err(VocabularyValueError {{
+                vocabulary: SemanticVocabulary::{vocabulary_variant},
+            }}),
+        }}
+    }}
+}}
+"""
+
+
 def render_rust(registry: Registry) -> str:
     data = registry.data
     sources = data["sources"]
     routes = {row["id"]: row for row in data["routes"]}
+    vocabularies = {row["id"]: row for row in data["vocabularies"]}
     limits = [row["id"] for row in data["limits"]]
     capabilities = data["capabilities"]
 
@@ -282,9 +338,7 @@ def render_rust(registry: Registry) -> str:
 
     status_blocks = "\n".join(
         [
-            _render_status_enum(
-                "PostOrderStatus", "PostOrder", routes["post_order"]["statuses"]
-            ),
+            _render_status_enum("PostOrderStatus", "PostOrder", routes["post_order"]["statuses"]),
             _render_status_enum(
                 "ExactOrderStatus", "GetExactOrder", routes["get_exact_order"]["statuses"]
             ),
@@ -292,6 +346,17 @@ def render_rust(registry: Registry) -> str:
                 "AssociatedTradeStatus",
                 "GetAssociatedTrades",
                 routes["get_associated_trades"]["statuses"],
+            ),
+        ]
+    )
+    vocabulary_blocks = "\n".join(
+        [
+            _render_vocabulary_enum("ProviderSide", "Side", vocabularies["side"]["values"]),
+            _render_vocabulary_enum(
+                "ProviderOrderType", "OrderType", vocabularies["order_type"]["values"]
+            ),
+            _render_vocabulary_enum(
+                "ProviderTraderSide", "TraderSide", vocabularies["trader_side"]["values"]
             ),
         ]
     )
@@ -312,18 +377,18 @@ impl SemanticRoute {{
     #[must_use]
     pub const fn method(self) -> &'static str {{
         match self {{
-            Self::PostOrder => "{routes['post_order']['method']}",
-            Self::GetExactOrder => "{routes['get_exact_order']['method']}",
-            Self::GetAssociatedTrades => "{routes['get_associated_trades']['method']}",
+            Self::PostOrder => "{routes["post_order"]["method"]}",
+            Self::GetExactOrder => "{routes["get_exact_order"]["method"]}",
+            Self::GetAssociatedTrades => "{routes["get_associated_trades"]["method"]}",
         }}
     }}
 
     #[must_use]
     pub const fn path(self) -> &'static str {{
         match self {{
-            Self::PostOrder => "{routes['post_order']['path']}",
-            Self::GetExactOrder => "{routes['get_exact_order']['path']}",
-            Self::GetAssociatedTrades => "{routes['get_associated_trades']['path']}",
+            Self::PostOrder => "{routes["post_order"]["path"]}",
+            Self::GetExactOrder => "{routes["get_exact_order"]["path"]}",
+            Self::GetAssociatedTrades => "{routes["get_associated_trades"]["path"]}",
         }}
     }}
 }}
@@ -334,6 +399,19 @@ pub struct WireValueError {{
 }}
 
 {status_blocks}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemanticVocabulary {{
+    Side,
+    OrderType,
+    TraderSide,
+}}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VocabularyValueError {{
+    pub vocabulary: SemanticVocabulary,
+}}
+
+{vocabulary_blocks}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SemanticLimitKind {{
 {limit_kinds}
@@ -364,7 +442,7 @@ impl SemanticLimits {{
 {limit_accessors}
 }}
 
-pub const TRANSACTION_HASH_BYTES: usize = {data['protocol_widths'][0]['value']};
+pub const TRANSACTION_HASH_BYTES: usize = {data["protocol_widths"][0]["value"]};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnavailableCapability {{
@@ -409,15 +487,15 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
         rendered = render_rust(load_registry(args.registry))
-    except RegistryError as exc:
-        print(f"semantic boundary registry error: {exc}", file=sys.stderr)
+    except RegistryError as e:
+        print(f"semantic boundary registry error: {e}", file=sys.stderr)
         return 1
 
     if args.check:
         try:
             current = args.output.read_text(encoding="utf-8")
-        except OSError as exc:
-            print(f"generated semantic boundary missing: {exc}", file=sys.stderr)
+        except OSError as e:
+            print(f"generated semantic boundary missing: {e}", file=sys.stderr)
             return 1
         if current != rendered:
             print("generated semantic boundary is stale", file=sys.stderr)

@@ -18,7 +18,8 @@ use serde_json::value::RawValue;
 
 use super::{
     AssociatedTradeStatus, CollectorError, CollectorKind, CollectorPlan, ExactOrderStatus,
-    FixedCollector, PostOrderStatus, SemanticLimits, SemanticRoute, SensitiveProviderBytes,
+    FixedCollector, PostOrderStatus, ProviderOrderType, ProviderSide, ProviderTraderSide,
+    SemanticLimits, SemanticRoute, SensitiveProviderBytes, TRANSACTION_HASH_BYTES,
 };
 
 /// Safe classification for rejected provider input.
@@ -65,7 +66,7 @@ pub struct PostOrderObservation {
     status: PostOrderStatus,
     taking_amount: Decimal,
     making_amount: Decimal,
-    transaction_hashes: Vec<[u8; 32]>,
+    transaction_hashes: Vec<[u8; TRANSACTION_HASH_BYTES]>,
     trade_ids: Vec<String>,
 }
 
@@ -91,7 +92,7 @@ impl PostOrderObservation {
     }
 
     #[must_use]
-    pub fn transaction_hashes(&self) -> &[[u8; 32]] {
+    pub fn transaction_hashes(&self) -> &[[u8; TRANSACTION_HASH_BYTES]] {
         &self.transaction_hashes
     }
 
@@ -151,7 +152,7 @@ pub struct AssociatedTradeObservation {
     status: AssociatedTradeStatus,
     size: Decimal,
     price: Decimal,
-    transaction_hash: Option<[u8; 32]>,
+    transaction_hash: Option<[u8; TRANSACTION_HASH_BYTES]>,
 }
 
 impl AssociatedTradeObservation {
@@ -176,7 +177,7 @@ impl AssociatedTradeObservation {
     }
 
     #[must_use]
-    pub const fn transaction_hash(&self) -> Option<[u8; 32]> {
+    pub const fn transaction_hash(&self) -> Option<[u8; TRANSACTION_HASH_BYTES]> {
         self.transaction_hash
     }
 }
@@ -322,6 +323,7 @@ pub fn decode_exact_order(
 
 pub fn decode_associated_trades(
     bytes: SensitiveProviderBytes,
+    expected_order_id: &str,
 ) -> Result<AssociatedTradesObservation, SemanticDiagnostic> {
     let route = SemanticRoute::GetAssociatedTrades;
     if bytes.metadata().route() != route {
@@ -329,7 +331,7 @@ pub fn decode_associated_trades(
     }
     let limits = bytes.limits();
     bytes.decode_with(|raw| {
-        collect_trades(raw, limits)
+        collect_trades(raw, expected_order_id, limits)
             .map(|trades| AssociatedTradesObservation { trades })
             .map_err(|class| SemanticDiagnostic::new(route, class))
     })
@@ -354,6 +356,7 @@ fn decode_post_wire(
         })?,
         None => Vec::new(),
     };
+
     if has_duplicates(&transaction_hashes) {
         return Err(DiagnosticClass::Contradictory);
     }
@@ -364,6 +367,7 @@ fn decode_post_wire(
         })?,
         None => Vec::new(),
     };
+
     if has_duplicates(&trade_ids) {
         return Err(DiagnosticClass::Contradictory);
     }
@@ -382,6 +386,8 @@ fn decode_exact_wire(
     expected_id: &str,
     limits: SemanticLimits,
 ) -> Result<ExactOrderObservation, DiagnosticClass> {
+    checked_string(expected_id, limits)?;
+
     for value in [
         wire.id,
         wire.owner,
@@ -396,6 +402,8 @@ fn decode_exact_wire(
         checked_string(value, limits)?;
     }
     let _ = wire.created_at;
+    ProviderSide::try_from(wire.side).map_err(|_| DiagnosticClass::UnknownStatus)?;
+    ProviderOrderType::try_from(wire.order_type).map_err(|_| DiagnosticClass::UnknownStatus)?;
     if wire.id != expected_id {
         return Err(DiagnosticClass::Contradictory);
     }
@@ -413,6 +421,7 @@ fn decode_exact_wire(
             Ok(value.to_owned())
         },
     )?;
+
     if has_duplicates(&associated_trade_ids) {
         return Err(DiagnosticClass::Contradictory);
     }
@@ -448,8 +457,9 @@ fn convert_trade(
     checked_optional_string(wire.match_time_nano, limits)?;
     checked_optional_string(wire.err_msg, limits)?;
     let _ = wire.bucket_index;
+    ProviderSide::try_from(wire.side).map_err(|_| DiagnosticClass::UnknownStatus)?;
+    ProviderTraderSide::try_from(wire.trader_side).map_err(|_| DiagnosticClass::UnknownStatus)?;
     checked_decimal(wire.fee_rate_bps, limits)?;
-    validate_maker_orders(wire.maker_orders, limits)?;
     let status =
         AssociatedTradeStatus::try_from(wire.status).map_err(|_| DiagnosticClass::UnknownStatus)?;
     let size = checked_decimal(wire.size, limits)?;
@@ -471,6 +481,7 @@ fn checked_string(value: &str, limits: SemanticLimits) -> Result<(), DiagnosticC
     if value.is_empty() {
         return Err(DiagnosticClass::Incomplete);
     }
+
     if value.len() > limits.string_bytes() {
         return Err(DiagnosticClass::Oversized);
     }
@@ -493,18 +504,23 @@ fn checked_decimal(value: &str, limits: SemanticLimits) -> Result<Decimal, Diagn
     if value.is_empty() {
         return Err(DiagnosticClass::Incomplete);
     }
+
     if value.len() > limits.decimal_bytes() {
         return Err(DiagnosticClass::Oversized);
     }
     Decimal::from_str(value).map_err(|_| DiagnosticClass::InvalidDecimal)
 }
 
-fn parse_hash(value: &str, limits: SemanticLimits) -> Result<[u8; 32], DiagnosticClass> {
+fn parse_hash(
+    value: &str,
+    limits: SemanticLimits,
+) -> Result<[u8; TRANSACTION_HASH_BYTES], DiagnosticClass> {
     checked_string(value, limits)?;
-    if value.len() != 66 || !value.starts_with("0x") {
+    if value.len() != 2 + 2 * TRANSACTION_HASH_BYTES || !value.starts_with("0x") {
         return Err(DiagnosticClass::InvalidHash);
     }
-    let mut hash = [0_u8; 32];
+    let mut hash = [0_u8; TRANSACTION_HASH_BYTES];
+
     for (index, pair) in value.as_bytes()[2..].chunks_exact(2).enumerate() {
         let high = hex_nibble(pair[0]).ok_or(DiagnosticClass::InvalidHash)?;
         let low = hex_nibble(pair[1]).ok_or(DiagnosticClass::InvalidHash)?;
@@ -623,13 +639,14 @@ where
                     return Err(A::Error::custom("semantic value rejected"));
                 }
             };
-            if let Err(error) = self.collector.try_push(item, value.len()) {
-                *self.failure = Some(collector_class(error));
+
+            if let Err(e) = self.collector.try_push(item, value.len()) {
+                *self.failure = Some(collector_class(e));
                 return Err(A::Error::custom("semantic capacity rejected"));
             }
         }
-        self.collector.finish().map_err(|error| {
-            *self.failure = Some(collector_class(error));
+        self.collector.finish().map_err(|e| {
+            *self.failure = Some(collector_class(e));
             A::Error::custom("semantic collection rejected")
         })
     }
@@ -637,8 +654,10 @@ where
 
 fn collect_trades(
     raw: &[u8],
+    expected_order_id: &str,
     limits: SemanticLimits,
 ) -> Result<Vec<AssociatedTradeObservation>, DiagnosticClass> {
+    checked_string(expected_order_id, limits)?;
     let plan = CollectorPlan::bounded(
         CollectorKind::AssociatedTrades,
         limits.associated_trades(),
@@ -649,6 +668,7 @@ fn collect_trades(
     let mut failure = None;
     let seed = TradeArraySeed {
         collector: plan.allocate(),
+        expected_order_id,
         limits,
         failure: &mut failure,
     };
@@ -658,9 +678,9 @@ fn collect_trades(
         Ok(_) => return Err(DiagnosticClass::Malformed),
         Err(_) => return Err(failure.unwrap_or(DiagnosticClass::Malformed)),
     };
+
     for (index, trade) in trades.iter().enumerate() {
-        if let Some(previous) = trades[..index].iter().find(|other| other.id == trade.id) {
-            let _ = previous;
+        if trades[..index].iter().any(|other| other.id == trade.id) {
             return Err(DiagnosticClass::Contradictory);
         }
     }
@@ -669,6 +689,7 @@ fn collect_trades(
 
 struct TradeArraySeed<'a> {
     collector: FixedCollector<AssociatedTradeObservation>,
+    expected_order_id: &'a str,
     limits: SemanticLimits,
     failure: &'a mut Option<DiagnosticClass>,
 }
@@ -682,6 +703,7 @@ impl<'de> DeserializeSeed<'de> for TradeArraySeed<'_> {
     {
         deserializer.deserialize_seq(TradeArrayVisitor {
             collector: self.collector,
+            expected_order_id: self.expected_order_id,
             limits: self.limits,
             failure: self.failure,
         })
@@ -690,6 +712,7 @@ impl<'de> DeserializeSeed<'de> for TradeArraySeed<'_> {
 
 struct TradeArrayVisitor<'a> {
     collector: FixedCollector<AssociatedTradeObservation>,
+    expected_order_id: &'a str,
     limits: SemanticLimits,
     failure: &'a mut Option<DiagnosticClass>,
 }
@@ -707,6 +730,20 @@ impl<'de> Visitor<'de> for TradeArrayVisitor<'_> {
     {
         while let Some(wire) = sequence.next_element::<WireTrade<'de>>()? {
             let encoded_bytes = wire.id.len();
+            let maker_matches =
+                match validate_maker_orders(wire.maker_orders, self.expected_order_id, self.limits)
+                {
+                    Ok(matches) => matches,
+                    Err(class) => {
+                        *self.failure = Some(class);
+                        return Err(A::Error::custom("semantic maker orders rejected"));
+                    }
+                };
+
+            if wire.taker_order_id != self.expected_order_id && !maker_matches {
+                *self.failure = Some(DiagnosticClass::Contradictory);
+                return Err(A::Error::custom("trade does not reference requested order"));
+            }
             let trade = match convert_trade(wire, self.limits) {
                 Ok(trade) => trade,
                 Err(class) => {
@@ -714,19 +751,24 @@ impl<'de> Visitor<'de> for TradeArrayVisitor<'_> {
                     return Err(A::Error::custom("semantic trade rejected"));
                 }
             };
-            if let Err(error) = self.collector.try_push(trade, encoded_bytes) {
-                *self.failure = Some(collector_class(error));
+
+            if let Err(e) = self.collector.try_push(trade, encoded_bytes) {
+                *self.failure = Some(collector_class(e));
                 return Err(A::Error::custom("semantic trade capacity rejected"));
             }
         }
-        self.collector.finish().map_err(|error| {
-            *self.failure = Some(collector_class(error));
+        self.collector.finish().map_err(|e| {
+            *self.failure = Some(collector_class(e));
             A::Error::custom("semantic trade collection rejected")
         })
     }
 }
 
-fn validate_maker_orders(raw: &RawValue, limits: SemanticLimits) -> Result<(), DiagnosticClass> {
+fn validate_maker_orders(
+    raw: &RawValue,
+    expected_order_id: &str,
+    limits: SemanticLimits,
+) -> Result<bool, DiagnosticClass> {
     let plan = CollectorPlan::bounded(
         CollectorKind::ResponseItems,
         limits.response_items(),
@@ -737,13 +779,14 @@ fn validate_maker_orders(raw: &RawValue, limits: SemanticLimits) -> Result<(), D
     let mut failure = None;
     let seed = MakerArraySeed {
         collector: plan.allocate(),
+        expected_order_id,
         limits,
         failure: &mut failure,
     };
     let mut deserializer = serde_json::Deserializer::from_str(raw.get());
     match seed.deserialize(&mut deserializer) {
-        Ok(()) if deserializer.end().is_ok() => Ok(()),
-        Ok(()) => Err(DiagnosticClass::Malformed),
+        Ok(matches) if deserializer.end().is_ok() => Ok(matches),
+        Ok(_) => Err(DiagnosticClass::Malformed),
         Err(_) => Err(failure.unwrap_or(DiagnosticClass::Malformed)),
     }
 }
@@ -762,6 +805,9 @@ fn validate_maker(
         checked_string(value, limits)?;
     }
     checked_optional_string(maker.side, limits)?;
+    if let Some(side) = maker.side {
+        ProviderSide::try_from(side).map_err(|_| DiagnosticClass::UnknownStatus)?;
+    }
     checked_optional_string(maker.builder_code, limits)?;
     checked_decimal(maker.matched_amount, limits)?;
     checked_decimal(maker.price, limits)?;
@@ -774,12 +820,13 @@ fn validate_maker(
 
 struct MakerArraySeed<'a> {
     collector: FixedCollector<()>,
+    expected_order_id: &'a str,
     limits: SemanticLimits,
     failure: &'a mut Option<DiagnosticClass>,
 }
 
 impl<'de> DeserializeSeed<'de> for MakerArraySeed<'_> {
-    type Value = ();
+    type Value = bool;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
@@ -787,20 +834,24 @@ impl<'de> DeserializeSeed<'de> for MakerArraySeed<'_> {
     {
         deserializer.deserialize_seq(MakerArrayVisitor {
             collector: self.collector,
+            expected_order_id: self.expected_order_id,
             limits: self.limits,
             failure: self.failure,
+            matched_expected_order: false,
         })
     }
 }
 
 struct MakerArrayVisitor<'a> {
     collector: FixedCollector<()>,
+    expected_order_id: &'a str,
     limits: SemanticLimits,
     failure: &'a mut Option<DiagnosticClass>,
+    matched_expected_order: bool,
 }
 
 impl<'de> Visitor<'de> for MakerArrayVisitor<'_> {
-    type Value = ();
+    type Value = bool;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("a bounded maker-order array")
@@ -812,18 +863,21 @@ impl<'de> Visitor<'de> for MakerArrayVisitor<'_> {
     {
         while let Some(maker) = sequence.next_element::<WireMakerOrder<'de>>()? {
             let encoded_bytes = maker.order_id.len();
+            self.matched_expected_order |= maker.order_id == self.expected_order_id;
             if let Err(class) = validate_maker(maker, self.limits) {
                 *self.failure = Some(class);
                 return Err(A::Error::custom("semantic maker order rejected"));
             }
-            if let Err(error) = self.collector.try_push((), encoded_bytes) {
-                *self.failure = Some(collector_class(error));
+
+            if let Err(e) = self.collector.try_push((), encoded_bytes) {
+                *self.failure = Some(collector_class(e));
                 return Err(A::Error::custom("semantic maker capacity rejected"));
             }
         }
-        self.collector.finish().map_err(|error| {
-            *self.failure = Some(collector_class(error));
+        self.collector.finish().map_err(|e| {
+            *self.failure = Some(collector_class(e));
             A::Error::custom("semantic maker collection rejected")
-        })
+        })?;
+        Ok(self.matched_expected_order)
     }
 }

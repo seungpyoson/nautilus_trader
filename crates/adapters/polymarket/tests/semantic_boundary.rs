@@ -8,12 +8,14 @@
 // -------------------------------------------------------------------------------------------------
 
 use nautilus_polymarket::semantic::{
-    AssociatedTradeStatus, CollectorError, CollectorKind, CollectorPlan, CurrentV2Capabilities,
-    DiagnosticClass, ExactOrderStatus, FinalizedBlockRef, PostOrderStatus, PreDispatchHook,
-    PreSendHook, SemanticCredential, SemanticDiagnostic, SemanticHookError, SemanticLimitError,
-    SemanticLimitKind, SemanticLimitValues, SemanticLimits, SemanticRoute, SensitiveProviderBytes,
-    SensitiveSignedRequest, decode_associated_trades, decode_exact_order, decode_post_order,
+    AssociatedTradeStatus, CURRENT_V2_UNAVAILABLE, CollectorError, CollectorKind, CollectorPlan,
+    CurrentV2Capabilities, DiagnosticClass, ExactOrderStatus, FinalizedBlockRef, PostOrderStatus,
+    PreDispatchHook, PreSendHook, RedactedMetadata, SemanticCredential, SemanticDiagnostic,
+    SemanticHookError, SemanticLimitError, SemanticLimitKind, SemanticLimitValues, SemanticLimits,
+    SemanticRoute, SensitiveProviderBytes, SensitiveSignedRequest, decode_associated_trades,
+    decode_exact_order, decode_post_order,
 };
+use rstest::rstest;
 
 fn limit_values(transaction_hashes: usize) -> SemanticLimitValues {
     SemanticLimitValues {
@@ -34,7 +36,7 @@ fn limits(transaction_hashes: usize) -> SemanticLimits {
     SemanticLimits::checked(limit_values(transaction_hashes)).unwrap()
 }
 
-#[test]
+#[rstest]
 fn semantic_limits_reject_each_zero_field() {
     let mut values = limit_values(96);
     values.request_body_bytes = 0;
@@ -46,7 +48,7 @@ fn semantic_limits_reject_each_zero_field() {
     );
 }
 
-#[test]
+#[rstest]
 fn transaction_hash_plan_accepts_capacity_minus_one_and_capacity() {
     let limits = limits(96);
 
@@ -54,7 +56,7 @@ fn transaction_hash_plan_accepts_capacity_minus_one_and_capacity() {
     assert!(CollectorPlan::bounded(CollectorKind::TransactionHashes, 96, 96 * 32, limits).is_ok());
 }
 
-#[test]
+#[rstest]
 fn transaction_hash_plan_rejects_capacity_plus_one() {
     let error = CollectorPlan::bounded(CollectorKind::TransactionHashes, 97, 96 * 32, limits(96))
         .unwrap_err();
@@ -62,7 +64,7 @@ fn transaction_hash_plan_rejects_capacity_plus_one() {
     assert_eq!(error, CollectorError::ItemCapacity);
 }
 
-#[test]
+#[rstest]
 fn request_plan_accepts_capacity_edges_and_rejects_capacity_plus_one() {
     let limits = limits(96);
 
@@ -78,7 +80,7 @@ fn request_plan_accepts_capacity_edges_and_rejects_capacity_plus_one() {
     );
 }
 
-#[test]
+#[rstest]
 fn response_plan_accepts_capacity_edges_and_rejects_capacity_plus_one() {
     let limits = limits(96);
 
@@ -94,7 +96,7 @@ fn response_plan_accepts_capacity_edges_and_rejects_capacity_plus_one() {
     );
 }
 
-#[test]
+#[rstest]
 fn collector_plan_rejects_zero_capacity() {
     let limits = limits(96);
 
@@ -108,7 +110,7 @@ fn collector_plan_rejects_zero_capacity() {
     );
 }
 
-#[test]
+#[rstest]
 fn bounded_collector_checks_bytes_before_retaining_item() {
     let plan = CollectorPlan::bounded(CollectorKind::ResponseItems, 2, 4, limits(96)).unwrap();
     let mut collector = plan.allocate();
@@ -122,7 +124,7 @@ fn bounded_collector_checks_bytes_before_retaining_item() {
     assert_eq!(collector.len(), 1);
 }
 
-#[test]
+#[rstest]
 fn bounded_collector_checks_items_before_retaining_item() {
     let plan = CollectorPlan::bounded(CollectorKind::ResponseItems, 1, 4, limits(96)).unwrap();
     let mut collector = plan.allocate();
@@ -135,7 +137,7 @@ fn bounded_collector_checks_items_before_retaining_item() {
     assert_eq!(collector.len(), 1);
 }
 
-#[test]
+#[rstest]
 fn exact_collector_rejects_incomplete_item_count() {
     let plan = CollectorPlan::exact(CollectorKind::ResponseItems, 2, 4, limits(96)).unwrap();
     let mut collector = plan.allocate();
@@ -144,7 +146,7 @@ fn exact_collector_rejects_incomplete_item_count() {
     assert_eq!(collector.finish(), Err(CollectorError::Incomplete));
 }
 
-#[test]
+#[rstest]
 fn exact_collector_rejects_contradictory_byte_total() {
     let plan = CollectorPlan::exact(CollectorKind::ResponseItems, 2, 4, limits(96)).unwrap();
     let mut collector = plan.allocate();
@@ -154,7 +156,7 @@ fn exact_collector_rejects_contradictory_byte_total() {
     assert_eq!(collector.finish(), Err(CollectorError::Contradictory));
 }
 
-#[test]
+#[rstest]
 fn exact_collector_finishes_only_at_declared_totals() {
     let plan = CollectorPlan::exact(CollectorKind::ResponseItems, 2, 4, limits(96)).unwrap();
     let mut collector = plan.allocate();
@@ -164,7 +166,7 @@ fn exact_collector_finishes_only_at_declared_totals() {
     assert_eq!(collector.finish().unwrap(), vec![1, 2]);
 }
 
-#[test]
+#[rstest]
 fn collector_rejects_byte_addition_overflow() {
     let plan = CollectorPlan::bounded(CollectorKind::ResponseItems, 2, 4096, limits(96)).unwrap();
     let mut collector = plan.allocate();
@@ -177,7 +179,7 @@ fn collector_rejects_byte_addition_overflow() {
     assert_eq!(collector.len(), 1);
 }
 
-#[test]
+#[rstest]
 fn sensitive_values_expose_only_redacted_metadata() {
     let sentinel = b"credential-success-failure-malformed-sentinel";
     let limits = limits(96);
@@ -203,7 +205,7 @@ fn sensitive_values_expose_only_redacted_metadata() {
     assert!(!format!("{:?}", request.metadata()).contains("sentinel"));
 }
 
-#[test]
+#[rstest]
 fn sensitive_values_reject_oversized_input() {
     let limits = limits(96);
     let oversized_request = [0_u8; 129];
@@ -251,7 +253,7 @@ struct RejectPreDispatch;
 impl PreDispatchHook for RejectPreDispatch {
     fn before_dispatch(
         &self,
-        request: &nautilus_polymarket::semantic::RedactedMetadata,
+        request: &RedactedMetadata,
         block: FinalizedBlockRef,
     ) -> Result<(), SemanticHookError> {
         assert_eq!(request.route(), SemanticRoute::PostOrder);
@@ -260,7 +262,7 @@ impl PreDispatchHook for RejectPreDispatch {
     }
 }
 
-#[test]
+#[rstest]
 fn semantic_hooks_are_synchronous_and_fail_closed() {
     let request = SensitiveSignedRequest::checked(
         SemanticRoute::PostOrder,
@@ -313,7 +315,7 @@ fn trade_json(status: &str, id: &str, size: &str) -> String {
     )
 }
 
-#[test]
+#[rstest]
 fn post_decoder_accepts_every_generated_status() {
     let hash = r#"["0x0000000000000000000000000000000000000000000000000000000000000000"]"#;
     for wire in ["live", "matched", "delayed", "unmatched"] {
@@ -327,7 +329,7 @@ fn post_decoder_accepts_every_generated_status() {
     }
 }
 
-#[test]
+#[rstest]
 fn exact_order_decoder_accepts_every_generated_status_and_matching_id() {
     for wire in [
         "ORDER_STATUS_LIVE",
@@ -349,15 +351,14 @@ fn exact_order_decoder_accepts_every_generated_status_and_matching_id() {
     }
 }
 
-#[test]
+#[rstest]
 fn associated_trade_decoder_accepts_every_generated_status() {
     for wire in ["MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"] {
         let json = format!("[{}]", trade_json(wire, "trade-1", "1.0"));
-        let observation = decode_associated_trades(provider_bytes(
-            SemanticRoute::GetAssociatedTrades,
-            &json,
-            limits(96),
-        ))
+        let observation = decode_associated_trades(
+            provider_bytes(SemanticRoute::GetAssociatedTrades, &json, limits(96)),
+            "order-1",
+        )
         .unwrap();
         assert_eq!(
             observation.trades()[0].status(),
@@ -366,7 +367,7 @@ fn associated_trade_decoder_accepts_every_generated_status() {
     }
 }
 
-#[test]
+#[rstest]
 fn route_decoders_reject_unknown_cross_route_and_malformed_data_safely() {
     let hash = r#"["0x0000000000000000000000000000000000000000000000000000000000000000"]"#;
     for json in [
@@ -391,7 +392,7 @@ fn route_decoders_reject_unknown_cross_route_and_malformed_data_safely() {
     );
 }
 
-#[test]
+#[rstest]
 fn route_decoders_reject_incomplete_extra_oversized_and_contradictory_data() {
     let missing =
         r#"{"success":true,"errorMsg":"","status":"live","takingAmount":"1","makingAmount":"1"}"#;
@@ -442,29 +443,239 @@ fn route_decoders_reject_incomplete_extra_oversized_and_contradictory_data() {
         trade_json("MATCHED", "trade-1", "2.0")
     );
     assert_eq!(
-        decode_error(decode_associated_trades(provider_bytes(
-            SemanticRoute::GetAssociatedTrades,
-            &conflicting,
-            limits(96),
-        )))
+        decode_error(decode_associated_trades(
+            provider_bytes(SemanticRoute::GetAssociatedTrades, &conflicting, limits(96),),
+            "order-1"
+        ))
         .class(),
         DiagnosticClass::Contradictory
     );
 }
 
-#[test]
+#[rstest]
+fn every_decoder_rejects_wrong_route_unknown_status_and_scalar_cap_plus_one() {
+    let post = post_json("live", "[]", "order-1", "1");
+    let wrong_route = provider_bytes(SemanticRoute::PostOrder, &post, limits(96));
+    assert_eq!(
+        decode_error(decode_exact_order(wrong_route, "order-1")).class(),
+        DiagnosticClass::WrongRoute
+    );
+
+    let exact_unknown = exact_json("MATCHED", "order-1");
+    assert_eq!(
+        decode_error(decode_exact_order(
+            provider_bytes(SemanticRoute::GetExactOrder, &exact_unknown, limits(96),),
+            "order-1",
+        ))
+        .class(),
+        DiagnosticClass::UnknownStatus
+    );
+
+    let trade_unknown = format!("[{}]", trade_json("ORDER_STATUS_LIVE", "trade-1", "1"));
+    assert_eq!(
+        decode_error(decode_associated_trades(
+            provider_bytes(
+                SemanticRoute::GetAssociatedTrades,
+                &trade_unknown,
+                limits(96),
+            ),
+            "order-1"
+        ))
+        .class(),
+        DiagnosticClass::UnknownStatus
+    );
+
+    let oversized_id = "x".repeat(257);
+    let oversized_string = post_json("live", "[]", &oversized_id, "1");
+    assert_eq!(
+        decode_error(decode_post_order(provider_bytes(
+            SemanticRoute::PostOrder,
+            &oversized_string,
+            limits(96),
+        )))
+        .class(),
+        DiagnosticClass::Oversized
+    );
+
+    let oversized_decimal = "1".repeat(129);
+    let oversized_number = post_json("live", "[]", "order-1", &oversized_decimal);
+    assert_eq!(
+        decode_error(decode_post_order(provider_bytes(
+            SemanticRoute::PostOrder,
+            &oversized_number,
+            limits(96),
+        )))
+        .class(),
+        DiagnosticClass::Oversized
+    );
+
+    for exact_bad_value in [
+        exact_json("ORDER_STATUS_LIVE", "order-1")
+            .replace(r#""side":"BUY""#, r#""side":"SIDEWAYS""#),
+        exact_json("ORDER_STATUS_LIVE", "order-1")
+            .replace(r#""order_type":"GTC""#, r#""order_type":"BOGUS""#),
+    ] {
+        assert_eq!(
+            decode_error(decode_exact_order(
+                provider_bytes(SemanticRoute::GetExactOrder, &exact_bad_value, limits(96),),
+                "order-1",
+            ))
+            .class(),
+            DiagnosticClass::UnknownStatus
+        );
+    }
+
+    let unrelated_trade = format!(
+        "[{}]",
+        trade_json("MATCHED", "trade-1", "1").replace("order-1", "order-2")
+    );
+    assert_eq!(
+        decode_error(decode_associated_trades(
+            provider_bytes(
+                SemanticRoute::GetAssociatedTrades,
+                &unrelated_trade,
+                limits(96),
+            ),
+            "order-1",
+        ))
+        .class(),
+        DiagnosticClass::Contradictory
+    );
+
+    for trade_bad_value in [
+        trade_json("MATCHED", "trade-1", "1")
+            .replace(r#""trader_side":"TAKER""#, r#""trader_side":"BOGUS""#),
+        trade_json("MATCHED", "trade-1", "1").replace(r#""side":"BUY""#, r#""side":"SIDEWAYS""#),
+    ] {
+        let body = format!("[{trade_bad_value}]");
+        assert_eq!(
+            decode_error(decode_associated_trades(
+                provider_bytes(SemanticRoute::GetAssociatedTrades, &body, limits(96)),
+                "order-1",
+            ))
+            .class(),
+            DiagnosticClass::UnknownStatus
+        );
+    }
+
+    let maker = r#"{"order_id":"order-1","owner":"owner","maker_address":"maker","matched_amount":"1","price":"0.5","fee_rate_bps":"0","asset_id":"asset","outcome":"YES","side":"BUY"}"#;
+    let maker_associated = trade_json("MATCHED", "trade-1", "1")
+        .replace("order-1", "order-2")
+        .replace(
+            r#""maker_orders":[]"#,
+            &format!(r#""maker_orders":[{maker}]"#),
+        );
+    let body = format!("[{maker_associated}]");
+    assert!(
+        decode_associated_trades(
+            provider_bytes(SemanticRoute::GetAssociatedTrades, &body, limits(96)),
+            "order-1",
+        )
+        .is_ok()
+    );
+
+    let invalid_maker = maker.replace(r#""side":"BUY""#, r#""side":"SIDEWAYS""#);
+    let invalid_maker_side = trade_json("MATCHED", "trade-1", "1")
+        .replace("order-1", "order-2")
+        .replace(
+            r#""maker_orders":[]"#,
+            &format!(r#""maker_orders":[{invalid_maker}]"#),
+        );
+    let invalid_maker_side = format!("[{invalid_maker_side}]");
+    assert_eq!(
+        decode_error(decode_associated_trades(
+            provider_bytes(
+                SemanticRoute::GetAssociatedTrades,
+                &invalid_maker_side,
+                limits(96),
+            ),
+            "order-1",
+        ))
+        .class(),
+        DiagnosticClass::UnknownStatus
+    );
+}
+
+#[rstest]
+fn exact_and_trade_decoders_reject_route_specific_negative_matrix() {
+    let exact = exact_json("ORDER_STATUS_LIVE", "order-1");
+    let exact_cases = [
+        exact.replace(r#""owner":"owner","#, ""),
+        exact.replace("}", r#","extra":true}"#),
+        exact.replace(r#""price":"0.5""#, r#""price":"not-decimal""#),
+    ];
+
+    for json in exact_cases {
+        assert!(
+            decode_exact_order(
+                provider_bytes(SemanticRoute::GetExactOrder, &json, limits(96)),
+                "order-1",
+            )
+            .is_err()
+        );
+    }
+
+    let trade = trade_json("MATCHED", "trade-1", "1");
+    let trade_cases = [
+        trade.replace(r#""owner":"owner","#, ""),
+        trade.replace("}", r#","extra":true}"#),
+        trade.replace(r#""size":"1""#, r#""size":"not-decimal""#),
+        trade.replace(
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "0x00",
+        ),
+    ];
+
+    for json in trade_cases {
+        let body = format!("[{json}]");
+        assert!(
+            decode_associated_trades(
+                provider_bytes(SemanticRoute::GetAssociatedTrades, &body, limits(96)),
+                "order-1",
+            )
+            .is_err()
+        );
+    }
+
+    assert!(
+        decode_associated_trades(
+            provider_bytes(SemanticRoute::GetAssociatedTrades, "[", limits(96)),
+            "order-1",
+        )
+        .is_err()
+    );
+
+    let oversized = (0..9)
+        .map(|index| trade_json("MATCHED", &format!("trade-{index}"), "1"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut values = limit_values(96);
+    values.response_body_bytes = 16_384;
+    let expanded_body_limit = SemanticLimits::checked(values).unwrap();
+    assert_eq!(
+        decode_error(decode_associated_trades(
+            provider_bytes(
+                SemanticRoute::GetAssociatedTrades,
+                &format!("[{oversized}]"),
+                expanded_body_limit,
+            ),
+            "order-1",
+        ))
+        .class(),
+        DiagnosticClass::Oversized
+    );
+}
+
+#[rstest]
 fn current_v2_capabilities_are_all_explicitly_unavailable() {
     let capabilities = CurrentV2Capabilities::current_v2();
     let unavailable = capabilities.unavailable();
 
     assert_eq!(unavailable.len(), 3);
-    assert_eq!(
-        unavailable,
-        &nautilus_polymarket::semantic::CURRENT_V2_UNAVAILABLE
-    );
+    assert_eq!(unavailable, &CURRENT_V2_UNAVAILABLE);
 }
 
-#[test]
+#[rstest]
 fn observations_and_larger_capacity_cannot_authorize_autonomous_entry() {
     let mut above_retired_ceiling = limit_values(96);
     above_retired_ceiling.response_items = 128;

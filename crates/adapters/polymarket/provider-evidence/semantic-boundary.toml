@@ -26,6 +26,14 @@ blob = "7384b7727d9b73743b987ebaf0d95815b233c29d"
 authority = "provider_schema_evidence"
 
 [[sources]]
+id = "typescript_side"
+repository = "Polymarket/clob-client-v2"
+commit = "ff5913f83132a141e01d403e505b6ccc003aa0f7"
+path = "src/order-utils/model/side.ts"
+blob = "4c1eccd3242b42ec5a0344673703cff27b72a355"
+authority = "provider_schema_evidence"
+
+[[sources]]
 id = "rust_vocabulary"
 repository = "Polymarket/rs-clob-client-v2"
 commit = "3ae1aae5e9ded38f984464c9fc0f307f8a9f41fb"
@@ -96,6 +104,21 @@ id = "get_associated_trades"
 method = "GET"
 path = "/data/trades"
 statuses = ["MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"]
+
+[[vocabularies]]
+id = "side"
+source = "typescript_side"
+values = ["BUY", "SELL"]
+
+[[vocabularies]]
+id = "order_type"
+source = "typescript_schema"
+values = ["GTC", "FOK", "GTD", "FAK"]
+
+[[vocabularies]]
+id = "trader_side"
+source = "typescript_schema"
+values = ["TAKER", "MAKER"]
 
 [[limits]]
 id = "request_body_bytes"

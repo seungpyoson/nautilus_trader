@@ -11,45 +11,37 @@ use super::{CURRENT_V2_UNAVAILABLE, CapabilityEvidence};
 
 /// The registered provider capability state for the reviewed V2 revisions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CurrentV2Capabilities {
-    unavailable: [CapabilityEvidence; 3],
-}
+pub struct CurrentV2Capabilities;
 
 impl CurrentV2Capabilities {
     /// Returns the closed capability state generated from registered evidence.
     #[must_use]
     pub const fn current_v2() -> Self {
-        Self {
-            unavailable: CURRENT_V2_UNAVAILABLE,
-        }
+        Self
     }
 
     /// Returns every independent unavailable capability.
     #[must_use]
-    pub const fn unavailable(&self) -> &[CapabilityEvidence; 3] {
-        &self.unavailable
+    pub const fn unavailable(&self) -> &'static [CapabilityEvidence] {
+        &CURRENT_V2_UNAVAILABLE
     }
 
     /// Always fails because the reviewed V2 evidence satisfies no autonomous-entry gate.
     pub const fn require_autonomous_entry(
         &self,
     ) -> Result<AutonomousEntryCapability, CapabilityUnavailable> {
-        Err(CapabilityUnavailable {
-            unavailable: self.unavailable,
-        })
+        Err(CapabilityUnavailable)
     }
 }
 
 /// The complete fail-closed current-V2 capability result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CapabilityUnavailable {
-    unavailable: [CapabilityEvidence; 3],
-}
+pub struct CapabilityUnavailable;
 
 impl CapabilityUnavailable {
     #[must_use]
-    pub const fn unavailable(&self) -> &[CapabilityEvidence; 3] {
-        &self.unavailable
+    pub const fn unavailable(&self) -> &'static [CapabilityEvidence] {
+        &CURRENT_V2_UNAVAILABLE
     }
 }
 

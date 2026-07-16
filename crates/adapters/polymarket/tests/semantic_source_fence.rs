@@ -9,7 +9,9 @@
 
 use std::{path::Path, process::Command};
 
-#[test]
+use rstest::rstest;
+
+#[rstest]
 fn semantic_generated_artifact_and_source_fence_are_exact() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()

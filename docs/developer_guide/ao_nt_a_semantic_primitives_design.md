@@ -45,7 +45,7 @@ The provider facts are registered from these reviewed sources:
 
 - `Polymarket/clob-client-v2` at
   `ff5913f83132a141e01d403e505b6ccc003aa0f7`, including
-  `src/endpoints.ts` and `src/types/clob.ts`;
+  `src/endpoints.ts`, `src/types/clob.ts`, and `src/order-utils/model/side.ts`;
 - `Polymarket/rs-clob-client-v2` at
   `3ae1aae5e9ded38f984464c9fc0f307f8a9f41fb`, including
   `src/clob/types/mod.rs` and `src/clob/types/response.rs`;
@@ -78,6 +78,10 @@ It defines separate wire vocabularies for each route:
 
 No shared catch-all provider enum is used by the semantic boundary. A status
 accepted for one route is rejected on every other route.
+
+The registered TypeScript schema also generates the closed `BUY`/`SELL`,
+`GTC`/`FOK`/`GTD`/`FAK`, and `TAKER`/`MAKER` vocabularies. Strict decoders do
+not accept handwritten or open-ended substitutes for those values.
 
 The registry also owns the applicable body, item, string, decimal, transaction
 hash, trade-id, and log limit categories. Every numeric operational capacity is
@@ -244,13 +248,13 @@ absence is an ordinary fail-closed result, not a panic and not a warning.
 
 | Requirement | Evidence |
 |---|---|
-| Item and byte bounds | Unit tests at caller limit minus one, limit, and limit plus one for request and response collectors, including a transaction-hash limit above 64 |
-| Check before allocation | Counting-allocator integration tests on invalid plans and oversized byte copies |
-| Strict provider decoding | Route tests for every generated value plus unknown, malformed, extra-field, cross-route, oversized, incomplete, and contradictory fixtures |
-| Non-observable sensitive values | Compile-fail doctests, forbidden-trait static checks, zeroization tests, and sentinel projection tests |
-| Generated provenance | Deterministic generator check and registry-to-generated exact equality tests |
-| Registered effects only | Static source-fence verifier over semantic modules and generated route vocabulary |
-| V2 capability absence | Generated negative fixtures for all three unavailable contracts and autonomous-entry rejection tests |
+| Item and byte bounds | Unit tests at caller limit minus one, limit, and limit plus one for request and response collectors, including a transaction‑hash limit above 64 |
+| Check before allocation | Counting‑allocator integration tests on invalid plans and oversized byte copies |
+| Strict provider decoding | Route tests for every generated value plus unknown, malformed, extra‑field, cross‑route, oversized, incomplete, and contradictory fixtures |
+| Non‑observable sensitive values | Compile‑fail doctests, forbidden‑trait static checks, zeroization tests, and sentinel projection tests |
+| Generated provenance | Deterministic generator check and registry‑to‑generated exact equality tests |
+| Registered effects only | Static source‑fence verifier over semantic modules and generated route vocabulary |
+| V2 capability absence | Generated negative fixtures for all three unavailable contracts and autonomous‑entry rejection tests |
 | No physical runtime | Static rejection of network/task/runtime imports and direct inspection of the confined diff |
 
 Formatting, generator check mode, the static verifier, focused Rust tests, and

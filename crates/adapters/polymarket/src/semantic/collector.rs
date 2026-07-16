@@ -49,9 +49,11 @@ impl CollectorPlan {
         if item_capacity == 0 || byte_capacity == 0 {
             return Err(CollectorError::ZeroCapacity);
         }
+
         if item_capacity > item_limit(kind, limits) {
             return Err(CollectorError::ItemCapacity);
         }
+
         if byte_capacity > byte_limit(kind, limits) {
             return Err(CollectorError::ByteCapacity);
         }
@@ -130,6 +132,7 @@ impl<T> FixedCollector<T> {
         if self.plan.exact && self.items.len() != self.plan.item_capacity {
             return Err(CollectorError::Incomplete);
         }
+
         if self.plan.exact && self.observed_bytes != self.plan.byte_capacity {
             return Err(CollectorError::Contradictory);
         }
