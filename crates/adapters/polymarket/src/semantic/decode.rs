@@ -195,7 +195,7 @@ impl AssociatedTradesObservation {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WirePostOrder<'a> {
     success: bool,
@@ -214,7 +214,7 @@ struct WirePostOrder<'a> {
     making_amount: &'a str,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireExactOrder<'a> {
     #[serde(borrow)]
@@ -235,7 +235,7 @@ struct WireExactOrder<'a> {
     order_type: &'a str,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireTrade<'a> {
     id: &'a str,
@@ -264,7 +264,7 @@ struct WireTrade<'a> {
     trader_side: &'a str,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireMakerOrder<'a> {
     order_id: &'a str,
@@ -347,8 +347,8 @@ fn decode_post_wire(
     }
     let status =
         PostOrderStatus::try_from(wire.status).map_err(|_| DiagnosticClass::UnknownStatus)?;
-    let taking_amount = checked_non_negative_decimal(wire.taking_amount, limits)?;
-    let making_amount = checked_non_negative_decimal(wire.making_amount, limits)?;
+    let taking_amount = checked_decimal(wire.taking_amount, limits)?;
+    let making_amount = checked_decimal(wire.making_amount, limits)?;
     let transaction_hashes = match wire.transaction_hashes {
         Some(raw) => collect_strings(raw, CollectorKind::TransactionHashes, limits, |value| {
             parse_hash(value, limits)
@@ -408,13 +408,9 @@ fn decode_exact_wire(
     }
     let status =
         ExactOrderStatus::try_from(wire.status).map_err(|_| DiagnosticClass::UnknownStatus)?;
-    let original_size = checked_non_negative_decimal(wire.original_size, limits)?;
-    let size_matched = checked_non_negative_decimal(wire.size_matched, limits)?;
-    let price = checked_non_negative_decimal(wire.price, limits)?;
-
-    if size_matched > original_size {
-        return Err(DiagnosticClass::Contradictory);
-    }
+    let original_size = checked_decimal(wire.original_size, limits)?;
+    let size_matched = checked_decimal(wire.size_matched, limits)?;
+    let price = checked_decimal(wire.price, limits)?;
     let associated_trade_ids = collect_strings(
         wire.associate_trades,
         CollectorKind::AssociatedTrades,
@@ -461,11 +457,12 @@ fn convert_trade(
     checked_optional_string(wire.err_msg, limits)?;
     let _ = wire.bucket_index;
     ProviderSide::try_from(wire.side).map_err(|_| DiagnosticClass::UnknownStatus)?;
+    ProviderTraderSide::try_from(wire.trader_side).map_err(|_| DiagnosticClass::UnknownStatus)?;
     checked_decimal(wire.fee_rate_bps, limits)?;
     let status =
         AssociatedTradeStatus::try_from(wire.status).map_err(|_| DiagnosticClass::UnknownStatus)?;
-    let size = checked_non_negative_decimal(wire.size, limits)?;
-    let price = checked_non_negative_decimal(wire.price, limits)?;
+    let size = checked_decimal(wire.size, limits)?;
+    let price = checked_decimal(wire.price, limits)?;
     let transaction_hash = wire
         .transaction_hash
         .map(|value| parse_hash(value, limits))
@@ -511,17 +508,6 @@ fn checked_decimal(value: &str, limits: SemanticLimits) -> Result<Decimal, Diagn
         return Err(DiagnosticClass::Oversized);
     }
     Decimal::from_str(value).map_err(|_| DiagnosticClass::InvalidDecimal)
-}
-
-fn checked_non_negative_decimal(
-    value: &str,
-    limits: SemanticLimits,
-) -> Result<Decimal, DiagnosticClass> {
-    let value = checked_decimal(value, limits)?;
-    if value < Decimal::ZERO {
-        return Err(DiagnosticClass::Contradictory);
-    }
-    Ok(value)
 }
 
 fn parse_hash(
@@ -769,25 +755,10 @@ impl<'de> Visitor<'de> for TradeArrayVisitor<'_> {
                         return Err(A::Error::custom("semantic maker orders rejected"));
                     }
                 };
-            let trader_side = match ProviderTraderSide::try_from(wire.trader_side) {
-                Ok(side) => side,
-                Err(_) => {
-                    *self.failure = Some(DiagnosticClass::UnknownStatus);
-                    return Err(A::Error::custom("semantic trader side rejected"));
-                }
-            };
-            let role_matches = match trader_side {
-                ProviderTraderSide::Taker => {
-                    wire.taker_order_id == self.expected_order_id && !maker_matches
-                }
-                ProviderTraderSide::Maker => {
-                    wire.taker_order_id != self.expected_order_id && maker_matches
-                }
-            };
 
-            if !role_matches {
+            if wire.taker_order_id != self.expected_order_id && !maker_matches {
                 *self.failure = Some(DiagnosticClass::Contradictory);
-                return Err(A::Error::custom("trade role contradicts requested order"));
+                return Err(A::Error::custom("trade does not reference requested order"));
             }
             let trade = match convert_trade(wire, self.limits) {
                 Ok(trade) => trade,
@@ -858,8 +829,8 @@ fn validate_maker(
         ProviderSide::try_from(side).map_err(|_| DiagnosticClass::UnknownStatus)?;
     }
     checked_optional_string(maker.builder_code, limits)?;
-    checked_non_negative_decimal(maker.matched_amount, limits)?;
-    checked_non_negative_decimal(maker.price, limits)?;
+    checked_decimal(maker.matched_amount, limits)?;
+    checked_decimal(maker.price, limits)?;
     checked_decimal(maker.fee_rate_bps, limits)?;
     if let Some(builder_fee) = maker.builder_fee {
         checked_decimal(builder_fee, limits)?;

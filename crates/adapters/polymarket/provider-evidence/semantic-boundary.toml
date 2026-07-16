@@ -34,14 +34,6 @@ path = "src/order-utils/model/side.ts"
 blob = "4c1eccd3242b42ec5a0344673703cff27b72a355"
 authority = "provider_schema_evidence"
 
-[[sources]]
-id = "exchange_order_state"
-repository = "Polymarket/ctf-exchange-v2"
-commit = "ccc0596074f4dfd62c944fbca4de252893b82b4b"
-path = "src/exchange/libraries/Structs.sol"
-blob = "0bbcd991063772a864bfe4c51679b7d589559d76"
-authority = "provider_contract_evidence"
-
 [[routes]]
 id = "post_order"
 source = "typescript_routes"
@@ -123,16 +115,6 @@ authority = "caller"
 id = "transaction_hash_bytes"
 value = 32
 source = "bolt_architecture"
-
-[[numeric_constraints]]
-id = "non_negative_provider_decimals"
-source = "exchange_order_state"
-evidence = ["uint256 makerAmount;", "uint256 takerAmount;", "uint248 remaining;"]
-
-[[numeric_constraints]]
-id = "matched_not_above_original"
-source = "typescript_schema"
-evidence = ["original_size: string;", "size_matched: string;"]
 
 [[capabilities]]
 id = "permanent_terminality"

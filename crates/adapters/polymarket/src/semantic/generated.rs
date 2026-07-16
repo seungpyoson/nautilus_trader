@@ -350,17 +350,6 @@ impl SemanticLimits {
 pub const TRANSACTION_HASH_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NumericConstraint {
-    NonNegativeProviderDecimals,
-    MatchedNotAboveOriginal,
-}
-
-pub const NUMERIC_CONSTRAINTS: [NumericConstraint; 2] = [
-    NumericConstraint::NonNegativeProviderDecimals,
-    NumericConstraint::MatchedNotAboveOriginal,
-];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnavailableCapability {
     PermanentTerminality,
     CompleteCapture,
@@ -398,7 +387,7 @@ pub struct RegisteredSource {
     pub authority: &'static str,
 }
 
-pub const REGISTERED_SOURCES: [RegisteredSource; 5] = [
+pub const REGISTERED_SOURCES: [RegisteredSource; 4] = [
     RegisteredSource {
         id: "bolt_architecture",
         repository: "seungpyoson/bolt-v2",
@@ -430,13 +419,5 @@ pub const REGISTERED_SOURCES: [RegisteredSource; 5] = [
         path: "src/order-utils/model/side.ts",
         blob: "4c1eccd3242b42ec5a0344673703cff27b72a355",
         authority: "provider_schema_evidence",
-    },
-    RegisteredSource {
-        id: "exchange_order_state",
-        repository: "Polymarket/ctf-exchange-v2",
-        commit: "ccc0596074f4dfd62c944fbca4de252893b82b4b",
-        path: "src/exchange/libraries/Structs.sol",
-        blob: "0bbcd991063772a864bfe4c51679b7d589559d76",
-        authority: "provider_contract_evidence",
     },
 ];

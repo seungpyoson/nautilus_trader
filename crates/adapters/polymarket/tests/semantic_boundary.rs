@@ -599,38 +599,6 @@ fn every_decoder_rejects_wrong_route_unknown_status_and_scalar_cap_plus_one() {
         .is_ok()
     );
 
-    let crossed_taker =
-        maker_associated.replace(r#""trader_side":"MAKER""#, r#""trader_side":"TAKER""#);
-    let crossed_taker = format!("[{crossed_taker}]");
-    assert_eq!(
-        decode_error(decode_associated_trades(
-            provider_bytes(
-                SemanticRoute::GetAssociatedTrades,
-                &crossed_taker,
-                limits(96),
-            ),
-            "order-1",
-        ))
-        .class(),
-        DiagnosticClass::Contradictory
-    );
-
-    let crossed_maker = trade_json("MATCHED", "trade-1", "1")
-        .replace(r#""trader_side":"TAKER""#, r#""trader_side":"MAKER""#);
-    let crossed_maker = format!("[{crossed_maker}]");
-    assert_eq!(
-        decode_error(decode_associated_trades(
-            provider_bytes(
-                SemanticRoute::GetAssociatedTrades,
-                &crossed_maker,
-                limits(96),
-            ),
-            "order-1",
-        ))
-        .class(),
-        DiagnosticClass::Contradictory
-    );
-
     let invalid_maker = maker.replace(r#""side":"BUY""#, r#""side":"SIDEWAYS""#);
     let invalid_maker_side = trade_json("MATCHED", "trade-1", "1")
         .replace("order-1", "order-2")
@@ -774,50 +742,6 @@ fn exact_and_trade_decoders_reject_route_specific_negative_matrix() {
         ))
         .class(),
         DiagnosticClass::Oversized
-    );
-}
-
-#[rstest]
-fn decoders_reject_source_bound_numeric_contradictions() {
-    let negative_post = post_json("live", "[]", "order-1", "1")
-        .replace(r#""takingAmount":"1.25""#, r#""takingAmount":"-1.25""#);
-    assert_eq!(
-        decode_error(decode_post_order(provider_bytes(
-            SemanticRoute::PostOrder,
-            &negative_post,
-            limits(96),
-        )))
-        .class(),
-        DiagnosticClass::Contradictory
-    );
-
-    for exact in [
-        exact_json("ORDER_STATUS_LIVE", "order-1").replace(r#""price":"0.5""#, r#""price":"-0.5""#),
-        exact_json("ORDER_STATUS_LIVE", "order-1")
-            .replace(r#""size_matched":"1.0""#, r#""size_matched":"3.0""#),
-    ] {
-        assert_eq!(
-            decode_error(decode_exact_order(
-                provider_bytes(SemanticRoute::GetExactOrder, &exact, limits(96)),
-                "order-1",
-            ))
-            .class(),
-            DiagnosticClass::Contradictory
-        );
-    }
-
-    let negative_trade = format!("[{}]", trade_json("MATCHED", "trade-1", "-1"));
-    assert_eq!(
-        decode_error(decode_associated_trades(
-            provider_bytes(
-                SemanticRoute::GetAssociatedTrades,
-                &negative_trade,
-                limits(96),
-            ),
-            "order-1",
-        ))
-        .class(),
-        DiagnosticClass::Contradictory
     );
 }
 

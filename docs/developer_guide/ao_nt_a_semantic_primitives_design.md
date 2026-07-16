@@ -46,18 +46,15 @@ The provider facts are registered from these reviewed sources:
 - `Polymarket/clob-client-v2` at
   `ff5913f83132a141e01d403e505b6ccc003aa0f7`, including
   `src/endpoints.ts`, `src/types/clob.ts`, and `src/order-utils/model/side.ts`;
-- `Polymarket/ctf-exchange-v2` at
-  `ccc0596074f4dfd62c944fbca4de252893b82b4b`, specifically
-  `src/exchange/libraries/Structs.sol`;
 - the accepted bolt-v2 architecture at `fe368f851`, for operational-limit and
   capability authority.
 
 Each source row points to a checked-in base64 encoding of the complete Git blob.
-Generation recomputes the Git object SHA-1 from the decoded bytes before using
-them. Routes are read from exact TypeScript constant declarations; vocabulary,
-schema, numeric constraints, and capabilities must match exact source excerpts.
-The tooling does not predict source structure with regular expressions or keep
-a second handwritten copy of provider values.
+Checked-in commit and tree objects cryptographically bind each declared commit,
+path, and blob. The repository name is a locator because Git object identity is
+repository-independent. Generation recomputes every Git object SHA-1 before
+following the commit-to-path chain. Routes and vocabulary are derived from exact
+TypeScript declarations without a second handwritten value list.
 
 Required operational-limit categories are registered separately as issue
 authority from bolt-v2 issue #1383. Provider sources prove vocabulary and
@@ -105,16 +102,24 @@ fence. It verifies that:
 - every generated route, status, limit, and capability reason comes from the
   registry;
 - the registered source identities are unique and complete;
-- semantic code contains no unregistered provider route or status literal;
-- semantic modules contain no unapproved effect roots, output macros, or task
-  and thread spawning calls under an exact token census;
+- semantic code does not duplicate any registered provider route or vocabulary
+  literal;
+- the public semantic surface contains no unsafe/FFI capability, effect-capable
+  callback, unapproved qualified root, output macro, or task/thread spawn;
 - sensitive wrappers do not gain formatting or serialization implementations;
 - generated output exactly matches a fresh generator run.
 
 The verifier tokenizes Rust deterministically, ignoring comments and literal
-contents when classifying effects. It also confines the diff from the registered
-base revision to the semantic subtree and the exact module export. It does not
-use regex or substring prediction as a substitute for source evidence.
+contents when classifying structural capabilities. It uses the CI-supplied merge
+base when available, requires it to equal the declared base, and confines that
+diff to the semantic subtree and exact module export. Local runs without a
+trusted base are diagnostic only. The verifier checks exact registered literals;
+it does not guess semantic meaning from spelling, case, prefixes, or regex.
+
+This is a structural guard, not a proof of arbitrary Rust call-graph purity.
+Review and compiler evidence remain required. The sensitive provider wrapper is
+tighter: its complete method set and each raw-field access are exact-allowlisted
+to the three route-specific decoder calls.
 
 The static verifier never treats a current network fetch as build authority.
 Updating a source revision requires an explicit registry and generated-artifact
@@ -228,12 +233,12 @@ Missing fields, extra fields, malformed decimals, invalid identifiers,
 incomplete collections, contradictory duplicate records, or any unknown value
 fail closed.
 
-Associated-trade correlation is role-exact: a `TAKER` record must identify the
-requested order as the taker and not as a maker, while a `MAKER` record must
-identify it in the maker set and not as the taker. Provider decimal quantities
-backed by unsigned source fields are non-negative, and exact-order matched size
-cannot exceed original size. These are registered source constraints; the
-decoder does not guess price ceilings, tick policy, or other unstated rules.
+Associated trades must reference the requested order as either the taker id or a
+maker-order id. The pinned sources define the `TAKER`/`MAKER` vocabulary but do
+not establish a complete correlation contract, so this slice does not invent
+one. Likewise, decimals are checked for syntax and caller-supplied byte bounds;
+sign, price ceilings, matched-size relations, and tick policy remain unenforced
+until authoritative field-level semantics are registered.
 
 No decoder infers terminality from a status. Decoded observations are semantic
 facts only.
@@ -278,8 +283,8 @@ absence is an ordinary fail-closed result, not a panic and not a warning.
 | Check before allocation | Counting‑allocator integration tests on invalid plans, oversized byte copies, capacity‑plus‑one arrays, and unrepresentable reservations |
 | Strict provider decoding | Route tests for every generated value plus unknown, malformed, extra‑field, cross‑route, oversized, incomplete, and contradictory fixtures |
 | Non‑observable sensitive values | Compile‑fail doctests, forbidden‑trait static checks, zeroization tests, and sentinel projection tests |
-| Generated provenance | Deterministic generator check, exact cached‑Git‑blob hash verification, source‑drift tests, and registry‑to‑generated equality |
-| Registered effects only | Deterministic Rust‑token census, exact route vocabulary checks, and base‑revision diff confinement |
+| Generated provenance | Cached commit/tree/blob object‑chain verification, source‑drift tests, and registry‑to‑generated equality |
+| Structural capability guard | Deterministic Rust‑token checks, exact sensitive access allowlists, exact registered‑literal checks, and trusted‑base diff confinement |
 | V2 capability absence | Generated negative fixtures for all three unavailable contracts and autonomous‑entry rejection tests |
 | No physical runtime | Static rejection of network/task/runtime imports and direct inspection of the confined diff |
 

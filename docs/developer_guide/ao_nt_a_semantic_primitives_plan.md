@@ -13,8 +13,8 @@ Nautilus revision pinned by bolt-v2 without adding a physical network runtime.
 generates route vocabularies, required branded limit fields, and unavailable V2
 capability facts. Handwritten pure Rust modules consume those generated types for
 checked collectors, opaque sensitive hooks, and strict route decoders; a static
-source fence prevents provider effects or duplicate protocol literals outside the
-generated artifact.
+source fence rejects registered-literal duplication and structurally forbidden
+public capabilities while review remains responsible for call-graph purity.
 
 **Tech Stack:** Rust 2024, serde/serde_json, rust_decimal, aws-lc-rs, zeroize,
 Python 3 `tomllib`, Cargo integration tests.
@@ -90,7 +90,8 @@ Python 3 `tomllib`, Cargo integration tests.
 - [ ] **Step 1: Write the registry before the generator**
 
 Register the exact repositories, revisions, paths, and blob SHAs documented by
-the design. Define the three routes, separate status arrays, the ten required
+the design, with cached Git commit/tree proofs binding commit to path and blob.
+Define the three routes, separate status arrays, the ten required
 limit fields, protocol-fixed 32-byte hash width, and all three V2 capability
 states as unavailable. The operational limit rows contain names and authority,
 not numeric defaults.
@@ -169,8 +170,8 @@ git commit -m "feat(polymarket): generate semantic boundary evidence"
   `CollectorPlan::allocate`, `FixedCollector::try_push`, and
   `FixedCollector::finish`.
 - `CollectorError` is a closed allocation-free enum: `ZeroCapacity`,
-  `ItemCapacity`, `ByteCapacity`, `ArithmeticOverflow`, `Incomplete`, and
-  `Contradictory`.
+  `ItemCapacity`, `ByteCapacity`, `ArithmeticOverflow`, `AllocationCapacity`,
+  `Incomplete`, and `Contradictory`.
 
 - [ ] **Step 1: Add failing caller-limit boundary tests**
 
@@ -252,8 +253,9 @@ git commit -m "feat(polymarket): add fixed semantic collectors"
 - Produces `SensitiveProviderBytes`, `SensitiveSignedRequest`,
   `SemanticCredential`, `RedactedMetadata`, `FinalizedBlockRef`, `PreSendHook`,
   `PreDispatchHook`, and `SemanticHookError`.
-- Only crate-private decode closures can borrow raw bytes; public callers receive
-  safe metadata containing route, validated length, and `[u8; 32]` SHA-256.
+- Only the exact route-specific methods owned by `SensitiveProviderBytes` can
+  borrow raw bytes; no generic decode closure exists. Public callers receive safe
+  metadata containing route, validated length, and `[u8; 32]` SHA-256.
 
 - [ ] **Step 1: Add compile-fail documentation examples**
 
@@ -431,16 +433,17 @@ git commit -m "feat(polymarket): block unavailable autonomous capability"
 
 - `python3 scripts/verify_polymarket_semantic_boundary.py --check` verifies the
   real tree.
-- `--self-test` injects an unregistered route, unregistered status, network
-  effect, task spawn, and forbidden sensitive trait implementation and requires
-  each injected case to be rejected.
+- `--self-test` injects registered-literal duplication, network roots, task spawn,
+  unsafe/FFI, public callback capability, forbidden sensitive traits, and an
+  alternate raw-byte projection and requires each case to be rejected.
 
 - [ ] **Step 1: Implement the static verifier and its negative self-tests**
 
-Scan `src/semantic` while treating `generated.rs` as the sole protocol-literal
-source. Reject route-like literals and registered-status duplicates elsewhere.
-Reject `reqwest`, `hyper`, DNS/TLS/socket/client construction, Tokio spawning,
-detached work, and `Debug`/`Display`/serde implementations for sensitive types.
+Scan `src/semantic` while treating `generated.rs` as the sole source for exact
+registered provider literals. Do not predict route or status meaning from text
+shape. Reject unapproved qualified roots, unsafe/FFI, public callback capability,
+task/thread spawning, and `Debug`/`Display`/serde implementations for sensitive
+types. Exact-allowlist every raw-field access in `SensitiveProviderBytes`.
 
 - [ ] **Step 2: Wire the verifier into a focused Cargo integration test**
 

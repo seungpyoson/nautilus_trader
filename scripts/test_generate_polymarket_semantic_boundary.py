@@ -20,7 +20,7 @@ base_revision = "d636f17604cdbddc28ad40e0e15720e2d19bf860"
 [[sources]]
 id = "architecture"
 repository = "seungpyoson/bolt-v2"
-commit = "fe368f8510000000000000000000000000000000"
+commit = "2222222222222222222222222222222222222222"
 path = "docs/architecture.md"
 blob = "1111111111111111111111111111111111111111"
 authority = "semantic_contract"
@@ -99,16 +99,6 @@ id = "transaction_hash_bytes"
 value = 32
 source = "architecture"
 
-[[numeric_constraints]]
-id = "non_negative_provider_decimals"
-source = "architecture"
-evidence = ["uint256 makerAmount;", "uint256 takerAmount;", "uint248 remaining;"]
-
-[[numeric_constraints]]
-id = "matched_not_above_original"
-source = "architecture"
-evidence = ["original_size: string;", "size_matched: string;"]
-
 [[capabilities]]
 id = "permanent_terminality"
 state = "unavailable"
@@ -146,9 +136,16 @@ submit/delay/retry/match/duplicate/preapproval work
 """
 
 
-def git_blob_oid(content: bytes) -> str:
-    header = f"blob {len(content)}\0".encode()
+def git_object_oid(kind: str, content: bytes) -> str:
+    header = f"{kind} {len(content)}\0".encode()
     return hashlib.sha1(header + content, usedforsecurity=False).hexdigest()
+
+
+def git_tree(entries: list[tuple[str, str, str]]) -> tuple[str, bytes]:
+    content = b"".join(
+        f"{mode} {name}\0".encode() + bytes.fromhex(oid) for mode, name, oid in entries
+    )
+    return git_object_oid("tree", content), content
 
 
 def load(
@@ -160,9 +157,22 @@ def load(
 ):
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "registry.toml"
-        blob = git_blob_oid(source_bytes)
+        blob = git_object_oid("blob", source_bytes)
+        docs_tree, docs_content = git_tree([("100644", "architecture.md", blob)])
+        root_tree, root_content = git_tree([("40000", "docs", docs_tree)])
+        commit_content = f"tree {root_tree}\n\nsource proof fixture\n".encode()
+        commit = git_object_oid("commit", commit_content)
         text = text.replace("1111111111111111111111111111111111111111", blob)
+        text = text.replace("2222222222222222222222222222222222222222", commit)
         path.write_text(textwrap.dedent(text), encoding="utf-8")
+        objects = path.parent / "objects"
+        objects.mkdir()
+        for oid, kind, content in (
+            (commit, "commit", commit_content),
+            (root_tree, "tree", root_content),
+            (docs_tree, "tree", docs_content),
+        ):
+            (objects / f"{oid}.{kind}.b64").write_bytes(base64.b64encode(content))
         if write_cache:
             cache = path.parent / "blobs" / f"{blob}.b64"
             cache.parent.mkdir()
@@ -241,6 +251,19 @@ def test_tampered_source_cache_is_rejected() -> None:
     raise AssertionError("registry unexpectedly accepted a tampered source cache")
 
 
+def test_self_consistent_blob_with_false_path_is_rejected() -> None:
+    invalid = VALID_REGISTRY.replace('path = "docs/architecture.md"', 'path = "docs/false.md"')
+    assert_rejected(invalid, "path is absent from commit proof")
+
+
+def test_self_consistent_blob_with_false_commit_is_rejected() -> None:
+    invalid = VALID_REGISTRY.replace(
+        'commit = "2222222222222222222222222222222222222222"',
+        'commit = "3333333333333333333333333333333333333333"',
+    )
+    assert_rejected(invalid, "commit proof unavailable")
+
+
 def test_route_drift_from_source_is_rejected() -> None:
     invalid = VALID_REGISTRY.replace('symbol = "POST_ORDER"', 'symbol = "POST_GUESSED"')
     assert_rejected(invalid, "source-bound route")
@@ -280,6 +303,8 @@ if __name__ == "__main__":
         test_provider_vocabulary_drift_is_rejected,
         test_missing_source_cache_is_rejected,
         test_tampered_source_cache_is_rejected,
+        test_self_consistent_blob_with_false_path_is_rejected,
+        test_self_consistent_blob_with_false_commit_is_rejected,
         test_route_drift_from_source_is_rejected,
         test_status_drift_from_source_is_rejected,
         test_protocol_width_drift_from_source_is_rejected,

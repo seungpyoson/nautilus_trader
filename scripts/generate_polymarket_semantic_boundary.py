@@ -38,10 +38,6 @@ REQUIRED_CAPABILITIES = {
     "complete_capture",
     "competing_work_absence",
 }
-REQUIRED_NUMERIC_CONSTRAINTS = {
-    "matched_not_above_original",
-    "non_negative_provider_decimals",
-}
 
 
 class RegistryError(ValueError):
@@ -240,9 +236,85 @@ def _require_rows(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _git_blob_oid(content: bytes) -> str:
-    header = f"blob {len(content)}\0".encode()
+def _git_object_oid(kind: str, content: bytes) -> str:
+    header = f"{kind} {len(content)}\0".encode()
     return hashlib.sha1(header + content, usedforsecurity=False).hexdigest()
+
+
+def _read_cached_git_object(
+    registry_path: Path,
+    oid: str,
+    kind: str,
+    context: str,
+) -> bytes:
+    cache = registry_path.parent / "objects" / f"{oid}.{kind}.b64"
+    try:
+        encoded = cache.read_bytes()
+    except OSError as e:
+        raise RegistryError(f"{context}: {kind} proof unavailable") from e
+    try:
+        content = base64.b64decode(b"".join(encoded.split()), validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise RegistryError(f"{context}: invalid {kind} proof encoding") from e
+    if _git_object_oid(kind, content) != oid:
+        raise RegistryError(f"{context}: {kind} proof digest mismatch")
+    return content
+
+
+def _commit_tree_oid(commit: bytes, context: str) -> str:
+    try:
+        first_line = commit.splitlines()[0].decode("ascii")
+    except (IndexError, UnicodeDecodeError) as e:
+        raise RegistryError(f"{context}: invalid commit proof") from e
+    prefix = "tree "
+    tree = first_line.removeprefix(prefix)
+    if not first_line.startswith(prefix) or not _is_hex_40(tree):
+        raise RegistryError(f"{context}: commit proof lacks a valid root tree")
+    return tree
+
+
+def _tree_entries(tree: bytes, context: str) -> dict[str, tuple[str, str]]:
+    entries: dict[str, tuple[str, str]] = {}
+    cursor = 0
+    while cursor < len(tree):
+        separator = tree.find(b" ", cursor)
+        terminator = tree.find(b"\0", separator + 1)
+        if separator < 0 or terminator < 0 or terminator + 21 > len(tree):
+            raise RegistryError(f"{context}: malformed tree proof")
+        try:
+            mode = tree[cursor:separator].decode("ascii")
+            name = tree[separator + 1 : terminator].decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise RegistryError(f"{context}: invalid tree entry") from e
+        oid = tree[terminator + 1 : terminator + 21].hex()
+        if not mode or not name or name in entries or not _is_hex_40(oid):
+            raise RegistryError(f"{context}: invalid tree entry")
+        entries[name] = (mode, oid)
+        cursor = terminator + 21
+    return entries
+
+
+def _verify_source_path(row: dict[str, Any], registry_path: Path) -> None:
+    context = f"source {row['id']}"
+    commit = _read_cached_git_object(registry_path, row["commit"], "commit", context)
+    tree_oid = _commit_tree_oid(commit, context)
+    components = row["path"].split("/")
+    if any(not component or component in {".", ".."} for component in components):
+        raise RegistryError(f"{context}: invalid source path")
+    for index, component in enumerate(components):
+        tree = _read_cached_git_object(registry_path, tree_oid, "tree", context)
+        entry = _tree_entries(tree, context).get(component)
+        if entry is None:
+            raise RegistryError(f"{context}: path is absent from commit proof")
+        mode, oid = entry
+        final = index == len(components) - 1
+        if final:
+            if mode == "40000" or oid != row["blob"]:
+                raise RegistryError(f"{context}: commit/path/blob proof mismatch")
+        else:
+            if mode != "40000":
+                raise RegistryError(f"{context}: path component is not a tree")
+            tree_oid = oid
 
 
 def _validate_sources(data: dict[str, Any], registry_path: Path) -> dict[str, str]:
@@ -261,6 +333,7 @@ def _validate_sources(data: dict[str, Any], registry_path: Path) -> dict[str, st
         for field in ("commit", "blob"):
             if not _is_hex_40(row.get(field)):
                 raise RegistryError(f"source {row['id']}: invalid {field}")
+        _verify_source_path(row, registry_path)
         cache = registry_path.parent / "blobs" / f"{row['blob']}.b64"
         try:
             encoded = cache.read_bytes()
@@ -270,7 +343,7 @@ def _validate_sources(data: dict[str, Any], registry_path: Path) -> dict[str, st
             content = base64.b64decode(b"".join(encoded.split()), validate=True)
         except (binascii.Error, ValueError) as e:
             raise RegistryError(f"source {row['id']}: invalid source cache encoding") from e
-        if _git_blob_oid(content) != row["blob"]:
+        if _git_object_oid("blob", content) != row["blob"]:
             raise RegistryError(f"source {row['id']}: blob digest mismatch")
         try:
             source_text[row["id"]] = content.decode("utf-8")
@@ -321,7 +394,9 @@ def _validate_routes(data: dict[str, Any], source_text: dict[str, str]) -> None:
 
 
 def _validate_statuses(
-    row: dict[str, Any], statuses: set[str], source_text: dict[str, str]
+    row: dict[str, Any],
+    statuses: set[str],
+    source_text: dict[str, str],
 ) -> None:
     status_source = row.get("status_source")
     if status_source not in source_text:
@@ -348,7 +423,7 @@ def _validate_vocabularies(data: dict[str, Any], source_text: dict[str, str]) ->
     _validate_unique_ids(vocabularies, "vocabularies")
     if {row["id"] for row in vocabularies} != REQUIRED_VOCABULARIES:
         raise RegistryError(
-            f"vocabularies: required vocabularies are {sorted(REQUIRED_VOCABULARIES)}"
+            f"vocabularies: required vocabularies are {sorted(REQUIRED_VOCABULARIES)}",
         )
     for row in vocabularies:
         _reject_unknown(row, {"id", "source", "declaration", "symbol"}, f"vocabulary {row['id']}")
@@ -402,11 +477,13 @@ def _validate_capabilities(data: dict[str, Any], source_text: dict[str, str]) ->
     _validate_unique_ids(capabilities, "capabilities")
     if {row["id"] for row in capabilities} != REQUIRED_CAPABILITIES:
         raise RegistryError(
-            f"capabilities: required capabilities are {sorted(REQUIRED_CAPABILITIES)}"
+            f"capabilities: required capabilities are {sorted(REQUIRED_CAPABILITIES)}",
         )
     for row in capabilities:
         _reject_unknown(
-            row, {"id", "state", "reason", "source", "evidence"}, f"capability {row['id']}"
+            row,
+            {"id", "state", "reason", "source", "evidence"},
+            f"capability {row['id']}",
         )
         if row.get("state") != "unavailable":
             raise RegistryError(f"capability {row['id']}: current V2 must be unavailable")
@@ -418,24 +495,6 @@ def _validate_capabilities(data: dict[str, Any], source_text: dict[str, str]) ->
             raise RegistryError(f"capability {row['id']}: invalid source evidence")
         if evidence not in source_text[source]:
             raise RegistryError(f"capability {row['id']}: source evidence mismatch")
-
-
-def _validate_numeric_constraints(data: dict[str, Any], source_text: dict[str, str]) -> None:
-    constraints = _require_rows(data, "numeric_constraints")
-    _validate_unique_ids(constraints, "numeric_constraints")
-    if {row["id"] for row in constraints} != REQUIRED_NUMERIC_CONSTRAINTS:
-        raise RegistryError(
-            f"numeric_constraints: required constraints are {sorted(REQUIRED_NUMERIC_CONSTRAINTS)}"
-        )
-    for row in constraints:
-        _reject_unknown(row, {"id", "source", "evidence"}, f"constraint {row['id']}")
-        source = row.get("source")
-        evidence = row.get("evidence")
-        if source not in source_text or not isinstance(evidence, list) or not evidence:
-            raise RegistryError(f"constraint {row['id']}: invalid source evidence")
-        for excerpt in evidence:
-            if not isinstance(excerpt, str) or excerpt not in source_text[source]:
-                raise RegistryError(f"constraint {row['id']}: source evidence mismatch")
 
 
 def load_registry(path: Path) -> Registry:
@@ -456,7 +515,6 @@ def load_registry(path: Path) -> Registry:
             "limits",
             "protocol_widths",
             "capabilities",
-            "numeric_constraints",
         },
         "registry",
     )
@@ -471,7 +529,6 @@ def load_registry(path: Path) -> Registry:
     _validate_limits(data)
     _validate_widths(data, source_text)
     _validate_capabilities(data, source_text)
-    _validate_numeric_constraints(data, source_text)
 
     return Registry(data, source_text)
 
@@ -565,7 +622,6 @@ def render_rust(registry: Registry) -> str:
     vocabularies = {row["id"]: row for row in data["vocabularies"]}
     limits = [row["id"] for row in data["limits"]]
     capabilities = data["capabilities"]
-    numeric_constraints = data["numeric_constraints"]
 
     source_rows = "\n".join(
         "    RegisteredSource {\n"
@@ -597,34 +653,36 @@ def render_rust(registry: Registry) -> str:
         "    },"
         for row in capabilities
     )
-    numeric_variants = "\n".join(f"    {_camel(row['id'])}," for row in numeric_constraints)
-    numeric_rows = "\n".join(
-        f"    NumericConstraint::{_camel(row['id'])}," for row in numeric_constraints
-    )
 
     status_blocks = "\n".join(
         [
             _render_status_enum("PostOrderStatus", "PostOrder", routes["post_order"]["statuses"]),
             _render_status_enum(
-                "ExactOrderStatus", "GetExactOrder", routes["get_exact_order"]["statuses"]
+                "ExactOrderStatus",
+                "GetExactOrder",
+                routes["get_exact_order"]["statuses"],
             ),
             _render_status_enum(
                 "AssociatedTradeStatus",
                 "GetAssociatedTrades",
                 routes["get_associated_trades"]["statuses"],
             ),
-        ]
+        ],
     )
     vocabulary_blocks = "\n".join(
         [
             _render_vocabulary_enum("ProviderSide", "Side", vocabularies["side"]["values"]),
             _render_vocabulary_enum(
-                "ProviderOrderType", "OrderType", vocabularies["order_type"]["values"]
+                "ProviderOrderType",
+                "OrderType",
+                vocabularies["order_type"]["values"],
             ),
             _render_vocabulary_enum(
-                "ProviderTraderSide", "TraderSide", vocabularies["trader_side"]["values"]
+                "ProviderTraderSide",
+                "TraderSide",
+                vocabularies["trader_side"]["values"],
             ),
-        ]
+        ],
     )
 
     return f"""// This file is generated by scripts/generate_polymarket_semantic_boundary.py.
@@ -709,15 +767,6 @@ impl SemanticLimits {{
 }}
 
 pub const TRANSACTION_HASH_BYTES: usize = {data["protocol_widths"][0]["value"]};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NumericConstraint {{
-{numeric_variants}
-}}
-
-pub const NUMERIC_CONSTRAINTS: [NumericConstraint; {len(numeric_constraints)}] = [
-{numeric_rows}
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnavailableCapability {{

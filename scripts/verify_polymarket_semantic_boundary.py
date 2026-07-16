@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,14 @@ ALLOWED_QUALIFIED_ROOTS = {
 ALLOWED_STD_MODULES = {"fmt", "num", "str"}
 FORBIDDEN_OUTPUT_MACROS = ("dbg!", "eprint!", "eprintln!", "print!", "println!")
 FORBIDDEN_OUTPUT_MACRO_NAMES = {macro.removesuffix("!") for macro in FORBIDDEN_OUTPUT_MACROS}
+ALLOWED_INTERNAL_CALLBACK_COUNTS = {"decode.rs": {"FnMut": 3}}
+SENSITIVE_PROVIDER_METHODS = {
+    "checked",
+    "metadata",
+    "decode_post_order",
+    "decode_exact_order",
+    "decode_associated_trades",
+}
 GIT = shutil.which("git")
 
 
@@ -195,6 +204,7 @@ def _check_effects(name: str, source: str) -> None:
     values = _token_values(rust_tokens(source))
     _check_qualified_roots(name, values)
     _check_effect_calls(name, values)
+    _check_effect_capabilities(name, values)
 
 
 def _check_qualified_roots(name: str, values: list[str]) -> None:
@@ -221,26 +231,20 @@ def _check_effect_calls(name: str, values: list[str]) -> None:
             raise FenceError(f"{name}: unregistered spawn call")
 
 
+def _check_effect_capabilities(name: str, values: list[str]) -> None:
+    for forbidden in ("unsafe", "extern"):
+        if forbidden in values:
+            raise FenceError(f"{name}: forbidden {forbidden} capability")
+    allowed = ALLOWED_INTERNAL_CALLBACK_COUNTS.get(Path(name).name, {})
+    for callback in ("Fn", "FnMut", "FnOnce"):
+        if values.count(callback) != allowed.get(callback, 0):
+            raise FenceError(f"{name}: unregistered callback capability: {callback}")
+
+
 def _check_literals(name: str, source: str, routes: set[str], statuses: set[str]) -> None:
     strings = {token.value for token in rust_tokens(source) if token.kind == "string"}
-    route_literals = {value for value in strings if value.startswith("/")}
-    if route_literals:
-        literal = sorted(route_literals)[0]
-        if literal in routes:
-            raise FenceError(f"{name}: registered route literal must remain generated: {literal}")
-        raise FenceError(f"{name}: unregistered route literal: {literal}")
-
-    for status in sorted(statuses):
-        if status in strings:
-            raise FenceError(f"{name}: registered status literal must remain generated: {status}")
-    for value in sorted(strings):
-        status_like = value.startswith("ORDER_STATUS_") or (
-            len(value) >= 4
-            and value[0].isupper()
-            and all(character.isupper() or character == "_" for character in value)
-        )
-        if status_like:
-            raise FenceError(f"{name}: unregistered status-like literal: {value}")
+    for literal in sorted((routes | statuses) & strings):
+        raise FenceError(f"{name}: registered provider literal must remain generated: {literal}")
 
 
 def _check_sensitive_traits(name: str, source: str) -> None:
@@ -269,6 +273,13 @@ def _contains_token_sequence(values: list[str], sequence: list[str]) -> bool:
     return _sequence_index(values, sequence) is not None
 
 
+def _sequence_count(values: list[str], sequence: list[str]) -> int:
+    width = len(sequence)
+    return sum(
+        values[index : index + width] == sequence for index in range(len(values) - width + 1)
+    )
+
+
 def _attribute_tokens_before(values: list[str], index: int) -> list[list[str]]:
     attributes: list[list[str]] = []
     cursor = index - 1
@@ -293,12 +304,43 @@ def check_source(name: str, source: str, routes: set[str], statuses: set[str]) -
     _check_literals(name, source, routes, statuses)
     _check_sensitive_traits(name, source)
     values = _token_values(rust_tokens(source))
-    if "decode_with" in values:
-        raise FenceError(f"{name}: arbitrary sensitive-byte projection")
-    if not name.endswith("sensitive.rs") and _contains_token_sequence(
-        values, [".", "bytes", ".", "as_slice", "("]
-    ):
-        raise FenceError(f"{name}: raw sensitive bytes escaped their owner module")
+    if name.endswith("sensitive.rs"):
+        _check_sensitive_provider_impl(name, values)
+
+
+def _check_sensitive_provider_impl(name: str, values: list[str]) -> None:
+    methods = _impl_method_names(values, "SensitiveProviderBytes")
+    if methods != SENSITIVE_PROVIDER_METHODS:
+        raise FenceError(f"{name}: sensitive provider method surface drifted")
+    raw_access = ["self", ".", "bytes", ".", "as_slice", "(", ")"]
+    allowed_calls = (
+        ["decode_post_order_borrowed", "(", *raw_access, ","],
+        ["decode_exact_order_borrowed", "(", *raw_access, ","],
+        ["decode_associated_trades_borrowed", "(", *raw_access, ","],
+    )
+    for call in allowed_calls:
+        if not _contains_token_sequence(values, call):
+            raise FenceError(f"{name}: route-specific sensitive decode call drifted")
+    if _sequence_count(values, ["self", ".", "bytes"]) != len(allowed_calls):
+        raise FenceError(f"{name}: sensitive byte field access drifted")
+
+
+def _impl_method_names(values: list[str], type_name: str) -> set[str]:
+    start = _sequence_index(values, ["impl", type_name, "{"])
+    if start is None:
+        return set()
+    cursor = start + 3
+    depth = 1
+    methods: set[str] = set()
+    while cursor < len(values) and depth:
+        if values[cursor] == "{":
+            depth += 1
+        elif values[cursor] == "}":
+            depth -= 1
+        elif depth == 1 and values[cursor] == "fn" and cursor + 1 < len(values):
+            methods.add(values[cursor + 1])
+        cursor += 1
+    return methods
 
 
 def check_generated() -> None:
@@ -309,7 +351,7 @@ def check_generated() -> None:
         raise FenceError("generated semantic boundary is stale")
 
 
-def check_tree() -> None:
+def check_tree(base_revision: str) -> None:
     routes, statuses = registered_literals()
     for path in sorted(SEMANTIC.glob("*.rs")):
         if path.name == "generated.rs":
@@ -326,7 +368,7 @@ def check_tree() -> None:
     if "Ok(AutonomousEntryCapability" in capability_source:
         raise FenceError("capabilities.rs: autonomous entry became constructable")
 
-    check_diff_confinement(load_registry(REGISTRY).data["base_revision"])
+    check_diff_confinement(base_revision)
 
 
 def check_diff_confinement(base_revision: str) -> None:
@@ -352,7 +394,7 @@ def check_diff_confinement(base_revision: str) -> None:
             base_revision,
             "--",
             "crates/adapters/polymarket/src/lib.rs",
-        ]
+        ],
     )
     if lib_diff.returncode != 0:
         raise FenceError("unable to inspect the Polymarket module export")
@@ -380,8 +422,8 @@ def _run_git(arguments: list[str]) -> subprocess.CompletedProcess[str]:
 def run_self_test() -> None:
     routes, statuses = registered_literals()
     rejected = {
-        "unregistered route": 'const ROUTE: &str = "/unregistered-effect";',
-        "unregistered status": 'const STATUS: &str = "ORDER_STATUS_GUESSED";',
+        "registered route duplication": f'const ROUTE: &str = "{sorted(routes)[0]}";',
+        "registered status duplication": f'const STATUS: &str = "{sorted(statuses)[0]}";',
         "network effect": "fn effect() { let _ = reqwest::Client::new(); }",
         "task spawn": "fn effect() { tokio::spawn(async {}); }",
         "alternate task spawn": "fn effect() { tokio::task::spawn(async {}); }",
@@ -389,8 +431,9 @@ def run_self_test() -> None:
         "alternate socket": "fn effect() { socket2::Socket::new(domain, kind, protocol); }",
         "alternate client": "fn effect() { ureq::get(endpoint).call(); }",
         "logging sink": 'fn effect() { println!("provider bytes"); }',
+        "public callback": "pub fn run_effect(f: impl FnOnce()) { f(); }",
+        "foreign effect": 'unsafe extern "C" { fn connect(fd: i32) -> i32; }',
         "sensitive trait": "impl Debug for SensitiveProviderBytes {}",
-        "raw projection": "fn leak(value: SensitiveProviderBytes) { value.decode_with(log); }",
     }
     for label, source in rejected.items():
         try:
@@ -398,12 +441,28 @@ def run_self_test() -> None:
         except FenceError:
             continue
         raise FenceError(f"self-test failed to reject {label}")
+    raw_escape = """
+impl SensitiveProviderBytes {
+    pub(crate) fn inspect<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
+        f(self.bytes.as_ref())
+    }
+}
+"""
+    try:
+        _check_sensitive_provider_impl(
+            "self-test/sensitive.rs",
+            _token_values(rust_tokens(raw_escape)),
+        )
+    except FenceError:
+        return
+    raise FenceError("self-test failed to reject alternate sensitive raw-byte projection")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="verify the real semantic tree")
     parser.add_argument("--self-test", action="store_true", help="run negative fence fixtures")
+    parser.add_argument("--base-revision", help="trusted issue-bound merge base")
     return parser.parse_args()
 
 
@@ -412,8 +471,14 @@ def main() -> int:
     if not args.check and not args.self_test:
         raise FenceError("at least one of --check or --self-test is required")
     if args.check:
+        declared_base = load_registry(REGISTRY).data["base_revision"]
+        trusted_base = args.base_revision or os.environ.get("CHANGED_BASE_SHA") or declared_base
+        if (
+            args.base_revision or os.environ.get("CHANGED_BASE_SHA")
+        ) and trusted_base != declared_base:
+            raise FenceError("trusted merge base disagrees with the registered base revision")
         check_generated()
-        check_tree()
+        check_tree(trusted_base)
         print("semantic boundary source fence passed")
     if args.self_test:
         run_self_test()
