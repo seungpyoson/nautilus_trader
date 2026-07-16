@@ -434,9 +434,10 @@ git commit -m "feat(polymarket): block unavailable autonomous capability"
 - `python3 scripts/verify_polymarket_semantic_boundary.py --check` verifies the
   real tree.
 - `--self-test` injects registered-literal duplication, network roots, direct and
-  aliased imports, task spawn, unsafe/FFI, callback traits, function-pointer
-  parameters, aliases, and returns, forbidden sensitive traits, and an alternate
-  raw-byte projection and requires each case to be rejected.
+  aliased imports, import visibility and attributes, parent-module escape, task
+  spawn, unsafe/FFI, callback traits, function-pointer parameters, aliases, and
+  returns, forbidden sensitive traits, and an alternate raw-byte projection and
+  requires each case to be rejected.
 
 - [ ] **Step 1: Implement the static verifier and its negative self-tests**
 

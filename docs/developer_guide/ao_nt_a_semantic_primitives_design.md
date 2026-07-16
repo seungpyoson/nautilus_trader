@@ -107,7 +107,7 @@ fence. It verifies that:
 - the public semantic surface contains no unsafe/FFI capability, effect-capable
   callback trait, function-pointer type, unapproved qualified root, output
   macro, or task/thread spawn, and every complete import statement is
-  exact-allowlisted;
+  exact-allowlisted including visibility with import attributes forbidden;
 - sensitive wrappers do not gain formatting or serialization implementations;
 - generated output exactly matches a fresh generator run.
 

@@ -246,6 +246,7 @@ EXPECTED_IMPORTS = {
         ),
     ),
 }
+EXPECTED_IMPORT_VISIBILITIES = {"mod.rs": (("pub",),) * 6}
 ALLOWED_STD_MODULES = {"fmt", "num", "str"}
 FORBIDDEN_OUTPUT_MACROS = ("dbg!", "eprint!", "eprintln!", "print!", "println!")
 FORBIDDEN_OUTPUT_MACRO_NAMES = {macro.removesuffix("!") for macro in FORBIDDEN_OUTPUT_MACROS}
@@ -410,6 +411,8 @@ def _check_effects(name: str, source: str) -> None:
 
 
 def _check_qualified_roots(name: str, values: list[str]) -> None:
+    if _contains_token_sequence(values, ["super", "::", "super"]):
+        raise FenceError(f"{name}: parent-module escape is forbidden")
     for index, value in enumerate(values[:-1]):
         nested = (
             index > 1
@@ -433,17 +436,44 @@ def _check_qualified_roots(name: str, values: list[str]) -> None:
 
 def _check_imports(name: str, values: list[str]) -> None:
     imports: list[tuple[str, ...]] = []
+    visibilities: list[tuple[str, ...]] = []
     for index, value in enumerate(values):
         if value != "use":
             continue
+        start = _import_visibility_start(values, index)
+        if start > 0 and values[start - 1] == "]":
+            raise FenceError(f"{name}: attributes on imports are forbidden")
         try:
             end = values.index(";", index)
         except ValueError as error:
             raise FenceError(f"{name}: unterminated import") from error
+        visibilities.append(tuple(values[start:index]))
         imports.append(tuple(values[index : end + 1]))
     expected = EXPECTED_IMPORTS.get(Path(name).name, ())
-    if tuple(imports) != expected:
+    expected_visibilities = EXPECTED_IMPORT_VISIBILITIES.get(
+        Path(name).name,
+        ((),) * len(expected),
+    )
+    if tuple(imports) != expected or tuple(visibilities) != expected_visibilities:
         raise FenceError(f"{name}: imports differ from the exact registered statements")
+
+
+def _import_visibility_start(values: list[str], use_index: int) -> int:
+    if use_index > 0 and values[use_index - 1] == "pub":
+        return use_index - 1
+    if use_index == 0 or values[use_index - 1] != ")":
+        return use_index
+    depth = 1
+    cursor = use_index - 2
+    while cursor >= 0 and depth:
+        if values[cursor] == ")":
+            depth += 1
+        elif values[cursor] == "(":
+            depth -= 1
+        cursor -= 1
+    if depth == 0 and cursor >= 0 and values[cursor] == "pub":
+        return cursor
+    return use_index
 
 
 def _check_effect_calls(name: str, values: list[str]) -> None:
@@ -687,6 +717,9 @@ def run_self_test() -> None:
         "self-crate alias": (
             "use nautilus_polymarket::client::Client as de; fn effect() { de::new(); }"
         ),
+        "parent runtime escape": (
+            "fn effect() { super::super::http::clob::PolymarketClobHttpClient::new(); }"
+        ),
         "task spawn": "fn effect() { tokio::spawn(async {}); }",
         "alternate task spawn": "fn effect() { tokio::task::spawn(async {}); }",
         "thread spawn": "fn effect() { std::thread::spawn(effect); }",
@@ -703,6 +736,25 @@ def run_self_test() -> None:
     for label, source in rejected.items():
         try:
             check_source(f"self-test/{label}", source, routes, statuses)
+        except FenceError:
+            continue
+        raise FenceError(f"self-test failed to reject {label}")
+    module_source = (SEMANTIC / "mod.rs").read_text()
+    import_mutations = {
+        "restricted import visibility": module_source.replace(
+            "pub use capabilities::",
+            "pub(crate) use capabilities::",
+            1,
+        ),
+        "attributed import": module_source.replace(
+            "pub use capabilities::",
+            "#[allow(unused_imports)]\npub use capabilities::",
+            1,
+        ),
+    }
+    for label, mutation in import_mutations.items():
+        try:
+            check_source("self-test/mod.rs", mutation, routes, statuses)
         except FenceError:
             continue
         raise FenceError(f"self-test failed to reject {label}")
