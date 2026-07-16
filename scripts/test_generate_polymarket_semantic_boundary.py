@@ -153,12 +153,17 @@ def load(
     *,
     source_bytes: bytes = SOURCE_BYTES,
     cache_bytes: bytes | None = None,
+    commit_cache_bytes: bytes | None = None,
+    root_tree_cache_bytes: bytes | None = None,
+    tree_blob_oid: str | None = None,
     write_cache: bool = True,
 ):
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "registry.toml"
         blob = git_object_oid("blob", source_bytes)
-        docs_tree, docs_content = git_tree([("100644", "architecture.md", blob)])
+        docs_tree, docs_content = git_tree(
+            [("100644", "architecture.md", tree_blob_oid or blob)],
+        )
         root_tree, root_content = git_tree([("40000", "docs", docs_tree)])
         commit_content = f"tree {root_tree}\n\nsource proof fixture\n".encode()
         commit = git_object_oid("commit", commit_content)
@@ -168,8 +173,8 @@ def load(
         objects = path.parent / "objects"
         objects.mkdir()
         for oid, kind, content in (
-            (commit, "commit", commit_content),
-            (root_tree, "tree", root_content),
+            (commit, "commit", commit_cache_bytes or commit_content),
+            (root_tree, "tree", root_tree_cache_bytes or root_content),
             (docs_tree, "tree", docs_content),
         ):
             (objects / f"{oid}.{kind}.b64").write_bytes(base64.b64encode(content))
@@ -256,12 +261,39 @@ def test_self_consistent_blob_with_false_path_is_rejected() -> None:
     assert_rejected(invalid, "path is absent from commit proof")
 
 
-def test_self_consistent_blob_with_false_commit_is_rejected() -> None:
+def test_missing_commit_proof_is_rejected() -> None:
     invalid = VALID_REGISTRY.replace(
         'commit = "2222222222222222222222222222222222222222"',
         'commit = "3333333333333333333333333333333333333333"',
     )
     assert_rejected(invalid, "commit proof unavailable")
+
+
+def test_tampered_commit_proof_is_rejected() -> None:
+    try:
+        load(commit_cache_bytes=b"tampered commit")
+    except RegistryError as e:
+        assert "commit proof digest mismatch" in str(e)
+        return
+    raise AssertionError("registry unexpectedly accepted a tampered commit proof")
+
+
+def test_tampered_tree_proof_is_rejected() -> None:
+    try:
+        load(root_tree_cache_bytes=b"tampered tree")
+    except RegistryError as e:
+        assert "tree proof digest mismatch" in str(e)
+        return
+    raise AssertionError("registry unexpectedly accepted a tampered tree proof")
+
+
+def test_self_consistent_tree_blob_substitution_is_rejected() -> None:
+    try:
+        load(tree_blob_oid="4444444444444444444444444444444444444444")
+    except RegistryError as e:
+        assert "commit/path/blob proof mismatch" in str(e)
+        return
+    raise AssertionError("registry unexpectedly accepted a substituted path blob")
 
 
 def test_route_drift_from_source_is_rejected() -> None:
@@ -304,7 +336,10 @@ if __name__ == "__main__":
         test_missing_source_cache_is_rejected,
         test_tampered_source_cache_is_rejected,
         test_self_consistent_blob_with_false_path_is_rejected,
-        test_self_consistent_blob_with_false_commit_is_rejected,
+        test_missing_commit_proof_is_rejected,
+        test_tampered_commit_proof_is_rejected,
+        test_tampered_tree_proof_is_rejected,
+        test_self_consistent_tree_blob_substitution_is_rejected,
         test_route_drift_from_source_is_rejected,
         test_status_drift_from_source_is_rejected,
         test_protocol_width_drift_from_source_is_rejected,

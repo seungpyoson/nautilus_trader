@@ -29,7 +29,6 @@ ALLOWED_QUALIFIED_ROOTS = {
     "aws_lc_rs",
     "capabilities",
     "collector",
-    "crate",
     "de",
     "decode",
     "digest",
@@ -202,6 +201,7 @@ def registered_literals() -> tuple[set[str], set[str]]:
 
 def _check_effects(name: str, source: str) -> None:
     values = _token_values(rust_tokens(source))
+    _check_use_roots(name, values)
     _check_qualified_roots(name, values)
     _check_effect_calls(name, values)
     _check_effect_capabilities(name, values)
@@ -209,7 +209,13 @@ def _check_effects(name: str, source: str) -> None:
 
 def _check_qualified_roots(name: str, values: list[str]) -> None:
     for index, value in enumerate(values[:-1]):
-        if value == "::" or values[index + 1] != "::" or (index > 0 and values[index - 1] == "::"):
+        nested = (
+            index > 1
+            and values[index - 1] == "::"
+            and values[index - 2]
+            and (values[index - 2][0].isalpha() or values[index - 2][0] == "_")
+        )
+        if value == "::" or values[index + 1] != "::" or nested:
             continue
         if index + 2 < len(values) and values[index + 2] == "<":
             continue
@@ -221,6 +227,18 @@ def _check_qualified_roots(name: str, values: list[str]) -> None:
             module = values[index + 2]
             if module not in ALLOWED_STD_MODULES:
                 raise FenceError(f"{name}: unregistered std effect module: {module}")
+
+
+def _check_use_roots(name: str, values: list[str]) -> None:
+    for index, value in enumerate(values[:-1]):
+        if value != "use":
+            continue
+        root_index = index + 1
+        if values[root_index] == "::":
+            root_index += 1
+        if root_index >= len(values) or values[root_index] not in ALLOWED_QUALIFIED_ROOTS:
+            root = values[root_index] if root_index < len(values) else "<missing>"
+            raise FenceError(f"{name}: unregistered import root: {root}")
 
 
 def _check_effect_calls(name: str, values: list[str]) -> None:
@@ -239,6 +257,8 @@ def _check_effect_capabilities(name: str, values: list[str]) -> None:
     for callback in ("Fn", "FnMut", "FnOnce"):
         if values.count(callback) != allowed.get(callback, 0):
             raise FenceError(f"{name}: unregistered callback capability: {callback}")
+    if _contains_token_sequence(values, [":", "fn", "("]):
+        raise FenceError(f"{name}: unregistered function-pointer callback capability")
 
 
 def _check_literals(name: str, source: str, routes: set[str], statuses: set[str]) -> None:
@@ -309,6 +329,33 @@ def check_source(name: str, source: str, routes: set[str], statuses: set[str]) -
 
 
 def _check_sensitive_provider_impl(name: str, values: list[str]) -> None:
+    expected_layout = [
+        "pub",
+        "struct",
+        "SensitiveProviderBytes",
+        "{",
+        "bytes",
+        ":",
+        "Zeroizing",
+        "<",
+        "Vec",
+        "<",
+        "u8",
+        ">",
+        ">",
+        ",",
+        "limits",
+        ":",
+        "SemanticLimits",
+        ",",
+        "metadata",
+        ":",
+        "RedactedMetadata",
+        ",",
+        "}",
+    ]
+    if _sequence_count(values, expected_layout) != 1:
+        raise FenceError(f"{name}: sensitive provider field layout or visibility drifted")
     methods = _impl_method_names(values, "SensitiveProviderBytes")
     if methods != SENSITIVE_PROVIDER_METHODS:
         raise FenceError(f"{name}: sensitive provider method surface drifted")
@@ -425,6 +472,9 @@ def run_self_test() -> None:
         "registered route duplication": f'const ROUTE: &str = "{sorted(routes)[0]}";',
         "registered status duplication": f'const STATUS: &str = "{sorted(statuses)[0]}";',
         "network effect": "fn effect() { let _ = reqwest::Client::new(); }",
+        "absolute network effect": "fn effect() { let _ = ::reqwest::Client::new(); }",
+        "crate indirection": "fn effect() { crate::client::Client::new(); }",
+        "aliased import": "use reqwest as de; fn effect() { de::Client::new(); }",
         "task spawn": "fn effect() { tokio::spawn(async {}); }",
         "alternate task spawn": "fn effect() { tokio::task::spawn(async {}); }",
         "thread spawn": "fn effect() { std::thread::spawn(effect); }",
@@ -432,6 +482,7 @@ def run_self_test() -> None:
         "alternate client": "fn effect() { ureq::get(endpoint).call(); }",
         "logging sink": 'fn effect() { println!("provider bytes"); }',
         "public callback": "pub fn run_effect(f: impl FnOnce()) { f(); }",
+        "function pointer callback": "pub fn run_effect(f: fn()) { f(); }",
         "foreign effect": 'unsafe extern "C" { fn connect(fd: i32) -> i32; }',
         "sensitive trait": "impl Debug for SensitiveProviderBytes {}",
     }
@@ -441,21 +492,25 @@ def run_self_test() -> None:
         except FenceError:
             continue
         raise FenceError(f"self-test failed to reject {label}")
-    raw_escape = """
-impl SensitiveProviderBytes {
-    pub(crate) fn inspect<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
-        f(self.bytes.as_ref())
+    sensitive_source = (SEMANTIC / "sensitive.rs").read_text()
+    sensitive_mutations = {
+        "public sensitive field": sensitive_source.replace(
+            "    bytes: Zeroizing<Vec<u8>>,",
+            "    pub(crate) bytes: Zeroizing<Vec<u8>>,",
+            1,
+        ),
+        "alternate sensitive projection": sensitive_source.replace(
+            "self.bytes.as_slice()",
+            "self.bytes.as_ref()",
+            1,
+        ),
     }
-}
-"""
-    try:
-        _check_sensitive_provider_impl(
-            "self-test/sensitive.rs",
-            _token_values(rust_tokens(raw_escape)),
-        )
-    except FenceError:
-        return
-    raise FenceError("self-test failed to reject alternate sensitive raw-byte projection")
+    for label, mutation in sensitive_mutations.items():
+        try:
+            check_source("self-test/sensitive.rs", mutation, routes, statuses)
+        except FenceError:
+            continue
+        raise FenceError(f"self-test failed to reject {label}")
 
 
 def parse_args() -> argparse.Namespace:

@@ -441,9 +441,10 @@ git commit -m "feat(polymarket): block unavailable autonomous capability"
 
 Scan `src/semantic` while treating `generated.rs` as the sole source for exact
 registered provider literals. Do not predict route or status meaning from text
-shape. Reject unapproved qualified roots, unsafe/FFI, public callback capability,
-task/thread spawning, and `Debug`/`Display`/serde implementations for sensitive
-types. Exact-allowlist every raw-field access in `SensitiveProviderBytes`.
+shape. Reject unapproved direct/aliased imports and qualified roots, unsafe/FFI,
+public callback capability, task/thread spawning, and `Debug`/`Display`/serde
+implementations for sensitive types. Exact-allowlist the private sensitive field
+layout and every raw-field access in `SensitiveProviderBytes`.
 
 - [ ] **Step 2: Wire the verifier into a focused Cargo integration test**
 

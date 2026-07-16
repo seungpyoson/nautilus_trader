@@ -105,7 +105,8 @@ fence. It verifies that:
 - semantic code does not duplicate any registered provider route or vocabulary
   literal;
 - the public semantic surface contains no unsafe/FFI capability, effect-capable
-  callback, unapproved qualified root, output macro, or task/thread spawn;
+  callback (trait or function pointer), unapproved direct/aliased import or
+  qualified root, output macro, or task/thread spawn;
 - sensitive wrappers do not gain formatting or serialization implementations;
 - generated output exactly matches a fresh generator run.
 
@@ -118,8 +119,8 @@ it does not guess semantic meaning from spelling, case, prefixes, or regex.
 
 This is a structural guard, not a proof of arbitrary Rust call-graph purity.
 Review and compiler evidence remain required. The sensitive provider wrapper is
-tighter: its complete method set and each raw-field access are exact-allowlisted
-to the three route-specific decoder calls.
+tighter: its private field layout, complete method set, and each raw-field access
+are exact-allowlisted to the three route-specific decoder calls.
 
 The static verifier never treats a current network fetch as build authority.
 Updating a source revision requires an explicit registry and generated-artifact
