@@ -69,6 +69,7 @@ pub enum SensitiveValueError {
 #[allow(missing_debug_implementations)]
 pub struct SensitiveProviderBytes {
     bytes: Zeroizing<Vec<u8>>,
+    limits: SemanticLimits,
     metadata: RedactedMetadata,
 }
 
@@ -83,6 +84,7 @@ impl SensitiveProviderBytes {
         Ok(Self {
             metadata: metadata(route, bytes),
             bytes: Zeroizing::new(bytes.to_vec()),
+            limits,
         })
     }
 
@@ -90,6 +92,10 @@ impl SensitiveProviderBytes {
     #[must_use]
     pub const fn metadata(&self) -> &RedactedMetadata {
         &self.metadata
+    }
+
+    pub(crate) const fn limits(&self) -> SemanticLimits {
+        self.limits
     }
 
     pub(crate) fn decode_with<T>(&self, decode: impl FnOnce(&[u8]) -> T) -> T {

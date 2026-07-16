@@ -8,11 +8,17 @@
 // -------------------------------------------------------------------------------------------------
 
 mod collector;
+mod decode;
 mod generated;
 mod hooks;
 mod sensitive;
 
 pub use collector::{CollectorError, CollectorKind, CollectorPlan, FixedCollector};
+pub use decode::{
+    AssociatedTradeObservation, AssociatedTradesObservation, DiagnosticClass,
+    ExactOrderObservation, PostOrderObservation, SemanticDiagnostic, decode_associated_trades,
+    decode_exact_order, decode_post_order,
+};
 pub use generated::*;
 pub use hooks::{FinalizedBlockRef, PreDispatchHook, PreSendHook, SemanticHookError};
 pub use sensitive::{

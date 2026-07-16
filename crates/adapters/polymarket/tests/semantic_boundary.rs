@@ -8,10 +8,11 @@
 // -------------------------------------------------------------------------------------------------
 
 use nautilus_polymarket::semantic::{
-    CollectorError, CollectorKind, CollectorPlan, FinalizedBlockRef, PreDispatchHook, PreSendHook,
-    SemanticCredential, SemanticHookError, SemanticLimitError, SemanticLimitKind,
-    SemanticLimitValues, SemanticLimits, SemanticRoute, SensitiveProviderBytes,
-    SensitiveSignedRequest,
+    AssociatedTradeStatus, CollectorError, CollectorKind, CollectorPlan, DiagnosticClass,
+    ExactOrderStatus, FinalizedBlockRef, PostOrderStatus, PreDispatchHook, PreSendHook,
+    SemanticCredential, SemanticDiagnostic, SemanticHookError, SemanticLimitError,
+    SemanticLimitKind, SemanticLimitValues, SemanticLimits, SemanticRoute, SensitiveProviderBytes,
+    SensitiveSignedRequest, decode_associated_trades, decode_exact_order, decode_post_order,
 };
 
 fn limit_values(transaction_hashes: usize) -> SemanticLimitValues {
@@ -276,5 +277,177 @@ fn semantic_hooks_are_synchronous_and_fail_closed() {
     assert_eq!(
         RejectPreDispatch.before_dispatch(request.metadata(), block),
         Err(SemanticHookError::Unavailable)
+    );
+}
+
+fn provider_bytes(
+    route: SemanticRoute,
+    json: &str,
+    limits: SemanticLimits,
+) -> SensitiveProviderBytes {
+    SensitiveProviderBytes::checked(route, json.as_bytes(), limits).unwrap()
+}
+
+fn decode_error<T>(result: Result<T, SemanticDiagnostic>) -> SemanticDiagnostic {
+    match result {
+        Ok(_) => panic!("fixture unexpectedly decoded"),
+        Err(diagnostic) => diagnostic,
+    }
+}
+
+fn post_json(status: &str, hashes: &str, order_id: &str, making: &str) -> String {
+    format!(
+        r#"{{"success":true,"errorMsg":"","orderID":"{order_id}","transactionsHashes":{hashes},"tradeIDs":["trade-1"],"status":"{status}","takingAmount":"1.25","makingAmount":"{making}"}}"#
+    )
+}
+
+fn exact_json(status: &str, id: &str) -> String {
+    format!(
+        r#"{{"associate_trades":["trade-1"],"id":"{id}","status":"{status}","owner":"owner","maker_address":"maker","market":"market","asset_id":"asset","side":"BUY","original_size":"2.0","size_matched":"1.0","price":"0.5","outcome":"YES","created_at":42,"expiration":"0","order_type":"GTC"}}"#
+    )
+}
+
+fn trade_json(status: &str, id: &str, size: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","taker_order_id":"order-1","market":"market","asset_id":"asset","side":"BUY","size":"{size}","fee_rate_bps":"0","price":"0.5","status":"{status}","match_time":"1","last_update":"2","outcome":"YES","bucket_index":0,"owner":"owner","maker_address":"maker","maker_orders":[],"transaction_hash":"0x0000000000000000000000000000000000000000000000000000000000000000","trader_side":"TAKER"}}"#
+    )
+}
+
+#[test]
+fn post_decoder_accepts_every_generated_status() {
+    let hash = r#"["0x0000000000000000000000000000000000000000000000000000000000000000"]"#;
+    for wire in ["live", "matched", "delayed", "unmatched"] {
+        let json = post_json(wire, hash, "order-1", "2.5");
+        let observation =
+            decode_post_order(provider_bytes(SemanticRoute::PostOrder, &json, limits(96))).unwrap();
+        assert_eq!(
+            observation.status(),
+            PostOrderStatus::try_from(wire).unwrap()
+        );
+    }
+}
+
+#[test]
+fn exact_order_decoder_accepts_every_generated_status_and_matching_id() {
+    for wire in [
+        "ORDER_STATUS_LIVE",
+        "ORDER_STATUS_INVALID",
+        "ORDER_STATUS_CANCELED_MARKET_RESOLVED",
+        "ORDER_STATUS_CANCELED",
+        "ORDER_STATUS_MATCHED",
+    ] {
+        let json = exact_json(wire, "order-1");
+        let observation = decode_exact_order(
+            provider_bytes(SemanticRoute::GetExactOrder, &json, limits(96)),
+            "order-1",
+        )
+        .unwrap();
+        assert_eq!(
+            observation.status(),
+            ExactOrderStatus::try_from(wire).unwrap()
+        );
+    }
+}
+
+#[test]
+fn associated_trade_decoder_accepts_every_generated_status() {
+    for wire in ["MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"] {
+        let json = format!("[{}]", trade_json(wire, "trade-1", "1.0"));
+        let observation = decode_associated_trades(provider_bytes(
+            SemanticRoute::GetAssociatedTrades,
+            &json,
+            limits(96),
+        ))
+        .unwrap();
+        assert_eq!(
+            observation.trades()[0].status(),
+            AssociatedTradeStatus::try_from(wire).unwrap()
+        );
+    }
+}
+
+#[test]
+fn route_decoders_reject_unknown_cross_route_and_malformed_data_safely() {
+    let hash = r#"["0x0000000000000000000000000000000000000000000000000000000000000000"]"#;
+    for json in [
+        post_json("ORDER_STATUS_LIVE", hash, "order-1", "2.5"),
+        post_json("unknown", hash, "order-1", "2.5"),
+        post_json("live", hash, "order-1", "not-a-decimal"),
+        post_json("live", r#"["0x00"]"#, "order-1", "2.5"),
+    ] {
+        let diagnostic = decode_error(decode_post_order(provider_bytes(
+            SemanticRoute::PostOrder,
+            &json,
+            limits(96),
+        )));
+        assert_eq!(diagnostic.route(), SemanticRoute::PostOrder);
+        assert!(!format!("{diagnostic:?}").contains("order-1"));
+    }
+
+    let malformed = provider_bytes(SemanticRoute::PostOrder, "{", limits(96));
+    assert_eq!(
+        decode_error(decode_post_order(malformed)).class(),
+        DiagnosticClass::Malformed
+    );
+}
+
+#[test]
+fn route_decoders_reject_incomplete_extra_oversized_and_contradictory_data() {
+    let missing =
+        r#"{"success":true,"errorMsg":"","status":"live","takingAmount":"1","makingAmount":"1"}"#;
+    let extra = r#"{"success":true,"errorMsg":"","orderID":"order-1","transactionsHashes":[],"tradeIDs":[],"status":"live","takingAmount":"1","makingAmount":"1","extra":true}"#;
+    for json in [missing.to_string(), extra.to_string()] {
+        assert!(
+            decode_post_order(provider_bytes(SemanticRoute::PostOrder, &json, limits(96))).is_err()
+        );
+    }
+
+    let duplicate_hashes = r#"["0x0000000000000000000000000000000000000000000000000000000000000000","0x0000000000000000000000000000000000000000000000000000000000000000"]"#;
+    let duplicate = post_json("live", duplicate_hashes, "order-1", "2.5");
+    assert_eq!(
+        decode_error(decode_post_order(provider_bytes(
+            SemanticRoute::PostOrder,
+            &duplicate,
+            limits(96),
+        )))
+        .class(),
+        DiagnosticClass::Contradictory
+    );
+
+    let three_hashes = r#"["0x0000000000000000000000000000000000000000000000000000000000000000","0x0100000000000000000000000000000000000000000000000000000000000000","0x0200000000000000000000000000000000000000000000000000000000000000"]"#;
+    let oversized = post_json("live", three_hashes, "order-1", "2.5");
+    assert_eq!(
+        decode_error(decode_post_order(provider_bytes(
+            SemanticRoute::PostOrder,
+            &oversized,
+            limits(2),
+        )))
+        .class(),
+        DiagnosticClass::Oversized
+    );
+
+    let mismatch = exact_json("ORDER_STATUS_LIVE", "other-order");
+    assert_eq!(
+        decode_error(decode_exact_order(
+            provider_bytes(SemanticRoute::GetExactOrder, &mismatch, limits(96)),
+            "order-1",
+        ))
+        .class(),
+        DiagnosticClass::Contradictory
+    );
+
+    let conflicting = format!(
+        "[{},{}]",
+        trade_json("MATCHED", "trade-1", "1.0"),
+        trade_json("MATCHED", "trade-1", "2.0")
+    );
+    assert_eq!(
+        decode_error(decode_associated_trades(provider_bytes(
+            SemanticRoute::GetAssociatedTrades,
+            &conflicting,
+            limits(96),
+        )))
+        .class(),
+        DiagnosticClass::Contradictory
     );
 }
