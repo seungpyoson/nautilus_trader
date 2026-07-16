@@ -8,9 +8,9 @@
 // -------------------------------------------------------------------------------------------------
 
 use nautilus_polymarket::semantic::{
-    AssociatedTradeStatus, CollectorError, CollectorKind, CollectorPlan, DiagnosticClass,
-    ExactOrderStatus, FinalizedBlockRef, PostOrderStatus, PreDispatchHook, PreSendHook,
-    SemanticCredential, SemanticDiagnostic, SemanticHookError, SemanticLimitError,
+    AssociatedTradeStatus, CollectorError, CollectorKind, CollectorPlan, CurrentV2Capabilities,
+    DiagnosticClass, ExactOrderStatus, FinalizedBlockRef, PostOrderStatus, PreDispatchHook,
+    PreSendHook, SemanticCredential, SemanticDiagnostic, SemanticHookError, SemanticLimitError,
     SemanticLimitKind, SemanticLimitValues, SemanticLimits, SemanticRoute, SensitiveProviderBytes,
     SensitiveSignedRequest, decode_associated_trades, decode_exact_order, decode_post_order,
 };
@@ -450,4 +450,38 @@ fn route_decoders_reject_incomplete_extra_oversized_and_contradictory_data() {
         .class(),
         DiagnosticClass::Contradictory
     );
+}
+
+#[test]
+fn current_v2_capabilities_are_all_explicitly_unavailable() {
+    let capabilities = CurrentV2Capabilities::current_v2();
+    let unavailable = capabilities.unavailable();
+
+    assert_eq!(unavailable.len(), 3);
+    assert_eq!(
+        unavailable,
+        &nautilus_polymarket::semantic::CURRENT_V2_UNAVAILABLE
+    );
+}
+
+#[test]
+fn observations_and_larger_capacity_cannot_authorize_autonomous_entry() {
+    let mut above_retired_ceiling = limit_values(96);
+    above_retired_ceiling.response_items = 128;
+    let _limits = SemanticLimits::checked(above_retired_ceiling).unwrap();
+    let non_capability_observations = [
+        "cancellation",
+        "not-found",
+        "elapsed-time",
+        "unsigned-expiry",
+        "fill-or-kill-text",
+        "quiet-chain",
+        "sequential-response-hashes",
+        "status-observation",
+    ];
+
+    for _observation in non_capability_observations {
+        let result = CurrentV2Capabilities::current_v2().require_autonomous_entry();
+        assert!(result.is_err());
+    }
 }

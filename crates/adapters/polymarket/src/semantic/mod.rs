@@ -7,12 +7,14 @@
 //  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
 // -------------------------------------------------------------------------------------------------
 
+mod capabilities;
 mod collector;
 mod decode;
 mod generated;
 mod hooks;
 mod sensitive;
 
+pub use capabilities::{AutonomousEntryCapability, CapabilityUnavailable, CurrentV2Capabilities};
 pub use collector::{CollectorError, CollectorKind, CollectorPlan, FixedCollector};
 pub use decode::{
     AssociatedTradeObservation, AssociatedTradesObservation, DiagnosticClass,
