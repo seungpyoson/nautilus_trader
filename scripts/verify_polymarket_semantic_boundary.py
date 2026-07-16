@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import re
+import shutil
+import subprocess
 import sys
-import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 from generate_polymarket_semantic_boundary import load_registry
@@ -17,35 +18,173 @@ ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / "crates/adapters/polymarket/provider-evidence/semantic-boundary.toml"
 SEMANTIC = ROOT / "crates/adapters/polymarket/src/semantic"
 
-ROUTE_LITERAL = re.compile(r'"/[A-Za-z0-9_{}?=&./-]+"')
-STATUS_LIKE = re.compile(r'"(?:ORDER_STATUS_[A-Z_]+|[A-Z][A-Z_]{3,})"')
-FORBIDDEN_EFFECTS = {
-    "reqwest": "HTTP client",
-    "hyper::": "HTTP runtime",
-    "tokio::spawn": "detached task",
-    "spawn_blocking": "detached blocking task",
-    "std::net": "network socket",
-    "TcpStream": "network socket",
-    "UdpSocket": "network socket",
-    "lookup_host": "DNS lookup",
-    "rustls": "TLS runtime",
-    "native_tls": "TLS runtime",
-}
 SENSITIVE_TYPES = (
     "SensitiveProviderBytes",
     "SensitiveSignedRequest",
     "SemanticCredential",
 )
 FORBIDDEN_TRAITS = ("Debug", "Display", "Serialize", "Deserialize")
+ALLOWED_QUALIFIED_ROOTS = {
+    "aws_lc_rs",
+    "capabilities",
+    "collector",
+    "crate",
+    "de",
+    "decode",
+    "digest",
+    "generated",
+    "hooks",
+    "nautilus_polymarket",
+    "rust_decimal",
+    "self",
+    "serde",
+    "serde_json",
+    "sensitive",
+    "std",
+    "super",
+    "zeroize",
+}
+ALLOWED_STD_MODULES = {"fmt", "num", "str"}
+FORBIDDEN_OUTPUT_MACROS = ("dbg!", "eprint!", "eprintln!", "print!", "println!")
+FORBIDDEN_OUTPUT_MACRO_NAMES = {macro.removesuffix("!") for macro in FORBIDDEN_OUTPUT_MACROS}
+GIT = shutil.which("git")
 
 
 class FenceError(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class RustToken:
+    kind: str
+    value: str
+
+
+def rust_tokens(source: str) -> list[RustToken]:
+    tokens: list[RustToken] = []
+    index = 0
+    while index < len(source):
+        index = _skip_rust_whitespace(source, index)
+        if index >= len(source):
+            break
+        matched, token, index = _scan_rust_item(source, index)
+        if not matched:
+            token = RustToken("punctuation", source[index])
+            index += 1
+        if token is not None:
+            tokens.append(token)
+    return tokens
+
+
+def _skip_rust_whitespace(source: str, index: int) -> int:
+    while index < len(source) and source[index].isspace():
+        index += 1
+    return index
+
+
+def _scan_rust_item(source: str, index: int) -> tuple[bool, RustToken | None, int]:
+    for scanner in (
+        _scan_rust_line_comment,
+        _scan_rust_block_comment,
+        _scan_rust_raw_string,
+        _scan_rust_string,
+        _scan_rust_identifier,
+        _scan_rust_double_colon,
+    ):
+        result = scanner(source, index)
+        if result is not None:
+            token, end = result
+            return True, token, end
+    return False, None, index
+
+
+def _scan_rust_line_comment(source: str, index: int) -> tuple[None, int] | None:
+    if not source.startswith("//", index):
+        return None
+    newline = source.find("\n", index + 2)
+    return None, len(source) if newline < 0 else newline + 1
+
+
+def _scan_rust_block_comment(source: str, index: int) -> tuple[None, int] | None:
+    if not source.startswith("/*", index):
+        return None
+    depth = 1
+    cursor = index + 2
+    while cursor < len(source) and depth:
+        if source.startswith("/*", cursor):
+            depth += 1
+            cursor += 2
+        elif source.startswith("*/", cursor):
+            depth -= 1
+            cursor += 2
+        else:
+            cursor += 1
+    if depth:
+        raise FenceError("unterminated Rust block comment")
+    return None, cursor
+
+
+def _scan_rust_raw_string(source: str, index: int) -> tuple[RustToken, int] | None:
+    if source[index] != "r" or index + 1 >= len(source):
+        return None
+    marker = index + 1
+    while marker < len(source) and source[marker] == "#":
+        marker += 1
+    if marker >= len(source) or source[marker] != '"':
+        return None
+    hashes = source[index + 1 : marker]
+    end_marker = '"' + hashes
+    end = source.find(end_marker, marker + 1)
+    if end < 0:
+        raise FenceError("unterminated Rust raw string")
+    return RustToken("string", source[marker + 1 : end]), end + len(end_marker)
+
+
+def _scan_rust_string(source: str, index: int) -> tuple[RustToken, int] | None:
+    if source[index] != '"':
+        return None
+    value: list[str] = []
+    cursor = index + 1
+    while cursor < len(source) and source[cursor] != '"':
+        if source[cursor] == "\\":
+            if cursor + 1 >= len(source):
+                raise FenceError("unterminated Rust string escape")
+            value.extend((source[cursor], source[cursor + 1]))
+            cursor += 2
+        else:
+            value.append(source[cursor])
+            cursor += 1
+    if cursor >= len(source):
+        raise FenceError("unterminated Rust string")
+    return RustToken("string", "".join(value)), cursor + 1
+
+
+def _scan_rust_identifier(source: str, index: int) -> tuple[RustToken, int] | None:
+    character = source[index]
+    if not character.isascii() or not (character.isalpha() or character == "_"):
+        return None
+    end = index + 1
+    while (
+        end < len(source)
+        and source[end].isascii()
+        and (source[end].isalnum() or source[end] == "_")
+    ):
+        end += 1
+    return RustToken("identifier", source[index:end]), end
+
+
+def _scan_rust_double_colon(source: str, index: int) -> tuple[RustToken, int] | None:
+    if not source.startswith("::", index):
+        return None
+    return RustToken("punctuation", "::"), index + 2
+
+
+def _token_values(tokens: list[RustToken]) -> list[str]:
+    return [token.value for token in tokens]
+
+
 def registered_literals() -> tuple[set[str], set[str]]:
-    with REGISTRY.open("rb") as handle:
-        data = tomllib.load(handle)
+    data = load_registry(REGISTRY).data
     routes = {row["path"] for row in data["routes"]}
     statuses = {status for row in data["routes"] for status in row.get("statuses", [])}
     vocabulary_values = {value for row in data["vocabularies"] for value in row.get("values", [])}
@@ -53,50 +192,113 @@ def registered_literals() -> tuple[set[str], set[str]]:
 
 
 def _check_effects(name: str, source: str) -> None:
-    for token, description in FORBIDDEN_EFFECTS.items():
-        if token in source:
-            raise FenceError(f"{name}: forbidden {description}: {token}")
+    values = _token_values(rust_tokens(source))
+    _check_qualified_roots(name, values)
+    _check_effect_calls(name, values)
+
+
+def _check_qualified_roots(name: str, values: list[str]) -> None:
+    for index, value in enumerate(values[:-1]):
+        if value == "::" or values[index + 1] != "::" or (index > 0 and values[index - 1] == "::"):
+            continue
+        if index + 2 < len(values) and values[index + 2] == "<":
+            continue
+        if not value or not value[0].islower():
+            continue
+        if value not in ALLOWED_QUALIFIED_ROOTS:
+            raise FenceError(f"{name}: unregistered qualified effect root: {value}")
+        if value == "std" and index + 2 < len(values):
+            module = values[index + 2]
+            if module not in ALLOWED_STD_MODULES:
+                raise FenceError(f"{name}: unregistered std effect module: {module}")
+
+
+def _check_effect_calls(name: str, values: list[str]) -> None:
+    for index, value in enumerate(values[:-1]):
+        if value in FORBIDDEN_OUTPUT_MACRO_NAMES and values[index + 1] == "!":
+            raise FenceError(f"{name}: forbidden output sink: {value}!")
+        if value == "spawn" and values[index + 1] == "(":
+            raise FenceError(f"{name}: unregistered spawn call")
 
 
 def _check_literals(name: str, source: str, routes: set[str], statuses: set[str]) -> None:
-    route_literals = {match.group(0)[1:-1] for match in ROUTE_LITERAL.finditer(source)}
+    strings = {token.value for token in rust_tokens(source) if token.kind == "string"}
+    route_literals = {value for value in strings if value.startswith("/")}
     if route_literals:
         literal = sorted(route_literals)[0]
         if literal in routes:
             raise FenceError(f"{name}: registered route literal must remain generated: {literal}")
         raise FenceError(f"{name}: unregistered route literal: {literal}")
 
-    quoted_statuses = {f'"{status}"' for status in statuses}
-    for status in sorted(quoted_statuses):
-        if status in source:
+    for status in sorted(statuses):
+        if status in strings:
             raise FenceError(f"{name}: registered status literal must remain generated: {status}")
-    match = STATUS_LIKE.search(source)
-    if match:
-        raise FenceError(f"{name}: unregistered status-like literal: {match.group(0)}")
+    for value in sorted(strings):
+        status_like = value.startswith("ORDER_STATUS_") or (
+            len(value) >= 4
+            and value[0].isupper()
+            and all(character.isupper() or character == "_" for character in value)
+        )
+        if status_like:
+            raise FenceError(f"{name}: unregistered status-like literal: {value}")
 
 
 def _check_sensitive_traits(name: str, source: str) -> None:
+    values = _token_values(rust_tokens(source))
     for sensitive in SENSITIVE_TYPES:
         for trait in FORBIDDEN_TRAITS:
-            impl_pattern = re.compile(rf"impl(?:<[^>]+>)?\s+{trait}\s+for\s+{sensitive}\b")
-            if impl_pattern.search(source):
+            if _contains_token_sequence(values, ["impl", trait, "for", sensitive]):
                 raise FenceError(f"{name}: forbidden {trait} implementation for {sensitive}")
-        struct_match = re.search(rf"pub struct {sensitive}\b", source)
-        if struct_match:
-            prefix = source[max(0, struct_match.start() - 300) : struct_match.start()]
-            derive_blocks = re.findall(r"#\[derive\(([^)]*)\)\]", prefix)
-            for block in derive_blocks:
-                traits = {part.strip() for part in block.split(",")}
-                forbidden = traits.intersection(FORBIDDEN_TRAITS)
-                if forbidden:
-                    found = sorted(forbidden)[0]
-                    raise FenceError(f"{name}: forbidden {found} derive for {sensitive}")
+        struct_index = _sequence_index(values, ["pub", "struct", sensitive])
+        if struct_index is not None:
+            attributes = _attribute_tokens_before(values, struct_index)
+            for trait in FORBIDDEN_TRAITS:
+                if any("derive" in attribute and trait in attribute for attribute in attributes):
+                    raise FenceError(f"{name}: forbidden {trait} derive for {sensitive}")
+
+
+def _sequence_index(values: list[str], sequence: list[str]) -> int | None:
+    width = len(sequence)
+    for index in range(len(values) - width + 1):
+        if values[index : index + width] == sequence:
+            return index
+    return None
+
+
+def _contains_token_sequence(values: list[str], sequence: list[str]) -> bool:
+    return _sequence_index(values, sequence) is not None
+
+
+def _attribute_tokens_before(values: list[str], index: int) -> list[list[str]]:
+    attributes: list[list[str]] = []
+    cursor = index - 1
+    while cursor >= 0 and values[cursor] == "]":
+        depth = 1
+        start = cursor - 1
+        while start >= 0 and depth:
+            if values[start] == "]":
+                depth += 1
+            elif values[start] == "[":
+                depth -= 1
+            start -= 1
+        if depth or start < 0 or values[start] != "#":
+            break
+        attributes.append(values[start + 2 : cursor])
+        cursor = start - 1
+    return attributes
 
 
 def check_source(name: str, source: str, routes: set[str], statuses: set[str]) -> None:
     _check_effects(name, source)
     _check_literals(name, source, routes, statuses)
     _check_sensitive_traits(name, source)
+    values = _token_values(rust_tokens(source))
+    if "decode_with" in values:
+        raise FenceError(f"{name}: arbitrary sensitive-byte projection")
+    if not name.endswith("sensitive.rs") and _contains_token_sequence(
+        values, [".", "bytes", ".", "as_slice", "("]
+    ):
+        raise FenceError(f"{name}: raw sensitive bytes escaped their owner module")
 
 
 def check_generated() -> None:
@@ -124,6 +326,56 @@ def check_tree() -> None:
     if "Ok(AutonomousEntryCapability" in capability_source:
         raise FenceError("capabilities.rs: autonomous entry became constructable")
 
+    check_diff_confinement(load_registry(REGISTRY).data["base_revision"])
+
+
+def check_diff_confinement(base_revision: str) -> None:
+    diff = _run_git(["diff", "--name-only", base_revision])
+    untracked = _run_git(["ls-files", "--others", "--exclude-standard"])
+    if diff.returncode != 0 or untracked.returncode != 0:
+        raise FenceError("unable to inspect issue-bound diff confinement")
+    allowed_exact = {
+        "crates/adapters/polymarket/src/lib.rs",
+    }
+    semantic_prefix = "crates/adapters/polymarket/src/semantic/"
+    changed_paths = set(diff.stdout.splitlines()) | set(untracked.stdout.splitlines())
+    for changed in sorted(changed_paths):
+        if not changed.startswith("crates/adapters/polymarket/src/"):
+            continue
+        if changed in allowed_exact or changed.startswith(semantic_prefix):
+            continue
+        raise FenceError(f"unregistered Polymarket runtime source in issue-bound diff: {changed}")
+    lib_diff = _run_git(
+        [
+            "diff",
+            "--unified=0",
+            base_revision,
+            "--",
+            "crates/adapters/polymarket/src/lib.rs",
+        ]
+    )
+    if lib_diff.returncode != 0:
+        raise FenceError("unable to inspect the Polymarket module export")
+    additions = [
+        line
+        for line in lib_diff.stdout.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    if additions != ["+pub mod semantic;"]:
+        raise FenceError("Polymarket module export drifted beyond the registered semantic module")
+
+
+def _run_git(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    if GIT is None:
+        raise FenceError("git executable is unavailable")
+    return subprocess.run(  # noqa: S603 -- fixed executable; revisions are validated hex.
+        [GIT, *arguments],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
 
 def run_self_test() -> None:
     routes, statuses = registered_literals()
@@ -132,7 +384,13 @@ def run_self_test() -> None:
         "unregistered status": 'const STATUS: &str = "ORDER_STATUS_GUESSED";',
         "network effect": "fn effect() { let _ = reqwest::Client::new(); }",
         "task spawn": "fn effect() { tokio::spawn(async {}); }",
+        "alternate task spawn": "fn effect() { tokio::task::spawn(async {}); }",
+        "thread spawn": "fn effect() { std::thread::spawn(effect); }",
+        "alternate socket": "fn effect() { socket2::Socket::new(domain, kind, protocol); }",
+        "alternate client": "fn effect() { ureq::get(endpoint).call(); }",
+        "logging sink": 'fn effect() { println!("provider bytes"); }',
         "sensitive trait": "impl Debug for SensitiveProviderBytes {}",
+        "raw projection": "fn leak(value: SensitiveProviderBytes) { value.decode_with(log); }",
     }
     for label, source in rejected.items():
         try:

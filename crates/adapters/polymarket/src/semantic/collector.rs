@@ -26,6 +26,7 @@ pub enum CollectorError {
     ItemCapacity,
     ByteCapacity,
     ArithmeticOverflow,
+    AllocationCapacity,
     Incomplete,
     Contradictory,
 }
@@ -78,13 +79,16 @@ impl CollectorPlan {
     }
 
     /// Performs the collector's sole allocation after validation has succeeded.
-    #[must_use]
-    pub fn allocate<T>(self) -> FixedCollector<T> {
-        FixedCollector {
-            items: Vec::with_capacity(self.item_capacity),
+    pub fn allocate<T>(self) -> Result<FixedCollector<T>, CollectorError> {
+        let mut items = Vec::new();
+        items
+            .try_reserve_exact(self.item_capacity)
+            .map_err(|_| CollectorError::AllocationCapacity)?;
+        Ok(FixedCollector {
+            items,
             plan: self,
             observed_bytes: 0,
-        }
+        })
     }
 }
 
@@ -97,8 +101,21 @@ pub struct FixedCollector<T> {
 }
 
 impl<T> FixedCollector<T> {
+    /// Checks the next item without constructing or retaining it.
+    pub fn check_push(&self, encoded_bytes: usize) -> Result<(), CollectorError> {
+        self.next_byte_total(encoded_bytes).map(|_| ())
+    }
+
     /// Retains an item only after count and byte checks succeed.
     pub fn try_push(&mut self, item: T, encoded_bytes: usize) -> Result<(), CollectorError> {
+        let observed_bytes = self.next_byte_total(encoded_bytes)?;
+
+        self.items.push(item);
+        self.observed_bytes = observed_bytes;
+        Ok(())
+    }
+
+    fn next_byte_total(&self, encoded_bytes: usize) -> Result<usize, CollectorError> {
         if self.items.len() >= self.plan.item_capacity {
             return Err(CollectorError::ItemCapacity);
         }
@@ -109,10 +126,7 @@ impl<T> FixedCollector<T> {
         if observed_bytes > self.plan.byte_capacity {
             return Err(CollectorError::ByteCapacity);
         }
-
-        self.items.push(item);
-        self.observed_bytes = observed_bytes;
-        Ok(())
+        Ok(observed_bytes)
     }
 
     /// Returns the retained item count.

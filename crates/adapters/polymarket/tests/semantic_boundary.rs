@@ -113,7 +113,7 @@ fn collector_plan_rejects_zero_capacity() {
 #[rstest]
 fn bounded_collector_checks_bytes_before_retaining_item() {
     let plan = CollectorPlan::bounded(CollectorKind::ResponseItems, 2, 4, limits(96)).unwrap();
-    let mut collector = plan.allocate();
+    let mut collector = plan.allocate().unwrap();
 
     collector.try_push("first", 4).unwrap();
     assert_eq!(collector.len(), 1);
@@ -127,7 +127,7 @@ fn bounded_collector_checks_bytes_before_retaining_item() {
 #[rstest]
 fn bounded_collector_checks_items_before_retaining_item() {
     let plan = CollectorPlan::bounded(CollectorKind::ResponseItems, 1, 4, limits(96)).unwrap();
-    let mut collector = plan.allocate();
+    let mut collector = plan.allocate().unwrap();
 
     collector.try_push("first", 1).unwrap();
     assert_eq!(
@@ -140,7 +140,7 @@ fn bounded_collector_checks_items_before_retaining_item() {
 #[rstest]
 fn exact_collector_rejects_incomplete_item_count() {
     let plan = CollectorPlan::exact(CollectorKind::ResponseItems, 2, 4, limits(96)).unwrap();
-    let mut collector = plan.allocate();
+    let mut collector = plan.allocate().unwrap();
     collector.try_push(1_u8, 2).unwrap();
 
     assert_eq!(collector.finish(), Err(CollectorError::Incomplete));
@@ -149,7 +149,7 @@ fn exact_collector_rejects_incomplete_item_count() {
 #[rstest]
 fn exact_collector_rejects_contradictory_byte_total() {
     let plan = CollectorPlan::exact(CollectorKind::ResponseItems, 2, 4, limits(96)).unwrap();
-    let mut collector = plan.allocate();
+    let mut collector = plan.allocate().unwrap();
     collector.try_push(1_u8, 1).unwrap();
     collector.try_push(2_u8, 2).unwrap();
 
@@ -159,7 +159,7 @@ fn exact_collector_rejects_contradictory_byte_total() {
 #[rstest]
 fn exact_collector_finishes_only_at_declared_totals() {
     let plan = CollectorPlan::exact(CollectorKind::ResponseItems, 2, 4, limits(96)).unwrap();
-    let mut collector = plan.allocate();
+    let mut collector = plan.allocate().unwrap();
     collector.try_push(1_u8, 2).unwrap();
     collector.try_push(2_u8, 2).unwrap();
 
@@ -169,7 +169,7 @@ fn exact_collector_finishes_only_at_declared_totals() {
 #[rstest]
 fn collector_rejects_byte_addition_overflow() {
     let plan = CollectorPlan::bounded(CollectorKind::ResponseItems, 2, 4096, limits(96)).unwrap();
-    let mut collector = plan.allocate();
+    let mut collector = plan.allocate().unwrap();
     collector.try_push(1_u8, 1).unwrap();
 
     assert_eq!(
@@ -177,6 +177,30 @@ fn collector_rejects_byte_addition_overflow() {
         Err(CollectorError::ArithmeticOverflow)
     );
     assert_eq!(collector.len(), 1);
+}
+
+#[rstest]
+fn collector_reports_unrepresentable_allocation_capacity() {
+    let values = SemanticLimitValues {
+        request_body_bytes: usize::MAX,
+        request_items: usize::MAX,
+        response_body_bytes: usize::MAX,
+        response_items: usize::MAX,
+        transaction_hashes: usize::MAX,
+        trade_ids: usize::MAX,
+        associated_trades: usize::MAX,
+        string_bytes: usize::MAX,
+        decimal_bytes: usize::MAX,
+        log_items: usize::MAX,
+    };
+    let limits = SemanticLimits::checked(values).unwrap();
+    let plan = CollectorPlan::bounded(CollectorKind::ResponseItems, usize::MAX, usize::MAX, limits)
+        .unwrap();
+
+    assert_eq!(
+        plan.allocate::<u16>().unwrap_err(),
+        CollectorError::AllocationCapacity
+    );
 }
 
 #[rstest]
@@ -561,6 +585,7 @@ fn every_decoder_rejects_wrong_route_unknown_status_and_scalar_cap_plus_one() {
     let maker = r#"{"order_id":"order-1","owner":"owner","maker_address":"maker","matched_amount":"1","price":"0.5","fee_rate_bps":"0","asset_id":"asset","outcome":"YES","side":"BUY"}"#;
     let maker_associated = trade_json("MATCHED", "trade-1", "1")
         .replace("order-1", "order-2")
+        .replace(r#""trader_side":"TAKER""#, r#""trader_side":"MAKER""#)
         .replace(
             r#""maker_orders":[]"#,
             &format!(r#""maker_orders":[{maker}]"#),
@@ -572,6 +597,38 @@ fn every_decoder_rejects_wrong_route_unknown_status_and_scalar_cap_plus_one() {
             "order-1",
         )
         .is_ok()
+    );
+
+    let crossed_taker =
+        maker_associated.replace(r#""trader_side":"MAKER""#, r#""trader_side":"TAKER""#);
+    let crossed_taker = format!("[{crossed_taker}]");
+    assert_eq!(
+        decode_error(decode_associated_trades(
+            provider_bytes(
+                SemanticRoute::GetAssociatedTrades,
+                &crossed_taker,
+                limits(96),
+            ),
+            "order-1",
+        ))
+        .class(),
+        DiagnosticClass::Contradictory
+    );
+
+    let crossed_maker = trade_json("MATCHED", "trade-1", "1")
+        .replace(r#""trader_side":"TAKER""#, r#""trader_side":"MAKER""#);
+    let crossed_maker = format!("[{crossed_maker}]");
+    assert_eq!(
+        decode_error(decode_associated_trades(
+            provider_bytes(
+                SemanticRoute::GetAssociatedTrades,
+                &crossed_maker,
+                limits(96),
+            ),
+            "order-1",
+        ))
+        .class(),
+        DiagnosticClass::Contradictory
     );
 
     let invalid_maker = maker.replace(r#""side":"BUY""#, r#""side":"SIDEWAYS""#);
@@ -717,6 +774,50 @@ fn exact_and_trade_decoders_reject_route_specific_negative_matrix() {
         ))
         .class(),
         DiagnosticClass::Oversized
+    );
+}
+
+#[rstest]
+fn decoders_reject_source_bound_numeric_contradictions() {
+    let negative_post = post_json("live", "[]", "order-1", "1")
+        .replace(r#""takingAmount":"1.25""#, r#""takingAmount":"-1.25""#);
+    assert_eq!(
+        decode_error(decode_post_order(provider_bytes(
+            SemanticRoute::PostOrder,
+            &negative_post,
+            limits(96),
+        )))
+        .class(),
+        DiagnosticClass::Contradictory
+    );
+
+    for exact in [
+        exact_json("ORDER_STATUS_LIVE", "order-1").replace(r#""price":"0.5""#, r#""price":"-0.5""#),
+        exact_json("ORDER_STATUS_LIVE", "order-1")
+            .replace(r#""size_matched":"1.0""#, r#""size_matched":"3.0""#),
+    ] {
+        assert_eq!(
+            decode_error(decode_exact_order(
+                provider_bytes(SemanticRoute::GetExactOrder, &exact, limits(96)),
+                "order-1",
+            ))
+            .class(),
+            DiagnosticClass::Contradictory
+        );
+    }
+
+    let negative_trade = format!("[{}]", trade_json("MATCHED", "trade-1", "-1"));
+    assert_eq!(
+        decode_error(decode_associated_trades(
+            provider_bytes(
+                SemanticRoute::GetAssociatedTrades,
+                &negative_trade,
+                limits(96),
+            ),
+            "order-1",
+        ))
+        .class(),
+        DiagnosticClass::Contradictory
     );
 }
 

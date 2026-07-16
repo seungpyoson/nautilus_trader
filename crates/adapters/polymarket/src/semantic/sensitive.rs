@@ -10,7 +10,13 @@
 use aws_lc_rs::digest;
 use zeroize::Zeroizing;
 
-use super::{SemanticLimits, SemanticRoute};
+use super::{
+    AssociatedTradesObservation, DiagnosticClass, ExactOrderObservation, PostOrderObservation,
+    SemanticDiagnostic, SemanticLimits, SemanticRoute,
+    decode::{
+        decode_associated_trades_borrowed, decode_exact_order_borrowed, decode_post_order_borrowed,
+    },
+};
 
 /// Safe metadata derived from a validated sensitive value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,12 +100,39 @@ impl SensitiveProviderBytes {
         &self.metadata
     }
 
-    pub(crate) const fn limits(&self) -> SemanticLimits {
-        self.limits
+    pub(super) fn decode_post_order(self) -> Result<PostOrderObservation, SemanticDiagnostic> {
+        let route = SemanticRoute::PostOrder;
+        if self.metadata.route() != route {
+            return Err(SemanticDiagnostic::new(route, DiagnosticClass::WrongRoute));
+        }
+        decode_post_order_borrowed(self.bytes.as_slice(), route, self.limits)
     }
 
-    pub(crate) fn decode_with<T>(&self, decode: impl FnOnce(&[u8]) -> T) -> T {
-        decode(self.bytes.as_slice())
+    pub(super) fn decode_exact_order(
+        self,
+        expected_id: &str,
+    ) -> Result<ExactOrderObservation, SemanticDiagnostic> {
+        let route = SemanticRoute::GetExactOrder;
+        if self.metadata.route() != route {
+            return Err(SemanticDiagnostic::new(route, DiagnosticClass::WrongRoute));
+        }
+        decode_exact_order_borrowed(self.bytes.as_slice(), expected_id, route, self.limits)
+    }
+
+    pub(super) fn decode_associated_trades(
+        self,
+        expected_order_id: &str,
+    ) -> Result<AssociatedTradesObservation, SemanticDiagnostic> {
+        let route = SemanticRoute::GetAssociatedTrades;
+        if self.metadata.route() != route {
+            return Err(SemanticDiagnostic::new(route, DiagnosticClass::WrongRoute));
+        }
+        decode_associated_trades_borrowed(
+            self.bytes.as_slice(),
+            expected_order_id,
+            route,
+            self.limits,
+        )
     }
 }
 

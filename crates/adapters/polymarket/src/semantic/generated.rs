@@ -350,6 +350,17 @@ impl SemanticLimits {
 pub const TRANSACTION_HASH_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NumericConstraint {
+    NonNegativeProviderDecimals,
+    MatchedNotAboveOriginal,
+}
+
+pub const NUMERIC_CONSTRAINTS: [NumericConstraint; 2] = [
+    NumericConstraint::NonNegativeProviderDecimals,
+    NumericConstraint::MatchedNotAboveOriginal,
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnavailableCapability {
     PermanentTerminality,
     CompleteCapture,
@@ -387,7 +398,7 @@ pub struct RegisteredSource {
     pub authority: &'static str,
 }
 
-pub const REGISTERED_SOURCES: [RegisteredSource; 10] = [
+pub const REGISTERED_SOURCES: [RegisteredSource; 5] = [
     RegisteredSource {
         id: "bolt_architecture",
         repository: "seungpyoson/bolt-v2",
@@ -421,51 +432,11 @@ pub const REGISTERED_SOURCES: [RegisteredSource; 10] = [
         authority: "provider_schema_evidence",
     },
     RegisteredSource {
-        id: "rust_vocabulary",
-        repository: "Polymarket/rs-clob-client-v2",
-        commit: "3ae1aae5e9ded38f984464c9fc0f307f8a9f41fb",
-        path: "src/clob/types/mod.rs",
-        blob: "310d8091afd65526d4dbcd2ba0c01fc554b94688",
-        authority: "independent_comparison_evidence",
-    },
-    RegisteredSource {
-        id: "rust_schema",
-        repository: "Polymarket/rs-clob-client-v2",
-        commit: "3ae1aae5e9ded38f984464c9fc0f307f8a9f41fb",
-        path: "src/clob/types/response.rs",
-        blob: "b6dbe326134b9b48f7283eb19f0b65eb10297420",
-        authority: "independent_comparison_evidence",
-    },
-    RegisteredSource {
-        id: "python_routes",
-        repository: "Polymarket/py-clob-client-v2",
-        commit: "fdb2590dc85e600ad98f1f668ea62a0627554d73",
-        path: "py_clob_client_v2/endpoints.py",
-        blob: "9980baf5861374c4c70f36da5213848e142b6493",
-        authority: "independent_comparison_evidence",
-    },
-    RegisteredSource {
-        id: "python_schema",
-        repository: "Polymarket/py-clob-client-v2",
-        commit: "fdb2590dc85e600ad98f1f668ea62a0627554d73",
-        path: "py_clob_client_v2/clob_types.py",
-        blob: "fa39f66752ce908aafc044f27d3624cda1a2fd5d",
-        authority: "independent_comparison_evidence",
-    },
-    RegisteredSource {
         id: "exchange_order_state",
         repository: "Polymarket/ctf-exchange-v2",
         commit: "ccc0596074f4dfd62c944fbca4de252893b82b4b",
         path: "src/exchange/libraries/Structs.sol",
         blob: "0bbcd991063772a864bfe4c51679b7d589559d76",
-        authority: "provider_contract_evidence",
-    },
-    RegisteredSource {
-        id: "exchange_fill_effect",
-        repository: "Polymarket/ctf-exchange-v2",
-        commit: "ccc0596074f4dfd62c944fbca4de252893b82b4b",
-        path: "src/exchange/interfaces/ITrading.sol",
-        blob: "4ea517d5808972e224255981d60d75049ac72032",
         authority: "provider_contract_evidence",
     },
 ];

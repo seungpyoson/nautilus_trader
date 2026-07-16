@@ -208,18 +208,24 @@ pub struct FixedCollector<T> {
 }
 
 impl CollectorPlan {
-    pub fn allocate<T>(self) -> FixedCollector<T> {
-        FixedCollector {
-            items: Vec::with_capacity(self.item_capacity),
+    pub fn allocate<T>(self) -> Result<FixedCollector<T>, CollectorError> {
+        let mut items = Vec::new();
+        items
+            .try_reserve_exact(self.item_capacity)
+            .map_err(|_| CollectorError::AllocationCapacity)?;
+        Ok(FixedCollector {
+            items,
             plan: self,
             observed_bytes: 0,
-        }
+        })
     }
 }
 ```
 
-Every check precedes `Vec::with_capacity` or `Vec::push`. `finish` returns the
-owned vector only after the exact-mode invariants pass.
+Every semantic check precedes reservation or `Vec::push`; reservation failure is
+a typed error. Route decoders perform a borrowed array-count preflight and reject
+capacity-plus-one before reservation. `finish` returns the owned vector only
+after the exact-mode invariants pass.
 
 - [ ] **Step 5: Export and commit**
 

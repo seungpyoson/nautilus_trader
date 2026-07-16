@@ -14,7 +14,8 @@ use std::{
 
 use nautilus_polymarket::semantic::{
     CollectorKind, CollectorPlan, SemanticCredential, SemanticLimitValues, SemanticLimits,
-    SemanticRoute, SensitiveProviderBytes, SensitiveSignedRequest,
+    SemanticRoute, SensitiveProviderBytes, SensitiveSignedRequest, decode_associated_trades,
+    decode_post_order,
 };
 use rstest::rstest;
 
@@ -76,6 +77,44 @@ fn rejected_capacity_checks_allocate_nothing() {
     let oversized_request = [0_u8; 129];
     let oversized_response = [0_u8; 4097];
     let oversized_credential = [0_u8; 257];
+    let mut one_trade_id_values = valid_values();
+    one_trade_id_values.trade_ids = 1;
+    let one_trade_id_limits = SemanticLimits::checked(one_trade_id_values).unwrap();
+    let post_cap_plus_one = SensitiveProviderBytes::checked(
+        SemanticRoute::PostOrder,
+        br#"{"success":true,"errorMsg":"","orderID":"order-1","tradeIDs":["one","two"],"status":"live","takingAmount":"1","makingAmount":"1"}"#,
+        one_trade_id_limits,
+    )
+    .unwrap();
+    let mut one_trade_values = valid_values();
+    one_trade_values.associated_trades = 1;
+    let one_trade_limits = SemanticLimits::checked(one_trade_values).unwrap();
+    let trade_cap_plus_one = SensitiveProviderBytes::checked(
+        SemanticRoute::GetAssociatedTrades,
+        br#"[{},{}]"#,
+        one_trade_limits,
+    )
+    .unwrap();
+    let huge_limits = SemanticLimits::checked(SemanticLimitValues {
+        request_body_bytes: usize::MAX,
+        request_items: usize::MAX,
+        response_body_bytes: usize::MAX,
+        response_items: usize::MAX,
+        transaction_hashes: usize::MAX,
+        trade_ids: usize::MAX,
+        associated_trades: usize::MAX,
+        string_bytes: usize::MAX,
+        decimal_bytes: usize::MAX,
+        log_items: usize::MAX,
+    })
+    .unwrap();
+    let huge_plan = CollectorPlan::bounded(
+        CollectorKind::ResponseItems,
+        usize::MAX,
+        usize::MAX,
+        huge_limits,
+    )
+    .unwrap();
 
     ALLOCATIONS.store(0, Ordering::SeqCst);
     ENABLED.store(true, Ordering::SeqCst);
@@ -97,6 +136,9 @@ fn rejected_capacity_checks_allocate_nothing() {
         b"passphrase",
         limits,
     );
+    let invalid_post_array = decode_post_order(post_cap_plus_one);
+    let invalid_trade_array = decode_associated_trades(trade_cap_plus_one, "order-1");
+    let invalid_allocation = huge_plan.allocate::<u16>();
     ENABLED.store(false, Ordering::SeqCst);
 
     assert!(invalid_limits.is_err());
@@ -104,5 +146,8 @@ fn rejected_capacity_checks_allocate_nothing() {
     assert!(invalid_request.is_err());
     assert!(invalid_response.is_err());
     assert!(invalid_credential.is_err());
+    assert!(invalid_post_array.is_err());
+    assert!(invalid_trade_array.is_err());
+    assert!(invalid_allocation.is_err());
     assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
 }

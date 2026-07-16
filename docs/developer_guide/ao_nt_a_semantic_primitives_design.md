@@ -46,15 +46,18 @@ The provider facts are registered from these reviewed sources:
 - `Polymarket/clob-client-v2` at
   `ff5913f83132a141e01d403e505b6ccc003aa0f7`, including
   `src/endpoints.ts`, `src/types/clob.ts`, and `src/order-utils/model/side.ts`;
-- `Polymarket/rs-clob-client-v2` at
-  `3ae1aae5e9ded38f984464c9fc0f307f8a9f41fb`, including
-  `src/clob/types/mod.rs` and `src/clob/types/response.rs`;
-- `Polymarket/py-clob-client-v2` at
-  `fdb2590dc85e600ad98f1f668ea62a0627554d73`, including
-  `py_clob_client_v2/endpoints.py` and `py_clob_client_v2/clob_types.py`;
 - `Polymarket/ctf-exchange-v2` at
-  `ccc0596074f4dfd62c944fbca4de252893b82b4b`, including the order status,
-  fill event, and matching surfaces under `src/exchange`.
+  `ccc0596074f4dfd62c944fbca4de252893b82b4b`, specifically
+  `src/exchange/libraries/Structs.sol`;
+- the accepted bolt-v2 architecture at `fe368f851`, for operational-limit and
+  capability authority.
+
+Each source row points to a checked-in base64 encoding of the complete Git blob.
+Generation recomputes the Git object SHA-1 from the decoded bytes before using
+them. Routes are read from exact TypeScript constant declarations; vocabulary,
+schema, numeric constraints, and capabilities must match exact source excerpts.
+The tooling does not predict source structure with regular expressions or keep
+a second handwritten copy of provider values.
 
 Required operational-limit categories are registered separately as issue
 authority from bolt-v2 issue #1383. Provider sources prove vocabulary and
@@ -93,7 +96,8 @@ schema facts rather than operational capacities.
 `scripts/generate_polymarket_semantic_boundary.py` reads the registry and emits
 `src/semantic/generated.rs`. The generated file is checked in so reviewers can
 inspect vocabulary and bound changes directly. The generator is deterministic,
-network-free, and supports a check mode that fails on drift.
+network-free, validates every cached Git blob, and supports a check mode that
+fails on drift.
 
 `scripts/verify_polymarket_semantic_boundary.py` performs the static source
 fence. It verifies that:
@@ -102,10 +106,15 @@ fence. It verifies that:
   registry;
 - the registered source identities are unique and complete;
 - semantic code contains no unregistered provider route or status literal;
-- semantic modules contain no HTTP client, socket, DNS, TLS, Tokio spawn, or
-  reqwest effect;
+- semantic modules contain no unapproved effect roots, output macros, or task
+  and thread spawning calls under an exact token census;
 - sensitive wrappers do not gain formatting or serialization implementations;
 - generated output exactly matches a fresh generator run.
+
+The verifier tokenizes Rust deterministically, ignoring comments and literal
+contents when classifying effects. It also confines the diff from the registered
+base revision to the semantic subtree and the exact module export. It does not
+use regex or substring prediction as a substitute for source evidence.
 
 The static verifier never treats a current network fetch as build authority.
 Updating a source revision requires an explicit registry and generated-artifact
@@ -120,8 +129,10 @@ operational capacities and produces the only branded limits value accepted by
 the semantic boundary. `CollectorPlan::checked(expected_items, expected_bytes,
 limits)` validates both declared dimensions using allocation-free arithmetic and
 static error variants.
-Only a valid plan can construct `FixedCollector<T>` and allocate its item
-storage. The plan fields are private, preventing unchecked construction.
+Only a valid plan can construct `FixedCollector<T>`. Storage reservation uses
+`try_reserve_exact`; an unrepresentable or unavailable allocation returns the
+typed `AllocationCapacity` error rather than panicking. The plan fields are
+private, preventing unchecked construction.
 
 Each pushed item supplies its exact encoded byte length. Before insertion, the
 collector checks:
@@ -136,16 +147,24 @@ checked plan. Too few items or bytes is incomplete; too many is overflow; a
 mismatched exact total is contradictory. All failures return closed error enums
 without allocating diagnostic strings or retaining rejected raw bytes.
 
-For a raw response body, `SensitiveProviderBytes::copy_checked` compares the
-source slice length with the caller-supplied route limit before allocating or copying. For a
-prepared request, the same rule applies to signed request bytes. A failed size
-check never constructs the sensitive wrapper.
+For a raw response body, `SensitiveProviderBytes::checked` compares the source
+slice length with the caller-supplied route limit before allocating or copying.
+Its only decoding operations are route-specific methods owned by the sensitive
+module; there is no generic raw-byte callback or projection. For a prepared
+request, the same rule applies to signed request bytes. A failed size check never
+constructs the sensitive wrapper.
+
+Array decoders first count borrowed raw elements without converting or storing
+them. They reject capacity-plus-one before collector reservation, then reserve
+only the observed in-limit count. Element validation checks collector capacity
+before conversion so rejected elements cannot trigger conversion allocations.
 
 Boundary tests exercise capacity minus one, capacity, and capacity plus one for
 both item and byte dimensions, and separately use a transaction-hash capacity
 above 64 to prove that no retired ceiling remains. A dedicated integration-test counting allocator
 proves rejected collector plans and oversized byte copies perform zero
-allocations before returning.
+allocations before returning. It also covers capacity-plus-one arrays and an
+unrepresentable reservation request.
 
 ## Sensitive values
 
@@ -209,6 +228,13 @@ Missing fields, extra fields, malformed decimals, invalid identifiers,
 incomplete collections, contradictory duplicate records, or any unknown value
 fail closed.
 
+Associated-trade correlation is role-exact: a `TAKER` record must identify the
+requested order as the taker and not as a maker, while a `MAKER` record must
+identify it in the maker set and not as the taker. Provider decimal quantities
+backed by unsigned source fields are non-negative, and exact-order matched size
+cannot exceed original size. These are registered source constraints; the
+decoder does not guess price ceilings, tick policy, or other unstated rules.
+
 No decoder infers terminality from a status. Decoded observations are semantic
 facts only.
 
@@ -249,11 +275,11 @@ absence is an ordinary fail-closed result, not a panic and not a warning.
 | Requirement | Evidence |
 |---|---|
 | Item and byte bounds | Unit tests at caller limit minus one, limit, and limit plus one for request and response collectors, including a transaction‑hash limit above 64 |
-| Check before allocation | Counting‑allocator integration tests on invalid plans and oversized byte copies |
+| Check before allocation | Counting‑allocator integration tests on invalid plans, oversized byte copies, capacity‑plus‑one arrays, and unrepresentable reservations |
 | Strict provider decoding | Route tests for every generated value plus unknown, malformed, extra‑field, cross‑route, oversized, incomplete, and contradictory fixtures |
 | Non‑observable sensitive values | Compile‑fail doctests, forbidden‑trait static checks, zeroization tests, and sentinel projection tests |
-| Generated provenance | Deterministic generator check and registry‑to‑generated exact equality tests |
-| Registered effects only | Static source‑fence verifier over semantic modules and generated route vocabulary |
+| Generated provenance | Deterministic generator check, exact cached‑Git‑blob hash verification, source‑drift tests, and registry‑to‑generated equality |
+| Registered effects only | Deterministic Rust‑token census, exact route vocabulary checks, and base‑revision diff confinement |
 | V2 capability absence | Generated negative fixtures for all three unavailable contracts and autonomous‑entry rejection tests |
 | No physical runtime | Static rejection of network/task/runtime imports and direct inspection of the confined diff |
 

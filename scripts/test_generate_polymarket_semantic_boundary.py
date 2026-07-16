@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import tempfile
 import textwrap
 from pathlib import Path
@@ -13,6 +15,7 @@ from generate_polymarket_semantic_boundary import render_rust
 
 VALID_REGISTRY = """
 schema_version = 1
+base_revision = "d636f17604cdbddc28ad40e0e15720e2d19bf860"
 
 [[sources]]
 id = "architecture"
@@ -24,34 +27,41 @@ authority = "semantic_contract"
 
 [[routes]]
 id = "post_order"
-method = "POST"
-path = "/order"
+source = "architecture"
+symbol = "POST_ORDER"
+status_source = "architecture"
 statuses = ["live"]
 
 [[routes]]
 id = "get_exact_order"
-method = "GET"
-path = "/data/order/{order_id}"
+source = "architecture"
+symbol = "GET_ORDER"
+parameter = "order_id"
+status_source = "architecture"
 statuses = ["ORDER_STATUS_LIVE"]
 
 [[routes]]
 id = "get_associated_trades"
-method = "GET"
-path = "/data/trades"
+source = "architecture"
+symbol = "GET_TRADES"
+status_source = "architecture"
 statuses = ["MATCHED"]
 
 [[vocabularies]]
 id = "side"
 source = "architecture"
-values = ["BUY", "SELL"]
+declaration = "enum"
+symbol = "Side"
 [[vocabularies]]
 id = "order_type"
 source = "architecture"
-values = ["GTC", "FOK", "GTD", "FAK"]
+declaration = "enum"
+symbol = "OrderType"
 [[vocabularies]]
 id = "trader_side"
 source = "architecture"
-values = ["TAKER", "MAKER"]
+declaration = "string_union"
+symbol = "trader_side"
 
 [[limits]]
 id = "request_body_bytes"
@@ -87,26 +97,76 @@ authority = "caller"
 [[protocol_widths]]
 id = "transaction_hash_bytes"
 value = 32
+source = "architecture"
+
+[[numeric_constraints]]
+id = "non_negative_provider_decimals"
+source = "architecture"
+evidence = ["uint256 makerAmount;", "uint256 takerAmount;", "uint248 remaining;"]
+
+[[numeric_constraints]]
+id = "matched_not_above_original"
+source = "architecture"
+evidence = ["original_size: string;", "size_matched: string;"]
 
 [[capabilities]]
 id = "permanent_terminality"
 state = "unavailable"
 reason = "no_exact_hash_tombstone"
+source = "architecture"
+evidence = "no permanent maker-controlled tombstone"
 [[capabilities]]
 id = "complete_capture"
 state = "unavailable"
 reason = "no_complete_hash_contract"
+source = "architecture"
+evidence = "no reviewed complete-at-most-64 hash-set contract"
 [[capabilities]]
 id = "competing_work_absence"
 state = "unavailable"
 reason = "no_competing_work_exclusion"
+source = "architecture"
+evidence = "submit/delay/retry/match/duplicate/preapproval work"
 """
 
 
-def load(text: str = VALID_REGISTRY):
+SOURCE_BYTES = b"""export const POST_ORDER = "/order";
+export const GET_ORDER = "/data/order/";
+export const GET_TRADES = "/data/trades";
+export enum Side { BUY = "BUY", SELL = "SELL" }
+export enum OrderType { GTC = "GTC", FOK = "FOK", GTD = "GTD", FAK = "FAK" }
+export interface Trade { trader_side: "TAKER" | "MAKER"; }
+original_size: string; size_matched: string;
+uint256 makerAmount; uint256 takerAmount; uint248 remaining;
+POST admits `live`; GET admits `ORDER_STATUS_LIVE`; trades admit `MATCHED`.
+canonical 32-byte transaction hashes
+no permanent maker-controlled tombstone
+no reviewed complete-at-most-64 hash-set contract
+submit/delay/retry/match/duplicate/preapproval work
+"""
+
+
+def git_blob_oid(content: bytes) -> str:
+    header = f"blob {len(content)}\0".encode()
+    return hashlib.sha1(header + content, usedforsecurity=False).hexdigest()
+
+
+def load(
+    text: str = VALID_REGISTRY,
+    *,
+    source_bytes: bytes = SOURCE_BYTES,
+    cache_bytes: bytes | None = None,
+    write_cache: bool = True,
+):
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "registry.toml"
+        blob = git_blob_oid(source_bytes)
+        text = text.replace("1111111111111111111111111111111111111111", blob)
         path.write_text(textwrap.dedent(text), encoding="utf-8")
+        if write_cache:
+            cache = path.parent / "blobs" / f"{blob}.b64"
+            cache.parent.mkdir()
+            cache.write_bytes(base64.b64encode(cache_bytes or source_bytes))
         return load_registry(path)
 
 
@@ -154,8 +214,60 @@ def test_missing_required_limit_is_rejected() -> None:
 
 
 def test_provider_vocabulary_drift_is_rejected() -> None:
-    invalid = VALID_REGISTRY.replace('values = ["BUY", "SELL"]', 'values = ["BUY", "SIDEWAYS"]')
-    assert_rejected(invalid, "registered provider evidence")
+    invalid_source = SOURCE_BYTES.replace(b'SELL = "SELL"', b'SELL = "SIDEWAYS"')
+    try:
+        load(source_bytes=invalid_source)
+    except RegistryError as e:
+        assert "enum member must equal its wire value" in str(e)
+        return
+    raise AssertionError("registry unexpectedly accepted provider vocabulary drift")
+
+
+def test_missing_source_cache_is_rejected() -> None:
+    try:
+        load(write_cache=False)
+    except RegistryError as e:
+        assert "source cache" in str(e)
+        return
+    raise AssertionError("registry unexpectedly accepted a missing source cache")
+
+
+def test_tampered_source_cache_is_rejected() -> None:
+    try:
+        load(cache_bytes=SOURCE_BYTES + b"tampered")
+    except RegistryError as e:
+        assert "blob digest" in str(e)
+        return
+    raise AssertionError("registry unexpectedly accepted a tampered source cache")
+
+
+def test_route_drift_from_source_is_rejected() -> None:
+    invalid = VALID_REGISTRY.replace('symbol = "POST_ORDER"', 'symbol = "POST_GUESSED"')
+    assert_rejected(invalid, "source-bound route")
+
+
+def test_status_drift_from_source_is_rejected() -> None:
+    invalid = VALID_REGISTRY.replace('statuses = ["live"]', 'statuses = ["guessed"]')
+    assert_rejected(invalid, "source-bound status")
+
+
+def test_protocol_width_drift_from_source_is_rejected() -> None:
+    invalid = VALID_REGISTRY.replace("value = 32", "value = 31")
+    assert_rejected(invalid, "source-bound width")
+
+
+def test_capability_evidence_drift_is_rejected() -> None:
+    invalid = VALID_REGISTRY.replace(
+        'evidence = "no permanent maker-controlled tombstone"',
+        'evidence = "guessed permanent terminality"',
+    )
+    assert_rejected(invalid, "source evidence mismatch")
+
+
+def test_generator_contains_no_duplicate_provider_vocabulary() -> None:
+    generator = Path(__file__).with_name("generate_polymarket_semantic_boundary.py").read_text()
+    for value in ('"BUY"', '"SELL"', '"TAKER"', '"MAKER"'):
+        assert value not in generator
 
 
 if __name__ == "__main__":
@@ -166,6 +278,13 @@ if __name__ == "__main__":
         test_available_current_v2_capability_is_rejected,
         test_missing_required_limit_is_rejected,
         test_provider_vocabulary_drift_is_rejected,
+        test_missing_source_cache_is_rejected,
+        test_tampered_source_cache_is_rejected,
+        test_route_drift_from_source_is_rejected,
+        test_status_drift_from_source_is_rejected,
+        test_protocol_width_drift_from_source_is_rejected,
+        test_capability_evidence_drift_is_rejected,
+        test_generator_contains_no_duplicate_provider_vocabulary,
     ]
     for test in tests:
         test()
