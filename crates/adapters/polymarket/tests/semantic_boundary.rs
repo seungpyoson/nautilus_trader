@@ -47,25 +47,62 @@ fn semantic_limits_reject_each_zero_field() {
 fn transaction_hash_plan_accepts_capacity_minus_one_and_capacity() {
     let limits = limits(96);
 
-    assert!(
-        CollectorPlan::bounded(CollectorKind::TransactionHashes, 95, 95 * 32, limits).is_ok()
-    );
-    assert!(
-        CollectorPlan::bounded(CollectorKind::TransactionHashes, 96, 96 * 32, limits).is_ok()
-    );
+    assert!(CollectorPlan::bounded(CollectorKind::TransactionHashes, 95, 95 * 32, limits).is_ok());
+    assert!(CollectorPlan::bounded(CollectorKind::TransactionHashes, 96, 96 * 32, limits).is_ok());
 }
 
 #[test]
 fn transaction_hash_plan_rejects_capacity_plus_one() {
-    let error = CollectorPlan::bounded(
-        CollectorKind::TransactionHashes,
-        97,
-        96 * 32,
-        limits(96),
-    )
-    .unwrap_err();
+    let error = CollectorPlan::bounded(CollectorKind::TransactionHashes, 97, 96 * 32, limits(96))
+        .unwrap_err();
 
     assert_eq!(error, CollectorError::ItemCapacity);
+}
+
+#[test]
+fn request_plan_accepts_capacity_edges_and_rejects_capacity_plus_one() {
+    let limits = limits(96);
+
+    assert!(CollectorPlan::bounded(CollectorKind::RequestItems, 7, 127, limits).is_ok());
+    assert!(CollectorPlan::bounded(CollectorKind::RequestItems, 8, 128, limits).is_ok());
+    assert_eq!(
+        CollectorPlan::bounded(CollectorKind::RequestItems, 9, 128, limits).unwrap_err(),
+        CollectorError::ItemCapacity
+    );
+    assert_eq!(
+        CollectorPlan::bounded(CollectorKind::RequestItems, 8, 129, limits).unwrap_err(),
+        CollectorError::ByteCapacity
+    );
+}
+
+#[test]
+fn response_plan_accepts_capacity_edges_and_rejects_capacity_plus_one() {
+    let limits = limits(96);
+
+    assert!(CollectorPlan::bounded(CollectorKind::ResponseItems, 7, 4095, limits).is_ok());
+    assert!(CollectorPlan::bounded(CollectorKind::ResponseItems, 8, 4096, limits).is_ok());
+    assert_eq!(
+        CollectorPlan::bounded(CollectorKind::ResponseItems, 9, 4096, limits).unwrap_err(),
+        CollectorError::ItemCapacity
+    );
+    assert_eq!(
+        CollectorPlan::bounded(CollectorKind::ResponseItems, 8, 4097, limits).unwrap_err(),
+        CollectorError::ByteCapacity
+    );
+}
+
+#[test]
+fn collector_plan_rejects_zero_capacity() {
+    let limits = limits(96);
+
+    assert_eq!(
+        CollectorPlan::bounded(CollectorKind::ResponseItems, 0, 1, limits).unwrap_err(),
+        CollectorError::ZeroCapacity
+    );
+    assert_eq!(
+        CollectorPlan::bounded(CollectorKind::ResponseItems, 1, 0, limits).unwrap_err(),
+        CollectorError::ZeroCapacity
+    );
 }
 
 #[test]

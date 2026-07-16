@@ -52,7 +52,9 @@ impl TryFrom<&str> for PostOrderStatus {
             "matched" => Ok(Self::Matched),
             "delayed" => Ok(Self::Delayed),
             "unmatched" => Ok(Self::Unmatched),
-            _ => Err(WireValueError { route: SemanticRoute::PostOrder }),
+            _ => Err(WireValueError {
+                route: SemanticRoute::PostOrder,
+            }),
         }
     }
 }
@@ -76,7 +78,9 @@ impl TryFrom<&str> for ExactOrderStatus {
             "ORDER_STATUS_CANCELED_MARKET_RESOLVED" => Ok(Self::CanceledMarketResolved),
             "ORDER_STATUS_CANCELED" => Ok(Self::Canceled),
             "ORDER_STATUS_MATCHED" => Ok(Self::Matched),
-            _ => Err(WireValueError { route: SemanticRoute::GetExactOrder }),
+            _ => Err(WireValueError {
+                route: SemanticRoute::GetExactOrder,
+            }),
         }
     }
 }
@@ -100,7 +104,9 @@ impl TryFrom<&str> for AssociatedTradeStatus {
             "CONFIRMED" => Ok(Self::Confirmed),
             "RETRYING" => Ok(Self::Retrying),
             "FAILED" => Ok(Self::Failed),
-            _ => Err(WireValueError { route: SemanticRoute::GetAssociatedTrades }),
+            _ => Err(WireValueError {
+                route: SemanticRoute::GetAssociatedTrades,
+            }),
         }
     }
 }
@@ -157,7 +163,11 @@ impl SemanticLimits {
         Ok(Self {
             request_body_bytes: match NonZeroUsize::new(values.request_body_bytes) {
                 Some(value) => value,
-                None => return Err(SemanticLimitError::Zero(SemanticLimitKind::RequestBodyBytes)),
+                None => {
+                    return Err(SemanticLimitError::Zero(
+                        SemanticLimitKind::RequestBodyBytes,
+                    ))
+                }
             },
             request_items: match NonZeroUsize::new(values.request_items) {
                 Some(value) => value,
@@ -165,7 +175,11 @@ impl SemanticLimits {
             },
             response_body_bytes: match NonZeroUsize::new(values.response_body_bytes) {
                 Some(value) => value,
-                None => return Err(SemanticLimitError::Zero(SemanticLimitKind::ResponseBodyBytes)),
+                None => {
+                    return Err(SemanticLimitError::Zero(
+                        SemanticLimitKind::ResponseBodyBytes,
+                    ))
+                }
             },
             response_items: match NonZeroUsize::new(values.response_items) {
                 Some(value) => value,
@@ -173,7 +187,11 @@ impl SemanticLimits {
             },
             transaction_hashes: match NonZeroUsize::new(values.transaction_hashes) {
                 Some(value) => value,
-                None => return Err(SemanticLimitError::Zero(SemanticLimitKind::TransactionHashes)),
+                None => {
+                    return Err(SemanticLimitError::Zero(
+                        SemanticLimitKind::TransactionHashes,
+                    ))
+                }
             },
             trade_ids: match NonZeroUsize::new(values.trade_ids) {
                 Some(value) => value,
@@ -181,7 +199,11 @@ impl SemanticLimits {
             },
             associated_trades: match NonZeroUsize::new(values.associated_trades) {
                 Some(value) => value,
-                None => return Err(SemanticLimitError::Zero(SemanticLimitKind::AssociatedTrades)),
+                None => {
+                    return Err(SemanticLimitError::Zero(
+                        SemanticLimitKind::AssociatedTrades,
+                    ))
+                }
             },
             string_bytes: match NonZeroUsize::new(values.string_bytes) {
                 Some(value) => value,
@@ -265,9 +287,18 @@ pub struct CapabilityEvidence {
 }
 
 pub const CURRENT_V2_UNAVAILABLE: [CapabilityEvidence; 3] = [
-    CapabilityEvidence { capability: UnavailableCapability::PermanentTerminality, reason: "no_indefinite_linearizable_exact_hash_tombstone" },
-    CapabilityEvidence { capability: UnavailableCapability::CompleteCapture, reason: "no_complete_bounded_transaction_hash_contract" },
-    CapabilityEvidence { capability: UnavailableCapability::CompetingWorkAbsence, reason: "no_competing_nonce_or_provider_work_exclusion" },
+    CapabilityEvidence {
+        capability: UnavailableCapability::PermanentTerminality,
+        reason: "no_indefinite_linearizable_exact_hash_tombstone",
+    },
+    CapabilityEvidence {
+        capability: UnavailableCapability::CompleteCapture,
+        reason: "no_complete_bounded_transaction_hash_contract",
+    },
+    CapabilityEvidence {
+        capability: UnavailableCapability::CompetingWorkAbsence,
+        reason: "no_competing_nonce_or_provider_work_exclusion",
+    },
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -281,13 +312,76 @@ pub struct RegisteredSource {
 }
 
 pub const REGISTERED_SOURCES: [RegisteredSource; 9] = [
-    RegisteredSource { id: "bolt_architecture", repository: "seungpyoson/bolt-v2", commit: "fe368f851aae33a064cf0157a1a03ed5e3092a21", path: "docs/superpowers/specs/2026-07-15-autonomous-operation-migration-pr-contract.md", blob: "39702ab6cb19514b8af382d57f86e35e096b0e4d", authority: "semantic_contract" },
-    RegisteredSource { id: "typescript_routes", repository: "Polymarket/clob-client-v2", commit: "ff5913f83132a141e01d403e505b6ccc003aa0f7", path: "src/endpoints.ts", blob: "88768ab142024c8c96df2c7b9a7feeec81baacfe", authority: "provider_route_evidence" },
-    RegisteredSource { id: "typescript_schema", repository: "Polymarket/clob-client-v2", commit: "ff5913f83132a141e01d403e505b6ccc003aa0f7", path: "src/types/clob.ts", blob: "7384b7727d9b73743b987ebaf0d95815b233c29d", authority: "provider_schema_evidence" },
-    RegisteredSource { id: "rust_vocabulary", repository: "Polymarket/rs-clob-client-v2", commit: "3ae1aae5e9ded38f984464c9fc0f307f8a9f41fb", path: "src/clob/types/mod.rs", blob: "310d8091afd65526d4dbcd2ba0c01fc554b94688", authority: "independent_comparison_evidence" },
-    RegisteredSource { id: "rust_schema", repository: "Polymarket/rs-clob-client-v2", commit: "3ae1aae5e9ded38f984464c9fc0f307f8a9f41fb", path: "src/clob/types/response.rs", blob: "b6dbe326134b9b48f7283eb19f0b65eb10297420", authority: "independent_comparison_evidence" },
-    RegisteredSource { id: "python_routes", repository: "Polymarket/py-clob-client-v2", commit: "fdb2590dc85e600ad98f1f668ea62a0627554d73", path: "py_clob_client_v2/endpoints.py", blob: "9980baf5861374c4c70f36da5213848e142b6493", authority: "independent_comparison_evidence" },
-    RegisteredSource { id: "python_schema", repository: "Polymarket/py-clob-client-v2", commit: "fdb2590dc85e600ad98f1f668ea62a0627554d73", path: "py_clob_client_v2/clob_types.py", blob: "fa39f66752ce908aafc044f27d3624cda1a2fd5d", authority: "independent_comparison_evidence" },
-    RegisteredSource { id: "exchange_order_state", repository: "Polymarket/ctf-exchange-v2", commit: "ccc0596074f4dfd62c944fbca4de252893b82b4b", path: "src/exchange/libraries/Structs.sol", blob: "0bbcd991063772a864bfe4c51679b7d589559d76", authority: "provider_contract_evidence" },
-    RegisteredSource { id: "exchange_fill_effect", repository: "Polymarket/ctf-exchange-v2", commit: "ccc0596074f4dfd62c944fbca4de252893b82b4b", path: "src/exchange/interfaces/ITrading.sol", blob: "4ea517d5808972e224255981d60d75049ac72032", authority: "provider_contract_evidence" },
+    RegisteredSource {
+        id: "bolt_architecture",
+        repository: "seungpyoson/bolt-v2",
+        commit: "fe368f851aae33a064cf0157a1a03ed5e3092a21",
+        path: "docs/superpowers/specs/2026-07-15-autonomous-operation-migration-pr-contract.md",
+        blob: "39702ab6cb19514b8af382d57f86e35e096b0e4d",
+        authority: "semantic_contract",
+    },
+    RegisteredSource {
+        id: "typescript_routes",
+        repository: "Polymarket/clob-client-v2",
+        commit: "ff5913f83132a141e01d403e505b6ccc003aa0f7",
+        path: "src/endpoints.ts",
+        blob: "88768ab142024c8c96df2c7b9a7feeec81baacfe",
+        authority: "provider_route_evidence",
+    },
+    RegisteredSource {
+        id: "typescript_schema",
+        repository: "Polymarket/clob-client-v2",
+        commit: "ff5913f83132a141e01d403e505b6ccc003aa0f7",
+        path: "src/types/clob.ts",
+        blob: "7384b7727d9b73743b987ebaf0d95815b233c29d",
+        authority: "provider_schema_evidence",
+    },
+    RegisteredSource {
+        id: "rust_vocabulary",
+        repository: "Polymarket/rs-clob-client-v2",
+        commit: "3ae1aae5e9ded38f984464c9fc0f307f8a9f41fb",
+        path: "src/clob/types/mod.rs",
+        blob: "310d8091afd65526d4dbcd2ba0c01fc554b94688",
+        authority: "independent_comparison_evidence",
+    },
+    RegisteredSource {
+        id: "rust_schema",
+        repository: "Polymarket/rs-clob-client-v2",
+        commit: "3ae1aae5e9ded38f984464c9fc0f307f8a9f41fb",
+        path: "src/clob/types/response.rs",
+        blob: "b6dbe326134b9b48f7283eb19f0b65eb10297420",
+        authority: "independent_comparison_evidence",
+    },
+    RegisteredSource {
+        id: "python_routes",
+        repository: "Polymarket/py-clob-client-v2",
+        commit: "fdb2590dc85e600ad98f1f668ea62a0627554d73",
+        path: "py_clob_client_v2/endpoints.py",
+        blob: "9980baf5861374c4c70f36da5213848e142b6493",
+        authority: "independent_comparison_evidence",
+    },
+    RegisteredSource {
+        id: "python_schema",
+        repository: "Polymarket/py-clob-client-v2",
+        commit: "fdb2590dc85e600ad98f1f668ea62a0627554d73",
+        path: "py_clob_client_v2/clob_types.py",
+        blob: "fa39f66752ce908aafc044f27d3624cda1a2fd5d",
+        authority: "independent_comparison_evidence",
+    },
+    RegisteredSource {
+        id: "exchange_order_state",
+        repository: "Polymarket/ctf-exchange-v2",
+        commit: "ccc0596074f4dfd62c944fbca4de252893b82b4b",
+        path: "src/exchange/libraries/Structs.sol",
+        blob: "0bbcd991063772a864bfe4c51679b7d589559d76",
+        authority: "provider_contract_evidence",
+    },
+    RegisteredSource {
+        id: "exchange_fill_effect",
+        repository: "Polymarket/ctf-exchange-v2",
+        commit: "ccc0596074f4dfd62c944fbca4de252893b82b4b",
+        path: "src/exchange/interfaces/ITrading.sol",
+        blob: "4ea517d5808972e224255981d60d75049ac72032",
+        authority: "provider_contract_evidence",
+    },
 ];

@@ -192,6 +192,30 @@ def _status_variant(wire: str) -> str:
     return _camel(normalized)
 
 
+def _render_limit_check(name: str) -> str:
+    kind = _camel(name)
+    compact_none = (
+        "                None => return "
+        f"Err(SemanticLimitError::Zero(SemanticLimitKind::{kind})),"
+    )
+    if len(kind) < 16:
+        none_arm = f"{compact_none}\n"
+    else:
+        none_arm = (
+            "                None => {\n"
+            "                    return Err(SemanticLimitError::Zero(\n"
+            f"                        SemanticLimitKind::{kind},\n"
+            "                    ))\n"
+            "                }\n"
+        )
+    return (
+        f"            {name}: match NonZeroUsize::new(values.{name}) {{\n"
+        "                Some(value) => value,\n"
+        f"{none_arm}"
+        "            },"
+    )
+
+
 def _render_status_enum(name: str, route_variant: str, statuses: list[str]) -> str:
     variants = "\n".join(f"    {_status_variant(wire)}," for wire in statuses)
     matches = "\n".join(
@@ -209,7 +233,9 @@ impl TryFrom<&str> for {name} {{
     fn try_from(value: &str) -> Result<Self, Self::Error> {{
         match value {{
 {matches}
-            _ => Err(WireValueError {{ route: SemanticRoute::{route_variant} }}),
+            _ => Err(WireValueError {{
+                route: SemanticRoute::{route_variant},
+            }}),
         }}
     }}
 }}
@@ -224,22 +250,19 @@ def render_rust(registry: Registry) -> str:
     capabilities = data["capabilities"]
 
     source_rows = "\n".join(
-        "    RegisteredSource { "
-        f'id: "{row["id"]}", repository: "{row["repository"]}", '
-        f'commit: "{row["commit"]}", path: "{row["path"]}", '
-        f'blob: "{row["blob"]}", authority: "{row["authority"]}"'
-        " },"
+        "    RegisteredSource {\n"
+        f'        id: "{row["id"]}",\n'
+        f'        repository: "{row["repository"]}",\n'
+        f'        commit: "{row["commit"]}",\n'
+        f'        path: "{row["path"]}",\n'
+        f'        blob: "{row["blob"]}",\n'
+        f'        authority: "{row["authority"]}",\n'
+        "    },"
         for row in sources
     )
     limit_value_fields = "\n".join(f"    pub {name}: usize," for name in limits)
     limit_private_fields = "\n".join(f"    {name}: NonZeroUsize," for name in limits)
-    limit_checks = "\n".join(
-        f"            {name}: match NonZeroUsize::new(values.{name}) {{\n"
-        f"                Some(value) => value,\n"
-        f"                None => return Err(SemanticLimitError::Zero(SemanticLimitKind::{_camel(name)})),\n"
-        f"            }},"
-        for name in limits
-    )
+    limit_checks = "\n".join(_render_limit_check(name) for name in limits)
     limit_accessors = "\n\n".join(
         f"    #[must_use]\n"
         f"    pub const fn {name}(self) -> usize {{\n"
@@ -250,10 +273,10 @@ def render_rust(registry: Registry) -> str:
     limit_kinds = "\n".join(f"    {_camel(name)}," for name in limits)
     cap_variants = "\n".join(f"    {_camel(row['id'])}," for row in capabilities)
     cap_rows = "\n".join(
-        "    CapabilityEvidence { "
-        f"capability: UnavailableCapability::{_camel(row['id'])}, "
-        f'reason: "{row["reason"]}"'
-        " },"
+        "    CapabilityEvidence {\n"
+        f"        capability: UnavailableCapability::{_camel(row['id'])},\n"
+        f'        reason: "{row["reason"]}",\n'
+        "    },"
         for row in capabilities
     )
 
