@@ -54,6 +54,7 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 fn valid_values() -> SemanticLimitValues {
     SemanticLimitValues {
         request_body_bytes: 128,
+        request_items: 8,
         response_body_bytes: 4096,
         response_items: 8,
         transaction_hashes: 96,

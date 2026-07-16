@@ -33,6 +33,7 @@ DEFAULT_OUTPUT = (
 REQUIRED_ROUTES = {"post_order", "get_exact_order", "get_associated_trades"}
 REQUIRED_LIMITS = {
     "request_body_bytes",
+    "request_items",
     "response_body_bytes",
     "response_items",
     "transaction_hashes",

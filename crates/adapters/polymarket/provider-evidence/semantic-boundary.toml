@@ -101,6 +101,9 @@ statuses = ["MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"]
 id = "request_body_bytes"
 authority = "caller"
 [[limits]]
+id = "request_items"
+authority = "caller"
+[[limits]]
 id = "response_body_bytes"
 authority = "caller"
 [[limits]]

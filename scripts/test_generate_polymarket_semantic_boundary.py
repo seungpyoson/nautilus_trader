@@ -50,6 +50,9 @@ statuses = ["MATCHED"]
 id = "request_body_bytes"
 authority = "caller"
 [[limits]]
+id = "request_items"
+authority = "caller"
+[[limits]]
 id = "response_body_bytes"
 authority = "caller"
 [[limits]]
@@ -132,7 +135,7 @@ class GeneratorTests(unittest.TestCase):
 
     def test_missing_required_limit_is_rejected(self) -> None:
         invalid = VALID_REGISTRY.replace(
-            '[[limits]]\nid = "log_items"\nauthority = "caller"\n', ""
+            '[[limits]]\nid = "request_items"\nauthority = "caller"\n', ""
         )
         with self.assertRaisesRegex(RegistryError, "required limits"):
             self.load(invalid)

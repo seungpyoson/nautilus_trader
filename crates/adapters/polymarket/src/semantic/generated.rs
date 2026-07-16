@@ -108,6 +108,7 @@ impl TryFrom<&str> for AssociatedTradeStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SemanticLimitKind {
     RequestBodyBytes,
+    RequestItems,
     ResponseBodyBytes,
     ResponseItems,
     TransactionHashes,
@@ -126,6 +127,7 @@ pub enum SemanticLimitError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SemanticLimitValues {
     pub request_body_bytes: usize,
+    pub request_items: usize,
     pub response_body_bytes: usize,
     pub response_items: usize,
     pub transaction_hashes: usize,
@@ -139,6 +141,7 @@ pub struct SemanticLimitValues {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SemanticLimits {
     request_body_bytes: NonZeroUsize,
+    request_items: NonZeroUsize,
     response_body_bytes: NonZeroUsize,
     response_items: NonZeroUsize,
     transaction_hashes: NonZeroUsize,
@@ -155,6 +158,10 @@ impl SemanticLimits {
             request_body_bytes: match NonZeroUsize::new(values.request_body_bytes) {
                 Some(value) => value,
                 None => return Err(SemanticLimitError::Zero(SemanticLimitKind::RequestBodyBytes)),
+            },
+            request_items: match NonZeroUsize::new(values.request_items) {
+                Some(value) => value,
+                None => return Err(SemanticLimitError::Zero(SemanticLimitKind::RequestItems)),
             },
             response_body_bytes: match NonZeroUsize::new(values.response_body_bytes) {
                 Some(value) => value,
@@ -194,6 +201,11 @@ impl SemanticLimits {
     #[must_use]
     pub const fn request_body_bytes(self) -> usize {
         self.request_body_bytes.get()
+    }
+
+    #[must_use]
+    pub const fn request_items(self) -> usize {
+        self.request_items.get()
     }
 
     #[must_use]

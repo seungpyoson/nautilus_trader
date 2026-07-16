@@ -89,7 +89,7 @@ Python 3 `tomllib`, Cargo integration tests.
 - [ ] **Step 1: Write the registry before the generator**
 
 Register the exact repositories, revisions, paths, and blob SHAs documented by
-the design. Define the three routes, separate status arrays, the nine required
+the design. Define the three routes, separate status arrays, the ten required
 limit fields, protocol-fixed 32-byte hash width, and all three V2 capability
 states as unavailable. The operational limit rows contain names and authority,
 not numeric defaults.
