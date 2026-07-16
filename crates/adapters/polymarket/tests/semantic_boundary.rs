@@ -599,10 +599,28 @@ fn every_decoder_rejects_wrong_route_unknown_status_and_scalar_cap_plus_one() {
 #[rstest]
 fn exact_and_trade_decoders_reject_route_specific_negative_matrix() {
     let exact = exact_json("ORDER_STATUS_LIVE", "order-1");
+    let oversized_string = "x".repeat(257);
+    let oversized_decimal = "1".repeat(129);
+    let oversized_associated_trades = (0..9)
+        .map(|index| format!(r#""trade-{index}""#))
+        .collect::<Vec<_>>()
+        .join(",");
     let exact_cases = [
         exact.replace(r#""owner":"owner","#, ""),
         exact.replace("}", r#","extra":true}"#),
         exact.replace(r#""price":"0.5""#, r#""price":"not-decimal""#),
+        exact.replace(
+            r#""owner":"owner""#,
+            &format!(r#""owner":"{oversized_string}""#),
+        ),
+        exact.replace(
+            r#""original_size":"2.0""#,
+            &format!(r#""original_size":"{oversized_decimal}""#),
+        ),
+        exact.replace(
+            r#"["trade-1"]"#,
+            &format!("[{oversized_associated_trades}]"),
+        ),
     ];
 
     for json in exact_cases {
@@ -614,6 +632,13 @@ fn exact_and_trade_decoders_reject_route_specific_negative_matrix() {
             .is_err()
         );
     }
+    assert!(
+        decode_exact_order(
+            provider_bytes(SemanticRoute::GetExactOrder, "{", limits(96)),
+            "order-1",
+        )
+        .is_err()
+    );
 
     let trade = trade_json("MATCHED", "trade-1", "1");
     let trade_cases = [
@@ -634,6 +659,35 @@ fn exact_and_trade_decoders_reject_route_specific_negative_matrix() {
                 "order-1",
             )
             .is_err()
+        );
+    }
+
+    let valid_trade_body = format!("[{}]", trade_json("MATCHED", "trade-1", "1"));
+    assert_eq!(
+        decode_error(decode_associated_trades(
+            provider_bytes(SemanticRoute::PostOrder, &valid_trade_body, limits(96)),
+            "order-1",
+        ))
+        .class(),
+        DiagnosticClass::WrongRoute
+    );
+
+    for oversized_trade in [
+        trade_json("MATCHED", "trade-1", "1").replace(
+            r#""owner":"owner""#,
+            &format!(r#""owner":"{oversized_string}""#),
+        ),
+        trade_json("MATCHED", "trade-1", "1")
+            .replace(r#""size":"1""#, &format!(r#""size":"{oversized_decimal}""#)),
+    ] {
+        let body = format!("[{oversized_trade}]");
+        assert_eq!(
+            decode_error(decode_associated_trades(
+                provider_bytes(SemanticRoute::GetAssociatedTrades, &body, limits(96)),
+                "order-1",
+            ))
+            .class(),
+            DiagnosticClass::Oversized
         );
     }
 
