@@ -34,7 +34,6 @@ ALLOWED_QUALIFIED_ROOTS = {
     "digest",
     "generated",
     "hooks",
-    "nautilus_polymarket",
     "rust_decimal",
     "self",
     "serde",
@@ -43,6 +42,209 @@ ALLOWED_QUALIFIED_ROOTS = {
     "std",
     "super",
     "zeroize",
+}
+EXPECTED_IMPORTS = {
+    "capabilities.rs": (
+        ("use", "super", "::", "{", "CURRENT_V2_UNAVAILABLE", ",", "CapabilityEvidence", "}", ";"),
+    ),
+    "collector.rs": (("use", "super", "::", "SemanticLimits", ";"),),
+    "decode.rs": (
+        ("use", "std", "::", "str", "::", "FromStr", ";"),
+        ("use", "rust_decimal", "::", "Decimal", ";"),
+        (
+            "use",
+            "serde",
+            "::",
+            "{",
+            "Deserialize",
+            ",",
+            "Deserializer",
+            ",",
+            "de",
+            "::",
+            "{",
+            "DeserializeSeed",
+            ",",
+            "Error",
+            "as",
+            "_",
+            ",",
+            "SeqAccess",
+            ",",
+            "Visitor",
+            "}",
+            ",",
+            "}",
+            ";",
+        ),
+        ("use", "serde_json", "::", "value", "::", "RawValue", ";"),
+        (
+            "use",
+            "super",
+            "::",
+            "{",
+            "AssociatedTradeStatus",
+            ",",
+            "CollectorError",
+            ",",
+            "CollectorKind",
+            ",",
+            "CollectorPlan",
+            ",",
+            "ExactOrderStatus",
+            ",",
+            "FixedCollector",
+            ",",
+            "PostOrderStatus",
+            ",",
+            "ProviderOrderType",
+            ",",
+            "ProviderSide",
+            ",",
+            "ProviderTraderSide",
+            ",",
+            "SemanticLimits",
+            ",",
+            "SemanticRoute",
+            ",",
+            "SensitiveProviderBytes",
+            ",",
+            "TRANSACTION_HASH_BYTES",
+            ",",
+            "}",
+            ";",
+        ),
+    ),
+    "hooks.rs": (
+        ("use", "super", "::", "{", "RedactedMetadata", ",", "SensitiveSignedRequest", "}", ";"),
+    ),
+    "mod.rs": (
+        (
+            "use",
+            "capabilities",
+            "::",
+            "{",
+            "AutonomousEntryCapability",
+            ",",
+            "CapabilityUnavailable",
+            ",",
+            "CurrentV2Capabilities",
+            "}",
+            ";",
+        ),
+        (
+            "use",
+            "collector",
+            "::",
+            "{",
+            "CollectorError",
+            ",",
+            "CollectorKind",
+            ",",
+            "CollectorPlan",
+            ",",
+            "FixedCollector",
+            "}",
+            ";",
+        ),
+        (
+            "use",
+            "decode",
+            "::",
+            "{",
+            "AssociatedTradeObservation",
+            ",",
+            "AssociatedTradesObservation",
+            ",",
+            "DiagnosticClass",
+            ",",
+            "ExactOrderObservation",
+            ",",
+            "PostOrderObservation",
+            ",",
+            "SemanticDiagnostic",
+            ",",
+            "decode_associated_trades",
+            ",",
+            "decode_exact_order",
+            ",",
+            "decode_post_order",
+            ",",
+            "}",
+            ";",
+        ),
+        ("use", "generated", "::", "*", ";"),
+        (
+            "use",
+            "hooks",
+            "::",
+            "{",
+            "FinalizedBlockRef",
+            ",",
+            "PreDispatchHook",
+            ",",
+            "PreSendHook",
+            ",",
+            "SemanticHookError",
+            "}",
+            ";",
+        ),
+        (
+            "use",
+            "sensitive",
+            "::",
+            "{",
+            "RedactedMetadata",
+            ",",
+            "SemanticCredential",
+            ",",
+            "SensitiveProviderBytes",
+            ",",
+            "SensitiveSignedRequest",
+            ",",
+            "SensitiveValueError",
+            ",",
+            "}",
+            ";",
+        ),
+    ),
+    "sensitive.rs": (
+        ("use", "aws_lc_rs", "::", "digest", ";"),
+        ("use", "zeroize", "::", "Zeroizing", ";"),
+        (
+            "use",
+            "super",
+            "::",
+            "{",
+            "AssociatedTradesObservation",
+            ",",
+            "DiagnosticClass",
+            ",",
+            "ExactOrderObservation",
+            ",",
+            "PostOrderObservation",
+            ",",
+            "SemanticDiagnostic",
+            ",",
+            "SemanticLimits",
+            ",",
+            "SemanticRoute",
+            ",",
+            "decode",
+            "::",
+            "{",
+            "decode_associated_trades_borrowed",
+            ",",
+            "decode_exact_order_borrowed",
+            ",",
+            "decode_post_order_borrowed",
+            ",",
+            "}",
+            ",",
+            "}",
+            ";",
+        ),
+    ),
 }
 ALLOWED_STD_MODULES = {"fmt", "num", "str"}
 FORBIDDEN_OUTPUT_MACROS = ("dbg!", "eprint!", "eprintln!", "print!", "println!")
@@ -201,7 +403,7 @@ def registered_literals() -> tuple[set[str], set[str]]:
 
 def _check_effects(name: str, source: str) -> None:
     values = _token_values(rust_tokens(source))
-    _check_use_roots(name, values)
+    _check_imports(name, values)
     _check_qualified_roots(name, values)
     _check_effect_calls(name, values)
     _check_effect_capabilities(name, values)
@@ -229,16 +431,19 @@ def _check_qualified_roots(name: str, values: list[str]) -> None:
                 raise FenceError(f"{name}: unregistered std effect module: {module}")
 
 
-def _check_use_roots(name: str, values: list[str]) -> None:
-    for index, value in enumerate(values[:-1]):
+def _check_imports(name: str, values: list[str]) -> None:
+    imports: list[tuple[str, ...]] = []
+    for index, value in enumerate(values):
         if value != "use":
             continue
-        root_index = index + 1
-        if values[root_index] == "::":
-            root_index += 1
-        if root_index >= len(values) or values[root_index] not in ALLOWED_QUALIFIED_ROOTS:
-            root = values[root_index] if root_index < len(values) else "<missing>"
-            raise FenceError(f"{name}: unregistered import root: {root}")
+        try:
+            end = values.index(";", index)
+        except ValueError as error:
+            raise FenceError(f"{name}: unterminated import") from error
+        imports.append(tuple(values[index : end + 1]))
+    expected = EXPECTED_IMPORTS.get(Path(name).name, ())
+    if tuple(imports) != expected:
+        raise FenceError(f"{name}: imports differ from the exact registered statements")
 
 
 def _check_effect_calls(name: str, values: list[str]) -> None:
@@ -257,8 +462,11 @@ def _check_effect_capabilities(name: str, values: list[str]) -> None:
     for callback in ("Fn", "FnMut", "FnOnce"):
         if values.count(callback) != allowed.get(callback, 0):
             raise FenceError(f"{name}: unregistered callback capability: {callback}")
-    if _contains_token_sequence(values, [":", "fn", "("]):
-        raise FenceError(f"{name}: unregistered function-pointer callback capability")
+    if any(
+        value == "fn" and values[index + 1 : index + 2] == ["("]
+        for index, value in enumerate(values)
+    ):
+        raise FenceError(f"{name}: unregistered function-pointer type capability")
 
 
 def _check_literals(name: str, source: str, routes: set[str], statuses: set[str]) -> None:
@@ -475,6 +683,10 @@ def run_self_test() -> None:
         "absolute network effect": "fn effect() { let _ = ::reqwest::Client::new(); }",
         "crate indirection": "fn effect() { crate::client::Client::new(); }",
         "aliased import": "use reqwest as de; fn effect() { de::Client::new(); }",
+        "parent-module alias": "use super::client::Client as de; fn effect() { de::new(); }",
+        "self-crate alias": (
+            "use nautilus_polymarket::client::Client as de; fn effect() { de::new(); }"
+        ),
         "task spawn": "fn effect() { tokio::spawn(async {}); }",
         "alternate task spawn": "fn effect() { tokio::task::spawn(async {}); }",
         "thread spawn": "fn effect() { std::thread::spawn(effect); }",
@@ -483,6 +695,8 @@ def run_self_test() -> None:
         "logging sink": 'fn effect() { println!("provider bytes"); }',
         "public callback": "pub fn run_effect(f: impl FnOnce()) { f(); }",
         "function pointer callback": "pub fn run_effect(f: fn()) { f(); }",
+        "function pointer alias": "pub type Callback = fn(); pub fn run_effect(f: Callback) { f(); }",
+        "function pointer return": "pub fn callback() -> fn() { effect }",
         "foreign effect": 'unsafe extern "C" { fn connect(fd: i32) -> i32; }',
         "sensitive trait": "impl Debug for SensitiveProviderBytes {}",
     }

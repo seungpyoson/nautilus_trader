@@ -105,8 +105,9 @@ fence. It verifies that:
 - semantic code does not duplicate any registered provider route or vocabulary
   literal;
 - the public semantic surface contains no unsafe/FFI capability, effect-capable
-  callback (trait or function pointer), unapproved direct/aliased import or
-  qualified root, output macro, or task/thread spawn;
+  callback trait, function-pointer type, unapproved qualified root, output
+  macro, or task/thread spawn, and every complete import statement is
+  exact-allowlisted;
 - sensitive wrappers do not gain formatting or serialization implementations;
 - generated output exactly matches a fresh generator run.
 

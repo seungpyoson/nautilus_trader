@@ -433,18 +433,20 @@ git commit -m "feat(polymarket): block unavailable autonomous capability"
 
 - `python3 scripts/verify_polymarket_semantic_boundary.py --check` verifies the
   real tree.
-- `--self-test` injects registered-literal duplication, network roots, task spawn,
-  unsafe/FFI, public callback capability, forbidden sensitive traits, and an
-  alternate raw-byte projection and requires each case to be rejected.
+- `--self-test` injects registered-literal duplication, network roots, direct and
+  aliased imports, task spawn, unsafe/FFI, callback traits, function-pointer
+  parameters, aliases, and returns, forbidden sensitive traits, and an alternate
+  raw-byte projection and requires each case to be rejected.
 
 - [ ] **Step 1: Implement the static verifier and its negative self-tests**
 
 Scan `src/semantic` while treating `generated.rs` as the sole source for exact
 registered provider literals. Do not predict route or status meaning from text
 shape. Reject unapproved direct/aliased imports and qualified roots, unsafe/FFI,
-public callback capability, task/thread spawning, and `Debug`/`Display`/serde
-implementations for sensitive types. Exact-allowlist the private sensitive field
-layout and every raw-field access in `SensitiveProviderBytes`.
+callback traits, every function-pointer type, task/thread spawning, and
+`Debug`/`Display`/serde implementations for sensitive types. Exact-allowlist
+each complete import statement, the private sensitive field layout, and every
+raw-field access in `SensitiveProviderBytes`.
 
 - [ ] **Step 2: Wire the verifier into a focused Cargo integration test**
 
