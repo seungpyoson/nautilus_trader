@@ -1,0 +1,145 @@
+schema_version = 1
+issue_url = "https://github.com/seungpyoson/bolt-v2/issues/1383"
+
+[[sources]]
+id = "bolt_architecture"
+repository = "seungpyoson/bolt-v2"
+commit = "fe368f851aae33a064cf0157a1a03ed5e3092a21"
+path = "docs/superpowers/specs/2026-07-15-autonomous-operation-migration-pr-contract.md"
+blob = "39702ab6cb19514b8af382d57f86e35e096b0e4d"
+authority = "semantic_contract"
+
+[[sources]]
+id = "typescript_routes"
+repository = "Polymarket/clob-client-v2"
+commit = "ff5913f83132a141e01d403e505b6ccc003aa0f7"
+path = "src/endpoints.ts"
+blob = "88768ab142024c8c96df2c7b9a7feeec81baacfe"
+authority = "provider_route_evidence"
+
+[[sources]]
+id = "typescript_schema"
+repository = "Polymarket/clob-client-v2"
+commit = "ff5913f83132a141e01d403e505b6ccc003aa0f7"
+path = "src/types/clob.ts"
+blob = "7384b7727d9b73743b987ebaf0d95815b233c29d"
+authority = "provider_schema_evidence"
+
+[[sources]]
+id = "rust_vocabulary"
+repository = "Polymarket/rs-clob-client-v2"
+commit = "3ae1aae5e9ded38f984464c9fc0f307f8a9f41fb"
+path = "src/clob/types/mod.rs"
+blob = "310d8091afd65526d4dbcd2ba0c01fc554b94688"
+authority = "independent_comparison_evidence"
+
+[[sources]]
+id = "rust_schema"
+repository = "Polymarket/rs-clob-client-v2"
+commit = "3ae1aae5e9ded38f984464c9fc0f307f8a9f41fb"
+path = "src/clob/types/response.rs"
+blob = "b6dbe326134b9b48f7283eb19f0b65eb10297420"
+authority = "independent_comparison_evidence"
+
+[[sources]]
+id = "python_routes"
+repository = "Polymarket/py-clob-client-v2"
+commit = "fdb2590dc85e600ad98f1f668ea62a0627554d73"
+path = "py_clob_client_v2/endpoints.py"
+blob = "9980baf5861374c4c70f36da5213848e142b6493"
+authority = "independent_comparison_evidence"
+
+[[sources]]
+id = "python_schema"
+repository = "Polymarket/py-clob-client-v2"
+commit = "fdb2590dc85e600ad98f1f668ea62a0627554d73"
+path = "py_clob_client_v2/clob_types.py"
+blob = "fa39f66752ce908aafc044f27d3624cda1a2fd5d"
+authority = "independent_comparison_evidence"
+
+[[sources]]
+id = "exchange_order_state"
+repository = "Polymarket/ctf-exchange-v2"
+commit = "ccc0596074f4dfd62c944fbca4de252893b82b4b"
+path = "src/exchange/libraries/Structs.sol"
+blob = "0bbcd991063772a864bfe4c51679b7d589559d76"
+authority = "provider_contract_evidence"
+
+[[sources]]
+id = "exchange_fill_effect"
+repository = "Polymarket/ctf-exchange-v2"
+commit = "ccc0596074f4dfd62c944fbca4de252893b82b4b"
+path = "src/exchange/interfaces/ITrading.sol"
+blob = "4ea517d5808972e224255981d60d75049ac72032"
+authority = "provider_contract_evidence"
+
+[[routes]]
+id = "post_order"
+method = "POST"
+path = "/order"
+statuses = ["live", "matched", "delayed", "unmatched"]
+
+[[routes]]
+id = "get_exact_order"
+method = "GET"
+path = "/data/order/{order_id}"
+statuses = [
+  "ORDER_STATUS_LIVE",
+  "ORDER_STATUS_INVALID",
+  "ORDER_STATUS_CANCELED_MARKET_RESOLVED",
+  "ORDER_STATUS_CANCELED",
+  "ORDER_STATUS_MATCHED",
+]
+
+[[routes]]
+id = "get_associated_trades"
+method = "GET"
+path = "/data/trades"
+statuses = ["MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"]
+
+[[limits]]
+id = "request_body_bytes"
+authority = "caller"
+[[limits]]
+id = "response_body_bytes"
+authority = "caller"
+[[limits]]
+id = "response_items"
+authority = "caller"
+[[limits]]
+id = "transaction_hashes"
+authority = "caller"
+[[limits]]
+id = "trade_ids"
+authority = "caller"
+[[limits]]
+id = "associated_trades"
+authority = "caller"
+[[limits]]
+id = "string_bytes"
+authority = "caller"
+[[limits]]
+id = "decimal_bytes"
+authority = "caller"
+[[limits]]
+id = "log_items"
+authority = "caller"
+
+[[protocol_widths]]
+id = "transaction_hash_bytes"
+value = 32
+
+[[capabilities]]
+id = "permanent_terminality"
+state = "unavailable"
+reason = "no_indefinite_linearizable_exact_hash_tombstone"
+
+[[capabilities]]
+id = "complete_capture"
+state = "unavailable"
+reason = "no_complete_bounded_transaction_hash_contract"
+
+[[capabilities]]
+id = "competing_work_absence"
+state = "unavailable"
+reason = "no_competing_nonce_or_provider_work_exclusion"
