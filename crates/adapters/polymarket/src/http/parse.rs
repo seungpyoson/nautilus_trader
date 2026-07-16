@@ -139,7 +139,12 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
         && !market.closed.unwrap_or(false)
         && market.accepting_orders.unwrap_or(false);
 
-    let neg_risk = market.neg_risk.unwrap_or(false);
+    let neg_risk = market.neg_risk.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Gamma market '{}' is missing required negRisk metadata",
+            market.id
+        )
+    })?;
 
     let mut defs = Vec::with_capacity(2);
 
@@ -426,6 +431,28 @@ mod tests {
             Some("btc-updown-5m-1773307200")
         );
         assert_eq!(yes_def.game_id, None);
+    }
+
+    #[rstest]
+    fn test_parse_gamma_market_rejects_missing_neg_risk() {
+        let mut market = load_gamma_market("gamma_market.json");
+        market.neg_risk = None;
+
+        let error = parse_gamma_market(&market).unwrap_err();
+
+        assert!(error.to_string().contains("negRisk"));
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_parse_gamma_market_preserves_explicit_neg_risk(#[case] neg_risk: bool) {
+        let mut market = load_gamma_market("gamma_market.json");
+        market.neg_risk = Some(neg_risk);
+
+        let defs = parse_gamma_market(&market).unwrap();
+
+        assert!(defs.iter().all(|definition| definition.neg_risk == neg_risk));
     }
 
     #[rstest]
