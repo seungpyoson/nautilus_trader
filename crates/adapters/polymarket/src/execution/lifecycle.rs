@@ -263,17 +263,20 @@ impl PolymarketExecutionClient {
         Ok(())
     }
 
-    pub(super) fn get_neg_risk(&self, instrument_id: &InstrumentId) -> bool {
+    pub(super) fn get_neg_risk(&self, instrument_id: &InstrumentId) -> Result<bool, String> {
         self.neg_risk_index
             .get_cloned(instrument_id)
-            .unwrap_or(false)
+            .ok_or_else(|| format!("Missing required neg_risk metadata for {instrument_id}"))
     }
 
     pub(super) fn get_neg_risk_from_snapshot(
         neg_risk_index: &AHashMap<InstrumentId, bool>,
         instrument_id: &InstrumentId,
-    ) -> bool {
-        neg_risk_index.get(instrument_id).copied().unwrap_or(false)
+    ) -> Result<bool, String> {
+        neg_risk_index
+            .get(instrument_id)
+            .copied()
+            .ok_or_else(|| format!("Missing required neg_risk metadata for {instrument_id}"))
     }
 
     fn upsert_execution_lookup(&self, instrument: &InstrumentAny) {
@@ -425,12 +428,16 @@ fn upsert_execution_lookup(
     shared_token_instruments.insert(token_id, instrument.clone());
 
     if let InstrumentAny::BinaryOption(bo) = instrument {
-        let neg_risk = bo
-            .info
-            .as_ref()
-            .and_then(|i| i.get_bool("neg_risk"))
-            .unwrap_or(false);
-        neg_risk_index.insert(bo.id, neg_risk);
+        match bo.info.as_ref().and_then(|i| i.get_bool("neg_risk")) {
+            Some(neg_risk) => neg_risk_index.insert(bo.id, neg_risk),
+            None => {
+                neg_risk_index.remove(&bo.id);
+                log::error!(
+                    "Polymarket instrument {} is missing required boolean neg_risk metadata; execution will deny orders",
+                    bo.id
+                );
+            }
+        }
     }
 }
 
@@ -588,6 +595,22 @@ mod tests {
         InstrumentAny::BinaryOption(binary)
     }
 
+    fn test_binary_option_without_valid_neg_risk(
+        raw_symbol: &str,
+        value: Option<Value>,
+    ) -> InstrumentAny {
+        let mut instrument = test_binary_option(raw_symbol, false, false);
+        let InstrumentAny::BinaryOption(binary) = &mut instrument else {
+            unreachable!("fixture is a binary option");
+        };
+        let mut info = nautilus_core::Params::new();
+        if let Some(value) = value {
+            info.insert("neg_risk".to_string(), value);
+        }
+        binary.info = Some(info);
+        instrument
+    }
+
     fn open_limit_order(instrument_id: InstrumentId) -> OrderAny {
         OrderAny::Limit(LimitOrder::new(
             TraderId::from("TESTER-001"),
@@ -736,6 +759,31 @@ mod tests {
                 .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
         );
         assert!(client.neg_risk_index.contains_key(&expired.id()));
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(Value::String("false".to_string())))]
+    fn execution_lookup_rejects_missing_or_wrong_type_neg_risk(#[case] value: Option<Value>) {
+        let (client, _cache) = test_client();
+        let instrument = test_binary_option_without_valid_neg_risk("0xINVALID_NEG_RISK", value);
+
+        client.on_instrument_update(&instrument);
+
+        assert!(!client.neg_risk_index.contains_key(&instrument.id()));
+        assert!(client.get_neg_risk(&instrument.id()).is_err());
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn execution_lookup_preserves_explicit_neg_risk(#[case] expected: bool) {
+        let (client, _cache) = test_client();
+        let instrument = test_binary_option("0xEXPLICIT_NEG_RISK", false, expected);
+
+        client.on_instrument_update(&instrument);
+
+        assert_eq!(client.get_neg_risk(&instrument.id()), Ok(expected));
     }
 
     #[rstest]

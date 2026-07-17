@@ -452,7 +452,10 @@ mod tests {
 
         let defs = parse_gamma_market(&market).unwrap();
 
-        assert!(defs.iter().all(|definition| definition.neg_risk == neg_risk));
+        assert!(
+            defs.iter()
+                .all(|definition| definition.neg_risk == neg_risk)
+        );
     }
 
     #[rstest]

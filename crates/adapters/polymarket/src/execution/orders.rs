@@ -54,7 +54,13 @@ impl PolymarketExecutionClient {
             None => return,
         };
 
-        let neg_risk = self.get_neg_risk(&order.instrument_id());
+        let neg_risk = match self.get_neg_risk(&order.instrument_id()) {
+            Ok(value) => value,
+            Err(reason) => {
+                self.emitter.emit_order_denied(&order, &reason);
+                return;
+            }
+        };
         let token_id = instrument.raw_symbol().to_string();
         let tick_decimals = instrument.price_precision() as u32;
         let price = order.price().unwrap();
@@ -171,7 +177,13 @@ impl PolymarketExecutionClient {
             None => return,
         };
 
-        let neg_risk = self.get_neg_risk(&order.instrument_id());
+        let neg_risk = match self.get_neg_risk(&order.instrument_id()) {
+            Ok(value) => value,
+            Err(reason) => {
+                self.emitter.emit_order_denied(&order, &reason);
+                return;
+            }
+        };
         let token_id = instrument.raw_symbol().to_string();
         let tick_decimals = instrument.price_precision() as u32;
         let side = order.order_side();
@@ -464,6 +476,14 @@ impl PolymarketExecutionClient {
             let price = order
                 .price()
                 .expect("validated limit order must have a price");
+            let neg_risk =
+                match Self::get_neg_risk_from_snapshot(&neg_risk_index, &order.instrument_id()) {
+                    Ok(value) => value,
+                    Err(reason) => {
+                        self.emitter.emit_order_denied(&order, &reason);
+                        continue;
+                    }
+                };
             batch_orders.push(BatchLimitOrderContext {
                 request: LimitOrderSubmitRequest {
                     token_id: instrument.raw_symbol().to_string(),
@@ -472,10 +492,7 @@ impl PolymarketExecutionClient {
                     quantity: order.quantity(),
                     time_in_force: order.time_in_force(),
                     post_only: order.is_post_only(),
-                    neg_risk: Self::get_neg_risk_from_snapshot(
-                        &neg_risk_index,
-                        &order.instrument_id(),
-                    ),
+                    neg_risk,
                     expire_time: order.expire_time(),
                     tick_decimals: instrument.price_precision() as u32,
                 },
