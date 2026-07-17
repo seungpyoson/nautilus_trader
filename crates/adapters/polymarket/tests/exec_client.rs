@@ -1571,7 +1571,7 @@ async fn test_submit_market_order_posts_order_type_from_time_in_force(
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_market_order_with_time_in_force(
         "O-MKT-TIF",
@@ -1607,7 +1607,7 @@ async fn test_submit_market_order_buy_accepted() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_market_order("O-MKT-BUY", instrument_id, OrderSide::Buy, true);
     cache
@@ -1654,7 +1654,7 @@ async fn test_submit_market_order_buy_quote_to_base_conversion() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     // BUY 10 USDC worth with quote_quantity=true
     let order = make_market_order("O-MKT-QTY", instrument_id, OrderSide::Buy, true);
@@ -1726,7 +1726,7 @@ async fn test_submit_market_buy_quote_to_base_uses_signed_taker_amount() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_market_order("O-MKT-MULTI", instrument_id, OrderSide::Buy, true);
     cache
@@ -1786,7 +1786,13 @@ async fn test_submit_market_buy_quote_to_base_at_size_precision_two() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN-PREC2.POLYMARKET");
-    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 2);
+    add_execution_instrument_to_cache_with_neg_risk(
+        &mut client,
+        &cache,
+        instrument_id,
+        2,
+        Some(Value::Bool(false)),
+    );
 
     let order = make_market_order("O-MKT-PREC2", instrument_id, OrderSide::Buy, true);
     cache
@@ -1828,7 +1834,7 @@ async fn test_submit_market_order_sell_no_updated_event() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     // SELL 10 shares with quote_quantity=false (no conversion needed)
     let order = make_market_order("O-MKT-SELL", instrument_id, OrderSide::Sell, false);
@@ -1866,7 +1872,7 @@ async fn test_submit_market_order_http_5xx_submit_outcome_unknown() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_market_order("O-MKT-UNKNOWN", instrument_id, OrderSide::Buy, true);
     cache
@@ -1902,7 +1908,7 @@ async fn test_submit_market_order_rejected_empty_book() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_market_order("O-MKT-EMPTY", instrument_id, OrderSide::Buy, true);
     cache
@@ -1970,7 +1976,7 @@ async fn test_fok_deferred_check_emits_terminal_event(
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_market_order_with_time_in_force(
         "O-FOK-UNMATCHED",
@@ -2049,7 +2055,7 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_market_order_with_time_in_force(
         "O-FOK-MATCHED",
@@ -2247,15 +2253,50 @@ fn make_cancel_cmd(client_order_id: &str, instrument_id: InstrumentId) -> Cancel
     )
 }
 
-fn add_instrument_to_cache(cache: &Rc<RefCell<Cache>>, instrument_id: InstrumentId) {
-    add_instrument_to_cache_with_size_precision(cache, instrument_id, 0);
-}
-
 fn add_instrument_to_cache_with_size_precision(
     cache: &Rc<RefCell<Cache>>,
     instrument_id: InstrumentId,
     size_precision: u8,
 ) {
+    let instrument =
+        test_binary_option_with_neg_risk(instrument_id, size_precision, Some(Value::Bool(false)));
+    cache.borrow_mut().add_instrument(instrument).unwrap();
+}
+
+fn add_execution_instrument_to_cache(
+    client: &mut PolymarketExecutionClient,
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+) {
+    add_execution_instrument_to_cache_with_neg_risk(
+        client,
+        cache,
+        instrument_id,
+        0,
+        Some(Value::Bool(false)),
+    );
+}
+
+fn add_execution_instrument_to_cache_with_neg_risk(
+    client: &mut PolymarketExecutionClient,
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    size_precision: u8,
+    neg_risk: Option<Value>,
+) {
+    let instrument = test_binary_option_with_neg_risk(instrument_id, size_precision, neg_risk);
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    client.on_instrument(instrument);
+}
+
+fn test_binary_option_with_neg_risk(
+    instrument_id: InstrumentId,
+    size_precision: u8,
+    neg_risk: Option<Value>,
+) -> InstrumentAny {
     let symbol = "71321045679252212594626385532706912750332728571942532289631379312455583992563";
     let size_increment = if size_precision == 0 {
         Quantity::from("1")
@@ -2266,6 +2307,10 @@ fn add_instrument_to_cache_with_size_precision(
         ))
     };
     let raw_symbol = Symbol::from(symbol);
+    let mut info = nautilus_core::Params::new();
+    if let Some(neg_risk) = neg_risk {
+        info.insert("neg_risk".to_string(), neg_risk);
+    }
 
     let instrument = BinaryOption::new(
         instrument_id,
@@ -2291,14 +2336,11 @@ fn add_instrument_to_cache_with_size_precision(
         None, // maker_fee
         None, // taker_fee
         None, // tick_scheme
-        None, // info
+        Some(info),
         UnixNanos::default(),
         UnixNanos::default(),
     );
-    cache
-        .borrow_mut()
-        .add_instrument(InstrumentAny::BinaryOption(instrument))
-        .unwrap();
+    InstrumentAny::BinaryOption(instrument)
 }
 
 fn submit_and_accept_order(cache: &Rc<RefCell<Cache>>, order: &mut OrderAny, venue_order_id: &str) {
@@ -2349,6 +2391,197 @@ async fn assert_no_execution_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver
         Ok(Some(event)) => panic!("Expected no execution event, was {event:?}"),
         Ok(None) => panic!("Execution event channel closed"),
     }
+}
+
+#[rstest]
+#[case::missing(None)]
+#[case::wrong_type(Some(Value::String("false".to_string())))]
+#[tokio::test]
+async fn test_submit_limit_order_denies_invalid_neg_risk_before_http_post(
+    #[case] neg_risk: Option<Value>,
+) {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("INVALID-NEG-RISK-LIMIT.POLYMARKET");
+    add_execution_instrument_to_cache_with_neg_risk(
+        &mut client,
+        &cache,
+        instrument_id,
+        0,
+        neg_risk,
+    );
+    let order = make_limit_order(
+        "O-INVALID-NEG-RISK-LIMIT",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+
+    let denied = assert_order_event(recv_execution_event(&mut rx).await, "Denied");
+    assert!(
+        order_event_reason(&denied).contains("Missing required neg_risk metadata"),
+        "denial reason was {}",
+        order_event_reason(&denied)
+    );
+    assert_eq!(*state.order_post_count.lock().await, 0);
+    assert_eq!(*state.batch_order_post_count.lock().await, 0);
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[case::missing(None)]
+#[case::wrong_type(Some(Value::String("false".to_string())))]
+#[tokio::test]
+async fn test_submit_market_order_denies_invalid_neg_risk_before_book_or_http(
+    #[case] neg_risk: Option<Value>,
+) {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("INVALID-NEG-RISK-MARKET.POLYMARKET");
+    add_execution_instrument_to_cache_with_neg_risk(
+        &mut client,
+        &cache,
+        instrument_id,
+        0,
+        neg_risk,
+    );
+    let order = make_market_order(
+        "O-INVALID-NEG-RISK-MARKET",
+        instrument_id,
+        OrderSide::Buy,
+        true,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+
+    let denied = assert_order_event(recv_execution_event(&mut rx).await, "Denied");
+    assert!(
+        order_event_reason(&denied).contains("Missing required neg_risk metadata"),
+        "denial reason was {}",
+        order_event_reason(&denied)
+    );
+    assert_eq!(*state.order_post_count.lock().await, 0);
+    assert_eq!(*state.batch_order_post_count.lock().await, 0);
+    assert_eq!(state.last_path.lock().await.as_str(), "");
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_order_list_denies_invalid_neg_risk_and_submits_valid_remainder() {
+    let state = TestServerState::default();
+    *state.batch_order_response.lock().await = Some(json!([
+        {"success": true, "orderID": "0xneg-risk-false", "errorMsg": ""},
+        {"success": true, "orderID": "0xneg-risk-true", "errorMsg": ""}
+    ]));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let invalid_id = InstrumentId::from("INVALID-NEG-RISK-BATCH.POLYMARKET");
+    let false_id = InstrumentId::from("EXPLICIT-FALSE-BATCH.POLYMARKET");
+    let true_id = InstrumentId::from("EXPLICIT-TRUE-BATCH.POLYMARKET");
+    add_execution_instrument_to_cache_with_neg_risk(&mut client, &cache, invalid_id, 0, None);
+    add_execution_instrument_to_cache_with_neg_risk(
+        &mut client,
+        &cache,
+        false_id,
+        0,
+        Some(Value::Bool(false)),
+    );
+    add_execution_instrument_to_cache_with_neg_risk(
+        &mut client,
+        &cache,
+        true_id,
+        0,
+        Some(Value::Bool(true)),
+    );
+
+    let invalid = make_limit_order(
+        "O-BATCH-INVALID-NEG-RISK",
+        invalid_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    let explicit_false = make_limit_order(
+        "O-BATCH-EXPLICIT-FALSE",
+        false_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    let explicit_true = make_limit_order(
+        "O-BATCH-EXPLICIT-TRUE",
+        true_id,
+        OrderSide::Sell,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    for order in [&invalid, &explicit_false, &explicit_true] {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+    }
+
+    let cmd = make_submit_order_list_cmd(invalid_id, &[invalid, explicit_false, explicit_true]);
+    client.submit_order_list(cmd).unwrap();
+
+    let denied = assert_order_event(recv_execution_event(&mut rx).await, "Denied");
+    assert!(
+        order_event_reason(&denied).contains("Missing required neg_risk metadata"),
+        "denial reason was {}",
+        order_event_reason(&denied)
+    );
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+    assert_eq!(*state.order_post_count.lock().await, 0);
+    assert_eq!(*state.batch_order_post_count.lock().await, 1);
+    assert_eq!(
+        state
+            .last_body
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_no_execution_event(&mut rx).await;
 }
 
 #[rstest]
@@ -2488,7 +2721,7 @@ async fn test_submit_order_post_only_with_gtc_allowed() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_limit_order(
         "O-POST-GTC",
@@ -2521,7 +2754,7 @@ async fn test_submit_order_accepted_on_http_success() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_limit_order(
         "O-ACCEPT",
@@ -2562,7 +2795,7 @@ async fn test_submit_order_rejected_on_http_failure_response() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_limit_order(
         "O-REJECT-RESP",
@@ -2604,7 +2837,7 @@ async fn test_submit_order_http_5xx_submit_outcome_unknown() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_limit_order(
         "O-REJECT-500",
@@ -2651,7 +2884,7 @@ async fn test_submit_order_retries_5xx_and_accepts_when_recovered() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_limit_order(
         "O-RETRY-RECOVER",
@@ -2697,7 +2930,7 @@ async fn test_submit_order_5xx_exhausts_retries_submit_outcome_unknown() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order = make_limit_order(
         "O-RETRY-EXHAUST",
@@ -2746,7 +2979,7 @@ async fn test_submit_order_list_posts_batch_and_accepts_orders() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order1 = make_limit_order(
         "O-LIST-1",
@@ -2819,7 +3052,7 @@ async fn test_submit_order_list_denies_invalid_orders_before_batch_post() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let valid1 = make_limit_order(
         "O-LIST-VALID-1",
@@ -2885,7 +3118,7 @@ async fn test_submit_order_list_singleton_routes_through_single_order_path() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let valid = make_limit_order(
         "O-LIST-SINGLE-VALID",
@@ -2938,7 +3171,7 @@ async fn test_submit_order_list_rejects_failed_batch_response_entry() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order1 = make_limit_order(
         "O-LIST-REJECT-1",
@@ -2988,7 +3221,7 @@ async fn test_submit_order_list_rejects_orders_missing_batch_responses() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order1 = make_limit_order(
         "O-LIST-MISSING-1",
@@ -3037,7 +3270,7 @@ async fn test_submit_order_list_does_not_retry_batch_post_on_http_error() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order1 = make_limit_order(
         "O-LIST-ERR-1",
@@ -3104,7 +3337,7 @@ async fn test_submit_order_list_routes_market_order_through_single_path() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let market = make_market_order("O-MIX-MKT", instrument_id, OrderSide::Sell, false);
     let limit1 = make_limit_order(
@@ -3196,7 +3429,7 @@ async fn test_submit_order_list_preserves_rejected_reason_from_batch_response() 
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let order1 = make_limit_order(
         "O-LIST-REASON-1",
@@ -3257,7 +3490,7 @@ async fn test_submit_order_list_filters_out_ineligible_entries(#[case] kind: &st
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let valid1 = make_limit_order(
         "O-FILTER-VALID-1",
@@ -3382,7 +3615,7 @@ async fn test_submit_order_list_routes_remainder_singleton_through_single_order_
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let orders: Vec<OrderAny> = (0..TOTAL)
         .map(|i| {
@@ -3437,7 +3670,7 @@ async fn test_submit_order_list_chunks_beyond_batch_order_limit() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let orders: Vec<OrderAny> = (0..TOTAL)
         .map(|i| {
@@ -3923,7 +4156,7 @@ async fn test_cancel_order_deferred_when_no_venue_order_id() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let mut order = make_limit_order(
         "O-DEFERRED-CANCEL",
@@ -3993,7 +4226,7 @@ async fn test_cancel_order_deferred_with_already_done_response() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let mut order = make_limit_order(
         "O-DEFERRED-DONE",
@@ -4056,7 +4289,7 @@ async fn test_cancel_order_deferred_ambiguous_http_failure_does_not_emit_cancel_
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let mut order = make_limit_order(
         "O-DEFERRED-AMBIGUOUS",
@@ -4122,7 +4355,7 @@ async fn test_cancel_order_deferred_explicit_structured_rejection_emits_cancel_r
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let mut order = make_limit_order(
         "O-DEFERRED-REJECT",
@@ -4278,7 +4511,7 @@ async fn test_query_order_does_not_block_within_runtime() {
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_execution_instrument_to_cache(&mut client, &cache, instrument_id);
 
     let cmd = QueryOrder::new(
         TraderId::from("TESTER-001"),
