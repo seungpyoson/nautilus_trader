@@ -2491,6 +2491,67 @@ async fn test_submit_market_order_denies_invalid_neg_risk_before_book_or_http(
 
 #[rstest]
 #[tokio::test]
+async fn test_submit_order_list_denies_all_invalid_neg_risk_before_http_post() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let missing_id = InstrumentId::from("MISSING-NEG-RISK-BATCH.POLYMARKET");
+    let wrong_type_id = InstrumentId::from("WRONG-TYPE-NEG-RISK-BATCH.POLYMARKET");
+    add_execution_instrument_to_cache_with_neg_risk(&mut client, &cache, missing_id, 0, None);
+    add_execution_instrument_to_cache_with_neg_risk(
+        &mut client,
+        &cache,
+        wrong_type_id,
+        0,
+        Some(Value::String("false".to_string())),
+    );
+
+    let missing = make_limit_order(
+        "O-BATCH-MISSING-NEG-RISK",
+        missing_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    let wrong_type = make_limit_order(
+        "O-BATCH-WRONG-TYPE-NEG-RISK",
+        wrong_type_id,
+        OrderSide::Sell,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    for order in [&missing, &wrong_type] {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+    }
+
+    let cmd = make_submit_order_list_cmd(missing_id, &[missing, wrong_type]);
+    client.submit_order_list(cmd).unwrap();
+
+    for _ in 0..2 {
+        let denied = assert_order_event(recv_execution_event(&mut rx).await, "Denied");
+        assert!(
+            order_event_reason(&denied).contains("Missing required neg_risk metadata"),
+            "denial reason was {}",
+            order_event_reason(&denied)
+        );
+    }
+    assert_eq!(*state.order_post_count.lock().await, 0);
+    assert_eq!(*state.batch_order_post_count.lock().await, 0);
+    assert_eq!(state.last_path.lock().await.as_str(), "");
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_submit_order_list_denies_invalid_neg_risk_and_submits_valid_remainder() {
     let state = TestServerState::default();
     *state.batch_order_response.lock().await = Some(json!([
