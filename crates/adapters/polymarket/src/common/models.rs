@@ -81,11 +81,21 @@ impl PolymarketMakerOrder {
     ///   It compares exactly: the venue matches the key byte-for-byte during L2
     ///   authentication, so a case-differing key fails authentication outright.
     ///
-    /// An API key authenticates a signer that may be configured with any funder, so
-    /// a key match alone does not prove the order belongs to the *configured*
-    /// funder. Narrowing ownership to the address would reintroduce the signature
-    /// type 2 failure, so the ambiguity is accepted here and the account is expected
-    /// to keep one funder per credential set.
+    /// An API key authenticates a signer that may be configured with any funder, so a
+    /// key match alone does not prove the order belongs to the *configured* funder.
+    /// Narrowing ownership to the address would reintroduce the signature type 2
+    /// failure, so the ambiguity is accepted and the account is expected to keep one
+    /// funder per credential set. Violating that is visible in both directions:
+    ///
+    /// - two funders on one credential attributes the other funder's maker fills to
+    ///   this account, whose positions are fetched for the configured funder alone;
+    /// - two credentials on one funder leaves maker orders placed under the other key
+    ///   matchable only by address, which signature type 2 does not guarantee, so
+    ///   reconciliation fails closed rather than under-reporting the fill.
+    ///
+    /// The taker path cannot make this check at all: a trade carries no taker address,
+    /// only the trade-level API key, so taker fills rest on the endpoint returning the
+    /// authenticated account's trades.
     pub(crate) fn is_owned_by(&self, user_address: &str, api_key: &str) -> bool {
         self.maker_address.eq_ignore_ascii_case(user_address) || self.owner == api_key
     }

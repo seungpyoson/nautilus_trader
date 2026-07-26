@@ -25,7 +25,7 @@ use nautilus_core::{
 };
 use nautilus_model::{
     enums::{LiquiditySide, OrderStatus, PositionSideSpecified},
-    identifiers::{AccountId, ClientId, InstrumentId, Venue, VenueOrderId},
+    identifiers::{AccountId, ClientId, InstrumentId, TradeId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Currency, Quantity},
@@ -263,6 +263,25 @@ fn owned_maker_orders_in_scope<'a>(
         .filter(|(_, standing)| standing.in_scope && standing.owned)
         .map(|(mo, _)| *mo)
         .collect();
+    // A request that names venue orders asserts each of them belongs to the account, so
+    // an unowned one cannot be excused by a sibling in the same match: answering with no
+    // fill for an order the caller asked about by ID is the silent miss this rule exists
+    // to prevent.
+    if scope.has_order_targets()
+        && let Some((mo, _)) = standings
+            .iter()
+            .find(|(_, standing)| standing.in_scope && !standing.owned)
+    {
+        anyhow::bail!(
+            "Polymarket reconciliation targeted maker order {} in trade {} has no owned \
+             maker order for configured maker address {}; its maker address is {}",
+            mo.order_id,
+            trade.id,
+            ctx.user_address,
+            mo.maker_address
+        );
+    }
+
     let trade_in_scope =
         scope.covers_every_trade() || standings.iter().any(|(_, standing)| standing.in_scope);
     let owned_anywhere = standings.iter().any(|(_, standing)| standing.owned);
@@ -310,7 +329,12 @@ pub(crate) fn build_fill_reports_from_trades(
     scope: &FillReconciliationScope,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Vec<FillReport>> {
-    let mut reports = Vec::new();
+    let mut reports: Vec<FillReport> = Vec::new();
+    // A paginated response can repeat a trade and a match can repeat a maker order, so
+    // fills are identified by the pair that makes them unique. Emitting a duplicate
+    // would double-count it in the confirmed quantities that order reports are capped
+    // against, turning a partial fill into a full one.
+    let mut seen: AHashSet<(TradeId, VenueOrderId)> = AHashSet::new();
     let scope = scope.resolve(instruments)?;
 
     for trade in trades {
@@ -357,7 +381,10 @@ pub(crate) fn build_fill_reports_from_trades(
                     ts_event,
                     ts_init,
                 )?;
-                reports.push(report);
+
+                if seen.insert((report.trade_id, report.venue_order_id)) {
+                    reports.push(report);
+                }
             }
         } else {
             let venue_order_id = try_venue_order_id(&trade.taker_order_id, &trade.id)?;
@@ -409,7 +436,10 @@ pub(crate) fn build_fill_reports_from_trades(
                 taker_fee_rate,
                 ts_init,
             )?;
-            reports.push(report);
+
+            if seen.insert((report.trade_id, report.venue_order_id)) {
+                reports.push(report);
+            }
         }
     }
 
@@ -570,6 +600,16 @@ fn position_quantity(
 }
 
 /// Full reconciliation mass status generation.
+///
+/// A venue record this adapter cannot map to a loaded NT instrument fails startup
+/// rather than being skipped, because a skipped order, fill, or position is
+/// indistinguishable from one the account does not hold. The cost is that an account
+/// carrying records for a market it no longer loads instruments for, such as a
+/// resolved one, cannot start while those records are in scope. The supported answer
+/// is the lookback window: `lookback_mins` bounds which confirmed trades are
+/// considered at all, and anything outside it is discarded before a rule sees it. An
+/// unbounded request keeps the whole history in scope, which is what requesting it
+/// means.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn generate_mass_status(
     http_client: &PolymarketClobHttpClient,
@@ -608,7 +648,7 @@ pub(crate) async fn generate_mass_status(
 
     let trades: Vec<PolymarketTradeReport> = trades
         .into_iter()
-        .filter(|trade| is_within_lookback(trade, cutoff))
+        .filter(|trade| is_within_window(trade, cutoff, None))
         .collect();
 
     let mut fill_reports = build_fill_reports_from_trades(
@@ -664,7 +704,7 @@ pub(crate) async fn generate_mass_status(
     cap_order_reports_to_confirmed_fills(
         &mut order_reports,
         &fill_reports,
-        &orders_with_unsettled_trades(&trades),
+        &unsettled_matched_by_order(&trades)?,
     )?;
 
     let mut mass_status = ExecutionMassStatus::new(client_id, ctx.account_id, venue, ts_init, None);
@@ -678,18 +718,26 @@ pub(crate) async fn generate_mass_status(
 
 /// Returns whether a confirmed trade can still contribute to a bounded answer.
 ///
-/// The venue's `after` parameter bounds the request, but its documentation does not
-/// state which timestamp it filters on, so the window is enforced here as well
-/// rather than trusted. A trade whose `match_time` cannot be parsed is kept: only
-/// the report path decides what an unreadable timestamp means, and dropping it here
-/// would silently discard a fill this reconciliation is responsible for.
-fn is_within_lookback(trade: &PolymarketTradeReport, cutoff: Option<UnixNanos>) -> bool {
-    let Some(cutoff) = cutoff else {
+/// The venue's `after` and `before` parameters bound the request, but their
+/// documentation does not state which timestamp they filter on, so the window is
+/// enforced here as well rather than trusted. Enforcing it before reports are built
+/// also keeps a record the answer would discard from reaching the fail-closed rules.
+/// A trade whose `match_time` cannot be parsed is kept: only the report path decides
+/// what an unreadable timestamp means, and dropping it here would silently discard a
+/// fill this reconciliation is responsible for.
+pub(crate) fn is_within_window(
+    trade: &PolymarketTradeReport,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+) -> bool {
+    if start.is_none() && end.is_none() {
         return true;
-    };
+    }
 
     match try_parse_timestamp(&trade.match_time) {
-        Ok(ts_event) => ts_event >= cutoff,
+        Ok(ts_event) => {
+            start.is_none_or(|start| ts_event >= start) && end.is_none_or(|end| ts_event <= end)
+        }
         Err(_) => true,
     }
 }
@@ -713,48 +761,89 @@ fn lookback_cutoff(
     )))
 }
 
-/// Venue order IDs the response shows with a trade that has not settled yet.
+/// Matched volume per venue order that this response shows as unconfirmed.
 ///
 /// The venue counts a matched trade toward an order's filled size before that trade
-/// confirms, and the adapter defers fill quantity until confirmation, so those orders
-/// are held to their confirmed fills rather than to the venue's matched size.
-fn orders_with_unsettled_trades(trades: &[PolymarketTradeReport]) -> AHashSet<VenueOrderId> {
-    trades
+/// confirms, and a failed trade never settles at all, so any trade that is not
+/// confirmed contributes volume the adapter must not report as filled.
+fn unsettled_matched_by_order(
+    trades: &[PolymarketTradeReport],
+) -> anyhow::Result<AHashMap<VenueOrderId, Decimal>> {
+    let mut unsettled: AHashMap<VenueOrderId, Decimal> = AHashMap::new();
+
+    for trade in trades
         .iter()
-        .filter(|trade| trade.status.is_pending_settlement())
-        .flat_map(|trade| {
-            std::iter::once(trade.taker_order_id.as_str())
-                .chain(trade.maker_orders.iter().map(|mo| mo.order_id.as_str()))
-        })
-        .filter_map(|order_id| VenueOrderId::new_checked(order_id).ok())
-        .collect()
+        .filter(|trade| trade.status != PolymarketTradeStatus::Confirmed)
+    {
+        let contributions = std::iter::once((trade.taker_order_id.as_str(), trade.size)).chain(
+            trade
+                .maker_orders
+                .iter()
+                .map(|mo| (mo.order_id.as_str(), mo.matched_amount)),
+        );
+
+        for (order_id, matched) in contributions {
+            let Ok(venue_order_id) = VenueOrderId::new_checked(order_id) else {
+                continue;
+            };
+            let total = unsettled.entry(venue_order_id).or_insert(Decimal::ZERO);
+
+            *total = total.checked_add(matched).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsettled matched quantity overflow for venue order {venue_order_id}"
+                )
+            })?;
+        }
+    }
+
+    Ok(unsettled)
 }
 
 fn cap_order_reports_to_confirmed_fills(
     order_reports: &mut [OrderStatusReport],
     fill_reports: &[FillReport],
-    unsettled_orders: &AHashSet<VenueOrderId>,
+    unsettled_by_order: &AHashMap<VenueOrderId, Decimal>,
 ) -> anyhow::Result<()> {
     let confirmed_by_order = confirmed_filled_quantities(fill_reports)?;
 
     for report in order_reports {
-        let confirmed = confirmed_by_order.get(&report.venue_order_id).copied();
+        // A confirmed fill for this order is direct evidence, so the report is held to
+        // it exactly as before.
+        if let Some(confirmed) = confirmed_by_order.get(&report.venue_order_id).copied() {
+            try_cap_order_report_filled_qty(
+                report,
+                Quantity::zero(report.quantity.precision),
+                Some(confirmed),
+            )?;
+            continue;
+        }
 
-        // An order with no confirmed fill and nothing settling is uncorroborated,
-        // not known to be unfilled: its fills may predate the lookback window, and
-        // zeroing it would understate a filled quantity the venue itself reports. An
-        // order with a trade still settling is the opposite case, because the venue
-        // already counts that volume as matched while the adapter defers it until
-        // confirmation. Either way the venue's quantity relationship is normalized.
-        if confirmed.is_none() && !unsettled_orders.contains(&report.venue_order_id) {
+        // With no confirmed fill, the response cannot corroborate the order: its fills
+        // may simply predate the lookback window, so zeroing it would understate a
+        // filled quantity the venue itself reports. Only the volume this response shows
+        // as unconfirmed is deducted, which covers both a trade still settling and one
+        // that failed outright. Deducting nothing leaves the venue's quantity standing.
+        let unsettled = unsettled_by_order
+            .get(&report.venue_order_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+
+        if unsettled.is_zero() {
             normalize_terminal_order_report_quantity(report);
             continue;
         }
 
+        let supported = report
+            .filled_qty
+            .as_decimal()
+            .checked_sub(unsettled)
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO);
+
         try_cap_order_report_filled_qty(
             report,
             Quantity::zero(report.quantity.precision),
-            confirmed,
+            Some(supported),
         )?;
     }
     Ok(())
@@ -1106,6 +1195,32 @@ mod tests {
         .expect_err("a confirmed maker trade must contain an owned maker order");
 
         assert!(error.to_string().contains("no owned maker order"));
+    }
+
+    /// A request naming venue orders asserts each is the account's own, so an unowned
+    /// targeted order must fail even when a sibling in the same match is owned:
+    /// otherwise the caller silently receives no fill for the order it asked about.
+    #[rstest]
+    fn targeted_unowned_order_fails_even_when_a_sibling_is_owned() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        disown_maker_orders(&mut trade);
+        // The sibling is ours; the order the request names is not.
+        trade.maker_orders[1].maker_address = USER_ADDRESS.to_string();
+        let targeted = VenueOrderId::from(trade.maker_orders[0].order_id.as_str());
+
+        let error = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            &FillReconciliationScope::VenueOrder(targeted),
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect_err("a targeted order that is not ours must fail rather than report nothing");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("targeted maker order"), "{rendered}");
+        assert!(rendered.contains("no owned maker order"), "{rendered}");
     }
 
     #[rstest]
@@ -1500,6 +1615,100 @@ mod tests {
         );
     }
 
+    /// A paginated response can repeat a trade and a match can repeat a maker order.
+    /// Emitting the duplicate would double-count it in the confirmed quantities that
+    /// order reports are capped against, turning a partial fill into a full one.
+    #[rstest]
+    #[case::repeated_trade(false)]
+    #[case::repeated_maker_order(true)]
+    fn deduplicates_repeated_fill_identities(#[case] repeat_within_trade: bool) {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        disown_maker_orders(&mut trade);
+        trade.maker_orders[0].maker_address = USER_ADDRESS.to_string();
+        let trades = if repeat_within_trade {
+            let duplicate = trade.maker_orders[0].clone();
+            trade.maker_orders.push(duplicate);
+            vec![trade]
+        } else {
+            vec![trade.clone(), trade]
+        };
+
+        let reports = build_fill_reports_from_trades(
+            &trades,
+            &fill_context(),
+            &instruments,
+            &FillReconciliationScope::All,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("duplicate venue records must not fail reconciliation");
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            confirmed_filled_quantities(&reports)
+                .expect("no overflow")
+                .get(&reports[0].venue_order_id)
+                .copied(),
+            Some(Decimal::from(25))
+        );
+    }
+
+    /// The venue applies its time bounds to an undocumented timestamp, so a record the
+    /// answer would discard must be filtered before it can reach the fail-closed rules.
+    #[rstest]
+    #[case::before_the_window("1700000000", Some(1_800_000_000_000_000_000u64), None, false)]
+    #[case::after_the_window("1900000000", None, Some(1_800_000_000_000_000_000u64), false)]
+    #[case::inside_the_window(
+        "1850000000",
+        Some(1_800_000_000_000_000_000u64),
+        Some(1_900_000_000_000_000_000u64),
+        true
+    )]
+    #[case::unbounded("1700000000", None, None, true)]
+    fn bounds_confirmed_trades_to_the_requested_window(
+        #[case] match_time: &str,
+        #[case] start: Option<u64>,
+        #[case] end: Option<u64>,
+        #[case] expected: bool,
+    ) {
+        let (_, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.match_time = match_time.to_string();
+
+        assert_eq!(
+            is_within_window(&trade, start.map(UnixNanos::from), end.map(UnixNanos::from)),
+            expected
+        );
+    }
+
+    /// `TradeId` is stack-allocated and aborts the process on an empty, over-long, or
+    /// non-ASCII value. The maker path composes a truncated ID, so its reachable
+    /// failure is a non-ASCII value, which previously also sliced through a character
+    /// boundary; the taker path uses the venue ID whole, so length reaches it too.
+    #[rstest]
+    #[case::maker_path_non_ascii(|trade: &mut PolymarketTradeReport| trade.id = "é".repeat(20))]
+    #[case::taker_path_too_long(|trade: &mut PolymarketTradeReport| {
+        trade.trader_side = PolymarketLiquiditySide::Taker;
+        trade.id = "x".repeat(64);
+    })]
+    fn rejects_a_malformed_trade_id(#[case] mutate: fn(&mut PolymarketTradeReport)) {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.maker_orders[0].maker_address = USER_ADDRESS.to_string();
+        mutate(&mut trade);
+
+        let error = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            &FillReconciliationScope::All,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect_err("a malformed trade ID must fail reconciliation");
+
+        assert!(error.to_string().contains("trade ID"), "{error}");
+    }
+
     /// A match carries counterparties' identifiers too, and `VenueOrderId` panics on
     /// a malformed value, so reconciliation must reject one rather than abort the
     /// process.
@@ -1640,16 +1849,13 @@ mod tests {
     #[case::before_the_window("1700000000", false)]
     #[case::inside_the_window("1900000000", true)]
     #[case::unparsable_is_kept("not-a-timestamp", true)]
-    fn bounds_confirmed_trades_to_the_lookback_window(
-        #[case] match_time: &str,
-        #[case] expected: bool,
-    ) {
+    fn bounds_confirmed_trades_to_the_window(#[case] match_time: &str, #[case] expected: bool) {
         let (_, instrument) = mapped_instrument();
         let mut trade = confirmed_maker_trade_for(&instrument);
         trade.match_time = match_time.to_string();
         let cutoff = Some(UnixNanos::from(1_800_000_000_000_000_000u64));
 
-        assert_eq!(is_within_lookback(&trade, cutoff), expected);
+        assert_eq!(is_within_window(&trade, cutoff, None), expected);
     }
 
     #[rstest]
@@ -1658,7 +1864,7 @@ mod tests {
         let mut trade = confirmed_maker_trade_for(&instrument);
         trade.match_time = "1700000000".to_string();
 
-        assert!(is_within_lookback(&trade, None));
+        assert!(is_within_window(&trade, None, None));
     }
 
     #[rstest]
@@ -1770,19 +1976,26 @@ mod tests {
             None,
         )];
 
-        cap_order_reports_to_confirmed_fills(&mut reports, &[], &AHashSet::new()).unwrap();
+        cap_order_reports_to_confirmed_fills(&mut reports, &[], &AHashMap::new()).unwrap();
 
         assert_eq!(reports[0].filled_qty, Quantity::from("4.0000"));
         assert_eq!(reports[0].quantity, Quantity::from("10.0000"));
         assert_eq!(reports[0].order_status, OrderStatus::PartiallyFilled);
     }
 
-    /// The venue counts a matched trade toward an order's filled size before that
-    /// trade confirms, and the adapter defers fill quantity until confirmation, so an
-    /// order with something still settling is held to its confirmed fills rather than
-    /// treated as merely uncorroborated.
+    /// Only the volume this response shows as unconfirmed is deducted from the venue's
+    /// filled quantity. Deducting all of it defers the whole fill; deducting part of it
+    /// must leave the remainder standing, because that remainder is confirmed volume
+    /// whose fill simply predates the lookback window.
     #[rstest]
-    fn holds_an_order_with_an_unsettled_trade_to_its_confirmed_fills() {
+    #[case::all_volume_unsettled("4.0000", "4.0000", "0.0000")]
+    #[case::partial_volume_unsettled("5.0000", "1.0000", "4.0000")]
+    #[case::no_unsettled_volume("4.0000", "0.0000", "4.0000")]
+    fn deducts_only_unconfirmed_volume_from_the_venue_filled_quantity(
+        #[case] venue_filled: &str,
+        #[case] unsettled: &str,
+        #[case] expected: &str,
+    ) {
         let venue_order_id = VenueOrderId::from("V-SETTLING");
         let mut reports = vec![OrderStatusReport::new(
             AccountId::from("POLY-001"),
@@ -1794,35 +2007,53 @@ mod tests {
             TimeInForce::Gtc,
             OrderStatus::PartiallyFilled,
             Quantity::from("10.0000"),
-            Quantity::from("4.0000"),
+            Quantity::from(venue_filled),
             UnixNanos::from(1),
             UnixNanos::from(1),
             UnixNanos::from(1),
             None,
         )];
-        let unsettled = AHashSet::from_iter([venue_order_id]);
+        let unsettled_qty = Quantity::from(unsettled).as_decimal();
+        let unsettled_by_order = if unsettled_qty.is_zero() {
+            AHashMap::new()
+        } else {
+            AHashMap::from_iter([(venue_order_id, unsettled_qty)])
+        };
 
-        cap_order_reports_to_confirmed_fills(&mut reports, &[], &unsettled).unwrap();
+        cap_order_reports_to_confirmed_fills(&mut reports, &[], &unsettled_by_order).unwrap();
 
-        assert_eq!(reports[0].filled_qty, Quantity::zero(4));
+        assert_eq!(reports[0].filled_qty, Quantity::from(expected));
     }
 
-    /// Only a trade that is still settling contributes an unsettled order ID, and
-    /// both sides of the match are covered.
+    /// Any trade that is not confirmed contributes volume, which covers a trade still
+    /// settling and one that failed outright, and both sides of a match are counted.
     #[rstest]
-    fn collects_order_ids_from_unsettled_trades_only() {
+    #[case::still_settling(PolymarketTradeStatus::Matched)]
+    #[case::failed_outright(PolymarketTradeStatus::Failed)]
+    fn counts_unconfirmed_volume_on_both_sides_of_a_match(#[case] status: PolymarketTradeStatus) {
         let (_, instrument) = mapped_instrument();
-        let mut settling = confirmed_maker_trade_for(&instrument);
-        settling.status = PolymarketTradeStatus::Matched;
+        let mut unconfirmed = confirmed_maker_trade_for(&instrument);
+        unconfirmed.status = status;
         let confirmed = confirmed_maker_trade_for(&instrument);
 
-        let unsettled = orders_with_unsettled_trades(&[settling.clone(), confirmed]);
+        let unsettled =
+            unsettled_matched_by_order(&[unconfirmed.clone(), confirmed]).expect("no overflow");
 
-        assert!(unsettled.contains(&VenueOrderId::from(settling.taker_order_id.as_str())));
-        assert!(unsettled.contains(&VenueOrderId::from(
-            settling.maker_orders[0].order_id.as_str()
-        )));
-        assert_eq!(unsettled.len(), 1 + settling.maker_orders.len());
+        assert_eq!(
+            unsettled
+                .get(&VenueOrderId::from(unconfirmed.taker_order_id.as_str()))
+                .copied(),
+            Some(unconfirmed.size)
+        );
+        assert_eq!(
+            unsettled
+                .get(&VenueOrderId::from(
+                    unconfirmed.maker_orders[0].order_id.as_str()
+                ))
+                .copied(),
+            Some(unconfirmed.maker_orders[0].matched_amount)
+        );
+        assert_eq!(unsettled.len(), 1 + unconfirmed.maker_orders.len());
     }
 
     /// Terminal-quantity normalization still applies to an uncorroborated report,
@@ -1846,7 +2077,7 @@ mod tests {
             None,
         )];
 
-        cap_order_reports_to_confirmed_fills(&mut reports, &[], &AHashSet::new()).unwrap();
+        cap_order_reports_to_confirmed_fills(&mut reports, &[], &AHashMap::new()).unwrap();
 
         assert_eq!(reports[0].quantity, Quantity::from("99.995"));
         assert_eq!(reports[0].filled_qty, Quantity::from("99.995"));
@@ -1890,7 +2121,7 @@ mod tests {
             None,
         )];
 
-        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &AHashSet::new()).unwrap();
+        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &AHashMap::new()).unwrap();
 
         assert_eq!(reports[0].filled_qty, Quantity::from("4.0000"));
     }
@@ -1938,7 +2169,7 @@ mod tests {
             None,
         )];
 
-        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &AHashSet::new()).unwrap();
+        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &AHashMap::new()).unwrap();
 
         assert_eq!(reports[0].quantity, Quantity::from(expected_quantity));
         assert_eq!(reports[0].filled_qty, Quantity::from(confirmed));

@@ -73,6 +73,7 @@ use nautilus_model::{
         LimitOrder, MarketOrder, Order, OrderAny, OrderList, OrderTestBuilder,
         stubs::TestOrderEventStubs,
     },
+    reports::FillReport,
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
@@ -1270,6 +1271,112 @@ async fn test_generate_order_status_reports_fails_on_unmapped_confirmed_fill() {
         .expect_err("an unmapped confirmed fill must fail order reconciliation");
 
     assert!(error.to_string().contains("target taker fill"), "{error}");
+}
+
+async fn fill_reports_for_window(
+    match_time_secs: u64,
+    start_secs: Option<u64>,
+) -> anyhow::Result<Vec<FillReport>> {
+    let state = TestServerState::default();
+    *state.trades_response_override.lock().await =
+        Some(unowned_confirmed_maker_trade(match_time_secs));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let cmd = GenerateFillReports {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: None,
+        venue_order_id: None,
+        start: start_secs.map(|secs| UnixNanos::from(secs * 1_000_000_000)),
+        end: None,
+        params: None,
+        log_receipt_level: LogLevel::Info,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    client.generate_fill_reports(cmd).await
+}
+
+/// The venue applies its time bounds to an undocumented timestamp, so a record the
+/// answer would discard must be filtered before it can reach the fail-closed rules.
+/// Otherwise an obsolete trade fails a request that never covered it.
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_excludes_records_outside_the_requested_window() {
+    let now = unix_now_secs();
+
+    let reports = fill_reports_for_window(now - 365 * 24 * 60 * 60, Some(now - 60))
+        .await
+        .expect("an obsolete record must not fail a bounded fill request");
+
+    assert!(reports.is_empty());
+}
+
+/// The same record inside the window still fails: the window bounds the rule, it does
+/// not weaken it.
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_still_fails_inside_the_requested_window() {
+    let now = unix_now_secs();
+
+    let error = fill_reports_for_window(now - 10, Some(now - 60))
+        .await
+        .expect_err("an unattributable record inside the window must fail");
+
+    assert!(
+        error.to_string().contains("no owned maker order"),
+        "{error}"
+    );
+}
+
+/// The venue applies `asset_id` to the taker's asset, so filtering by it would drop
+/// the maker fills of a cross-asset match: exactly the fills scope classification
+/// exists to report. An instrument-scoped request must filter by condition ID.
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_filters_by_market_not_asset_id() {
+    let state = TestServerState::default();
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let cmd = GenerateFillReports {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: Some(instrument_id),
+        venue_order_id: None,
+        start: None,
+        end: None,
+        params: None,
+        log_receipt_level: LogLevel::Info,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    client
+        .generate_fill_reports(cmd)
+        .await
+        .expect("an instrument-scoped fill request must succeed against an empty venue");
+
+    let query = state.last_query.lock().await;
+    assert!(
+        !query.contains_key("asset_id"),
+        "asset_id would drop cross-asset maker fills: {query:?}"
+    );
+    assert!(query.contains_key("market"), "{query:?}");
 }
 
 #[rstest]

@@ -102,16 +102,46 @@ pub fn determine_order_side(
 ///
 /// Format: `{trade_id[..27]}-{venue_order_id[last 8]}` = 36 chars.
 pub fn make_composite_trade_id(trade_id: &str, venue_order_id: &str) -> TradeId {
-    let prefix_len = trade_id.len().min(27);
-    let suffix_len = venue_order_id.len().min(8);
-    let suffix_start = venue_order_id.len().saturating_sub(suffix_len);
-    TradeId::from(
-        format!(
-            "{}-{}",
-            &trade_id[..prefix_len],
-            &venue_order_id[suffix_start..]
-        )
-        .as_str(),
+    TradeId::from(composite_trade_id(trade_id, venue_order_id).as_str())
+}
+
+/// Builds the composite trade ID, failing rather than aborting on a value the
+/// identifier rejects.
+///
+/// `TradeId` is stack-allocated with a 36-byte capacity and rejects an empty or
+/// over-long value by panicking through `TradeId::from`, so reconciliation paths that
+/// promise a `Result` construct it here instead.
+pub(crate) fn try_make_composite_trade_id(
+    trade_id: &str,
+    venue_order_id: &str,
+) -> anyhow::Result<TradeId> {
+    let composite = composite_trade_id(trade_id, venue_order_id);
+
+    TradeId::new_checked(&composite)
+        .map_err(|e| anyhow::anyhow!("invalid composite trade ID {composite}: {e}"))
+}
+
+/// Truncation walks character boundaries, because slicing a multi-byte value at a
+/// byte index panics.
+fn composite_trade_id(trade_id: &str, venue_order_id: &str) -> String {
+    let prefix_end = trade_id
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(trade_id.len()))
+        .take_while(|index| *index <= 27)
+        .last()
+        .unwrap_or(0);
+    let suffix_start = venue_order_id
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(venue_order_id.len()))
+        .find(|index| venue_order_id.len() - index <= 8)
+        .unwrap_or(0);
+
+    format!(
+        "{}-{}",
+        &trade_id[..prefix_end],
+        &venue_order_id[suffix_start..]
     )
 }
 
@@ -370,6 +400,10 @@ pub(crate) fn try_parse_fill_report(
             trade.id
         )
     })?;
+    // `TradeId::from` aborts on a value the identifier rejects, so a malformed venue
+    // trade ID must fail this reconciliation rather than the process.
+    TradeId::new_checked(&trade.id)
+        .map_err(|e| anyhow::anyhow!("confirmed taker fill has an invalid trade ID: {e}"))?;
 
     Ok(build_fill_report(
         trade,
@@ -505,6 +539,10 @@ pub(crate) fn try_build_maker_fill_report(
     .map_err(|e| {
         anyhow::anyhow!("cannot represent confirmed maker fill {trade_id} commission: {e}")
     })?;
+    // `build_maker_report` composes the trade ID through `TradeId::from`, which aborts
+    // on a value the identifier rejects. A match carries counterparties' identifiers as
+    // well as the account's own, so validate before composing.
+    try_make_composite_trade_id(trade_id, &mo.order_id)?;
 
     Ok(build_maker_report(
         mo,

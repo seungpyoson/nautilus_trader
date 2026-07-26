@@ -39,7 +39,7 @@ use super::{
     },
     reconciliation::{
         FillContext, FillReconciliationScope, apply_fill_filters, build_fill_reports_from_trades,
-        build_position_reports, confirmed_filled_quantities,
+        build_position_reports, confirmed_filled_quantities, is_within_window,
         normalize_terminal_order_report_quantity, resolve_requested_instrument,
         try_cap_order_report_filled_qty,
     },
@@ -541,9 +541,12 @@ impl PolymarketExecutionClient {
         let mut params = GetTradesParams::default();
 
         if let Some(instrument_id) = cmd.instrument_id {
-            let (token_id, _) =
-                resolve_requested_instrument(&self.shared_token_instruments, instrument_id)?;
-            params.asset_id = Some(token_id.to_string());
+            // Filter by the market's condition ID, never by asset_id: the venue applies
+            // asset_id to the taker's asset, so it would drop the maker fills of a
+            // cross-asset match and hide exactly the fills scope classification exists
+            // to report. Resolution still runs so an unknown instrument fails here.
+            resolve_requested_instrument(&self.shared_token_instruments, instrument_id)?;
+            params.market = Some(crate::providers::extract_condition_id(&instrument_id)?);
         }
         params.after = cmd
             .start
@@ -554,6 +557,13 @@ impl PolymarketExecutionClient {
             .get_trades(params)
             .await
             .context("failed to fetch trades")?;
+        // The venue's time bounds are applied to an undocumented timestamp, so the
+        // requested window is enforced locally before reports are built. Otherwise a
+        // record the answer would discard could still fail the reconciliation rules.
+        let trades: Vec<_> = trades
+            .into_iter()
+            .filter(|trade| is_within_window(trade, cmd.start, cmd.end))
+            .collect();
 
         let ctx = self.fill_context();
         let scope = match (cmd.instrument_id, cmd.venue_order_id) {
