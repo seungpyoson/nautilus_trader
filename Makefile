@@ -182,10 +182,21 @@ else
 CARGO_FEATURES := $(BASE_FEATURES)
 endif
 CORE_SELECTED_FEATURE_LIST := $(filter-out hypersync,$(subst $(comma),$(space),$(CARGO_FEATURES)))
-CORE_SELECTED_FEATURES := $(subst $(space),$(comma),$(strip $(CORE_SELECTED_FEATURE_LIST)))
+CORE_SELECTED_FEATURES := $(subst $(space),$(comma),$(strip $(CORE_SELECTED_FEATURE_LIST))),nautilus-serialization/sbe,nautilus-infrastructure/postgres
+
+# Standard-precision (64-bit) selection, shared by the test and clippy targets.
+# Two independent routes re-enable high precision, and both must be closed or the build
+# silently runs high precision under a standard-precision name:
+#   --no-default-features       most adapters declare default = [..., "high-precision"]
+#   --exclude nautilus-blockchain   it depends on nautilus-model/defi, which implies high-precision
+# `cargo tree` does not reflect either route reliably here. Verify a change by deleting an
+# `#[allow(clippy::useless_conversion)]` in crates/model/src/types/quantity.rs and confirming
+# clippy reports it under this selection.
+STANDARD_PRECISION_ARGS := --workspace --exclude nautilus-blockchain --no-default-features --lib --tests --features "ffi,python"
 
 CARGO_BUILD_JOB_TARGETS := install install-debug build build-debug \
 	build-debug-pyo3 build-wheel build-wheel-debug build-dry-run check-code \
+	check-code-standard-precision \
 	check-all-targets clippy clippy-fix clippy-fix-nightly clippy-pedantic-crate-% \
 	docs docs-rust docsrs-check cargo-build cargo-check check-features hawk cargo-test \
 	cargo-test-extras cargo-test-doc cargo-test-core-local cargo-test-core-selected \
@@ -213,19 +224,26 @@ ifneq ($(strip $(NEXTEST_TEST_THREADS_FOR_RUST)),)
 $(NEXTEST_ENV_TARGETS): export NEXTEST_TEST_THREADS=$(NEXTEST_TEST_THREADS_FOR_RUST)
 endif
 
-# Core crates (excludes adapters/*, nautilus-pyo3, nautilus-cli)
+# Core crates (excludes adapters/* and workspace members without tests)
 CORE_CRATES := nautilus-analysis nautilus-backtest nautilus-common nautilus-core \
-    nautilus-cryptography nautilus-data nautilus-execution nautilus-indicators \
-    nautilus-infrastructure nautilus-live nautilus-model nautilus-network \
-    nautilus-persistence nautilus-portfolio nautilus-risk nautilus-serialization \
+    nautilus-cryptography nautilus-data nautilus-event-store nautilus-execution \
+    nautilus-indicators nautilus-infrastructure nautilus-live nautilus-model \
+    nautilus-network nautilus-persistence nautilus-persistence-macros \
+    nautilus-plugin nautilus-portfolio nautilus-risk nautilus-serialization \
     nautilus-system nautilus-testkit nautilus-trading
 
-# Adapter crates (crates/adapters/*)
+# Crates tested in the workspace-compiled adapter lane
 ADAPTER_CRATES := nautilus-architect-ax nautilus-betfair nautilus-binance \
-    nautilus-bitmex nautilus-blockchain nautilus-bybit nautilus-databento \
-    nautilus-deribit nautilus-dydx nautilus-hyperliquid nautilus-kraken \
-    nautilus-lighter nautilus-okx nautilus-polymarket nautilus-sandbox \
-    nautilus-tardis
+    nautilus-bitmex nautilus-blockchain nautilus-bybit nautilus-cli \
+    nautilus-coinbase nautilus-databento nautilus-deribit nautilus-derive \
+    nautilus-dydx nautilus-hyperliquid nautilus-interactive-brokers \
+    nautilus-kraken nautilus-lighter nautilus-okx nautilus-polymarket \
+    nautilus-sandbox nautilus-tardis
+
+# Workspace members without Rust test functions:
+# nautilus-trader is the container library, nautilus-pyo3 owns generated bindings,
+# and nautilus-tutorials has a binary target with test = false.
+NO_TEST_CRATES := nautilus-trader nautilus-pyo3 nautilus-tutorials
 
 # > Colors
 # Use ANSI escape codes directly for cross-platform compatibility (Git Bash on Windows doesn't have tput)
@@ -392,6 +410,15 @@ check-code:  #-- Run clippy on lib/test targets and ruff --fix (use HYPERSYNC=tr
 	@uv run --active --no-sync ruff check . --fix --force-exclude
 	@printf "$(GREEN)Checks passed$(RESET)\n"
 
+.PHONY: check-code-standard-precision
+# Keep the generated Cython/C bindings on their committed high-precision setting; the Rust
+# compilation is driven by the cargo feature, so only binding generation would drift here.
+check-code-standard-precision: export HIGH_PRECISION=1
+check-code-standard-precision:  #-- Run clippy on lib/test targets with standard precision
+	$(info $(M) Running standard-precision code quality checks...)
+	@cargo clippy $(STANDARD_PRECISION_ARGS) --profile nextest -- -D warnings
+	@printf "$(GREEN)Standard-precision checks passed$(RESET)\n"
+
 .PHONY: check-all-targets
 check-all-targets:  #-- Run clippy on all targets including bins and examples (nightly)
 	$(info $(M) Running full clippy on all targets...)
@@ -426,8 +453,8 @@ pre-flight:  #-- Run pre-flight checks (format, check-code, cargo-test, build-de
 		$(MAKE) --no-print-directory install-deps \
 		&& $(MAKE) --no-print-directory format \
 		&& $(MAKE) --no-print-directory check-code EXTRA_FEATURES="capnp,hypersync" \
-		&& $(MAKE) --no-print-directory cargo-test-extras \
 		&& $(MAKE) --no-print-directory cargo-test-doc EXTRA_FEATURES="capnp,hypersync" \
+		&& $(MAKE) --no-print-directory cargo-test-extras \
 		&& $(MAKE) --no-print-directory build-debug \
 		&& $(MAKE) --no-print-directory pytest \
 		&& $(MAKE) --no-print-directory security-audit \
@@ -609,7 +636,6 @@ docs-check-links:  #-- Check for broken links in documentation (periodic audit)
 		--exclude-path target \
 		--exclude-path docs/python-api-latest \
 		--exclude "file://.*/python-api-latest/.*" \
-		--exclude-file .lycheeignore \
 		"**/*.md" "docs/**/*.py"
 	@printf "$(GREEN)Link check passed$(RESET)\n"
 
@@ -777,7 +803,9 @@ cargo-test-extras:  #-- Run all Rust tests with capnp and hypersync features (co
 
 # Doctests need their own target because `cargo nextest` cannot run them.
 # Sharing --features and --profile with the nextest targets lets both reuse the
-# same compiled artifacts.
+# same compiled artifacts. Run this before those targets: rustdoc links a
+# throwaway binary per doc example, and going first releases those transient
+# files before the nextest test-binary set lands, which keeps peak disk lower.
 .PHONY: cargo-test-doc
 cargo-test-doc: export RUST_BACKTRACE=1
 cargo-test-doc:  #-- Run Rust doctests (examples in `///` and `//!` comments)
@@ -822,12 +850,12 @@ endif
 .PHONY: cargo-test-adapters
 cargo-test-adapters: export RUST_BACKTRACE=1
 cargo-test-adapters: check-nextest-installed
-cargo-test-adapters:  #-- Run Rust tests for adapter crates with workspace compilation
+cargo-test-adapters:  #-- Run Rust tests for the workspace-compiled adapter lane
 ifeq ($(VERBOSE),true)
-	$(info $(M) Running Rust tests for adapter crates...)
+	$(info $(M) Running Rust tests for the workspace-compiled adapter lane...)
 	cargo nextest run --workspace --lib --tests --features "$(CARGO_FEATURES)" -E '$(ADAPTER_FILTERSET)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --verbose
 else
-	$(info $(M) Running Rust tests for adapter crates (showing summary and failures only)...)
+	$(info $(M) Running Rust tests for the workspace-compiled adapter lane (showing summary and failures only)...)
 	cargo nextest run --workspace --lib --tests --features "$(CARGO_FEATURES)" -E '$(ADAPTER_FILTERSET)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --status-level fail --final-status-level flaky
 endif
 
@@ -883,9 +911,11 @@ cargo-test-lib:  #-- Run Rust library tests only with high precision
 
 .PHONY: cargo-test-standard-precision
 cargo-test-standard-precision: export RUST_BACKTRACE=1
+# See check-code-standard-precision: keep generated bindings off the standard-precision setting.
+cargo-test-standard-precision: export HIGH_PRECISION=1
 cargo-test-standard-precision: check-nextest-installed
 cargo-test-standard-precision:  #-- Run Rust tests with standard precision (debug profile)
-	cargo nextest run --workspace --lib --tests --features "ffi,python" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE)
+	cargo nextest run $(STANDARD_PRECISION_ARGS) $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE)
 
 .PHONY: cargo-test-debug
 cargo-test-debug: export RUST_BACKTRACE=1
@@ -1208,8 +1238,8 @@ pre-flight-v2:  #-- Run v2 pre-flight checks (format, tests, build, generated dr
 		$(MAKE) --no-print-directory install-deps \
 		&& $(MAKE) --no-print-directory format \
 		&& $(MAKE) --no-print-directory check-code EXTRA_FEATURES="capnp,hypersync" \
-		&& $(MAKE) --no-print-directory cargo-test-extras \
 		&& $(MAKE) --no-print-directory cargo-test-doc EXTRA_FEATURES="capnp,hypersync" \
+		&& $(MAKE) --no-print-directory cargo-test-extras \
 		&& $(MAKE) --no-print-directory build-debug-v2 \
 		&& $(MAKE) --no-print-directory check-v2-generated-drift \
 		&& $(MAKE) --no-print-directory pytest-v2 \

@@ -739,6 +739,183 @@ fn test_initialize_orders_splits_initial_margin_by_account_when_broker_routed(
     );
 }
 
+const ORDERING_SYMBOLS: [&str; 6] = [
+    "EUR/USD", "EUR/GBP", "EUR/CHF", "EUR/CAD", "EUR/AUD", "EUR/NZD",
+];
+
+// Instrument ids sort by symbol, so margin recalculation visits them in this sequence
+// whichever order the cache was populated in, and `margins` records that sequence.
+const ORDERING_MARGIN_SYMBOLS: [&str; 6] = [
+    "EUR/AUD", "EUR/CAD", "EUR/CHF", "EUR/GBP", "EUR/NZD", "EUR/USD",
+];
+
+// The account reports only USD, so every other instrument quote currency carries a margin
+// with no venue-reported balance behind it.
+fn ordering_portfolio(reversed: bool) -> (Portfolio, AccountId, Vec<InstrumentAny>) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let account_id = AccountId::new("SIM-001");
+    let mut symbols = ORDERING_SYMBOLS;
+    if reversed {
+        symbols.reverse();
+    }
+    let instruments: Vec<InstrumentAny> = symbols
+        .iter()
+        .map(|symbol| {
+            InstrumentAny::CurrencyPair(default_fx_ccy(
+                Symbol::from(*symbol),
+                Some(Venue::test_default()),
+            ))
+        })
+        .collect();
+
+    let mut cache = Cache::new(None, None);
+    for instrument in &instruments {
+        cache.add_instrument(instrument.clone()).unwrap();
+    }
+
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(TestClock::new())),
+        Rc::new(RefCell::new(cache)),
+        None,
+    );
+    portfolio.update_account(&AccountState::new(
+        account_id,
+        AccountType::Margin,
+        vec![AccountBalance::new(
+            Money::new(1_000_000.00, Currency::USD()),
+            Money::zero(Currency::USD()),
+            Money::new(1_000_000.00, Currency::USD()),
+        )],
+        Vec::new(),
+        true,
+        uuid4(),
+        0.into(),
+        0.into(),
+        None,
+    ));
+
+    (portfolio, account_id, instruments)
+}
+
+fn margin_and_balance_order(
+    portfolio: &Portfolio,
+    account_id: &AccountId,
+) -> (Vec<InstrumentId>, Vec<Currency>) {
+    let cache = portfolio.cache();
+    let cache = cache.borrow();
+    let Some(AccountAny::Margin(account)) = cache.account_owned(account_id) else {
+        panic!("margin account not found");
+    };
+    (
+        account.margins.keys().copied().collect(),
+        account.balances.keys().copied().collect(),
+    )
+}
+
+fn order_after_initialize_positions(reversed: bool) -> (Vec<InstrumentId>, Vec<Currency>) {
+    let (mut portfolio, account_id, instruments) = ordering_portfolio(reversed);
+
+    for (i, instrument) in instruments.iter().enumerate() {
+        let fill = make_fill_for_account(
+            instrument,
+            account_id,
+            OrderSide::Buy,
+            Quantity::from("100000"),
+            Price::from("1.00000"),
+            PositionId::new(format!("P-{i}")),
+        );
+        let position = Position::new(instrument, fill);
+        portfolio
+            .cache()
+            .borrow_mut()
+            .add_position(&position, OmsType::Hedging)
+            .unwrap();
+
+        let quote = get_quote_tick(instrument, 1.0, 1.0, 1.0, 1.0);
+        portfolio.cache().borrow_mut().add_quote(quote).unwrap();
+        portfolio.update_quote_tick(&quote);
+    }
+
+    portfolio.initialize_positions();
+    margin_and_balance_order(&portfolio, &account_id)
+}
+
+fn order_after_initialize_orders(reversed: bool) -> (Vec<InstrumentId>, Vec<Currency>) {
+    let (mut portfolio, account_id, instruments) = ordering_portfolio(reversed);
+
+    for (i, instrument) in instruments.iter().enumerate() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::new(format!("O-{i}")))
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("100000"))
+            .price(Price::from("1.00000"))
+            .build();
+        portfolio
+            .cache()
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        let submitted = order_submitted(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            account_id,
+            uuid4(),
+        );
+        portfolio
+            .cache()
+            .borrow_mut()
+            .update_order(&OrderEventAny::Submitted(submitted))
+            .unwrap();
+        let accepted = order_accepted(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            account_id,
+            VenueOrderId::new(format!("V-{i}")),
+            uuid4(),
+        );
+        portfolio
+            .cache()
+            .borrow_mut()
+            .update_order(&OrderEventAny::Accepted(accepted))
+            .unwrap();
+    }
+
+    portfolio.initialize_orders();
+    margin_and_balance_order(&portfolio, &account_id)
+}
+
+// Repeated because each run builds its own cache and portfolio, so an `AHashSet` anywhere on
+// the initialization path reseeds and reorders the margins the account records.
+#[rstest]
+#[case::orders(order_after_initialize_orders)]
+#[case::positions(order_after_initialize_positions)]
+fn test_initialization_recalculates_margins_in_instrument_id_order(
+    #[case] initialize: fn(bool) -> (Vec<InstrumentId>, Vec<Currency>),
+) {
+    let expected_margins: Vec<InstrumentId> = ORDERING_MARGIN_SYMBOLS
+        .iter()
+        .map(|symbol| InstrumentId::new(Symbol::from(*symbol), Venue::test_default()))
+        .collect();
+
+    for run in 0..16 {
+        for reversed in [false, true] {
+            let (margins, balances) = initialize(reversed);
+            assert_eq!(margins, expected_margins, "run {run} reversed {reversed}");
+            assert_eq!(
+                balances,
+                vec![Currency::USD()],
+                "run {run} reversed {reversed} materialized an unreported currency"
+            );
+        }
+    }
+}
+
 #[rstest]
 fn test_pending_tick_recovery_preserves_account_margins_when_broker_routed(
     mut simple_cache: Cache,

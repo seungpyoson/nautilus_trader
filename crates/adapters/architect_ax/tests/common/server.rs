@@ -47,8 +47,17 @@ use nautilus_model::{
     types::{Currency, Price, Quantity},
 };
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use serde_json::json;
 use ustr::Ustr;
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct CapturedOrdersQuery {
+    pub start_timestamp_ns: Option<i64>,
+    pub end_timestamp_ns: Option<i64>,
+    pub limit: Option<i32>,
+    pub cursor: Option<String>,
+}
 
 #[derive(Clone)]
 pub(crate) struct TestServerState {
@@ -64,6 +73,8 @@ pub(crate) struct TestServerState {
     pub messages_received: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
     pub cancel_all_count: Arc<AtomicUsize>,
     pub cancel_all_fail: Arc<AtomicBool>,
+    pub whoami_count: Arc<AtomicUsize>,
+    pub whoami_fail: Arc<AtomicBool>,
     pub preview_count: Arc<AtomicUsize>,
     pub preview_empty: Arc<AtomicBool>,
     pub preview_fail: Arc<AtomicBool>,
@@ -72,7 +83,12 @@ pub(crate) struct TestServerState {
     pub replace_order_count: Arc<AtomicUsize>,
     pub replace_order_oid: Arc<tokio::sync::Mutex<Option<String>>>,
     pub order_status_queries: Arc<tokio::sync::Mutex<Vec<GetOrderStatusParams>>>,
+    pub open_orders_queries: Arc<tokio::sync::Mutex<Vec<GetOpenOrdersParams>>>,
     pub open_orders_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+    pub orders_queries: Arc<tokio::sync::Mutex<Vec<CapturedOrdersQuery>>>,
+    pub orders_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+    pub orders_page_size: Arc<tokio::sync::Mutex<Option<usize>>>,
+    pub orders_repeated_cursor: Arc<tokio::sync::Mutex<Option<String>>>,
     pub fills_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
     pub positions_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
 }
@@ -92,6 +108,8 @@ impl Default for TestServerState {
             messages_received: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             cancel_all_count: Arc::new(AtomicUsize::new(0)),
             cancel_all_fail: Arc::new(AtomicBool::new(false)),
+            whoami_count: Arc::new(AtomicUsize::new(0)),
+            whoami_fail: Arc::new(AtomicBool::new(false)),
             preview_count: Arc::new(AtomicUsize::new(0)),
             preview_empty: Arc::new(AtomicBool::new(false)),
             preview_fail: Arc::new(AtomicBool::new(false)),
@@ -100,7 +118,12 @@ impl Default for TestServerState {
             replace_order_count: Arc::new(AtomicUsize::new(0)),
             replace_order_oid: Arc::new(tokio::sync::Mutex::new(None)),
             order_status_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            open_orders_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             open_orders_payload: Arc::new(tokio::sync::Mutex::new(None)),
+            orders_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            orders_payload: Arc::new(tokio::sync::Mutex::new(None)),
+            orders_page_size: Arc::new(tokio::sync::Mutex::new(None)),
+            orders_repeated_cursor: Arc::new(tokio::sync::Mutex::new(None)),
             fills_payload: Arc::new(tokio::sync::Mutex::new(None)),
             positions_payload: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -121,6 +144,10 @@ impl TestServerState {
         self.messages_received.lock().await.clear();
         self.cancel_all_count.store(0, Ordering::Relaxed);
         self.order_status_queries.lock().await.clear();
+        self.open_orders_queries.lock().await.clear();
+        self.orders_queries.lock().await.clear();
+        *self.orders_page_size.lock().await = None;
+        *self.orders_repeated_cursor.lock().await = None;
     }
 
     pub(crate) async fn set_subscription_failures(&self, topics: Vec<String>) {
@@ -194,6 +221,7 @@ async fn handle_md_socket(mut socket: WebSocket, state: TestServerState) {
 
                 match msg_type {
                     Some("subscribe") => {
+                        let rid = value.get("rid").and_then(|v| v.as_i64()).unwrap_or(0);
                         let symbol = value.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
                         let level = value
                             .get("level")
@@ -214,11 +242,45 @@ async fn handle_md_socket(mut socket: WebSocket, state: TestServerState) {
                             .await
                             .push((key.clone(), !should_fail));
 
-                        if !should_fail {
+                        if should_fail {
+                            let error = json!({
+                                "rid": rid,
+                                "error": {
+                                    "code": 400,
+                                    "message": "subscription failed",
+                                },
+                            });
+
+                            if socket
+                                .send(Message::Text(error.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+
+                        {
                             let mut subs = state.subscriptions.lock().await;
                             if !subs.contains(&key) {
                                 subs.push(key);
                             }
+                        }
+
+                        let ack = json!({
+                            "rid": rid,
+                            "result": {
+                                "subscribed": symbol,
+                            },
+                        });
+
+                        if socket
+                            .send(Message::Text(ack.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
                         }
 
                         if level != "TRADES" {
@@ -251,15 +313,36 @@ async fn handle_md_socket(mut socket: WebSocket, state: TestServerState) {
                         }
                     }
                     Some("unsubscribe") => {
+                        let rid = value.get("rid").and_then(|v| v.as_i64()).unwrap_or(0);
                         let symbol = value.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
 
-                        let mut subs = state.subscriptions.lock().await;
-                        subs.retain(|s| !s.starts_with(symbol));
+                        {
+                            let mut subs = state.subscriptions.lock().await;
+                            subs.retain(|s| !s.starts_with(symbol));
+                        }
 
-                        let mut events = state.subscription_events.lock().await;
-                        events.retain(|(t, _)| !t.starts_with(symbol));
+                        {
+                            let mut events = state.subscription_events.lock().await;
+                            events.retain(|(t, _)| !t.starts_with(symbol));
+                        }
+
+                        let ack = json!({
+                            "rid": rid,
+                            "result": {
+                                "unsubscribed": symbol,
+                            },
+                        });
+
+                        if socket
+                            .send(Message::Text(ack.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     Some("subscribe_candles") => {
+                        let rid = value.get("rid").and_then(|v| v.as_i64()).unwrap_or(0);
                         let symbol = value.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
                         let width = value.get("width").and_then(|v| v.as_str()).unwrap_or("1m");
 
@@ -272,7 +355,22 @@ async fn handle_md_socket(mut socket: WebSocket, state: TestServerState) {
 
                         let mut subs = state.subscriptions.lock().await;
                         if !subs.contains(&key) {
-                            subs.push(key);
+                            subs.push(key.clone());
+                        }
+
+                        let ack = json!({
+                            "rid": rid,
+                            "result": {
+                                "subscribed_candle": key,
+                            },
+                        });
+
+                        if socket
+                            .send(Message::Text(ack.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
                         }
 
                         // Send two candles with different timestamps to trigger bar emission
@@ -288,10 +386,29 @@ async fn handle_md_socket(mut socket: WebSocket, state: TestServerState) {
                         }
                     }
                     Some("unsubscribe_candles") => {
+                        let rid = value.get("rid").and_then(|v| v.as_i64()).unwrap_or(0);
                         let symbol = value.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                        let width = value.get("width").and_then(|v| v.as_str()).unwrap_or("1m");
 
-                        let mut subs = state.subscriptions.lock().await;
-                        subs.retain(|s| !s.starts_with(&format!("{symbol}:candle")));
+                        {
+                            let mut subs = state.subscriptions.lock().await;
+                            subs.retain(|s| !s.starts_with(&format!("{symbol}:candle")));
+                        }
+
+                        let ack = json!({
+                            "rid": rid,
+                            "result": {
+                                "unsubscribed_candle": format!("{symbol}:candle:{width}"),
+                            },
+                        });
+
+                        if socket
+                            .send(Message::Text(ack.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     _ => {}
                 }
@@ -460,6 +577,19 @@ async fn handle_get_balances() -> Json<serde_json::Value> {
     Json(load_test_data("http_get_balances.json"))
 }
 
+async fn handle_get_whoami(State(state): State<TestServerState>) -> axum::response::Response {
+    state.whoami_count.fetch_add(1, Ordering::Relaxed);
+    if state.whoami_fail.load(Ordering::Relaxed) {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"server error"})),
+        )
+            .into_response()
+    } else {
+        Json(load_test_data("http_get_whoami.json")).into_response()
+    }
+}
+
 async fn handle_authenticate() -> Json<serde_json::Value> {
     Json(json!({
         "token": "mock_session_token_for_testing"
@@ -558,6 +688,7 @@ async fn handle_open_orders(
     State(state): State<TestServerState>,
     Query(params): Query<GetOpenOrdersParams>,
 ) -> Json<serde_json::Value> {
+    state.open_orders_queries.lock().await.push(params.clone());
     let guard = state.open_orders_payload.lock().await;
     let payload = guard
         .as_ref()
@@ -582,6 +713,47 @@ async fn handle_open_orders(
         "total_count": total_count,
         "limit": limit,
         "offset": offset,
+    }))
+}
+
+async fn handle_orders(
+    State(state): State<TestServerState>,
+    Query(params): Query<CapturedOrdersQuery>,
+) -> Json<serde_json::Value> {
+    state.orders_queries.lock().await.push(params.clone());
+    let guard = state.orders_payload.lock().await;
+    let payload = guard
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| load_test_data("http_get_orders.json"));
+    let orders = payload
+        .get("orders")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let total_count = orders.len();
+    let repeated_cursor = state.orders_repeated_cursor.lock().await.clone();
+    let offset = match params.cursor.as_deref() {
+        Some(cursor) if repeated_cursor.as_deref() == Some(cursor) => 1,
+        Some(cursor) => cursor.parse::<usize>().unwrap_or(0),
+        None => 0,
+    };
+    let limit = params.limit.unwrap_or(100).max(0) as usize;
+    let page_size = (*state.orders_page_size.lock().await).unwrap_or(limit);
+    let page = orders
+        .into_iter()
+        .skip(offset)
+        .take(page_size.min(limit))
+        .collect::<Vec<_>>();
+    let next_offset = offset + page.len();
+    let next_cursor = (next_offset < total_count)
+        .then(|| repeated_cursor.unwrap_or_else(|| next_offset.to_string()));
+
+    Json(json!({
+        "orders": page,
+        "total_count": total_count,
+        "limit": limit,
+        "next_cursor": next_cursor,
     }))
 }
 
@@ -639,6 +811,7 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/authenticate", post(handle_authenticate))
         .route("/instruments", get(handle_get_instruments))
         .route("/balances", get(handle_get_balances))
+        .route("/whoami", get(handle_get_whoami))
         .route("/positions", get(handle_positions))
         .route("/cancel-all-orders", post(handle_cancel_all_orders))
         .route(
@@ -648,6 +821,7 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/replace-order", post(handle_replace_order))
         .route("/order-status", get(handle_order_status))
         .route("/open-orders", get(handle_open_orders))
+        .route("/orders", get(handle_orders))
         .route("/fills", get(handle_fills))
         .with_state(state)
 }
