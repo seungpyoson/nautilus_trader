@@ -1398,6 +1398,284 @@ async fn test_generate_mass_status_fails_on_unmapped_current_position() {
     );
 }
 
+/// Mass reconciliation discards confirmed trades outside the lookback window, so it
+/// must not request them: an unbounded fetch would expose the fail-closed maker
+/// completeness rule to venue records that can never contribute a report.
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_bounds_the_trade_request_to_the_lookback() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.positions_response_override.lock().await = Some(json!([]));
+    let addr = start_mock_server(state.clone()).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+    let lookback_mins = 60u64;
+    let before_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after the unix epoch")
+        .as_secs();
+
+    client
+        .generate_mass_status(Some(lookback_mins))
+        .await
+        .expect("mass reconciliation must succeed against an empty venue");
+
+    let after: u64 = state
+        .last_query
+        .lock()
+        .await
+        .get("after")
+        .expect("a bounded lookback must request trades from the cutoff")
+        .parse()
+        .expect("after must be unix seconds");
+    let after_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after the unix epoch")
+        .as_secs();
+    let lookback_secs = lookback_mins * 60;
+
+    assert!(
+        after >= before_secs - lookback_secs && after <= after_secs - lookback_secs,
+        "cutoff {after} must be one lookback behind the request"
+    );
+}
+
+fn unowned_confirmed_maker_trade(match_time_secs: u64) -> serde_json::Value {
+    json!({
+        "data": [{
+            "id": "trade-obsolete",
+            "taker_order_id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",
+            "market": "0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917",
+            "asset_id": "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+            "side": "BUY",
+            "size": "1.0000",
+            "fee_rate_bps": "0",
+            "price": "0.5000",
+            "status": "CONFIRMED",
+            "match_time": match_time_secs.to_string(),
+            "last_update": match_time_secs.to_string(),
+            "outcome": "Yes",
+            "bucket_index": 0,
+            "owner": "00000000-0000-0000-0000-000000000009",
+            "maker_address": "0x000000000000000000000000000000000000dead",
+            "transaction_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+            "maker_orders": [{
+                "asset_id": "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+                "fee_rate_bps": "0",
+                "maker_address": "0x000000000000000000000000000000000000dead",
+                "matched_amount": "1.0000",
+                "order_id": "0xcounterparty-order",
+                "outcome": "Yes",
+                "owner": "00000000-0000-0000-0000-000000000009",
+                "price": "0.5000",
+                "side": "SELL"
+            }],
+            "trader_side": "MAKER"
+        }],
+        "next_cursor": "LTE="
+    })
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after the unix epoch")
+        .as_secs()
+}
+
+/// A confirmed maker trade the account cannot be found in fails reconciliation, so a
+/// record too old to contribute a report must never reach that rule: otherwise one
+/// obsolete venue record blocks every startup forever.
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_ignores_an_unattributable_trade_outside_the_lookback() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(unowned_confirmed_maker_trade(
+        unix_now_secs() - 365 * 24 * 60 * 60,
+    ));
+    *state.positions_response_override.lock().await = Some(json!([]));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect("an obsolete confirmed maker trade must not fail a bounded reconciliation");
+
+    assert!(
+        mass_status
+            .expect("mass status is generated")
+            .fill_reports()
+            .is_empty()
+    );
+}
+
+/// The same record inside the window still fails: the rule is bounded, not weakened.
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_fails_on_an_unattributable_trade_inside_the_lookback() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await =
+        Some(unowned_confirmed_maker_trade(unix_now_secs() - 60));
+    *state.positions_response_override.lock().await = Some(json!([]));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let error = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect_err("a confirmed maker trade in the window must contain an owned maker order");
+
+    assert!(
+        error.to_string().contains("no owned maker order"),
+        "{error}"
+    );
+}
+
+fn partially_filled_open_order() -> serde_json::Value {
+    json!({
+        "data": [{
+            "associate_trades": [],
+            "id": "0xaaaa000000000000000000000000000000000000000000000000000000000001",
+            "status": "LIVE",
+            "market": "0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917",
+            "original_size": "10.0000",
+            "outcome": "Yes",
+            "maker_address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "owner": "test_api_key",
+            "price": "0.5000",
+            "side": "BUY",
+            "size_matched": "4.0000",
+            "asset_id": TEST_TOKEN_ID,
+            "expiration": null,
+            "order_type": "GTC",
+            "created_at": 1703875200
+        }],
+        "next_cursor": "LTE="
+    })
+}
+
+fn trade_for_order(order_id: &str, status: &str) -> serde_json::Value {
+    json!({
+        "data": [{
+            "id": "trade-for-order",
+            "taker_order_id": order_id,
+            "market": "0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917",
+            "asset_id": TEST_TOKEN_ID,
+            "side": "BUY",
+            "size": "4.0000",
+            "fee_rate_bps": "0",
+            "price": "0.5000",
+            "status": status,
+            "match_time": unix_now_secs().to_string(),
+            "last_update": unix_now_secs().to_string(),
+            "outcome": "Yes",
+            "bucket_index": 0,
+            "owner": "test_api_key",
+            "maker_address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "transaction_hash": "0xabc",
+            "maker_orders": [],
+            "trader_side": "TAKER"
+        }],
+        "next_cursor": "LTE="
+    })
+}
+
+async fn mass_status_filled_qty(trades: serde_json::Value, lookback_mins: Option<u64>) -> Quantity {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(partially_filled_open_order());
+    *state.trades_response_override.lock().await = Some(trades);
+    *state.positions_response_override.lock().await = Some(json!([]));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let mass_status = client
+        .generate_mass_status(lookback_mins)
+        .await
+        .expect("mass reconciliation must succeed")
+        .expect("mass status is generated");
+
+    mass_status
+        .order_reports()
+        .values()
+        .next()
+        .expect("the open order must be reported")
+        .filled_qty
+}
+
+/// The venue reports this order as partially filled while the response carries no
+/// confirmed fill for it, which is what happens once its fills predate the lookback
+/// window. Reporting zero filled would understate a live order's exposure.
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_keeps_venue_filled_qty_without_confirmed_fills() {
+    let filled_qty = mass_status_filled_qty(json!({"data": [], "next_cursor": "LTE="}), None).await;
+
+    assert_eq!(filled_qty, Quantity::from("4.0000"));
+}
+
+/// The same order with a trade still settling is the opposite case: the venue counts
+/// that volume as matched while the adapter defers fill quantity until confirmation,
+/// so the report is held to its confirmed fills.
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_defers_filled_qty_while_a_trade_is_settling() {
+    let filled_qty = mass_status_filled_qty(
+        trade_for_order(
+            "0xaaaa000000000000000000000000000000000000000000000000000000000001",
+            "MATCHED",
+        ),
+        None,
+    )
+    .await;
+
+    assert_eq!(filled_qty, Quantity::zero(4));
+}
+
+/// An unbounded reconciliation request stays unbounded at the venue.
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_leaves_an_unbounded_lookback_unbounded() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.positions_response_override.lock().await = Some(json!([]));
+    let addr = start_mock_server(state.clone()).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    client
+        .generate_mass_status(None)
+        .await
+        .expect("mass reconciliation must succeed against an empty venue");
+
+    assert!(!state.last_query.lock().await.contains_key("after"));
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_generate_order_status_report_single_requires_venue_order_id() {

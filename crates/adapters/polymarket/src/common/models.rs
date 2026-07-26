@@ -63,6 +63,34 @@ pub struct PolymarketMakerOrder {
     pub side: Option<PolymarketOrderSide>,
 }
 
+impl PolymarketMakerOrder {
+    /// Returns whether this maker order belongs to the configured account.
+    ///
+    /// A match contains the maker orders of every maker that filled it, so the
+    /// adapter identifies its own by the two identities Polymarket reports per maker
+    /// order, and either one on its own is sufficient:
+    ///
+    /// - `maker_address` is the on-chain maker. It does not always carry the
+    ///   configured address: reconciliation for signature type 2 had to be repaired
+    ///   because the wallet address there differs from the funder that owns the
+    ///   order. The comparison also ignores case, because the venue reports EIP-55
+    ///   checksummed addresses while a configured funder may be in either form, and
+    ///   the mixed case is a checksum over the same address.
+    /// - `owner` is the CLOB API key that placed the order, which is why identifying
+    ///   user fills by API key was added after address matching proved insufficient.
+    ///   It compares exactly: the venue matches the key byte-for-byte during L2
+    ///   authentication, so a case-differing key fails authentication outright.
+    ///
+    /// An API key authenticates a signer that may be configured with any funder, so
+    /// a key match alone does not prove the order belongs to the *configured*
+    /// funder. Narrowing ownership to the address would reintroduce the signature
+    /// type 2 failure, so the ambiguity is accepted here and the account is expected
+    /// to keep one funder per credential set.
+    pub(crate) fn is_owned_by(&self, user_address: &str, api_key: &str) -> bool {
+        self.maker_address.eq_ignore_ascii_case(user_address) || self.owner == api_key
+    }
+}
+
 /// Human-readable label for a Polymarket instrument.
 #[derive(Debug, Clone)]
 pub struct PolymarketLabel {
@@ -117,6 +145,9 @@ mod tests {
         serde_json::from_str(&content).expect("Failed to parse test data")
     }
 
+    /// The CLOB API key that placed the maker order in [`sample_maker_order_json`].
+    const TRADE_FIXTURE_OWNER: &str = "00000000-0000-0000-0000-000000000002";
+
     fn sample_maker_order_json() -> &'static str {
         r#"{
             "asset_id": "71321045679252212594626385532706912750332728571942532289631379312455583992563",
@@ -128,6 +159,39 @@ mod tests {
             "owner": "00000000-0000-0000-0000-000000000002",
             "price": "0.6000"
         }"#
+    }
+
+    /// Either reported identity establishes ownership on its own. The venue reports
+    /// EIP-55 checksummed addresses, so address case cannot decide ownership, while
+    /// the API key stays an exact comparison.
+    #[rstest]
+    #[case::lowercase_address("0x70997970c51812dc3a010c7d01b50e0d17dc79c8", "other-key", true)]
+    #[case::checksummed_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8", "other-key", true)]
+    #[case::api_key_only(
+        "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+        TRADE_FIXTURE_OWNER,
+        true
+    )]
+    #[case::neither_identity("0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc", "other-key", false)]
+    fn test_maker_order_ownership(
+        #[case] user_address: &str,
+        #[case] api_key: &str,
+        #[case] expected: bool,
+    ) {
+        let order: PolymarketMakerOrder = serde_json::from_str(sample_maker_order_json()).unwrap();
+
+        assert_eq!(order.is_owned_by(user_address, api_key), expected);
+    }
+
+    #[rstest]
+    fn test_maker_order_ownership_api_key_is_exact() {
+        let mut order: PolymarketMakerOrder =
+            serde_json::from_str(sample_maker_order_json()).unwrap();
+        order.owner = "a1b2c3d4-0000-0000-0000-000000000002".to_string();
+        let owner = order.owner.clone();
+
+        assert!(order.is_owned_by("0xcounterparty", &owner));
+        assert!(!order.is_owned_by("0xcounterparty", &owner.to_uppercase()));
     }
 
     #[rstest]
