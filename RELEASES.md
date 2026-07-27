@@ -156,6 +156,10 @@ adapter set. The following limits remain deferred:
 - Fixed `CVec` ownership and FFI reconstruction issues that could cause undefined behavior (#4499), thanks @folknor
 
 ### Fixes
+- Fixed Polymarket reconciliation reporting no fill for a confirmed maker trade holding none of the account's own maker orders, understating filled quantity with no counter and no log entry
+- Fixed Polymarket maker-order ownership comparing the configured account address case-sensitively, so a checksummed funder disowned every one of the account's own maker orders
+- Fixed Polymarket mass-status reconciliation capping order filled quantity against confirmed fills with a zero local-filled floor, reporting a matched-but-unsettled order as filled nothing
+- Fixed Polymarket mass-status reconciliation interpreting the account's whole trade history regardless of the configured reconciliation lookback
 - Fixed v2 PyO3 API coverage and Python exception handling
 - Fixed `nautilus database init` panicking instead of skipping existing schema objects on re-run
 - Fixed `nautilus database init` leaving schema objects owned by the bootstrap administrator

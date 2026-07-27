@@ -57,19 +57,64 @@ pub(crate) struct FillContext<'a> {
     pub clock: &'static AtomicTime,
 }
 
+/// What [`build_fill_reports_from_trades`] could not turn into a fill report.
+///
+/// These are returned as facts rather than raised as errors because the callers
+/// differ in what they can do about them, and the most important one can do
+/// nothing at all. A mass status that fails mid-reconciliation aborts node
+/// startup, and `reconciliation_lookback_mins` defaults to `None` -- some
+/// deployments require it, to keep the reconciliation universe unnarrowed -- so
+/// under that configuration a single uninterpretable trade anywhere in the
+/// account's history would make the node permanently unstartable, with no
+/// setting an operator could change to recover. Failing is not the safe
+/// direction when the safe-looking choice cannot be turned off.
+///
+/// So the pass reports what it built and says loudly what it could not.
+/// `ExecutionMassStatus` carries no field for these counts, which is why the
+/// error-level log is the operator-visible signal today; giving the report a
+/// count is the change that would let a caller act on one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FillBuildDiscards {
+    /// Entries whose instrument was not loaded, so no report could be built.
+    pub unmapped_instruments: usize,
+    /// Confirmed maker trades holding none of the account's own maker orders.
+    pub unowned_maker_trades: usize,
+    /// Trades older than the caller's reconciliation window.
+    pub outside_lookback: usize,
+}
+
 /// Converts trade reports into fill reports: single implementation of maker/taker
 /// parsing used by both `generate_fill_reports()` and `generate_mass_status()`.
+///
+/// `cutoff` is the reconciliation window and has no default on purpose. `GET
+/// /trades` returns history the caller did not ask for, and a caller that
+/// narrowed its own output afterwards still interpreted all of it -- which is
+/// how a lookback that was configured came to have no effect on what this
+/// function saw. Taking the window as an argument makes every caller state one,
+/// so applying it cannot be forgotten in the wiring between the two.
+///
+/// A trade whose match time cannot be parsed is kept, because the fill built
+/// from one is stamped with the current time and therefore belongs to the
+/// window.
 pub(crate) fn build_fill_reports_from_trades(
     trades: &[PolymarketTradeReport],
     ctx: &FillContext<'_>,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     instrument_filter: Option<InstrumentId>,
+    cutoff: Option<UnixNanos>,
     ts_init: UnixNanos,
-) -> anyhow::Result<(Vec<FillReport>, usize)> {
+) -> (Vec<FillReport>, FillBuildDiscards) {
     let mut reports = Vec::new();
-    let mut filtered = 0usize;
+    let mut discards = FillBuildDiscards::default();
 
     for trade in trades {
+        if let Some(cutoff) = cutoff
+            && parse_timestamp(&trade.match_time).is_some_and(|ts| ts < cutoff)
+        {
+            discards.outside_lookback += 1;
+            continue;
+        }
+
         if trade.status != PolymarketTradeStatus::Confirmed {
             continue;
         }
@@ -83,14 +128,15 @@ pub(crate) fn build_fill_reports_from_trades(
             // cannot be interpreted, and reporting no fill for it would silently
             // understate the filled quantity of a live order.
             //
-            // This is worth failing over rather than counting because the caller has
-            // nowhere to put a count: `ExecutionMassStatus` carries reports and no
-            // measure of what was dropped building them, so a partial success here is
-            // indistinguishable from a complete one. Callers that can degrade already
-            // do -- the order-status paths turn this error into a warning. Whoever
-            // bounds the trades bounds the failure: `generate_mass_status` applies its
-            // lookback to the trades before this runs, so a trade the reconciliation
-            // window excludes cannot decide whether the pass succeeds.
+            // Counted and logged rather than raised. An earlier revision failed the
+            // whole pass here, on the reasoning that a caller with nowhere to put a
+            // count cannot distinguish partial success from complete success. That
+            // reasoning was right about the missing channel and wrong about the
+            // remedy: the caller that most needs to know is `generate_mass_status`,
+            // whose failure aborts startup, and the deployments that most need this
+            // guard run with no lookback at all -- so failing turned an understated
+            // fill into an unstartable node, permanently, for one bad trade anywhere
+            // in the account's history. See [`FillBuildDiscards`].
             //
             // Ownership is judged across the whole match, before any instrument filter,
             // because the unified book matches complementary tokens across assets: the
@@ -101,12 +147,15 @@ pub(crate) fn build_fill_reports_from_trades(
                 .iter()
                 .any(|mo| mo.is_owned_by(ctx.user_address, ctx.api_key))
             {
-                anyhow::bail!(
-                    "Polymarket reconciliation confirmed maker trade {} has no maker order \
-                     owned by the configured account {}",
+                discards.unowned_maker_trades += 1;
+                log::error!(
+                    "Polymarket reconciliation confirmed maker trade {} holds no maker order \
+                     owned by the configured account {}, so no fill is reported for it and \
+                     any quantity it filled is understated",
                     trade.id,
                     ctx.user_address
                 );
+                continue;
             }
 
             for mo in &trade.maker_orders {
@@ -118,7 +167,7 @@ pub(crate) fn build_fill_reports_from_trades(
                 let (instrument_id, price_prec, size_prec) = match instrument {
                     Some(i) => (i.id(), i.price_precision(), i.size_precision()),
                     None => {
-                        filtered += 1;
+                        discards.unmapped_instruments += 1;
                         continue;
                     }
                 };
@@ -159,7 +208,7 @@ pub(crate) fn build_fill_reports_from_trades(
                     instrument_taker_fee(&i),
                 ),
                 None => {
-                    filtered += 1;
+                    discards.unmapped_instruments += 1;
                     continue;
                 }
             };
@@ -185,7 +234,7 @@ pub(crate) fn build_fill_reports_from_trades(
         }
     }
 
-    Ok((reports, filtered))
+    (reports, discards)
 }
 
 /// Converts open orders into order status reports.
@@ -301,26 +350,6 @@ pub(crate) fn build_position_reports(
         .collect()
 }
 
-/// Narrows fetched trades to the reconciliation window.
-///
-/// `GET /trades` is unbounded, so this decides how much history one pass reads,
-/// and therefore how much history can make one pass fail. A trade whose match
-/// time cannot be parsed is kept: the fill built from one is stamped with the
-/// current time, so it belongs to the window by the same rule that used to
-/// filter the reports.
-fn trades_within_lookback(
-    trades: Vec<PolymarketTradeReport>,
-    cutoff: Option<UnixNanos>,
-) -> Vec<PolymarketTradeReport> {
-    let Some(cutoff) = cutoff else {
-        return trades;
-    };
-    trades
-        .into_iter()
-        .filter(|trade| parse_timestamp(&trade.match_time).is_none_or(|ts| ts >= cutoff))
-        .collect()
-}
-
 /// Full reconciliation mass status generation.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn generate_mass_status(
@@ -360,10 +389,10 @@ pub(crate) async fn generate_mass_status(
         .context("failed to fetch trades for mass status")?;
 
     let trades_before = all_trades.len();
-    let trades = trades_within_lookback(all_trades, cutoff);
 
     let (mut fill_reports, fills_filtered) =
-        build_fill_reports_from_trades(&trades, ctx, instruments, None, ts_init)?;
+        build_fill_reports_from_trades(&all_trades, ctx, instruments, None, cutoff, ts_init);
+    let trades_after = trades_before - fills_filtered.outside_lookback;
 
     // Snap dust drift on REST fills the same way the WS path does.
     // Commission stays as venue-reported.
@@ -380,9 +409,7 @@ pub(crate) async fn generate_mass_status(
     // Apply lookback filter. Fills are already inside the window: their trades
     // were filtered above, by the same cutoff, which is why there is no second
     // retain here to keep in step with the first.
-    if let Some(mins) = lookback_mins {
-        let cutoff = cutoff.expect("a lookback in minutes always yields a cutoff");
-
+    if let (Some(mins), Some(cutoff)) = (lookback_mins, cutoff) {
         let orders_before = order_reports.len();
         order_reports.retain(|r| r.ts_last >= cutoff);
         let orders_removed = orders_before - order_reports.len();
@@ -394,8 +421,8 @@ pub(crate) async fn generate_mass_status(
             order_reports.len(),
             orders_removed,
             trades_before,
-            trades.len(),
-            trades_before - trades.len(),
+            trades_after,
+            fills_filtered.outside_lookback,
         );
     } else {
         log::debug!(
@@ -403,7 +430,7 @@ pub(crate) async fn generate_mass_status(
             order_reports.len(),
             orders_filtered,
             fill_reports.len(),
-            fills_filtered,
+            fills_filtered.unmapped_instruments,
             position_reports.len(),
         );
     }
@@ -556,51 +583,50 @@ mod tests {
 
     /// The account filled this trade as a maker, so the response must carry one of its
     /// maker orders. Answering with no fill would understate a live order's filled
-    /// quantity rather than describe an account with no fill.
+    /// quantity rather than describe an account with no fill. The pass does not fail
+    /// over it -- see [`FillBuildDiscards`] -- so what is pinned here is that the trade
+    /// is *counted* as undescribed rather than passing as an ordinary empty result.
     #[rstest]
-    fn rejects_a_confirmed_maker_trade_with_no_owned_maker_order() {
+    fn counts_a_confirmed_maker_trade_with_no_owned_maker_order() {
         let (instruments, instrument) = mapped_instrument();
         let mut trade = confirmed_maker_trade_for(&instrument);
         disown_maker_orders(&mut trade);
 
-        let error = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades(
             &[trade],
             &fill_context(),
             &instruments,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
-        )
-        .expect_err("a confirmed maker trade must contain an owned maker order");
-
-        assert!(
-            error.to_string().contains("no maker order owned"),
-            "{error}"
         );
+
+        assert!(reports.is_empty(), "{reports:?}");
+        assert_eq!(discards.unowned_maker_trades, 1);
+        assert_eq!(discards.unmapped_instruments, 0);
     }
 
-    /// A confirmed maker trade carrying no maker orders at all is uninterpretable for the
+    /// A confirmed maker trade carrying no maker orders at all is undescribable for the
     /// same reason as one carrying only other accounts': the account filled it as a maker,
     /// so an order of its own is missing. The empty case reaches the rule down a different
     /// structural path than the disowned one, so it is pinned separately.
     #[rstest]
-    fn rejects_a_confirmed_maker_trade_with_no_maker_orders_at_all() {
+    fn counts_a_confirmed_maker_trade_with_no_maker_orders_at_all() {
         let (instruments, instrument) = mapped_instrument();
         let mut trade = confirmed_maker_trade_for(&instrument);
         trade.maker_orders.clear();
 
-        let error = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades(
             &[trade],
             &fill_context(),
             &instruments,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
-        )
-        .expect_err("a confirmed maker trade must contain an owned maker order");
-
-        assert!(
-            error.to_string().contains("no maker order owned"),
-            "{error}"
         );
+
+        assert!(reports.is_empty(), "{reports:?}");
+        assert_eq!(discards.unowned_maker_trades, 1);
     }
 
     /// The configured account, written the way a block explorer displays it. `user_address`
@@ -630,9 +656,9 @@ mod tests {
             &context,
             &instruments,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
-        )
-        .expect("an address differing only in case names the same account");
+        );
 
         assert_eq!(
             reports.len(),
@@ -646,10 +672,15 @@ mod tests {
     /// history of the account is judged on every pass, so a trade from any point in the
     /// account's past fails reconciliation with nothing an operator can configure to get
     /// past it.
+    /// Driven through the builder rather than a filter helper on purpose: a helper
+    /// tested on its own passes whether or not anything calls it, and the defect this
+    /// pins was exactly that -- a window that was computed and then not applied to what
+    /// the builder read.
     #[rstest]
     fn excludes_a_trade_older_than_the_lookback_window() {
-        let (_, instrument) = mapped_instrument();
+        let (instruments, instrument) = mapped_instrument();
         let cutoff = UnixNanos::from(2_000 * NANOSECONDS_IN_SECOND);
+        let ts_init = UnixNanos::from(1_000_000_000u64);
 
         let mut old = confirmed_maker_trade_for(&instrument);
         old.match_time = "1000".to_string();
@@ -658,14 +689,35 @@ mod tests {
         let mut undated = confirmed_maker_trade_for(&instrument);
         undated.match_time = "not a timestamp".to_string();
 
-        let kept = trades_within_lookback(vec![old, recent, undated], Some(cutoff));
+        let (windowed, discards) = build_fill_reports_from_trades(
+            &[old, recent, undated],
+            &fill_context(),
+            &instruments,
+            None,
+            Some(cutoff),
+            ts_init,
+        );
 
+        // The same two trades the window should have kept, read with no window, so the
+        // comparison states what survived rather than a count copied from the fixture.
+        let mut recent_again = confirmed_maker_trade_for(&instrument);
+        recent_again.match_time = "3000".to_string();
+        let mut undated_again = confirmed_maker_trade_for(&instrument);
+        undated_again.match_time = "not a timestamp".to_string();
+        let (expected, _) = build_fill_reports_from_trades(
+            &[recent_again, undated_again],
+            &fill_context(),
+            &instruments,
+            None,
+            None,
+            ts_init,
+        );
+
+        assert_eq!(discards.outside_lookback, 1);
         assert_eq!(
-            kept.iter()
-                .map(|trade| trade.match_time.as_str())
-                .collect::<Vec<_>>(),
-            vec!["3000", "not a timestamp"],
-            "the window keeps recent trades and any whose time cannot be read"
+            windowed.len(),
+            expected.len(),
+            "the window drops the old trade and keeps the recent and undated ones"
         );
     }
 
@@ -673,11 +725,24 @@ mod tests {
     /// and others deliberately require, so this must not quietly become bounded.
     #[rstest]
     fn keeps_every_trade_when_no_lookback_is_configured() {
-        let (_, instrument) = mapped_instrument();
+        let (instruments, instrument) = mapped_instrument();
         let mut old = confirmed_maker_trade_for(&instrument);
         old.match_time = "1".to_string();
 
-        assert_eq!(trades_within_lookback(vec![old], None).len(), 1);
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[old],
+            &fill_context(),
+            &instruments,
+            None,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(discards.outside_lookback, 0);
+        assert!(
+            !reports.is_empty(),
+            "an unbounded window must still reconcile the oldest trade"
+        );
     }
 
     /// Only confirmed trades are reconciled, so one that has merely matched must not be
@@ -701,9 +766,9 @@ mod tests {
             &fill_context(),
             &instruments,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
-        )
-        .expect("an unconfirmed trade must not be judged for maker ownership");
+        );
 
         assert!(reports.is_empty());
     }
@@ -725,9 +790,9 @@ mod tests {
             &fill_context(),
             &instruments,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
-        )
-        .expect("an owned maker order must reconcile");
+        );
 
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].venue_order_id, owned);
@@ -750,9 +815,9 @@ mod tests {
             &fill_context(),
             &instruments,
             Some(instrument.id()),
+            None,
             UnixNanos::from(1_000_000_000u64),
-        )
-        .expect("a cross-asset match must not fail an instrument-scoped request");
+        );
 
         assert!(reports.is_empty());
     }
@@ -770,9 +835,9 @@ mod tests {
             &fill_context(),
             &instruments,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
-        )
-        .expect("a taker trade must not require an owned maker order");
+        );
 
         assert_eq!(reports.len(), 1);
     }

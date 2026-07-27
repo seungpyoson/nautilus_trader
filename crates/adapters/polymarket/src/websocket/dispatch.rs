@@ -2655,6 +2655,49 @@ mod tests {
 
     // Unmatched -> Rejected (placement never became live); CanceledMarketResolved -> Expired
     // (market settled). Both are tracked own-order terminal states emitted as order events.
+    /// The live path judges ownership through the same predicate as the batch path, and a
+    /// delegation is only pinned by a test that fails when it is inlined again. `owner` is
+    /// deliberately a different key here, so the address comparison is the only thing that
+    /// can return true: `user_address` is the operator's configured funder taken verbatim,
+    /// so the checksummed spelling a block explorer displays must still own a payload the
+    /// venue sends in lowercase.
+    #[rstest]
+    fn owns_a_live_maker_order_whose_address_differs_only_in_case() {
+        let token_instruments = AtomicMap::new();
+        let fill_tracker = OrderFillTrackerMap::new();
+        let pending_submits = PendingSubmitTracker::default();
+        let order_identities = OrderIdentityRegistry::default();
+        let emitter = test_emitter();
+
+        let ctx = WsDispatchContext {
+            token_instruments: &token_instruments,
+            fill_tracker: &fill_tracker,
+            pending_submits: &pending_submits,
+            order_identities: &order_identities,
+            emitter: &emitter,
+            account_id: AccountId::from("POLY-001"),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+            user_address: "0xAbC0000000000000000000000000000000000001",
+            user_api_key: "configured-key",
+        };
+
+        let maker_order = PolymarketMakerOrder {
+            asset_id: Ustr::from("token-1"),
+            maker_address: "0xabc0000000000000000000000000000000000001".to_string(),
+            matched_amount: Decimal::ZERO,
+            order_id: "0xorder".to_string(),
+            outcome: crate::common::enums::PolymarketOutcome::yes(),
+            owner: "a-different-key".to_string(),
+            price: Decimal::ZERO,
+            side: None,
+        };
+
+        assert!(
+            is_user_maker_order(&maker_order, &ctx),
+            "a checksummed funder must own the account's own maker order"
+        );
+    }
+
     #[rstest]
     #[case(crate::common::enums::PolymarketOrderStatus::Unmatched, "Rejected")]
     #[case(
