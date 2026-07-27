@@ -83,6 +83,15 @@ pub(crate) fn build_fill_reports_from_trades(
             // cannot be interpreted, and reporting no fill for it would silently
             // understate the filled quantity of a live order.
             //
+            // This is worth failing over rather than counting because the caller has
+            // nowhere to put a count: `ExecutionMassStatus` carries reports and no
+            // measure of what was dropped building them, so a partial success here is
+            // indistinguishable from a complete one. Callers that can degrade already
+            // do -- the order-status paths turn this error into a warning. Whoever
+            // bounds the trades bounds the failure: `generate_mass_status` applies its
+            // lookback to the trades before this runs, so a trade the reconciliation
+            // window excludes cannot decide whether the pass succeeds.
+            //
             // Ownership is judged across the whole match, before any instrument filter,
             // because the unified book matches complementary tokens across assets: the
             // account's own order can sit on the token an instrument-scoped request did
@@ -90,7 +99,7 @@ pub(crate) fn build_fill_reports_from_trades(
             if !trade
                 .maker_orders
                 .iter()
-                .any(|mo| mo.maker_address == ctx.user_address || mo.owner == ctx.api_key)
+                .any(|mo| mo.is_owned_by(ctx.user_address, ctx.api_key))
             {
                 anyhow::bail!(
                     "Polymarket reconciliation confirmed maker trade {} has no maker order \
@@ -101,7 +110,7 @@ pub(crate) fn build_fill_reports_from_trades(
             }
 
             for mo in &trade.maker_orders {
-                if mo.maker_address != ctx.user_address && mo.owner != ctx.api_key {
+                if !mo.is_owned_by(ctx.user_address, ctx.api_key) {
                     continue;
                 }
                 let token_id = Ustr::from(mo.asset_id.as_str());
@@ -292,6 +301,26 @@ pub(crate) fn build_position_reports(
         .collect()
 }
 
+/// Narrows fetched trades to the reconciliation window.
+///
+/// `GET /trades` is unbounded, so this decides how much history one pass reads,
+/// and therefore how much history can make one pass fail. A trade whose match
+/// time cannot be parsed is kept: the fill built from one is stamped with the
+/// current time, so it belongs to the window by the same rule that used to
+/// filter the reports.
+fn trades_within_lookback(
+    trades: Vec<PolymarketTradeReport>,
+    cutoff: Option<UnixNanos>,
+) -> Vec<PolymarketTradeReport> {
+    let Some(cutoff) = cutoff else {
+        return trades;
+    };
+    trades
+        .into_iter()
+        .filter(|trade| parse_timestamp(&trade.match_time).is_none_or(|ts| ts >= cutoff))
+        .collect()
+}
+
 /// Full reconciliation mass status generation.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn generate_mass_status(
@@ -306,6 +335,15 @@ pub(crate) async fn generate_mass_status(
 ) -> anyhow::Result<Option<ExecutionMassStatus>> {
     let ts_init = ctx.clock.get_time_ns();
 
+    // One cutoff, read from the clock once, and applied to the trades rather
+    // than only to the reports built from them. `GET /trades` is unpaginated
+    // and unbounded, so without this the whole trade history of the account is
+    // interpreted on every reconciliation pass just to discard most of it -- and
+    // a trade too old to appear in the result still decides whether the pass
+    // succeeds. Bounding the input bounds what a failure can be caused by.
+    let cutoff = lookback_mins
+        .map(|mins| UnixNanos::from(ts_init.as_u64().saturating_sub(mins * 60 * 1_000_000_000)));
+
     // Fetch orders
     let orders = http_client
         .get_orders(GetOrdersParams::default())
@@ -316,10 +354,13 @@ pub(crate) async fn generate_mass_status(
         build_order_reports_from_orders(&orders, instruments, ctx.account_id, None, ts_init);
 
     // Fetch and parse fill reports
-    let trades = http_client
+    let all_trades = http_client
         .get_trades(GetTradesParams::default())
         .await
         .context("failed to fetch trades for mass status")?;
+
+    let trades_before = all_trades.len();
+    let trades = trades_within_lookback(all_trades, cutoff);
 
     let (mut fill_reports, fills_filtered) =
         build_fill_reports_from_trades(&trades, ctx, instruments, None, ts_init)?;
@@ -336,29 +377,25 @@ pub(crate) async fn generate_mass_status(
 
     let position_reports = build_position_reports(&positions, ctx.account_id, ts_init);
 
-    // Apply lookback filter
+    // Apply lookback filter. Fills are already inside the window: their trades
+    // were filtered above, by the same cutoff, which is why there is no second
+    // retain here to keep in step with the first.
     if let Some(mins) = lookback_mins {
-        let now_ns = ctx.clock.get_time_ns();
-        let cutoff_ns = now_ns.as_u64().saturating_sub(mins * 60 * 1_000_000_000);
-        let cutoff = UnixNanos::from(cutoff_ns);
+        let cutoff = cutoff.expect("a lookback in minutes always yields a cutoff");
 
         let orders_before = order_reports.len();
         order_reports.retain(|r| r.ts_last >= cutoff);
         let orders_removed = orders_before - order_reports.len();
 
-        let fills_before = fill_reports.len();
-        fill_reports.retain(|r| r.ts_event >= cutoff);
-        let fills_removed = fills_before - fill_reports.len();
-
         log::debug!(
-            "Lookback filter ({}min): orders {}->{} (removed {}), fills {}->{} (removed {})",
+            "Lookback filter ({}min): orders {}->{} (removed {}), trades {}->{} (removed {})",
             mins,
             orders_before,
             order_reports.len(),
             orders_removed,
-            fills_before,
-            fill_reports.len(),
-            fills_removed,
+            trades_before,
+            trades.len(),
+            trades_before - trades.len(),
         );
     } else {
         log::debug!(
@@ -456,6 +493,7 @@ pub(crate) fn normalize_terminal_order_report_quantity(report: &mut OrderStatusR
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::datetime::NANOSECONDS_IN_SECOND;
     use nautilus_model::{
         enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
         identifiers::TradeId,
@@ -563,6 +601,83 @@ mod tests {
             error.to_string().contains("no maker order owned"),
             "{error}"
         );
+    }
+
+    /// The configured account, written the way a block explorer displays it. `user_address`
+    /// is the operator's funder taken verbatim where one is set, and the venue's payload
+    /// carries whatever case the venue chose, so the two sides of the ownership test can
+    /// disagree on case while naming one account. Comparing them exactly turns that into a
+    /// trade belonging to somebody else -- silently before the rule above existed, and
+    /// loudly enough to stop the node after it.
+    #[rstest]
+    fn owns_a_maker_order_whose_address_differs_only_in_case() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        // The API key must not be able to carry this on its own, or the case of the
+        // address would never be consulted and the test would pass without it.
+        for maker_order in &mut trade.maker_orders {
+            maker_order.owner = COUNTERPARTY_API_KEY.to_string();
+        }
+        let checksummed = format!("0x{}", USER_ADDRESS[2..].to_uppercase());
+        assert_ne!(checksummed, USER_ADDRESS, "the fixture must vary the case");
+        let context = FillContext {
+            user_address: &checksummed,
+            ..fill_context()
+        };
+
+        let (reports, _) = build_fill_reports_from_trades(
+            &[trade],
+            &context,
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("an address differing only in case names the same account");
+
+        assert_eq!(
+            reports.len(),
+            1,
+            "the account's own maker order must still be reported"
+        );
+    }
+
+    /// The window bounds the guard above, which is what keeps a single uninterpretable
+    /// trade from being able to stop the node forever. Without this the whole trade
+    /// history of the account is judged on every pass, so a trade from any point in the
+    /// account's past fails reconciliation with nothing an operator can configure to get
+    /// past it.
+    #[rstest]
+    fn excludes_a_trade_older_than_the_lookback_window() {
+        let (_, instrument) = mapped_instrument();
+        let cutoff = UnixNanos::from(2_000 * NANOSECONDS_IN_SECOND);
+
+        let mut old = confirmed_maker_trade_for(&instrument);
+        old.match_time = "1000".to_string();
+        let mut recent = confirmed_maker_trade_for(&instrument);
+        recent.match_time = "3000".to_string();
+        let mut undated = confirmed_maker_trade_for(&instrument);
+        undated.match_time = "not a timestamp".to_string();
+
+        let kept = trades_within_lookback(vec![old, recent, undated], Some(cutoff));
+
+        assert_eq!(
+            kept.iter()
+                .map(|trade| trade.match_time.as_str())
+                .collect::<Vec<_>>(),
+            vec!["3000", "not a timestamp"],
+            "the window keeps recent trades and any whose time cannot be read"
+        );
+    }
+
+    /// No lookback means no window, and unbounded reconciliation is a configuration Bolt
+    /// and others deliberately require, so this must not quietly become bounded.
+    #[rstest]
+    fn keeps_every_trade_when_no_lookback_is_configured() {
+        let (_, instrument) = mapped_instrument();
+        let mut old = confirmed_maker_trade_for(&instrument);
+        old.match_time = "1".to_string();
+
+        assert_eq!(trades_within_lookback(vec![old], None).len(), 1);
     }
 
     /// Only confirmed trades are reconciled, so one that has merely matched must not be

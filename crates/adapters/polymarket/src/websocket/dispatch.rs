@@ -500,7 +500,13 @@ fn dispatch_maker_fills(
         .collect();
 
     if user_orders.is_empty() {
-        log::warn!("No matching maker orders for user in trade: {}", trade.id);
+        // Logged at error rather than warn: the account is being told about a
+        // trade of its own and cannot find itself in it, so the fill is dropped
+        // and the position it represents goes unbooked until reconciliation
+        // rebuilds it. The batch path fails outright on the same condition; this
+        // one cannot, because a dispatch has no channel to refuse through, so
+        // the severity of the log is the whole signal an operator gets.
+        log::error!("No matching maker orders for user in trade: {}", trade.id);
         return Vec::new();
     }
 
@@ -568,7 +574,7 @@ fn dispatch_maker_fills(
 }
 
 fn is_user_maker_order(order: &PolymarketMakerOrder, ctx: &WsDispatchContext<'_>) -> bool {
-    order.maker_address == ctx.user_address || order.owner == ctx.user_api_key
+    order.is_owned_by(ctx.user_address, ctx.user_api_key)
 }
 
 fn dispatch_taker_fill(

@@ -63,6 +63,28 @@ pub struct PolymarketMakerOrder {
     pub side: Option<PolymarketOrderSide>,
 }
 
+impl PolymarketMakerOrder {
+    /// Returns whether this maker entry belongs to the configured account.
+    ///
+    /// Both the reconciliation and the WebSocket path decide the same question,
+    /// and they must decide it identically: a maker entry the batch path counts
+    /// and the live path does not produces a fill that appears only on restart.
+    ///
+    /// The address is compared without regard to case. An EVM address has no
+    /// canonical case on the wire -- the checksummed mixed-case form and the
+    /// all-lowercase form name the same account -- and the two sides of this
+    /// comparison come from different places: the venue supplies one, while the
+    /// other is a configured funder taken verbatim from operator input, or the
+    /// signer address, which is always lowercase. Comparing them as exact
+    /// strings makes a cosmetic difference in configuration look like a trade
+    /// belonging to somebody else. `resolve_maker_address` already compares
+    /// addresses this way.
+    #[must_use]
+    pub fn is_owned_by(&self, user_address: &str, api_key: &str) -> bool {
+        self.maker_address.eq_ignore_ascii_case(user_address) || self.owner == api_key
+    }
+}
+
 /// Human-readable label for a Polymarket instrument.
 #[derive(Debug, Clone)]
 pub struct PolymarketLabel {
