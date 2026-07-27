@@ -371,7 +371,7 @@ pub(crate) async fn generate_mass_status(
         );
     }
 
-    cap_order_reports_to_confirmed_fills(&mut order_reports, &fill_reports);
+    cap_order_reports_to_confirmed_fills(&mut order_reports, &fill_reports, fill_tracker);
 
     let mut mass_status = ExecutionMassStatus::new(client_id, ctx.account_id, venue, ts_init, None);
 
@@ -382,14 +382,26 @@ pub(crate) async fn generate_mass_status(
     Ok(Some(mass_status))
 }
 
+/// Caps reported filled quantities, using locally tracked fills as the floor.
+///
+/// The floor matters because only `Confirmed` trades become fill reports. An
+/// order whose fills are still settling has no confirmed quantity here, so a
+/// zero floor would cap it to zero and report an order the venue calls filled
+/// as having filled nothing, understating filled quantity and overstating what
+/// remains. `generate_order_status_report` already floors at what this client
+/// saw fill; this path must agree with it, or the same order is described
+/// differently depending on which one produced the report.
 fn cap_order_reports_to_confirmed_fills(
     order_reports: &mut [OrderStatusReport],
     fill_reports: &[FillReport],
+    fill_tracker: &OrderFillTrackerMap,
 ) {
     let confirmed_by_order = confirmed_filled_quantities(fill_reports);
 
     for report in order_reports {
-        let local_filled = Quantity::zero(report.quantity.precision);
+        let local_filled = fill_tracker
+            .get_cumulative_filled(&report.venue_order_id)
+            .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
         cap_order_report_filled_qty(
             report,
             local_filled,
@@ -688,9 +700,109 @@ mod tests {
             None,
         )];
 
-        cap_order_reports_to_confirmed_fills(&mut reports, &fills);
+        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &OrderFillTrackerMap::new());
 
         assert_eq!(reports[0].filled_qty, Quantity::from("4.0000"));
+    }
+
+    /// Builds a partially filled report for an order the venue says filled `filled`.
+    fn order_report_filled(venue_order_id: VenueOrderId, filled: &str) -> OrderStatusReport {
+        OrderStatusReport::new(
+            AccountId::from("POLY-001"),
+            InstrumentId::from("TEST.POLYMARKET"),
+            None,
+            venue_order_id,
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::PartiallyFilled,
+            Quantity::from("10.0000"),
+            Quantity::from(filled),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        )
+    }
+
+    #[rstest]
+    fn floors_filled_quantity_at_locally_tracked_fills_without_confirmed_ones() {
+        let venue_order_id = VenueOrderId::from("V-PENDING");
+        let mut reports = vec![order_report_filled(venue_order_id, "6.0000")];
+
+        // Fills that have matched but not settled produce no confirmed fill
+        // report, so a zero floor would erase them.
+        let tracker = OrderFillTrackerMap::new();
+        tracker.restore_order(
+            venue_order_id,
+            Quantity::from("10.0000"),
+            Quantity::from("6.0000"),
+            OrderSide::Buy,
+        );
+
+        cap_order_reports_to_confirmed_fills(&mut reports, &[], &tracker);
+
+        assert_eq!(reports[0].filled_qty, Quantity::from("6.0000"));
+    }
+
+    #[rstest]
+    fn takes_the_greater_of_tracked_and_confirmed_fills() {
+        let venue_order_id = VenueOrderId::from("V-BOTH");
+        let mut reports = vec![order_report_filled(venue_order_id, "9.0000")];
+        let fills = vec![FillReport::new(
+            AccountId::from("POLY-001"),
+            InstrumentId::from("TEST.POLYMARKET"),
+            venue_order_id,
+            TradeId::from("T-BOTH"),
+            OrderSide::Buy,
+            Quantity::from("7.0000"),
+            Price::from("0.5000"),
+            Money::new(0.0, Currency::pUSD()),
+            LiquiditySide::Taker,
+            None,
+            None,
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        )];
+        let tracker = OrderFillTrackerMap::new();
+        tracker.restore_order(
+            venue_order_id,
+            Quantity::from("10.0000"),
+            Quantity::from("3.0000"),
+            OrderSide::Buy,
+        );
+
+        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &tracker);
+
+        assert_eq!(reports[0].filled_qty, Quantity::from("7.0000"));
+    }
+
+    #[rstest]
+    fn still_caps_a_venue_quantity_above_everything_known_locally() {
+        let venue_order_id = VenueOrderId::from("V-OVER");
+        let mut reports = vec![order_report_filled(venue_order_id, "10.0000")];
+        let tracker = OrderFillTrackerMap::new();
+        tracker.restore_order(
+            venue_order_id,
+            Quantity::from("10.0000"),
+            Quantity::from("2.0000"),
+            OrderSide::Buy,
+        );
+
+        cap_order_reports_to_confirmed_fills(&mut reports, &[], &tracker);
+
+        assert_eq!(reports[0].filled_qty, Quantity::from("2.0000"));
+    }
+
+    #[rstest]
+    fn caps_an_untracked_order_to_its_confirmed_fills() {
+        let venue_order_id = VenueOrderId::from("V-UNTRACKED");
+        let mut reports = vec![order_report_filled(venue_order_id, "5.0000")];
+
+        cap_order_reports_to_confirmed_fills(&mut reports, &[], &OrderFillTrackerMap::new());
+
+        assert_eq!(reports[0].filled_qty, Quantity::zero(4));
     }
 
     #[rstest]
@@ -736,7 +848,7 @@ mod tests {
             None,
         )];
 
-        cap_order_reports_to_confirmed_fills(&mut reports, &fills);
+        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &OrderFillTrackerMap::new());
 
         assert_eq!(reports[0].quantity, Quantity::from(expected_quantity));
         assert_eq!(reports[0].filled_qty, Quantity::from(confirmed));
