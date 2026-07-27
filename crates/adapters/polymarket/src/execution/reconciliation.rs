@@ -65,7 +65,7 @@ pub(crate) fn build_fill_reports_from_trades(
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     instrument_filter: Option<InstrumentId>,
     ts_init: UnixNanos,
-) -> (Vec<FillReport>, usize) {
+) -> anyhow::Result<(Vec<FillReport>, usize)> {
     let mut reports = Vec::new();
     let mut filtered = 0usize;
 
@@ -77,6 +77,29 @@ pub(crate) fn build_fill_reports_from_trades(
         let is_maker = trade.trader_side == PolymarketLiquiditySide::Maker;
 
         if is_maker {
+            // `GET /trades` returns the trades of the authenticated account and reports
+            // `trader_side` from its perspective, so a confirmed trade the account filled
+            // as maker holds at least one of its own maker orders. A trade holding none
+            // cannot be interpreted, and reporting no fill for it would silently
+            // understate the filled quantity of a live order.
+            //
+            // Ownership is judged across the whole match, before any instrument filter,
+            // because the unified book matches complementary tokens across assets: the
+            // account's own order can sit on the token an instrument-scoped request did
+            // not ask about while a counterparty's sits on the token it did.
+            if !trade
+                .maker_orders
+                .iter()
+                .any(|mo| mo.maker_address == ctx.user_address || mo.owner == ctx.api_key)
+            {
+                anyhow::bail!(
+                    "Polymarket reconciliation confirmed maker trade {} has no maker order \
+                     owned by the configured account {}",
+                    trade.id,
+                    ctx.user_address
+                );
+            }
+
             for mo in &trade.maker_orders {
                 if mo.maker_address != ctx.user_address && mo.owner != ctx.api_key {
                     continue;
@@ -153,7 +176,7 @@ pub(crate) fn build_fill_reports_from_trades(
         }
     }
 
-    (reports, filtered)
+    Ok((reports, filtered))
 }
 
 /// Converts open orders into order status reports.
@@ -299,7 +322,7 @@ pub(crate) async fn generate_mass_status(
         .context("failed to fetch trades for mass status")?;
 
     let (mut fill_reports, fills_filtered) =
-        build_fill_reports_from_trades(&trades, ctx, instruments, None, ts_init);
+        build_fill_reports_from_trades(&trades, ctx, instruments, None, ts_init)?;
 
     // Snap dust drift on REST fills the same way the WS path does.
     // Commission stays as venue-reported.
@@ -424,11 +447,208 @@ mod tests {
     use nautilus_model::{
         enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
         identifiers::TradeId,
+        instruments::stubs::binary_option,
         types::{Money, Price},
     };
     use rstest::rstest;
 
     use super::*;
+
+    /// Maker address of the configured account, as the trade fixture reports it.
+    const USER_ADDRESS: &str = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
+    const USER_API_KEY: &str = "00000000-0000-0000-0000-000000000001";
+    const COUNTERPARTY_ADDRESS: &str = "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc";
+    const COUNTERPARTY_API_KEY: &str = "00000000-0000-0000-0000-000000000003";
+    const COMPLEMENTARY_TOKEN: &str = "COMPLEMENTARY-TOKEN";
+
+    fn mapped_instrument() -> (AtomicMap<Ustr, InstrumentAny>, InstrumentAny) {
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let instruments = AtomicMap::new();
+        instruments.insert(
+            Ustr::from(instrument.raw_symbol().as_str()),
+            instrument.clone(),
+        );
+        (instruments, instrument)
+    }
+
+    /// A confirmed trade the configured account filled as a maker. The fixture's first
+    /// maker order is the account's own; the second belongs to a counterparty.
+    fn confirmed_maker_trade_for(instrument: &InstrumentAny) -> PolymarketTradeReport {
+        let content = std::fs::read_to_string("test_data/http_trade_report.json")
+            .expect("trade fixture should load");
+        let mut trade: PolymarketTradeReport =
+            serde_json::from_str(&content).expect("trade fixture should decode");
+        trade.status = PolymarketTradeStatus::Confirmed;
+        trade.trader_side = PolymarketLiquiditySide::Maker;
+        trade.asset_id = Ustr::from(instrument.raw_symbol().as_str());
+        for maker_order in &mut trade.maker_orders {
+            maker_order.asset_id = Ustr::from(instrument.raw_symbol().as_str());
+        }
+        trade
+    }
+
+    fn disown_maker_orders(trade: &mut PolymarketTradeReport) {
+        for maker_order in &mut trade.maker_orders {
+            maker_order.maker_address = COUNTERPARTY_ADDRESS.to_string();
+            maker_order.owner = COUNTERPARTY_API_KEY.to_string();
+        }
+    }
+
+    fn fill_context() -> FillContext<'static> {
+        FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: USER_ADDRESS,
+            api_key: USER_API_KEY,
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        }
+    }
+
+    /// The account filled this trade as a maker, so the response must carry one of its
+    /// maker orders. Answering with no fill would understate a live order's filled
+    /// quantity rather than describe an account with no fill.
+    #[rstest]
+    fn rejects_a_confirmed_maker_trade_with_no_owned_maker_order() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        disown_maker_orders(&mut trade);
+
+        let error = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect_err("a confirmed maker trade must contain an owned maker order");
+
+        assert!(
+            error.to_string().contains("no maker order owned"),
+            "{error}"
+        );
+    }
+
+    /// A confirmed maker trade carrying no maker orders at all is uninterpretable for the
+    /// same reason as one carrying only other accounts': the account filled it as a maker,
+    /// so an order of its own is missing. The empty case reaches the rule down a different
+    /// structural path than the disowned one, so it is pinned separately.
+    #[rstest]
+    fn rejects_a_confirmed_maker_trade_with_no_maker_orders_at_all() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.maker_orders.clear();
+
+        let error = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect_err("a confirmed maker trade must contain an owned maker order");
+
+        assert!(
+            error.to_string().contains("no maker order owned"),
+            "{error}"
+        );
+    }
+
+    /// Only confirmed trades are reconciled, so one that has merely matched must not be
+    /// judged for ownership at all. This pins the rule below the status filter: hoisting it
+    /// above would fail reconciliation on every pending trade belonging to someone else.
+    #[rstest]
+    #[case::matched(PolymarketTradeStatus::Matched)]
+    #[case::mined(PolymarketTradeStatus::Mined)]
+    #[case::retrying(PolymarketTradeStatus::Retrying)]
+    #[case::failed(PolymarketTradeStatus::Failed)]
+    fn ignores_an_unconfirmed_maker_trade_with_no_owned_maker_order(
+        #[case] status: PolymarketTradeStatus,
+    ) {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.status = status;
+        disown_maker_orders(&mut trade);
+
+        let (reports, _) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("an unconfirmed trade must not be judged for maker ownership");
+
+        assert!(reports.is_empty());
+    }
+
+    /// A match carries every maker's order, so only the account's own becomes a report.
+    #[rstest]
+    #[case::owned_by_maker_address(USER_ADDRESS, COUNTERPARTY_API_KEY)]
+    #[case::owned_by_api_key(COUNTERPARTY_ADDRESS, USER_API_KEY)]
+    fn reports_only_the_owned_maker_order(#[case] maker_address: &str, #[case] api_key: &str) {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        disown_maker_orders(&mut trade);
+        trade.maker_orders[0].maker_address = maker_address.to_string();
+        trade.maker_orders[0].owner = api_key.to_string();
+        let owned = VenueOrderId::from(trade.maker_orders[0].order_id.as_str());
+
+        let (reports, _) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("an owned maker order must reconcile");
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].venue_order_id, owned);
+    }
+
+    /// The unified book matches complementary tokens across assets, so the account's own
+    /// maker order can sit on a token an instrument-scoped request did not ask about
+    /// while a counterparty's sits on the token it did. That trade is interpretable and
+    /// simply contributes no report, so it must not fail.
+    #[rstest]
+    fn accepts_a_cross_asset_match_with_no_report_for_the_requested_instrument() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        disown_maker_orders(&mut trade);
+        trade.maker_orders[0].maker_address = USER_ADDRESS.to_string();
+        trade.maker_orders[0].asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
+
+        let (reports, _) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            Some(instrument.id()),
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("a cross-asset match must not fail an instrument-scoped request");
+
+        assert!(reports.is_empty());
+    }
+
+    /// A taker trade carries no maker order of the account, so the rule must not reach it.
+    #[rstest]
+    fn accepts_a_confirmed_taker_trade_without_owned_maker_orders() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.trader_side = PolymarketLiquiditySide::Taker;
+        disown_maker_orders(&mut trade);
+
+        let (reports, _) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("a taker trade must not require an owned maker order");
+
+        assert_eq!(reports.len(), 1);
+    }
 
     #[rstest]
     fn caps_order_report_to_confirmed_companion_fills() {

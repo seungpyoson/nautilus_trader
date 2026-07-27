@@ -1075,7 +1075,8 @@ mod tests {
             &instruments,
             None,
             UnixNanos::from(1_000_000_000u64),
-        );
+        )
+        .expect("an unowned taker trade must reconcile");
 
         assert!(reports.is_empty());
     }
