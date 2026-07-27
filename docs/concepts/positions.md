@@ -92,10 +92,10 @@ The position maintains a `signed_qty` field representing the net exposure:
 signed_qty = +100  # LONG position
 
 # Subsequent SELL 150 units at $55
-signed_qty = -50   # Now SHORT position
+signed_qty = -50  # Now SHORT position
 
 # Final BUY 50 units at $52
-signed_qty = 0     # Position FLAT (closed)
+signed_qty = 0  # Position FLAT (closed)
 ```
 
 ## Position adjustments
@@ -211,6 +211,11 @@ This snapshot is stored in the cache indexed by position ID. The position then r
 cycle while previous snapshots remain accessible. The Portfolio aggregates PnL across all snapshots
 for accurate totals.
 
+A fill void that corrects a fill from an earlier cycle is the one exception. The correction moves the
+cycle boundaries the stored snapshots describe, so the engine replaces them with the cycles the
+corrected history actually closes, keeping each counted once. See
+[Position replay across NETTING cycles](execution.md#position-replay-across-netting-cycles).
+
 :::note
 This historical snapshot mechanism differs from optional position state snapshots (`snapshot_positions`),
 which periodically record open-position state for telemetry. See the [Live guide](live.md) for
@@ -264,8 +269,8 @@ reference price (bid, ask, mid, last, or mark):
 
 ```python
 position.unrealized_pnl(last_price)  # Using last traded price
-position.unrealized_pnl(bid_price)   # Conservative for LONG positions
-position.unrealized_pnl(ask_price)   # Conservative for SHORT positions
+position.unrealized_pnl(bid_price)  # Conservative for LONG positions
+position.unrealized_pnl(ask_price)  # Conservative for SHORT positions
 ```
 
 Returns `Money(0, cost_currency)` for `FLAT` positions regardless of the price provided.

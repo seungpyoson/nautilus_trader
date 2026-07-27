@@ -28,16 +28,19 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::{Body, Bytes},
     extract::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
+    http::header::CONTENT_TYPE,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::stream;
 use nautilus_architect_ax::{
     common::consts::AX_VENUE,
-    http::query::{GetFillsParams, GetOpenOrdersParams, GetOrderStatusParams},
+    http::query::{GetFillsParams, GetInstrumentParams, GetOpenOrdersParams, GetOrderStatusParams},
 };
 use nautilus_common::testing::wait_until_async;
 use nautilus_model::{
@@ -75,6 +78,13 @@ pub(crate) struct TestServerState {
     pub cancel_all_fail: Arc<AtomicBool>,
     pub whoami_count: Arc<AtomicUsize>,
     pub whoami_fail: Arc<AtomicBool>,
+    pub instrument_queries: Arc<tokio::sync::Mutex<Vec<GetInstrumentParams>>>,
+    pub instrument_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+    pub instrument_fail: Arc<AtomicBool>,
+    pub instrument_response_delay: Arc<AtomicBool>,
+    pub instrument_response_dropped: Arc<tokio::sync::Notify>,
+    pub instrument_response_entered: Arc<tokio::sync::Notify>,
+    pub instrument_response_release: Arc<tokio::sync::Notify>,
     pub preview_count: Arc<AtomicUsize>,
     pub preview_empty: Arc<AtomicBool>,
     pub preview_fail: Arc<AtomicBool>,
@@ -110,6 +120,13 @@ impl Default for TestServerState {
             cancel_all_fail: Arc::new(AtomicBool::new(false)),
             whoami_count: Arc::new(AtomicUsize::new(0)),
             whoami_fail: Arc::new(AtomicBool::new(false)),
+            instrument_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            instrument_payload: Arc::new(tokio::sync::Mutex::new(None)),
+            instrument_fail: Arc::new(AtomicBool::new(false)),
+            instrument_response_delay: Arc::new(AtomicBool::new(false)),
+            instrument_response_dropped: Arc::new(tokio::sync::Notify::new()),
+            instrument_response_entered: Arc::new(tokio::sync::Notify::new()),
+            instrument_response_release: Arc::new(tokio::sync::Notify::new()),
             preview_count: Arc::new(AtomicUsize::new(0)),
             preview_empty: Arc::new(AtomicBool::new(false)),
             preview_fail: Arc::new(AtomicBool::new(false)),
@@ -143,7 +160,12 @@ impl TestServerState {
         self.heartbeat_count.store(0, Ordering::Relaxed);
         self.messages_received.lock().await.clear();
         self.cancel_all_count.store(0, Ordering::Relaxed);
+        self.instrument_fail.store(false, Ordering::Relaxed);
+        self.instrument_response_delay
+            .store(false, Ordering::Relaxed);
+        *self.instrument_payload.lock().await = None;
         self.order_status_queries.lock().await.clear();
+        self.instrument_queries.lock().await.clear();
         self.open_orders_queries.lock().await.clear();
         self.orders_queries.lock().await.clear();
         *self.orders_page_size.lock().await = None;
@@ -573,6 +595,56 @@ async fn handle_get_instruments() -> Json<serde_json::Value> {
     Json(load_test_data("http_get_instruments.json"))
 }
 
+async fn handle_get_instrument(
+    State(state): State<TestServerState>,
+    Query(params): Query<GetInstrumentParams>,
+) -> Response {
+    state.instrument_queries.lock().await.push(params.clone());
+
+    if state.instrument_fail.load(Ordering::Relaxed) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error":"instrument unavailable"})),
+        )
+            .into_response();
+    }
+
+    let mut instrument = state
+        .instrument_payload
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| load_test_data("http_get_instruments.json")["instruments"][0].clone());
+    instrument["symbol"] = json!(params.symbol.as_str());
+
+    if state.instrument_response_delay.load(Ordering::Relaxed) {
+        let dropped = Arc::clone(&state.instrument_response_dropped);
+        let entered = Arc::clone(&state.instrument_response_entered);
+        let release = Arc::clone(&state.instrument_response_release);
+        let body = Body::from_stream(stream::once(async move {
+            let _drop_signal = DropSignal(dropped);
+            entered.notify_one();
+            release.notified().await;
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from(instrument.to_string()))
+        }));
+
+        return Response::builder()
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .expect("valid delayed instrument response");
+    }
+
+    Json(instrument).into_response()
+}
+
+struct DropSignal(Arc<tokio::sync::Notify>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
 async fn handle_get_balances() -> Json<serde_json::Value> {
     Json(load_test_data("http_get_balances.json"))
 }
@@ -810,6 +882,7 @@ fn create_test_router(state: TestServerState) -> Router {
         // HTTP API routes
         .route("/authenticate", post(handle_authenticate))
         .route("/instruments", get(handle_get_instruments))
+        .route("/instrument", get(handle_get_instrument))
         .route("/balances", get(handle_get_balances))
         .route("/whoami", get(handle_get_whoami))
         .route("/positions", get(handle_positions))

@@ -118,6 +118,7 @@ adapter set. The following limits remain deferred:
 - Added Polymarket v2 `PolymarketDataLoader` v2 for public discovery and historical trades
 - Added Tardis MEXC spot and futures market data support
 - Added v2 `ExecutionEngineConfig.carry_replay_events_on_reopen` to carry position replay state across NETTING close/reopen cycles (#4546), thanks @HungNgo4444
+- Added v2 `Decimal` order fill pricing; `Order.avg_px` and `Order.slippage` no longer round through `f64`
 
 ### Breaking Changes
 - Changed v2 `PortfolioConfig.use_mark_prices` to prefer marks by default; set `false` to skip marks
@@ -128,6 +129,10 @@ adapter set. The following limits remain deferred:
 - Changed Rust CLI parser fields to crate-private; use `nautilus_cli::cli_command` and `run`
 - Changed v2 portfolios to record daily equity snapshots by default; set `equity_curve=False` to opt out
 - Changed v2 order-event schemas to persist activation prices and fill `info`; old catalogs must be migrated
+- Changed v2 `Order.avg_px` and `Order.slippage` from `f64` to `Decimal` in Rust, and from `float` to `decimal.Decimal` in Python
+- Changed Rust `OrderStatusReport::with_avg_px` to take a `Decimal` and return `Self`; it no longer returns a `Result`
+- Changed v2 SQL `order.avg_px` and `order.slippage` to `NUMERIC`; run `nautilus database init` before starting a Postgres-backed node, which now fails fast on the old column types
+- Changed the v2 `OrderSnapshot` Arrow schema to write `avg_px` and `slippage` as strings; the decoder also accepts the old `Float64` columns, but migrate an existing catalog rather than appending to it, since a directory holding both column types fails schema inference
 - Changed v2 instrument Arrow schemas to persist all constraints; old catalogs must be migrated
 - Changed v2 trailing-stop and order-event constructors to accept activation prices and fill `info`
 - Changed v2 `OrderPendingUpdate` and `OrderPendingCancel` `account_id` to optional (`AccountId | None`), matching v1
@@ -141,6 +146,7 @@ adapter set. The following limits remain deferred:
 - Renamed Interactive Brokers PyO3 enum variants to uppercase names (e.g. `MarketDataType.DELAYED`) (#4350)
 - Changed Architect AX request models and low-level APIs to current schemas; unverified stop-limit orders are rejected
 - Changed BitMEX quanto multipliers from raw to settlement-currency units (#4507), thanks for reporting @4px4d9cdby-star
+- Changed Bybit repay result status fields from `String` to `BybitRepayStatus`
 - Removed Polymarket v2 `ack_timeout_secs` config field; the buffer-and-drain submit path has no acknowledgment wait to bound
 
 ### Security
@@ -151,9 +157,14 @@ adapter set. The following limits remain deferred:
 
 ### Fixes
 - Fixed v2 PyO3 API coverage and Python exception handling
+- Fixed `nautilus database init` panicking instead of skipping existing schema objects on re-run
+- Fixed `nautilus database init` leaving schema objects owned by the bootstrap administrator
+- Fixed the v2 SQL schema loader splitting dollar-quoted (`$$`) statement bodies on their inner semicolons
 - Fixed v2 `BettingInstrument` catalog round trips corrupting raw symbols, increments, and precisions
 - Fixed v2 instrument catalog round trips dropping constraints, margins, and fees
 - Fixed v2 realized PnL returning zero for missing rates or range errors and panicking on overflow
+- Fixed v2 realized PnL counting only the newest snapshot for NETTING positions with three or more cycles (v1 parity)
+- Fixed v2 realized PnL miscounting archived NETTING cycles whose boundaries a prior-cycle fill void moved
 - Fixed v2 portfolio snapshots retaining stale-price flags after the affected position side closed
 - Fixed v2 portfolio snapshots dropping temporarily unpriced positions and hiding stale valuations
 - Fixed v2 equity curves omitting unrealized PnL between fills (#3899), thanks for reporting @q-learning-trader
@@ -278,6 +289,8 @@ adapter set. The following limits remain deferred:
 - Fixed Architect AX market data trade IDs colliding when one aggressor swept several book levels
 - Fixed Architect AX market data subscription tracking, unsubscribes, book-level changes, and failed-subscription replay
 - Fixed Architect AX startup reconciliation omitting filled and canceled orders from mass status
+- Fixed Architect AX startup reconciliation failing when venue reports referenced an uncached instrument
+- Fixed Architect AX data requests remaining active after disconnect, stop, reset, or dispose
 - Fixed Betfair v2 voids without reversing unapplied exposure from reconnect snapshots
 - Fixed Betfair matched sizes and v2 mass-status fill IDs, commissions, and gaps
 - Fixed Binance Futures hedge-mode tracking with configurable `oms_type` (#4422), thanks for reporting @luckykefu
@@ -304,7 +317,9 @@ adapter set. The following limits remain deferred:
 - Fixed Blockchain RPC pool snapshots panicking on incomplete topology
 - Fixed Bybit post-only rejections omitting the `due_post_only` flag (#4500), thanks @dxwil
 - Fixed Bybit spot instruments missing `min_notional` and the newer lot-size fields (#4527), thanks @dxwil
+- Fixed Bybit v2 spot margin auto-repayment quantities, MNT fees, and result handling
 - Fixed Bybit WebSocket fills hardcoding the commission currency to the quote currency (#4536), thanks @dxwil
+- Fixed Bybit REST and WebSocket corporate-action executions failing deserialization
 - Fixed Databento OPRA option contract multipliers (#4388), thanks for reporting @pjlegato
 - Fixed Databento MBO fill/no-action decoding and replay gating (#4446), thanks @taozle
 - Fixed Deribit tracked fill and amendment routing while preserving external-order reports
@@ -409,6 +424,7 @@ adapter set. The following limits remain deferred:
 - Upgraded `pyarrow` to v25.0.0
 
 ### Documentation Updates
+- Updated Bybit v2 spot margin auto-repayment behavior and configuration
 - Added the v1-to-v2 property, method, and callback migration matrix
 - Added canonical references and doc comments for portfolio statistics
 - Added Binance Futures `/fapi/v1/algoOrder` order-count rate limit docs
