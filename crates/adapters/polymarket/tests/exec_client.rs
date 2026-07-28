@@ -6315,3 +6315,175 @@ async fn test_query_account_does_not_block_within_runtime() {
         "Expected Account event, was {event:?}"
     );
 }
+
+// The three cases below all reduce to one question: when the adapter cannot
+// describe a confirmed fill because its instrument is not loaded, does it report
+// something wrong, or does it decline to report?
+//
+// Earlier revisions of this branch answered by failing the whole pass. That was
+// reverted, because the deployments that most need the guard run with no
+// reconciliation lookback, so one undescribable historical trade made the node
+// permanently unstartable. These pin the answers the current design gives, so the
+// reversal is not mistaken for these cases having stopped mattering.
+
+/// A venue order for an asset the request did not ask about must not be returned
+/// as a report for the asset it did ask about.
+///
+/// The command names `TEST-TOKEN`; the venue answers with an order whose
+/// `asset_id` is a token this client has never loaded. Relabelling it would
+/// attribute another market's order to this one.
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_does_not_relabel_another_asset() {
+    let state = TestServerState::default();
+    let mut order = load_json("http_open_order.json");
+    order["asset_id"] = Value::String("UNMAPPED-TOKEN".to_string());
+    *state.single_order_response.lock().await = Some(order);
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let cmd = GenerateOrderStatusReport {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: Some(instrument_id),
+        client_order_id: None,
+        venue_order_id: Some(VenueOrderId::from("0x123")),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    let outcome = client.generate_order_status_report(&cmd).await;
+
+    match outcome {
+        Err(_) => {}
+        Ok(None) => {}
+        Ok(Some(report)) => panic!(
+            "a venue order for another asset must not be reported against {instrument_id}, \
+             got instrument_id={} filled_qty={}",
+            report.instrument_id, report.filled_qty
+        ),
+    }
+}
+
+/// An order whose only confirmed fill cannot be described must not be reported as
+/// filled on the strength of the venue's own `size_matched`.
+///
+/// The venue calls the order MATCHED for 10, and its single confirmed trade is on
+/// an unloaded token, so no fill report can be built from it. Reporting filled=10
+/// with nothing backing it would hand the engine a quantity the adapter cannot
+/// evidence.
+#[rstest]
+#[tokio::test]
+async fn test_query_order_does_not_report_filled_on_an_undescribable_trade() {
+    let venue_order_id_str = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12";
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(json!({
+        "associate_trades": ["confirmed-trade"],
+        "id": venue_order_id_str,
+        "status": "MATCHED",
+        "market": "0xtest",
+        "original_size": "10.0000",
+        "outcome": "Yes",
+        "maker_address": "0xtest",
+        "owner": "test-owner",
+        "price": "0.5100",
+        "side": "BUY",
+        "size_matched": "10.0000",
+        "asset_id": "TEST-TOKEN",
+        "expiration": null,
+        "order_type": "GTC",
+        "created_at": 1_703_875_200_i64
+    }));
+    let mut trades = recovery_trades_response(venue_order_id_str, "10.0000", "0.5000");
+    trades["data"][0]["asset_id"] = Value::String("UNMAPPED-TOKEN".to_string());
+    *state.trades_response_override.lock().await = Some(trades);
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let cmd = GenerateOrderStatusReport {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: Some(instrument_id),
+        client_order_id: None,
+        venue_order_id: Some(VenueOrderId::from(venue_order_id_str)),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    let outcome = client.generate_order_status_report(&cmd).await;
+
+    if let Ok(Some(report)) = outcome {
+        assert!(
+            report.filled_qty.is_zero(),
+            "the only confirmed trade for this order is undescribable, so no filled \
+             quantity is evidenced; reported {} instead",
+            report.filled_qty
+        );
+    }
+}
+
+/// A trade still settling must not conceal that a *different*, confirmed trade
+/// could not be described.
+///
+/// One MINED trade and one Confirmed trade on an unloaded token. Deferring on the
+/// unsettled one is correct; doing so while silently dropping the confirmed one
+/// would report a clean deferral over an unreported fill.
+#[rstest]
+#[tokio::test]
+async fn test_pending_trade_does_not_conceal_an_undescribable_confirmed_fill() {
+    let venue_order_id_str = DEFAULT_ACCEPTED_ORDER_ID;
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(Value::Null);
+    let mut pending =
+        recovery_trades_response(venue_order_id_str, "1.0000", "0.5000")["data"][0].clone();
+    pending["status"] = Value::String("MINED".to_string());
+    let mut invalid_confirmed =
+        recovery_trades_response(venue_order_id_str, "1.0000", "0.5000")["data"][0].clone();
+    invalid_confirmed["id"] = Value::String("invalid-confirmed".to_string());
+    invalid_confirmed["asset_id"] = Value::String("UNMAPPED-TOKEN".to_string());
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [pending, invalid_confirmed],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let cmd = GenerateOrderStatusReport {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: Some(instrument_id),
+        client_order_id: None,
+        venue_order_id: Some(VenueOrderId::from(venue_order_id_str)),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    let outcome = client.generate_order_status_report(&cmd).await;
+
+    if let Ok(Some(report)) = outcome {
+        assert!(
+            report.filled_qty.is_zero(),
+            "neither trade yields a describable fill, so no quantity is evidenced; \
+             reported {} instead",
+            report.filled_qty
+        );
+    }
+}

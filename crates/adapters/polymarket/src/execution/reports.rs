@@ -386,6 +386,31 @@ impl PolymarketExecutionClient {
         };
 
         if let Some(order) = order {
+            // The venue is asked for an order by id and answers with whatever
+            // order carries that id, including one on a different asset. The
+            // instrument below comes from the command, not from the answer, so
+            // without this the report would carry the requested instrument's id
+            // over another asset's order -- attributing one market's order,
+            // quantity and price to another.
+            //
+            // The token map is keyed by `raw_symbol`, so an instrument's raw
+            // symbol is its token id and comparing against `asset_id` needs no
+            // lookup. Only checked when the instrument is loaded: with nothing
+            // loaded there is no token to compare, and refusing then would fail
+            // ordinary queries made before instruments arrive.
+            if let Some(instrument) = &instrument
+                && instrument.raw_symbol().as_str() != order.asset_id.as_str()
+            {
+                log::error!(
+                    "Polymarket order {venue_order_id} is on asset {} but was requested as \
+                     {instrument_id} (asset {}); reporting nothing rather than attributing \
+                     another asset's order to it",
+                    order.asset_id,
+                    instrument.raw_symbol(),
+                );
+                return Ok(None);
+            }
+
             let mut report = parse_order_status_report(
                 &order,
                 instrument_id,
