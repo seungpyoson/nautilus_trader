@@ -139,7 +139,7 @@ impl PolymarketExecutionClient {
             return Ok(Some(report));
         }
 
-        let (mut order_fills, _) = build_fill_reports_from_trades(
+        let (mut order_fills, discards) = build_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
@@ -147,6 +147,10 @@ impl PolymarketExecutionClient {
             None,
             ts_init,
         );
+
+        if let Some(losses) = discards.losses() {
+            log::debug!("Polymarket order status report: {losses}");
+        }
         order_fills.retain(|f| f.venue_order_id == venue_order_id);
         self.fill_tracker.snap_fill_reports(&mut order_fills);
 
@@ -536,7 +540,7 @@ impl PolymarketExecutionClient {
             .context("failed to fetch trades")?;
 
         let ctx = self.fill_context();
-        let (mut reports, _) = build_fill_reports_from_trades(
+        let (mut reports, discards) = build_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
@@ -544,6 +548,10 @@ impl PolymarketExecutionClient {
             None,
             self.clock.get_time_ns(),
         );
+
+        if let Some(losses) = discards.losses() {
+            log::debug!("Polymarket fill reports: {losses}");
+        }
 
         self.fill_tracker.snap_fill_reports(&mut reports);
 
@@ -623,7 +631,7 @@ async fn fetch_confirmed_fill_reports(
         .get_trades(params)
         .await
         .context("failed to fetch confirmed trades")?;
-    let (reports, _) = build_fill_reports_from_trades(
+    let (reports, discards) = build_fill_reports_from_trades(
         &trades,
         ctx,
         token_instruments,
@@ -631,6 +639,14 @@ async fn fetch_confirmed_fill_reports(
         None,
         ts_init,
     );
+    // Debug, not error. This runs on the open-order poll, so a permanent
+    // condition -- one historical trade the account cannot interpret -- would
+    // otherwise reprint at error level every few seconds forever. The pass that
+    // owns the operator-visible severity is `generate_mass_status`, which sees
+    // the same trade once.
+    if let Some(losses) = discards.losses() {
+        log::debug!("Polymarket fill fetch: {losses}");
+    }
     Ok(reports)
 }
 

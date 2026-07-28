@@ -503,9 +503,11 @@ fn dispatch_maker_fills(
         // Logged at error rather than warn: the account is being told about a
         // trade of its own and cannot find itself in it, so the fill is dropped
         // and the position it represents goes unbooked until reconciliation
-        // rebuilds it. The batch path fails outright on the same condition; this
-        // one cannot, because a dispatch has no channel to refuse through, so
-        // the severity of the log is the whole signal an operator gets.
+        // rebuilds it. A dispatch has no channel to refuse through, so the
+        // severity of the log is the whole signal an operator gets here.
+        // Reconciliation reaches the same verdict on the same condition and
+        // reports it once per pass from a count; neither path fails, and both
+        // say so loudly.
         log::error!("No matching maker orders for user in trade: {}", trade.id);
         return Vec::new();
     }
