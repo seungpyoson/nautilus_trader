@@ -391,20 +391,33 @@ impl PolymarketExecutionClient {
             // over another asset's order -- attributing one market's order,
             // quantity and price to another.
             //
-            // The token map is keyed by `raw_symbol`, so an instrument's raw
-            // symbol is its token id and comparing against `asset_id` needs no
-            // lookup. Only checked when the instrument is loaded: with nothing
-            // loaded there is no token to compare, and refusing then would fail
-            // ordinary queries made before instruments arrive.
-            if let Some(instrument) = &instrument
-                && instrument.raw_symbol().as_str() != order.asset_id.as_str()
-            {
+            // Either side is enough to prove this, and the requested side being
+            // unloaded is exactly when an early query runs -- so the answered
+            // side is consulted too, rather than letting an unloaded request
+            // pass everything through. Nothing is refused merely for being
+            // unknown: with neither side resolvable there is no mismatch to
+            // prove, and queries made before instruments arrive still work.
+            let mismatched = match &instrument {
+                // The token map is keyed by `raw_symbol`, so a loaded
+                // instrument's raw symbol is the token it trades and comparing
+                // against `asset_id` needs no lookup at all.
+                Some(requested) => requested.raw_symbol().as_str() != order.asset_id.as_str(),
+                // Not loaded, which is exactly when an early query runs. The
+                // asset the venue answered with may still be known, and if it
+                // belongs to a different instrument that is a mismatch just the
+                // same. Unknown proves nothing and is not refused.
+                None => self
+                    .shared_token_instruments
+                    .get_cloned(&Ustr::from(order.asset_id.as_str()))
+                    .is_some_and(|answered| answered.id() != instrument_id),
+            };
+
+            if mismatched {
                 log::error!(
                     "Polymarket order {venue_order_id} is on asset {} but was requested as \
-                     {instrument_id} (asset {}); reporting nothing rather than attributing \
-                     another asset's order to it",
+                     {instrument_id}; reporting nothing rather than attributing another \
+                     asset's order to it",
                     order.asset_id,
-                    instrument.raw_symbol(),
                 );
                 return Ok(None);
             }
@@ -568,11 +581,22 @@ impl PolymarketExecutionClient {
             &ctx,
             &self.shared_token_instruments,
             cmd.instrument_id,
-            None,
+            // The command's own lower bound, which this call used to withhold.
+            // The filter applied below reads the report's `ts_event`, and a trade
+            // whose `match_time` cannot be parsed is stamped with the current
+            // time -- so a trade of any age passed a window asking for recent
+            // ones, and `unknown_age`, which exists to make exactly that
+            // visible, was never incremented because it is only counted against
+            // a cutoff. Passing the bound is what separates "kept because it is
+            // recent" from "kept because we could not tell".
+            cmd.start,
             self.clock.get_time_ns(),
         );
 
-        discards.report(log::Level::Debug, "Polymarket fill reports");
+        // A bounded query that answered with trades it could not place in time
+        // has weakened the caller's window, which is worth more than a line the
+        // operator only sees with debug logging enabled.
+        discards.report(log::Level::Warn, "Polymarket fill reports");
 
         self.fill_tracker.snap_fill_reports(&mut reports);
 

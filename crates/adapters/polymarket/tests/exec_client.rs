@@ -1636,13 +1636,19 @@ async fn test_generate_order_status_report_returns_none_without_cached_order() {
     assert!(result.is_none());
 }
 
+/// The token id the fixture instrument trades. The loaded instrument's
+/// `raw_symbol` is this, so an order or trade carrying it belongs to that
+/// instrument and one carrying anything else does not.
+const FIXTURE_TOKEN_ID: &str =
+    "71321045679252212594626385532706912750332728571942532289631379312455583992563";
+
 fn recovery_trades_response(venue_order_id: &str, size: &str, price: &str) -> Value {
     json!({
         "data": [{
             "id": "trade-recovery",
             "taker_order_id": venue_order_id,
             "market": "0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917",
-            "asset_id": "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+            "asset_id": FIXTURE_TOKEN_ID,
             "side": "BUY",
             "size": size,
             "fee_rate_bps": "0",
@@ -2983,7 +2989,7 @@ fn add_instrument_to_cache_with_precisions(
     price_precision: u8,
     size_precision: u8,
 ) {
-    let symbol = "71321045679252212594626385532706912750332728571942532289631379312455583992563";
+    let symbol = FIXTURE_TOKEN_ID;
     let size_increment = if size_precision == 0 {
         Quantity::from("1")
     } else {
@@ -6361,13 +6367,67 @@ async fn test_generate_order_status_report_does_not_relabel_another_asset() {
     let outcome = client.generate_order_status_report(&cmd).await;
 
     match outcome {
-        Err(_) => {}
         Ok(None) => {}
         Ok(Some(report)) => panic!(
             "a venue order for another asset must not be reported against {instrument_id}, \
              got instrument_id={} filled_qty={}",
             report.instrument_id, report.filled_qty
         ),
+        Err(e) => {
+            panic!("declining to describe another asset's order is not a query failure: {e}")
+        }
+    }
+}
+
+/// The same protection when the *requested* instrument is the one not loaded.
+///
+/// An early query names an instrument this client has yet to load, and the venue
+/// answers with an order on an asset it *has* loaded -- a different instrument.
+/// Checking only the requested side would pass this through and label another
+/// market's order with the id that was asked for, which is the same corruption
+/// the test above rejects, reached from the other direction.
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_does_not_relabel_when_the_request_is_unloaded() {
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(load_json("http_open_order.json"));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    // Loaded: the instrument the answered asset actually belongs to.
+    let answered_id = InstrumentId::from("ANSWERED-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, answered_id, 4);
+    let answered = cache.borrow().instrument(&answered_id).unwrap().clone();
+    client.on_instrument(answered);
+
+    // Not loaded: the instrument the query asks about.
+    let requested_id = InstrumentId::from("UNLOADED-TOKEN.POLYMARKET");
+    assert!(
+        cache.borrow().instrument(&requested_id).is_none(),
+        "this case is only meaningful while the requested instrument is unloaded"
+    );
+
+    let cmd = GenerateOrderStatusReport {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: Some(requested_id),
+        client_order_id: None,
+        venue_order_id: Some(VenueOrderId::from("0x123")),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    match client.generate_order_status_report(&cmd).await {
+        Ok(None) => {}
+        Ok(Some(report)) => panic!(
+            "the answered asset belongs to {answered_id}, so it must not be reported \
+             against {requested_id}; got instrument_id={} filled_qty={}",
+            report.instrument_id, report.filled_qty
+        ),
+        Err(e) => {
+            panic!("declining to describe another asset's order is not a query failure: {e}")
+        }
     }
 }
 
@@ -6395,7 +6455,7 @@ async fn test_query_order_does_not_report_filled_on_an_undescribable_trade() {
         "price": "0.5100",
         "side": "BUY",
         "size_matched": "10.0000",
-        "asset_id": "TEST-TOKEN",
+        "asset_id": FIXTURE_TOKEN_ID,
         "expiration": null,
         "order_type": "GTC",
         "created_at": 1_703_875_200_i64
@@ -6424,14 +6484,15 @@ async fn test_query_order_does_not_report_filled_on_an_undescribable_trade() {
 
     let outcome = client.generate_order_status_report(&cmd).await;
 
-    if let Ok(Some(report)) = outcome {
-        assert!(
-            report.filled_qty.is_zero(),
-            "the only confirmed trade for this order is undescribable, so no filled \
-             quantity is evidenced; reported {} instead",
-            report.filled_qty
-        );
-    }
+    let report = outcome
+        .expect("an undescribable trade must not fail the query")
+        .expect("the order exists, so it is reported -- just not as filled");
+    assert!(
+        report.filled_qty.is_zero(),
+        "the only confirmed trade for this order is undescribable, so no filled \
+         quantity is evidenced; reported {} instead",
+        report.filled_qty
+    );
 }
 
 /// A trade still settling must not conceal that a *different*, confirmed trade
@@ -6445,7 +6506,23 @@ async fn test_query_order_does_not_report_filled_on_an_undescribable_trade() {
 async fn test_pending_trade_does_not_conceal_an_undescribable_confirmed_fill() {
     let venue_order_id_str = DEFAULT_ACCEPTED_ORDER_ID;
     let state = TestServerState::default();
-    *state.single_order_response.lock().await = Some(Value::Null);
+    *state.single_order_response.lock().await = Some(json!({
+        "associate_trades": ["trade-recovery", "invalid-confirmed"],
+        "id": venue_order_id_str,
+        "status": "MATCHED",
+        "market": "0xtest",
+        "original_size": "2.0000",
+        "outcome": "Yes",
+        "maker_address": "0xtest",
+        "owner": "test-owner",
+        "price": "0.5000",
+        "side": "BUY",
+        "size_matched": "2.0000",
+        "asset_id": FIXTURE_TOKEN_ID,
+        "expiration": null,
+        "order_type": "GTC",
+        "created_at": 1_703_875_200_i64
+    }));
     let mut pending =
         recovery_trades_response(venue_order_id_str, "1.0000", "0.5000")["data"][0].clone();
     pending["status"] = Value::String("MINED".to_string());
@@ -6478,12 +6555,13 @@ async fn test_pending_trade_does_not_conceal_an_undescribable_confirmed_fill() {
 
     let outcome = client.generate_order_status_report(&cmd).await;
 
-    if let Ok(Some(report)) = outcome {
-        assert!(
-            report.filled_qty.is_zero(),
-            "neither trade yields a describable fill, so no quantity is evidenced; \
-             reported {} instead",
-            report.filled_qty
-        );
-    }
+    let report = outcome
+        .expect("an undescribable trade must not fail the query")
+        .expect("the order exists, so it is reported -- just not as filled");
+    assert!(
+        report.filled_qty.is_zero(),
+        "neither trade yields a describable fill, so no quantity is evidenced; \
+         reported {} instead",
+        report.filled_qty
+    );
 }
