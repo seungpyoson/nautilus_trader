@@ -107,18 +107,25 @@ impl FillBuildDiscards {
         self.unmapped_instruments > 0 || self.unowned_maker_trades > 0
     }
 
-    /// One phrase naming what was lost, or `None` when nothing was.
+    /// Say what was lost, at the level the caller owns, or say nothing.
     ///
-    /// The level is still the caller's -- this only keeps three call sites from
-    /// describing the same two counts three different ways.
-    pub(crate) fn losses(&self) -> Option<String> {
-        self.lost_anything().then(|| {
-            format!(
-                "{} confirmed maker trade(s) held no maker order owned by this account and {} \
-                 entr(ies) had no loaded instrument, so their filled quantity is understated",
-                self.unowned_maker_trades, self.unmapped_instruments,
-            )
-        })
+    /// The caller passes the level because only it knows how loud this should be:
+    /// the reconciliation pass runs once and can afford an error, the report
+    /// paths run on a seconds-long poll and a permanent condition would print
+    /// forever. What is *not* the caller's business is deciding whether there is
+    /// anything to say, or how to word it -- each call site testing that for
+    /// itself is how one predicate becomes four copies that drift apart.
+    pub(crate) fn report(&self, level: log::Level, context: &str) {
+        if !self.lost_anything() {
+            return;
+        }
+        log::log!(
+            level,
+            "{context}: {} confirmed maker trade(s) held no maker order owned by this account \
+             and {} entr(ies) had no loaded instrument, so their filled quantity is understated",
+            self.unowned_maker_trades,
+            self.unmapped_instruments,
+        );
     }
 }
 
@@ -495,13 +502,14 @@ pub(crate) async fn generate_mass_status(
     // mass status it returns has no field to carry the count -- so an operator
     // reading the log is the only channel, and it says what was lost and that
     // the report does not show it.
-    if let Some(losses) = fills_filtered.losses() {
-        log::error!(
-            "Polymarket mass status for account {} is incomplete: {losses}, and this report \
-             carries no count of them",
-            ctx.user_address,
-        );
-    }
+    fills_filtered.report(
+        log::Level::Error,
+        &format!(
+            "Polymarket mass status for account {} is incomplete, and this report carries no \
+             count of it",
+            ctx.user_address
+        ),
+    );
 
     // Not an error: keeping these is deliberate and they are inside the window
     // by construction. Reported because the window's guarantee is weaker than it
@@ -686,12 +694,6 @@ mod tests {
         assert!(
             discards.lost_anything(),
             "an undescribable trade is a loss the caller must be able to report"
-        );
-        assert!(
-            discards
-                .losses()
-                .is_some_and(|losses| losses.contains("understated")),
-            "the description a caller logs must name the consequence"
         );
     }
 

@@ -148,9 +148,7 @@ impl PolymarketExecutionClient {
             ts_init,
         );
 
-        if let Some(losses) = discards.losses() {
-            log::debug!("Polymarket order status report: {losses}");
-        }
+        discards.report(log::Level::Debug, "Polymarket order status report");
         order_fills.retain(|f| f.venue_order_id == venue_order_id);
         self.fill_tracker.snap_fill_reports(&mut order_fills);
 
@@ -574,9 +572,7 @@ impl PolymarketExecutionClient {
             self.clock.get_time_ns(),
         );
 
-        if let Some(losses) = discards.losses() {
-            log::debug!("Polymarket fill reports: {losses}");
-        }
+        discards.report(log::Level::Debug, "Polymarket fill reports");
 
         self.fill_tracker.snap_fill_reports(&mut reports);
 
@@ -669,9 +665,7 @@ async fn fetch_confirmed_fill_reports(
     // otherwise reprint at error level every few seconds forever. The pass that
     // owns the operator-visible severity is `generate_mass_status`, which sees
     // the same trade once.
-    if let Some(losses) = discards.losses() {
-        log::debug!("Polymarket fill fetch: {losses}");
-    }
+    discards.report(log::Level::Debug, "Polymarket fill fetch");
     Ok(reports)
 }
 
