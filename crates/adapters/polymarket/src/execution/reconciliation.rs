@@ -99,14 +99,6 @@ pub(crate) struct FillBuildDiscards {
 }
 
 impl FillBuildDiscards {
-    /// Whether anything the account should have been able to interpret was lost.
-    ///
-    /// Deliberately not every field: `outside_lookback` is the window doing its
-    /// job, not a loss.
-    pub(crate) const fn lost_anything(&self) -> bool {
-        self.unmapped_instruments > 0 || self.unowned_maker_trades > 0
-    }
-
     /// Say what was lost, at the level the caller owns, or say nothing.
     ///
     /// The caller passes the level because only it knows how loud this should be:
@@ -115,17 +107,55 @@ impl FillBuildDiscards {
     /// forever. What is *not* the caller's business is deciding whether there is
     /// anything to say, or how to word it -- each call site testing that for
     /// itself is how one predicate becomes four copies that drift apart.
+    ///
+    /// Which is exactly what had happened to `unknown_age`: it was reported by
+    /// one caller, in a warning that caller raised for itself, and the other
+    /// three said nothing at all. A query whose only anomaly was a trade of
+    /// unparsable age was silent on three of the four paths, at every level,
+    /// because the predicate above did not count it. Stated here instead, once,
+    /// so adding a counter cannot leave three callers behind.
     pub(crate) fn report(&self, level: log::Level, context: &str) {
         if !self.lost_anything() {
             return;
         }
-        log::log!(
-            level,
-            "{context}: {} confirmed maker trade(s) held no maker order owned by this account \
-             and {} entr(ies) had no loaded instrument, so their filled quantity is understated",
-            self.unowned_maker_trades,
-            self.unmapped_instruments,
-        );
+        log::log!(level, "{context}: {}", self.findings().join("; "));
+    }
+
+    /// Whether the reports built from this query are weaker than they read.
+    ///
+    /// Derived from the findings rather than stated again beside them, because
+    /// stating it twice is how the predicate and the message came to disagree:
+    /// the message named `unknown_age` on one path while the predicate did not
+    /// count it on any.
+    ///
+    /// Deliberately not every field: `outside_lookback` produces no finding
+    /// because it is the window doing its job, not a weakness.
+    pub(crate) fn lost_anything(&self) -> bool {
+        !self.findings().is_empty()
+    }
+
+    fn findings(&self) -> Vec<String> {
+        let mut findings = Vec::new();
+        if self.unowned_maker_trades > 0 {
+            findings.push(format!(
+                "{} confirmed maker trade(s) held no maker order owned by this account",
+                self.unowned_maker_trades,
+            ));
+        }
+        if self.unmapped_instruments > 0 {
+            findings.push(format!(
+                "{} entr(ies) had no loaded instrument, so their filled quantity is understated",
+                self.unmapped_instruments,
+            ));
+        }
+        if self.unknown_age > 0 {
+            findings.push(format!(
+                "{} trade(s) had an unparsable match time and were kept, so the window admitted \
+                 trades of unknown age",
+                self.unknown_age,
+            ));
+        }
+        findings
     }
 }
 
@@ -162,6 +192,15 @@ pub(crate) fn build_fill_reports_from_trades(
     let mut discards = FillBuildDiscards::default();
 
     for trade in trades {
+        // Eligibility first, then the window. The other order counted the age of
+        // trades this function then discarded for not being confirmed, so a pass
+        // could report that it had kept a trade of unknown age while producing
+        // no report from one. Both counters describe confirmed trades now, which
+        // is what both of them are documented to describe.
+        if trade.status != PolymarketTradeStatus::Confirmed {
+            continue;
+        }
+
         if let Some(cutoff) = cutoff {
             match parse_timestamp(&trade.match_time) {
                 Some(ts) if ts < cutoff => {
@@ -171,10 +210,6 @@ pub(crate) fn build_fill_reports_from_trades(
                 Some(_) => {}
                 None => discards.unknown_age += 1,
             }
-        }
-
-        if trade.status != PolymarketTradeStatus::Confirmed {
-            continue;
         }
 
         let is_maker = trade.trader_side == PolymarketLiquiditySide::Maker;
@@ -432,8 +467,15 @@ pub(crate) async fn generate_mass_status(
     // all of it is interpreted on every reconciliation pass just to discard most
     // of it afterwards. Bounding the input is what makes the configured lookback
     // mean something to the work done rather than only to the output kept.
-    let cutoff = lookback_mins
-        .map(|mins| UnixNanos::from(ts_init.as_u64().saturating_sub(mins * 60 * 1_000_000_000)));
+    // Saturating throughout, including the conversion: `mins * 60 * 1_000_000_000`
+    // overflows a `u64` above roughly 584 years of lookback, which panics in
+    // debug and wraps in release -- turning an absurd-but-valid configuration
+    // into a cutoff in the future, which discards every trade. Saturating gives
+    // it the meaning the value asks for, an unbounded window.
+    let cutoff = lookback_mins.map(|mins| {
+        let span = mins.saturating_mul(60).saturating_mul(1_000_000_000);
+        UnixNanos::from(ts_init.as_u64().saturating_sub(span))
+    });
 
     // Fetch orders
     let orders = http_client
@@ -510,17 +552,6 @@ pub(crate) async fn generate_mass_status(
             ctx.user_address
         ),
     );
-
-    // Not an error: keeping these is deliberate and they are inside the window
-    // by construction. Reported because the window's guarantee is weaker than it
-    // reads whenever this is non-zero.
-    if fills_filtered.unknown_age > 0 {
-        log::warn!(
-            "Polymarket mass status kept {} trade(s) whose match time could not be parsed, so \
-             the reconciliation window admitted trades of unknown age",
-            fills_filtered.unknown_age,
-        );
-    }
 
     cap_order_reports_to_confirmed_fills(&mut order_reports, &fill_reports, fill_tracker);
 
@@ -815,9 +846,20 @@ mod tests {
             "the undated trade is kept, and the window says so rather than counting it as \
              evidence that it was recent"
         );
+        // Two different facts, which this assertion used to bundle into one and
+        // thereby hide. A windowed-out trade is the window working and is not
+        // reportable. An undated one is kept on the assumption that it is
+        // recent, which is the window's guarantee being weaker than it reads, so
+        // it is. Review found that bundling was why an undated trade produced no
+        // message at all on three of the four paths that build fill reports.
         assert!(
-            !discards.lost_anything(),
-            "a windowed-out or undated trade is the window working, not a loss"
+            discards.lost_anything(),
+            "an undated trade weakens the window's guarantee, so it must be reportable"
+        );
+        let windowed_out_only = FillBuildDiscards { unknown_age: 0, ..discards };
+        assert!(
+            !windowed_out_only.lost_anything(),
+            "a windowed-out trade on its own is the window working, not a loss"
         );
     }
 

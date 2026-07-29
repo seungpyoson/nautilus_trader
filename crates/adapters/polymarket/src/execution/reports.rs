@@ -378,8 +378,11 @@ impl PolymarketExecutionClient {
             .context("failed to fetch order")?;
 
         let instrument = self.core.cache().instrument(&instrument_id).cloned();
-        let (price_prec, size_prec) = match &instrument {
-            Some(i) => (i.price_precision(), i.size_precision()),
+        // One definition of "the precisions to build a report with", including
+        // what they are when nothing is known, so the two paths below cannot
+        // drift on the defaults.
+        let precisions = |known: Option<&InstrumentAny>| match known {
+            Some(instrument) => (instrument.price_precision(), instrument.size_precision()),
             None => (4, 6),
         };
 
@@ -397,19 +400,29 @@ impl PolymarketExecutionClient {
             // pass everything through. Nothing is refused merely for being
             // unknown: with neither side resolvable there is no mismatch to
             // prove, and queries made before instruments arrive still work.
-            let mismatched = match &instrument {
+            // Not loaded is exactly when an early query runs, so the asset the
+            // venue answered with is resolved too. Looked up once and kept,
+            // because it settles two questions rather than one: whether this is
+            // another asset's order, and what precisions the report is built
+            // with.
+            let answered = match &instrument {
+                Some(_) => None,
+                None => self
+                    .shared_token_instruments
+                    .get_cloned(&Ustr::from(order.asset_id.as_str())),
+            };
+
+            let mismatched = match (&instrument, &answered) {
                 // The token map is keyed by `raw_symbol`, so a loaded
                 // instrument's raw symbol is the token it trades and comparing
                 // against `asset_id` needs no lookup at all.
-                Some(requested) => requested.raw_symbol().as_str() != order.asset_id.as_str(),
-                // Not loaded, which is exactly when an early query runs. The
-                // asset the venue answered with may still be known, and if it
-                // belongs to a different instrument that is a mismatch just the
-                // same. Unknown proves nothing and is not refused.
-                None => self
-                    .shared_token_instruments
-                    .get_cloned(&Ustr::from(order.asset_id.as_str()))
-                    .is_some_and(|answered| answered.id() != instrument_id),
+                (Some(requested), _) => requested.raw_symbol().as_str() != order.asset_id.as_str(),
+                // The answered asset belongs to a different instrument, which is
+                // a mismatch just the same.
+                (None, Some(answered)) => answered.id() != instrument_id,
+                // Neither side resolvable: nothing to prove a mismatch with, and
+                // queries made before instruments arrive still work.
+                (None, None) => false,
             };
 
             if mismatched {
@@ -421,6 +434,11 @@ impl PolymarketExecutionClient {
                 );
                 return Ok(None);
             }
+
+            // Whichever side resolved. Falling back to the defaults while
+            // holding the answered instrument would round this report's own
+            // quantities for no reason.
+            let (price_prec, size_prec) = precisions(instrument.as_ref().or(answered.as_ref()));
 
             let mut report = parse_order_status_report(
                 &order,
@@ -478,7 +496,7 @@ impl PolymarketExecutionClient {
             venue_order_id,
             instrument_id,
             cmd.client_order_id,
-            size_prec,
+            precisions(instrument.as_ref()).1,
         )
         .await
     }
