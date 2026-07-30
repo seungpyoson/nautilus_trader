@@ -51,6 +51,47 @@ use crate::{
     },
 };
 
+/// The precisions to build a venue order's report with, or `None` if that order
+/// belongs to a different asset than the one it was requested as.
+///
+/// The venue is asked for an order by id and answers with whatever order carries
+/// that id, including one on a different asset, while the instrument comes from
+/// the command rather than from the answer. Without this an order's quantity and
+/// price are attributed to the wrong market.
+///
+/// Shared by both paths that ask for an order by id, because they had drifted:
+/// the bulk path validated and the single-order query did not, and the single
+/// query also fell back to the default precisions while holding the answered
+/// instrument. One definition means a future path cannot pick up only half of it.
+fn order_report_precisions(
+    instrument_id: InstrumentId,
+    asset_id: &str,
+    requested: Option<&InstrumentAny>,
+    answered: Option<&InstrumentAny>,
+) -> Option<(u8, u8)> {
+    let mismatched = match (requested, answered) {
+        // The token map is keyed by `raw_symbol`, so a loaded instrument's raw
+        // symbol is the token it trades and comparing against `asset_id` needs no
+        // lookup at all.
+        (Some(requested), _) => requested.raw_symbol().as_str() != asset_id,
+        // The answered asset belongs to a different instrument, which is a
+        // mismatch just the same.
+        (None, Some(answered)) => answered.id() != instrument_id,
+        // Neither side resolvable: nothing to prove a mismatch with, and queries
+        // made before instruments arrive still work.
+        (None, None) => false,
+    };
+    if mismatched {
+        return None;
+    }
+    // Whichever side resolved. Falling back to the defaults while holding the
+    // answered instrument would round this report's own quantities for no reason.
+    Some(match requested.or(answered) {
+        Some(instrument) => (instrument.price_precision(), instrument.size_precision()),
+        None => (4, 6),
+    })
+}
+
 impl PolymarketExecutionClient {
     pub(super) fn fill_context(&self) -> FillContext<'_> {
         let user_address = self
@@ -264,10 +305,13 @@ impl PolymarketExecutionClient {
         let account_id = self.core.account_id;
         let cache = self.core.cache();
 
-        let (price_prec, size_prec) = match cache.instrument(&instrument_id) {
-            Some(i) => (i.price_precision(), i.size_precision()),
-            None => (4, 6),
-        };
+        // Resolved after the venue answers, not here: the answer names the asset,
+        // and the precisions depend on which side resolved. Only the size
+        // precision is needed before then, for the cached filled quantity.
+        let requested_instrument = cache.instrument(&instrument_id).cloned();
+        let size_prec = requested_instrument
+            .as_ref()
+            .map_or(6, |instrument| instrument.size_precision());
 
         let http_client = self.http_client.clone();
         let fill_tracker = self.fill_tracker.clone();
@@ -287,6 +331,29 @@ impl PolymarketExecutionClient {
         self.spawn_task("query_order", async move {
             match http_client.get_order_optional(&venue_order_id).await {
                 Ok(Some(order)) => {
+                    // The same validation the bulk path performs, through the
+                    // same function. This path had none: it parsed the venue's
+                    // answer under the *requested* instrument without checking
+                    // the answer was on that asset, so another asset's order
+                    // could be reported as this one's.
+                    let answered = match &requested_instrument {
+                        Some(_) => None,
+                        None => token_instruments.get_cloned(&Ustr::from(order.asset_id.as_str())),
+                    };
+                    let Some((price_prec, size_prec)) = order_report_precisions(
+                        instrument_id,
+                        order.asset_id.as_str(),
+                        requested_instrument.as_ref(),
+                        answered.as_ref(),
+                    ) else {
+                        log::error!(
+                            "Polymarket order {venue_order_id} is on asset {} but was queried as \
+                             {instrument_id}; reporting nothing rather than attributing another \
+                             asset's order to it",
+                            order.asset_id,
+                        );
+                        return Ok(());
+                    };
                     let mut report = parse_order_status_report(
                         &order,
                         instrument_id,
@@ -412,20 +479,12 @@ impl PolymarketExecutionClient {
                     .get_cloned(&Ustr::from(order.asset_id.as_str())),
             };
 
-            let mismatched = match (&instrument, &answered) {
-                // The token map is keyed by `raw_symbol`, so a loaded
-                // instrument's raw symbol is the token it trades and comparing
-                // against `asset_id` needs no lookup at all.
-                (Some(requested), _) => requested.raw_symbol().as_str() != order.asset_id.as_str(),
-                // The answered asset belongs to a different instrument, which is
-                // a mismatch just the same.
-                (None, Some(answered)) => answered.id() != instrument_id,
-                // Neither side resolvable: nothing to prove a mismatch with, and
-                // queries made before instruments arrive still work.
-                (None, None) => false,
-            };
-
-            if mismatched {
+            let Some((price_prec, size_prec)) = order_report_precisions(
+                instrument_id,
+                order.asset_id.as_str(),
+                instrument.as_ref(),
+                answered.as_ref(),
+            ) else {
                 log::error!(
                     "Polymarket order {venue_order_id} is on asset {} but was requested as \
                      {instrument_id}; reporting nothing rather than attributing another \
@@ -433,12 +492,7 @@ impl PolymarketExecutionClient {
                     order.asset_id,
                 );
                 return Ok(None);
-            }
-
-            // Whichever side resolved. Falling back to the defaults while
-            // holding the answered instrument would round this report's own
-            // quantities for no reason.
-            let (price_prec, size_prec) = precisions(instrument.as_ref().or(answered.as_ref()));
+            };
 
             let mut report = parse_order_status_report(
                 &order,

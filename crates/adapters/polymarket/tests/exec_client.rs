@@ -6249,7 +6249,7 @@ async fn test_query_order_excludes_unconfirmed_matched_quantity() {
         "price": "0.5100",
         "side": "BUY",
         "size_matched": "10.0000",
-        "asset_id": "TEST-TOKEN",
+        "asset_id": FIXTURE_TOKEN_ID,
         "expiration": null,
         "order_type": "GTC",
         "created_at": 1_703_875_200_i64
@@ -6289,6 +6289,62 @@ async fn test_query_order_excludes_unconfirmed_matched_quantity() {
         }
         other => panic!("Expected Order report, was {other:?}"),
     }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_order_does_not_relabel_another_asset() {
+    // `generate_order_status_report` had this guard and `query_order` did not,
+    // so the same venue answer was refused on one path and attributed to the
+    // wrong market on the other. Both now go through `order_report_precisions`;
+    // this is the half that was unprotected.
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(json!({
+        "associate_trades": ["pending-trade"],
+        "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",
+        "status": "MATCHED",
+        "market": "0xtest",
+        "original_size": "10.0000",
+        "outcome": "Yes",
+        "maker_address": "0xtest",
+        "owner": "test-owner",
+        "price": "0.5100",
+        "side": "BUY",
+        "size_matched": "10.0000",
+        "asset_id": "0xa000000000000000000000000000000000000000000000000000000000000000",
+        "expiration": null,
+        "order_type": "GTC",
+        "created_at": 1_703_875_200_i64
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let cmd = QueryOrder::new(
+        TraderId::from("TESTER-001"),
+        Some(*POLYMARKET_CLIENT_ID),
+        StrategyId::from("S-001"),
+        instrument_id,
+        ClientOrderId::from("O-QUERY-FOREIGN"),
+        Some(VenueOrderId::from(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",
+        )),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+
+    client.query_order(cmd).unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "a venue order for another asset must not be reported against {instrument_id}"
+    );
 }
 
 #[rstest]

@@ -169,11 +169,18 @@ impl FillBuildDiscards {
 /// function saw. Taking the window as an argument makes every caller state one,
 /// so applying it cannot be forgotten in the wiring between the two.
 ///
-/// Callers answering a command rather than reconciling pass `None` and narrow by
-/// the command's own bounds afterwards. That is a different window from this one,
-/// not a caller forgetting to apply this one, and the two are not
-/// interchangeable: this cutoff reads the venue's `match_time`, while a command
-/// filter reads the timestamp of the fill built from it.
+/// A caller answering a command passes its lower bound here and applies the
+/// command's own bounds afterwards, because the two read different things: this
+/// cutoff reads the venue's `match_time`, while the command filter reads the
+/// timestamp of the fill built from it. They are complementary, not
+/// interchangeable, and neither substitutes for the other.
+///
+/// One consequence worth naming, because the counters are the only way to see it:
+/// a trade whose match time will not parse is stamped with the current time and
+/// so survives *this* stage, and is counted below -- but the command's upper
+/// bound is applied later, so a stamped-now trade outside that bound is dropped
+/// after being counted. The count therefore describes what this builder kept, not
+/// what the caller ultimately reported.
 ///
 /// A trade whose match time cannot be parsed is kept, because the fill built
 /// from one is stamped with the current time and therefore belongs to the
@@ -192,6 +199,7 @@ pub(crate) fn build_fill_reports_from_trades(
     let mut discards = FillBuildDiscards::default();
 
     for trade in trades {
+        let mut age_unknown = false;
         // Eligibility first, then the window. The other order counted the age of
         // trades this function then discarded for not being confirmed, so a pass
         // could report that it had kept a trade of unknown age while producing
@@ -208,7 +216,13 @@ pub(crate) fn build_fill_reports_from_trades(
                     continue;
                 }
                 Some(_) => {}
-                None => discards.unknown_age += 1,
+                // Not counted here. The window is only the first filter: a
+                // confirmed trade can still be discarded below for holding no
+                // owned maker order or for mapping to no instrument, and counting
+                // its age at this point let a pass report it had *kept* a trade of
+                // unknown age while producing no report from one. Counted once the
+                // trade has survived every filter, where "kept" is true.
+                None => age_unknown = true,
             }
         }
 
@@ -292,6 +306,9 @@ pub(crate) fn build_fill_reports_from_trades(
                     ts_event,
                     ts_init,
                 );
+                if age_unknown {
+                    discards.unknown_age += 1;
+                }
                 reports.push(report);
             }
         } else {
@@ -856,7 +873,10 @@ mod tests {
             discards.lost_anything(),
             "an undated trade weakens the window's guarantee, so it must be reportable"
         );
-        let windowed_out_only = FillBuildDiscards { unknown_age: 0, ..discards };
+        let windowed_out_only = FillBuildDiscards {
+            unknown_age: 0,
+            ..discards
+        };
         assert!(
             !windowed_out_only.lost_anything(),
             "a windowed-out trade on its own is the window working, not a loss"
