@@ -1501,6 +1501,86 @@ def test_trade_report_get_asset_id_taker_returns_trade_asset_id() -> None:
     assert result == taker_asset_id
 
 
+def test_trade_report_owns_maker_order_when_address_case_differs() -> None:
+    maker_address = "0xAbCd"
+    trade_report = PolymarketTradeReport(
+        id="test-trade-id",
+        taker_order_id="taker-order-123",
+        market="test-market",
+        asset_id="taker-asset",
+        side=PolymarketOrderSide.BUY,
+        size="1",
+        fee_rate_bps="0",
+        price="0.5",
+        status="CONFIRMED",
+        match_time="1725868859",
+        last_update="1725868885",
+        outcome="Yes",
+        bucket_index=0,
+        owner="test-owner",
+        maker_address=maker_address,
+        transaction_hash="0xabcd",
+        maker_orders=[
+            PolymarketMakerOrder(
+                asset_id="maker-asset",
+                fee_rate_bps="0",
+                maker_address=maker_address,
+                matched_amount="1",
+                order_id="maker-order-456",
+                outcome="No",
+                owner="different-api-key",
+                price="0.5",
+            ),
+        ],
+        trader_side=PolymarketLiquiditySide.MAKER,
+    )
+
+    result = trade_report.get_filled_user_order_ids(maker_address.lower(), "api-key")
+
+    assert result == ["maker-order-456"]
+
+
+def test_user_trade_owns_maker_order_when_address_case_differs() -> None:
+    maker_address = "0xAbCd"
+    user_trade = PolymarketUserTrade(
+        asset_id="taker-asset",
+        bucket_index=0,
+        fee_rate_bps="0",
+        id="test-trade-id",
+        last_update="1725868885",
+        maker_address=maker_address,
+        maker_orders=[
+            PolymarketMakerOrder(
+                asset_id="maker-asset",
+                fee_rate_bps="0",
+                maker_address=maker_address,
+                matched_amount="1",
+                order_id="maker-order-456",
+                outcome="No",
+                owner="different-api-key",
+                price="0.5",
+            ),
+        ],
+        market="test-market",
+        match_time="1725868859",
+        outcome="Yes",
+        owner="test-owner",
+        price="0.5",
+        side=PolymarketOrderSide.BUY,
+        size="1",
+        status=PolymarketTradeStatus.CONFIRMED,
+        taker_order_id="taker-order-123",
+        timestamp="1725868885871",
+        trade_owner="test-owner",
+        trader_side=PolymarketLiquiditySide.MAKER,
+        type=PolymarketEventType.TRADE,
+    )
+
+    result = user_trade.get_filled_user_order_ids(maker_address.lower(), "api-key")
+
+    assert result == ["maker-order-456"]
+
+
 def test_trade_report_get_asset_id_maker_returns_maker_order_asset_id() -> None:
     """
     Test that get_asset_id returns the maker order's asset_id when the user is a maker.

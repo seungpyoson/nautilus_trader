@@ -76,7 +76,7 @@ class PolymarketTradeReport(msgspec.Struct, frozen=True):
             user_order_ids = [
                 order.order_id
                 for order in self.maker_orders
-                if order.maker_address == maker_address or order.owner == api_key
+                if order.maker_address.lower() == maker_address.lower() or order.owner == api_key
             ]
         return user_order_ids
 

@@ -51,45 +51,25 @@ use crate::{
     },
 };
 
-/// The precisions to build a venue order's report with, or `None` if that order
-/// belongs to a different asset than the one it was requested as.
+/// The precisions to build a venue order's report with.
 ///
-/// The venue is asked for an order by id and answers with whatever order carries
-/// that id, including one on a different asset, while the instrument comes from
-/// the command rather than from the answer. Without this an order's quantity and
-/// price are attributed to the wrong market.
-///
-/// Shared by both paths that ask for an order by id, because they had drifted:
-/// the bulk path validated and the single-order query did not, and the single
-/// query also fell back to the default precisions while holding the answered
-/// instrument. One definition means a future path cannot pick up only half of it.
+/// Returns `None` when the answer belongs to a different asset or neither the
+/// requested nor answered asset can be resolved.
 fn order_report_precisions(
     instrument_id: InstrumentId,
     asset_id: &str,
     requested: Option<&InstrumentAny>,
     answered: Option<&InstrumentAny>,
 ) -> Option<(u8, u8)> {
-    let mismatched = match (requested, answered) {
-        // The token map is keyed by `raw_symbol`, so a loaded instrument's raw
-        // symbol is the token it trades and comparing against `asset_id` needs no
-        // lookup at all.
-        (Some(requested), _) => requested.raw_symbol().as_str() != asset_id,
-        // The answered asset belongs to a different instrument, which is a
-        // mismatch just the same.
-        (None, Some(answered)) => answered.id() != instrument_id,
-        // Neither side resolvable: nothing to prove a mismatch with, and queries
-        // made before instruments arrive still work.
-        (None, None) => false,
-    };
-    if mismatched {
-        return None;
+    match (requested, answered) {
+        (Some(requested), _) if requested.raw_symbol().as_str() == asset_id => {
+            Some((requested.price_precision(), requested.size_precision()))
+        }
+        (None, Some(answered)) if answered.id() == instrument_id => {
+            Some((answered.price_precision(), answered.size_precision()))
+        }
+        _ => None,
     }
-    // Whichever side resolved. Falling back to the defaults while holding the
-    // answered instrument would round this report's own quantities for no reason.
-    Some(match requested.or(answered) {
-        Some(instrument) => (instrument.price_precision(), instrument.size_precision()),
-        None => (4, 6),
-    })
 }
 
 impl PolymarketExecutionClient {
@@ -331,11 +311,6 @@ impl PolymarketExecutionClient {
         self.spawn_task("query_order", async move {
             match http_client.get_order_optional(&venue_order_id).await {
                 Ok(Some(order)) => {
-                    // The same validation the bulk path performs, through the
-                    // same function. This path had none: it parsed the venue's
-                    // answer under the *requested* instrument without checking
-                    // the answer was on that asset, so another asset's order
-                    // could be reported as this one's.
                     let answered = match &requested_instrument {
                         Some(_) => None,
                         None => token_instruments.get_cloned(&Ustr::from(order.asset_id.as_str())),
@@ -347,9 +322,8 @@ impl PolymarketExecutionClient {
                         answered.as_ref(),
                     ) else {
                         log::error!(
-                            "Polymarket order {venue_order_id} is on asset {} but was queried as \
-                             {instrument_id}; reporting nothing rather than attributing another \
-                             asset's order to it",
+                            "Cannot validate Polymarket order {venue_order_id} asset {} against \
+                             requested instrument {instrument_id}; reporting nothing",
                             order.asset_id,
                         );
                         return Ok(());
@@ -454,24 +428,6 @@ impl PolymarketExecutionClient {
         };
 
         if let Some(order) = order {
-            // The venue is asked for an order by id and answers with whatever
-            // order carries that id, including one on a different asset. The
-            // instrument below comes from the command, not from the answer, so
-            // without this the report would carry the requested instrument's id
-            // over another asset's order -- attributing one market's order,
-            // quantity and price to another.
-            //
-            // Either side is enough to prove this, and the requested side being
-            // unloaded is exactly when an early query runs -- so the answered
-            // side is consulted too, rather than letting an unloaded request
-            // pass everything through. Nothing is refused merely for being
-            // unknown: with neither side resolvable there is no mismatch to
-            // prove, and queries made before instruments arrive still work.
-            // Not loaded is exactly when an early query runs, so the asset the
-            // venue answered with is resolved too. Looked up once and kept,
-            // because it settles two questions rather than one: whether this is
-            // another asset's order, and what precisions the report is built
-            // with.
             let answered = match &instrument {
                 Some(_) => None,
                 None => self
@@ -486,9 +442,8 @@ impl PolymarketExecutionClient {
                 answered.as_ref(),
             ) else {
                 log::error!(
-                    "Polymarket order {venue_order_id} is on asset {} but was requested as \
-                     {instrument_id}; reporting nothing rather than attributing another \
-                     asset's order to it",
+                    "Cannot validate Polymarket order {venue_order_id} asset {} against requested \
+                     instrument {instrument_id}; reporting nothing",
                     order.asset_id,
                 );
                 return Ok(None);
@@ -653,14 +608,10 @@ impl PolymarketExecutionClient {
             &ctx,
             &self.shared_token_instruments,
             cmd.instrument_id,
-            // The command's own lower bound, which this call used to withhold.
-            // The filter applied below reads the report's `ts_event`, and a trade
+            // The filter below reads the report's `ts_event`, and a trade
             // whose `match_time` cannot be parsed is stamped with the current
-            // time -- so a trade of any age passed a window asking for recent
-            // ones, and `unknown_age`, which exists to make exactly that
-            // visible, was never incremented because it is only counted against
-            // a cutoff. Passing the bound is what separates "kept because it is
-            // recent" from "kept because we could not tell".
+            // time. Passing the bound here preserves the distinction between
+            // recent trades and trades whose age is unknown.
             cmd.start,
             self.clock.get_time_ns(),
         );

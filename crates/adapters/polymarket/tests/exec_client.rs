@@ -1311,9 +1311,12 @@ async fn test_generate_order_status_report_single_requires_instrument_id() {
 async fn test_generate_order_status_report_single_returns_report() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
-    let (client, _rx, _cache) = create_test_execution_client(addr);
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
     let cmd = GenerateOrderStatusReport {
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
@@ -6349,6 +6352,40 @@ async fn test_query_order_does_not_relabel_another_asset() {
 
 #[rstest]
 #[tokio::test]
+async fn test_query_order_waits_until_the_order_asset_can_be_validated() {
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(load_json("http_open_order.json"));
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("UNLOADED-TOKEN.POLYMARKET");
+    assert!(cache.borrow().instrument(&instrument_id).is_none());
+    let cmd = QueryOrder::new(
+        TraderId::from("TESTER-001"),
+        Some(*POLYMARKET_CLIENT_ID),
+        StrategyId::from("S-001"),
+        instrument_id,
+        ClientOrderId::from("O-QUERY-UNRESOLVED"),
+        Some(VenueOrderId::from("0x123")),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+
+    client.query_order(cmd).unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "an order must not be attributed until either asset identity can be validated"
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_query_account_does_not_block_within_runtime() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
@@ -6378,15 +6415,8 @@ async fn test_query_account_does_not_block_within_runtime() {
     );
 }
 
-// The three cases below all reduce to one question: when the adapter cannot
-// describe a confirmed fill because its instrument is not loaded, does it report
-// something wrong, or does it decline to report?
-//
-// Earlier revisions of this branch answered by failing the whole pass. That was
-// reverted, because the deployments that most need the guard run with no
-// reconciliation lookback, so one undescribable historical trade made the node
-// permanently unstartable. These pin the answers the current design gives, so the
-// reversal is not mistaken for these cases having stopped mattering.
+// The cases below verify that an undescribable confirmed fill is never
+// attributed to the wrong instrument.
 
 /// A venue order for an asset the request did not ask about must not be returned
 /// as a report for the asset it did ask about.
@@ -6485,6 +6515,35 @@ async fn test_generate_order_status_report_does_not_relabel_when_the_request_is_
             panic!("declining to describe another asset's order is not a query failure: {e}")
         }
     }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_waits_until_the_order_asset_can_be_validated() {
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(load_json("http_open_order.json"));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("UNLOADED-TOKEN.POLYMARKET");
+    assert!(cache.borrow().instrument(&instrument_id).is_none());
+    let cmd = GenerateOrderStatusReport {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: Some(instrument_id),
+        client_order_id: None,
+        venue_order_id: Some(VenueOrderId::from("0x123")),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    let outcome = client.generate_order_status_report(&cmd).await;
+
+    assert!(
+        matches!(outcome, Ok(None)),
+        "an order must not be attributed until either asset identity can be validated"
+    );
 }
 
 /// An order whose only confirmed fill cannot be described must not be reported as

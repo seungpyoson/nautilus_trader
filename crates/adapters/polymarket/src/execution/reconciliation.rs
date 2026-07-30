@@ -59,27 +59,9 @@ pub(crate) struct FillContext<'a> {
 
 /// What [`build_fill_reports_from_trades`] could not turn into a fill report.
 ///
-/// These are returned as facts rather than raised as errors because the callers
-/// differ in what they can do about them, and the most important one can do
-/// nothing at all. A mass status that fails mid-reconciliation aborts node
-/// startup, and `reconciliation_lookback_mins` defaults to `None` -- some
-/// deployments require it, to keep the reconciliation universe unnarrowed -- so
-/// under that configuration a single uninterpretable trade anywhere in the
-/// account's history would make the node permanently unstartable, with no
-/// setting an operator could change to recover. Failing is not the safe
-/// direction when the safe-looking choice cannot be turned off.
-///
-/// So the pass reports what it built and returns the count of what it could not.
-/// `ExecutionMassStatus` carries no field for these counts, which is why an
-/// operator-visible log is the only signal today; giving the report a count is
-/// the change that would let a caller act on one.
-///
-/// Severity belongs to the caller, and this type exists so that it can be. The
-/// callers differ by more than what they can do: `generate_mass_status` runs once
-/// per reconciliation pass, while the report paths run on a poll measured in
-/// seconds. A permanent condition -- one historical trade the account cannot
-/// interpret -- is worth an error once from the pass and is log spam from the
-/// poll, so this function raises neither and each caller states its own.
+/// The builder returns partial results with these counts so each caller can
+/// choose the appropriate severity. `ExecutionMassStatus` has no field for the
+/// counts, so callers currently surface them through logs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FillBuildDiscards {
     /// Entries whose instrument was not loaded, so no report could be built.
@@ -101,19 +83,8 @@ pub(crate) struct FillBuildDiscards {
 impl FillBuildDiscards {
     /// Say what was lost, at the level the caller owns, or say nothing.
     ///
-    /// The caller passes the level because only it knows how loud this should be:
-    /// the reconciliation pass runs once and can afford an error, the report
-    /// paths run on a seconds-long poll and a permanent condition would print
-    /// forever. What is *not* the caller's business is deciding whether there is
-    /// anything to say, or how to word it -- each call site testing that for
-    /// itself is how one predicate becomes four copies that drift apart.
-    ///
-    /// Which is exactly what had happened to `unknown_age`: it was reported by
-    /// one caller, in a warning that caller raised for itself, and the other
-    /// three said nothing at all. A query whose only anomaly was a trade of
-    /// unparsable age was silent on three of the four paths, at every level,
-    /// because the predicate above did not count it. Stated here instead, once,
-    /// so adding a counter cannot leave three callers behind.
+    /// The caller passes the level because reconciliation and polling paths have
+    /// different logging requirements.
     pub(crate) fn report(&self, level: log::Level, context: &str) {
         if !self.lost_anything() {
             return;
@@ -142,12 +113,14 @@ impl FillBuildDiscards {
                 self.unowned_maker_trades,
             ));
         }
+
         if self.unmapped_instruments > 0 {
             findings.push(format!(
                 "{} entr(ies) had no loaded instrument, so their filled quantity is understated",
                 self.unmapped_instruments,
             ));
         }
+
         if self.unknown_age > 0 {
             findings.push(format!(
                 "{} trade(s) had an unparsable match time and were kept, so the window admitted \
@@ -162,31 +135,9 @@ impl FillBuildDiscards {
 /// Converts trade reports into fill reports: single implementation of maker/taker
 /// parsing used by both `generate_fill_reports()` and `generate_mass_status()`.
 ///
-/// `cutoff` is the reconciliation window and has no default on purpose. `GET
-/// /trades` returns history the caller did not ask for, and a caller that
-/// narrowed its own output afterwards still interpreted all of it -- which is
-/// how a lookback that was configured came to have no effect on what this
-/// function saw. Taking the window as an argument makes every caller state one,
-/// so applying it cannot be forgotten in the wiring between the two.
-///
-/// A caller answering a command passes its lower bound here and applies the
-/// command's own bounds afterwards, because the two read different things: this
-/// cutoff reads the venue's `match_time`, while the command filter reads the
-/// timestamp of the fill built from it. They are complementary, not
-/// interchangeable, and neither substitutes for the other.
-///
-/// One consequence worth naming, because the counters are the only way to see it:
-/// a trade whose match time will not parse is stamped with the current time and
-/// so survives *this* stage, and is counted below -- but the command's upper
-/// bound is applied later, so a stamped-now trade outside that bound is dropped
-/// after being counted. The count therefore describes what this builder kept, not
-/// what the caller ultimately reported.
-///
-/// A trade whose match time cannot be parsed is kept, because the fill built
-/// from one is stamped with the current time and therefore belongs to the
-/// window. It is counted as [`FillBuildDiscards::unknown_age`], because "kept
-/// because we could not tell" and "kept because it is recent" are different
-/// facts and only one of them justifies the window's claim.
+/// `cutoff` applies to the venue's `match_time`. A confirmed trade with an
+/// unparsable match time is kept and counted as
+/// [`FillBuildDiscards::unknown_age`].
 pub(crate) fn build_fill_reports_from_trades(
     trades: &[PolymarketTradeReport],
     ctx: &FillContext<'_>,
@@ -200,11 +151,7 @@ pub(crate) fn build_fill_reports_from_trades(
 
     for trade in trades {
         let mut age_unknown = false;
-        // Eligibility first, then the window. The other order counted the age of
-        // trades this function then discarded for not being confirmed, so a pass
-        // could report that it had kept a trade of unknown age while producing
-        // no report from one. Both counters describe confirmed trades now, which
-        // is what both of them are documented to describe.
+
         if trade.status != PolymarketTradeStatus::Confirmed {
             continue;
         }
@@ -216,16 +163,11 @@ pub(crate) fn build_fill_reports_from_trades(
                     continue;
                 }
                 Some(_) => {}
-                // Not counted here. The window is only the first filter: a
-                // confirmed trade can still be discarded below for holding no
-                // owned maker order or for mapping to no instrument, and counting
-                // its age at this point let a pass report it had *kept* a trade of
-                // unknown age while producing no report from one. Counted once the
-                // trade has survived every filter, where "kept" is true.
                 None => age_unknown = true,
             }
         }
 
+        let reports_before = reports.len();
         let is_maker = trade.trader_side == PolymarketLiquiditySide::Maker;
 
         if is_maker {
@@ -234,16 +176,6 @@ pub(crate) fn build_fill_reports_from_trades(
             // as maker holds at least one of its own maker orders. A trade holding none
             // cannot be interpreted, and reporting no fill for it would silently
             // understate the filled quantity of a live order.
-            //
-            // Counted and logged rather than raised. An earlier revision failed the
-            // whole pass here, on the reasoning that a caller with nowhere to put a
-            // count cannot distinguish partial success from complete success. That
-            // reasoning was right about the missing channel and wrong about the
-            // remedy: the caller that most needs to know is `generate_mass_status`,
-            // whose failure aborts startup, and the deployments that most need this
-            // guard run with no lookback at all -- so failing turned an understated
-            // fill into an unstartable node, permanently, for one bad trade anywhere
-            // in the account's history. See [`FillBuildDiscards`].
             //
             // Ownership is judged across the whole match, before any instrument filter,
             // because the unified book matches complementary tokens across assets: the
@@ -255,10 +187,6 @@ pub(crate) fn build_fill_reports_from_trades(
                 .any(|mo| mo.is_owned_by(ctx.user_address, ctx.api_key))
             {
                 discards.unowned_maker_trades += 1;
-                // Debug here, and the operator-visible severity at the caller:
-                // this identifies *which* trade for whoever is diagnosing one,
-                // while how loud the condition is depends on whether the caller
-                // runs once per pass or on a seconds-long poll.
                 log::debug!(
                     "Polymarket confirmed maker trade {} holds no maker order owned by the \
                      configured account {}, so no fill is reported for it and any quantity \
@@ -306,9 +234,6 @@ pub(crate) fn build_fill_reports_from_trades(
                     ts_event,
                     ts_init,
                 );
-                if age_unknown {
-                    discards.unknown_age += 1;
-                }
                 reports.push(report);
             }
         } else {
@@ -345,6 +270,10 @@ pub(crate) fn build_fill_reports_from_trades(
                 ts_init,
             );
             reports.push(report);
+        }
+
+        if age_unknown && reports.len() > reports_before {
+            discards.unknown_age += 1;
         }
     }
 
@@ -489,10 +418,7 @@ pub(crate) async fn generate_mass_status(
     // debug and wraps in release -- turning an absurd-but-valid configuration
     // into a cutoff in the future, which discards every trade. Saturating gives
     // it the meaning the value asks for, an unbounded window.
-    let cutoff = lookback_mins.map(|mins| {
-        let span = mins.saturating_mul(60).saturating_mul(1_000_000_000);
-        UnixNanos::from(ts_init.as_u64().saturating_sub(span))
-    });
+    let cutoff = reconciliation_cutoff(ts_init, lookback_mins);
 
     // Fetch orders
     let orders = http_client
@@ -651,6 +577,13 @@ pub(crate) fn normalize_terminal_order_report_quantity(report: &mut OrderStatusR
         );
         report.quantity = report.filled_qty;
     }
+}
+
+fn reconciliation_cutoff(ts_init: UnixNanos, lookback_mins: Option<u64>) -> Option<UnixNanos> {
+    lookback_mins.map(|mins| {
+        let span = mins.saturating_mul(60).saturating_mul(1_000_000_000);
+        UnixNanos::from(ts_init.as_u64().saturating_sub(span))
+    })
 }
 
 #[cfg(test)]
@@ -863,12 +796,8 @@ mod tests {
             "the undated trade is kept, and the window says so rather than counting it as \
              evidence that it was recent"
         );
-        // Two different facts, which this assertion used to bundle into one and
-        // thereby hide. A windowed-out trade is the window working and is not
-        // reportable. An undated one is kept on the assumption that it is
-        // recent, which is the window's guarantee being weaker than it reads, so
-        // it is. Review found that bundling was why an undated trade produced no
-        // message at all on three of the four paths that build fill reports.
+        // A windowed-out trade is the window working and is not reportable. An
+        // undated trade weakens the window's guarantee and is reportable.
         assert!(
             discards.lost_anything(),
             "an undated trade weakens the window's guarantee, so it must be reportable"
@@ -883,8 +812,7 @@ mod tests {
         );
     }
 
-    /// No lookback means no window, and unbounded reconciliation is a configuration Bolt
-    /// and others deliberately require, so this must not quietly become bounded.
+    /// No lookback means no window, so unbounded reconciliation must remain unbounded.
     #[rstest]
     fn keeps_every_trade_when_no_lookback_is_configured() {
         let (instruments, instrument) = mapped_instrument();
@@ -905,6 +833,13 @@ mod tests {
             !reports.is_empty(),
             "an unbounded window must still reconcile the oldest trade"
         );
+    }
+
+    #[rstest]
+    fn maximum_lookback_saturates_to_an_unbounded_window() {
+        let cutoff = reconciliation_cutoff(UnixNanos::from(u64::MAX), Some(u64::MAX));
+
+        assert_eq!(cutoff, Some(UnixNanos::from(0)));
     }
 
     /// Only confirmed trades are reconciled, so one that has merely matched must not be
@@ -1002,6 +937,50 @@ mod tests {
         );
 
         assert_eq!(reports.len(), 1);
+    }
+
+    #[rstest]
+    fn counts_unknown_age_for_a_taker_trade() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.trader_side = PolymarketLiquiditySide::Taker;
+        trade.match_time = "not a timestamp".to_string();
+
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            None,
+            Some(UnixNanos::from(1)),
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(discards.unknown_age, 1);
+    }
+
+    #[rstest]
+    fn counts_unknown_age_once_for_a_maker_trade_with_multiple_reports() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.match_time = "not a timestamp".to_string();
+        for maker_order in &mut trade.maker_orders {
+            maker_order.maker_address = USER_ADDRESS.to_string();
+            maker_order.owner = COUNTERPARTY_API_KEY.to_string();
+        }
+        let expected_reports = trade.maker_orders.len();
+
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            None,
+            Some(UnixNanos::from(1)),
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(reports.len(), expected_reports);
+        assert_eq!(discards.unknown_age, 1);
     }
 
     #[rstest]
