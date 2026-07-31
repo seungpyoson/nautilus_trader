@@ -1717,6 +1717,58 @@ async fn test_generate_order_status_report_does_not_relabel_a_cached_order() {
 
 #[rstest]
 #[tokio::test]
+async fn test_generate_order_status_report_refuses_a_conflicting_cache_index() {
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(Value::Null);
+    let addr = start_mock_server(state).await;
+    let (client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+
+    let client_order_id = ClientOrderId::from("O-RECOVERY-INDEX-MISMATCH");
+    let order = make_limit_order(
+        client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    let cached_venue_order_id = VenueOrderId::from("0xcached-venue-order");
+    let requested_venue_order_id = VenueOrderId::from("0xrequested-venue-order");
+    cache
+        .borrow_mut()
+        .add_order(order, None, None, false)
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_venue_order_id(&client_order_id, &cached_venue_order_id, false)
+        .unwrap();
+
+    let cmd = GenerateOrderStatusReport {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: Some(instrument_id),
+        client_order_id: Some(client_order_id),
+        venue_order_id: Some(requested_venue_order_id),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    let report = client.generate_order_status_report(&cmd).await.unwrap();
+
+    assert!(
+        report.is_none(),
+        "a cache index for {cached_venue_order_id} must not authorize recovery as \
+         {requested_venue_order_id}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_generate_order_status_report_rejects_a_live_answer_for_another_cached_order() {
     let venue_order_id =
         VenueOrderId::from("0xlive-mismatch000000000000000000000000000000000000000000000000000ff");
@@ -1771,6 +1823,58 @@ async fn test_generate_order_status_report_rejects_a_live_answer_for_another_cac
     assert!(
         report.is_none(),
         "a venue answer for the requested asset must not relabel a cached order from another instrument"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_rejects_a_live_answer_for_a_conflicting_cache_index() {
+    let cached_venue_order_id = VenueOrderId::from("0xcached-live-venue-order");
+    let requested_venue_order_id = VenueOrderId::from("0xrequested-live-venue-order");
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_order.json");
+    venue_order["id"] = Value::String(requested_venue_order_id.to_string());
+    *state.single_order_response.lock().await = Some(venue_order);
+    let addr = start_mock_server(state).await;
+    let (client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let client_order_id = ClientOrderId::from("O-LIVE-INDEX-MISMATCH");
+    let order = make_limit_order(
+        client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order, None, None, false)
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_venue_order_id(&client_order_id, &cached_venue_order_id, false)
+        .unwrap();
+
+    let cmd = GenerateOrderStatusReport {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: Some(instrument_id),
+        client_order_id: Some(client_order_id),
+        venue_order_id: Some(requested_venue_order_id),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    let report = client.generate_order_status_report(&cmd).await.unwrap();
+
+    assert!(
+        report.is_none(),
+        "a live venue answer must not override a conflicting cache identity"
     );
 }
 
@@ -6514,6 +6618,63 @@ async fn test_query_order_does_not_relabel_another_asset() {
             .await
             .is_err(),
         "a venue order for another asset must not be reported against {instrument_id}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_order_refuses_a_conflicting_cache_index() {
+    let cached_venue_order_id = VenueOrderId::from("0xcached-query-venue-order");
+    let requested_venue_order_id = VenueOrderId::from("0xrequested-query-venue-order");
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_order.json");
+    venue_order["id"] = Value::String(requested_venue_order_id.to_string());
+    *state.single_order_response.lock().await = Some(venue_order);
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let client_order_id = ClientOrderId::from("O-QUERY-INDEX-MISMATCH");
+    let order = make_limit_order(
+        client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order, None, None, false)
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_venue_order_id(&client_order_id, &cached_venue_order_id, false)
+        .unwrap();
+
+    let cmd = QueryOrder::new(
+        TraderId::from("TESTER-001"),
+        Some(*POLYMARKET_CLIENT_ID),
+        StrategyId::from("S-001"),
+        instrument_id,
+        client_order_id,
+        Some(requested_venue_order_id),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+
+    client.query_order(cmd).unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "a conflicting cache identity must not emit an order report"
     );
 }
 

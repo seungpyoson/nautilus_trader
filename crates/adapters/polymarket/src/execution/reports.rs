@@ -72,6 +72,41 @@ fn order_report_precisions(
     }
 }
 
+/// Whether every available local identity agrees with an order-scoped request.
+///
+/// The order object, NT cache index, and adapter registry are independent
+/// lifecycle surfaces. A cached order is safe to consume only when at least one
+/// of them proves the requested venue identity and none contradicts it.
+fn cached_order_matches_request(
+    cached_instrument_id: InstrumentId,
+    order_venue_order_id: Option<VenueOrderId>,
+    cache_venue_order_id: Option<VenueOrderId>,
+    registry_venue_order_id: Option<VenueOrderId>,
+    instrument_id: InstrumentId,
+    venue_order_id: VenueOrderId,
+) -> bool {
+    if cached_instrument_id != instrument_id {
+        return false;
+    }
+
+    let known_venue_order_ids = [
+        order_venue_order_id,
+        cache_venue_order_id,
+        registry_venue_order_id,
+    ];
+
+    known_venue_order_ids
+        .iter()
+        .flatten()
+        .next()
+        .is_some_and(|_| {
+            known_venue_order_ids
+                .iter()
+                .flatten()
+                .all(|known| *known == venue_order_id)
+        })
+}
+
 impl PolymarketExecutionClient {
     pub(super) fn fill_context(&self) -> FillContext<'_> {
         let user_address = self
@@ -107,15 +142,24 @@ impl PolymarketExecutionClient {
         let resolved_client_order_id =
             client_order_id.or_else(|| self.core.cache().client_order_id(&venue_order_id).copied());
         let cached = resolved_client_order_id.and_then(|cid| self.core.cache().order_owned(&cid));
-        if let Some(cached) = &cached
-            && cached.instrument_id() != instrument_id
-        {
-            log::error!(
-                "Cached order {venue_order_id} belongs to instrument {}, not requested \
-                 instrument {instrument_id}; reporting nothing",
+        if let Some(cached) = &cached {
+            let client_order_id = cached.client_order_id();
+            let cache_venue_order_id = self.core.cache().venue_order_id(&client_order_id).copied();
+            let registry_venue_order_id = self.order_identities.venue_order_id(&client_order_id);
+            if !cached_order_matches_request(
                 cached.instrument_id(),
-            );
-            return Ok(None);
+                cached.venue_order_id(),
+                cache_venue_order_id,
+                registry_venue_order_id,
+                instrument_id,
+                venue_order_id,
+            ) {
+                log::error!(
+                    "Cached order {client_order_id} does not match requested venue order \
+                     {venue_order_id} and instrument {instrument_id}; reporting nothing"
+                );
+                return Ok(None);
+            }
         }
         let cached_quantity = cached.as_ref().map(Order::quantity);
         let cached_order_type = cached.as_ref().map_or(OrderType::Limit, Order::order_type);
@@ -317,19 +361,27 @@ impl PolymarketExecutionClient {
         let api_key = self.secrets.credential.api_key().to_string();
         let requested_venue_order_id = VenueOrderId::from(venue_order_id.as_str());
         let cached_filled = match cache.order(&client_order_id) {
-            Some(order)
-                if order.instrument_id() != instrument_id
-                    || order
-                        .venue_order_id()
-                        .is_some_and(|id| id != requested_venue_order_id) =>
-            {
-                log::error!(
-                    "Cached order {client_order_id} does not match requested venue order \
-                     {requested_venue_order_id} and instrument {instrument_id}; reporting nothing"
-                );
-                return;
+            Some(order) => {
+                let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
+                let registry_venue_order_id =
+                    self.order_identities.venue_order_id(&client_order_id);
+                if !cached_order_matches_request(
+                    order.instrument_id(),
+                    order.venue_order_id(),
+                    cache_venue_order_id,
+                    registry_venue_order_id,
+                    instrument_id,
+                    requested_venue_order_id,
+                ) {
+                    log::error!(
+                        "Cached order {client_order_id} does not match requested venue order \
+                         {requested_venue_order_id} and instrument {instrument_id}; reporting \
+                         nothing"
+                    );
+                    return;
+                }
+                order.filled_qty()
             }
-            Some(order) => order.filled_qty(),
             None => Quantity::zero(size_prec),
         };
 
@@ -493,18 +545,25 @@ impl PolymarketExecutionClient {
                             .and_then(|id| cache.order(id))
                     });
 
-                if let Some(ref cached) = cached
-                    && (cached.instrument_id() != instrument_id
-                        || cached
-                            .venue_order_id()
-                            .is_some_and(|id| id != venue_order_id))
-                {
-                    log::error!(
-                        "Cached order {} does not match requested venue order {venue_order_id} \
-                         and instrument {instrument_id}; reporting nothing",
-                        cached.client_order_id(),
-                    );
-                    return Ok(None);
+                if let Some(ref cached) = cached {
+                    let client_order_id = cached.client_order_id();
+                    let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
+                    let registry_venue_order_id =
+                        self.order_identities.venue_order_id(&client_order_id);
+                    if !cached_order_matches_request(
+                        cached.instrument_id(),
+                        cached.venue_order_id(),
+                        cache_venue_order_id,
+                        registry_venue_order_id,
+                        instrument_id,
+                        venue_order_id,
+                    ) {
+                        log::error!(
+                            "Cached order {client_order_id} does not match requested venue order \
+                             {venue_order_id} and instrument {instrument_id}; reporting nothing"
+                        );
+                        return Ok(None);
+                    }
                 }
                 cached.map_or_else(|| Quantity::zero(size_prec), |order| order.filled_qty())
             };

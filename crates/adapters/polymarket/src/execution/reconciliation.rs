@@ -138,6 +138,17 @@ impl FillBuildDiscards {
 /// `start` and `end` apply to the venue's `match_time`. A confirmed trade with
 /// an unparsable match time in either bounded query is kept and counted as
 /// [`FillBuildDiscards::unknown_age`].
+fn trade_mentions_venue_order(
+    trade: &PolymarketTradeReport,
+    venue_order_id: &VenueOrderId,
+) -> bool {
+    trade.taker_order_id == venue_order_id.as_str()
+        || trade
+            .maker_orders
+            .iter()
+            .any(|order| order.order_id == venue_order_id.as_str())
+}
+
 pub(crate) fn build_fill_reports_from_trades(
     trades: &[PolymarketTradeReport],
     ctx: &FillContext<'_>,
@@ -155,6 +166,16 @@ pub(crate) fn build_fill_reports_from_trades(
         let mut age_unknown = false;
 
         if trade.status != PolymarketTradeStatus::Confirmed {
+            continue;
+        }
+
+        // Order-scoped queries own diagnostics only for trades that mention
+        // that order. Keep the report-level filter below as well because one
+        // maker trade can contain the target plus other owned maker orders.
+        if venue_order_filter
+            .as_ref()
+            .is_some_and(|id| !trade_mentions_venue_order(trade, id))
+        {
             continue;
         }
 
@@ -706,6 +727,55 @@ mod tests {
 
         assert!(reports.is_empty(), "{reports:?}");
         assert_eq!(discards.unowned_maker_trades, 1);
+    }
+
+    #[rstest]
+    fn order_filter_ignores_unowned_maker_trades_for_other_orders() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        disown_maker_orders(&mut trade);
+
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            None,
+            Some(VenueOrderId::from("TARGET-NOT-IN-TRADE")),
+            None,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(reports.is_empty());
+        assert_eq!(
+            discards.unowned_maker_trades, 0,
+            "an unrelated trade must not become a diagnostic for an order-scoped query"
+        );
+    }
+
+    #[rstest]
+    fn order_filter_ignores_unmapped_instruments_for_other_orders() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.trader_side = PolymarketLiquiditySide::Taker;
+        trade.asset_id = Ustr::from("UNMAPPED-TOKEN");
+
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            None,
+            Some(VenueOrderId::from("TARGET-NOT-IN-TRADE")),
+            None,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(reports.is_empty());
+        assert_eq!(
+            discards.unmapped_instruments, 0,
+            "an unrelated trade must not become a diagnostic for an order-scoped query"
+        );
     }
 
     /// The configured account, written the way a block explorer displays it. `user_address`
