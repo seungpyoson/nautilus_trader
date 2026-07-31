@@ -175,6 +175,7 @@ impl PolymarketExecutionClient {
             let client_order_id = cached.client_order_id();
             let cache_venue_order_id = self.core.cache().venue_order_id(&client_order_id).copied();
             let registry_venue_order_id = self.order_identities.venue_order_id(&client_order_id);
+
             if !cached_order_matches_request(
                 cached.instrument_id(),
                 cached.venue_order_id(),
@@ -394,6 +395,7 @@ impl PolymarketExecutionClient {
                 let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
                 let registry_venue_order_id =
                     self.order_identities.venue_order_id(&client_order_id);
+
                 if !cached_order_matches_request(
                     order.instrument_id(),
                     order.venue_order_id(),
@@ -579,6 +581,7 @@ impl PolymarketExecutionClient {
                     let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
                     let registry_venue_order_id =
                         self.order_identities.venue_order_id(&client_order_id);
+
                     if !cached_order_matches_request(
                         cached.instrument_id(),
                         cached.venue_order_id(),
