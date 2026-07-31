@@ -107,6 +107,16 @@ impl PolymarketExecutionClient {
         let resolved_client_order_id =
             client_order_id.or_else(|| self.core.cache().client_order_id(&venue_order_id).copied());
         let cached = resolved_client_order_id.and_then(|cid| self.core.cache().order_owned(&cid));
+        if let Some(cached) = &cached
+            && cached.instrument_id() != instrument_id
+        {
+            log::error!(
+                "Cached order {venue_order_id} belongs to instrument {}, not requested \
+                 instrument {instrument_id}; reporting nothing",
+                cached.instrument_id(),
+            );
+            return Ok(None);
+        }
         let cached_quantity = cached.as_ref().map(Order::quantity);
         let cached_order_type = cached.as_ref().map_or(OrderType::Limit, Order::order_type);
         let cached_tif = cached
@@ -165,6 +175,7 @@ impl PolymarketExecutionClient {
             &ctx,
             &self.shared_token_instruments,
             Some(instrument_id),
+            None,
             None,
             ts_init,
         );
@@ -613,6 +624,7 @@ impl PolymarketExecutionClient {
             // time. Passing the bound here preserves the distinction between
             // recent trades and trades whose age is unknown.
             cmd.start,
+            cmd.end,
             self.clock.get_time_ns(),
         );
 
@@ -704,6 +716,7 @@ async fn fetch_confirmed_fill_reports(
         ctx,
         token_instruments,
         instrument_id,
+        None,
         None,
         ts_init,
     );

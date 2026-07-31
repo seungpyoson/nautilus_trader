@@ -1609,6 +1609,74 @@ async fn test_generate_order_status_report_recovers_canceled_when_no_trades() {
 
 #[rstest]
 #[tokio::test]
+async fn test_generate_order_status_report_does_not_relabel_a_cached_order() {
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(Value::Null);
+    let addr = start_mock_server(state).await;
+    let (client, _rx, cache) = create_test_execution_client(addr);
+
+    let cached_instrument_id = InstrumentId::from("CACHED-TOKEN.POLYMARKET");
+    let requested_instrument_id = InstrumentId::from("REQUESTED-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, cached_instrument_id, 4);
+    add_instrument_to_cache_with_size_precision(&cache, requested_instrument_id, 4);
+
+    let venue_order_id =
+        VenueOrderId::from("0xmismatch000000000000000000000000000000000000000000000000000000ff");
+    let client_order_id = ClientOrderId::from("O-RECOVERY-MISMATCH");
+    let mut order = OrderAny::Limit(LimitOrder::new(
+        TraderId::from("TESTER-001"),
+        StrategyId::from("S-001"),
+        cached_instrument_id,
+        client_order_id,
+        OrderSide::Buy,
+        Quantity::new(10.0, 4),
+        Price::from("0.5000"),
+        TimeInForce::Gtc,
+        None,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    ));
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, venue_order_id.as_str());
+
+    let cmd = GenerateOrderStatusReport {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: Some(requested_instrument_id),
+        client_order_id: Some(client_order_id),
+        venue_order_id: Some(venue_order_id),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    let report = client.generate_order_status_report(&cmd).await.unwrap();
+
+    assert!(
+        report.is_none(),
+        "a cached order for {cached_instrument_id} must not be reported as {requested_instrument_id}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_generate_order_status_report_returns_none_without_cached_order() {
     // No trades, no cached order: nothing to recover. Defer to the engine's
     // existing not-found-at-venue path (matches docs and Python behavior).

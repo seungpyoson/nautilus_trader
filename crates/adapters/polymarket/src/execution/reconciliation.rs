@@ -135,15 +135,17 @@ impl FillBuildDiscards {
 /// Converts trade reports into fill reports: single implementation of maker/taker
 /// parsing used by both `generate_fill_reports()` and `generate_mass_status()`.
 ///
-/// `cutoff` applies to the venue's `match_time`. A confirmed trade with an
-/// unparsable match time is kept and counted as
+/// `start` applies to the venue's `match_time`; `end` marks an upper-bounded
+/// query whose report filtering happens after construction. A confirmed trade
+/// with an unparsable match time in either bounded query is kept and counted as
 /// [`FillBuildDiscards::unknown_age`].
 pub(crate) fn build_fill_reports_from_trades(
     trades: &[PolymarketTradeReport],
     ctx: &FillContext<'_>,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     instrument_filter: Option<InstrumentId>,
-    cutoff: Option<UnixNanos>,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
     ts_init: UnixNanos,
 ) -> (Vec<FillReport>, FillBuildDiscards) {
     let mut reports = Vec::new();
@@ -156,7 +158,7 @@ pub(crate) fn build_fill_reports_from_trades(
             continue;
         }
 
-        if let Some(cutoff) = cutoff {
+        if let Some(cutoff) = start {
             match parse_timestamp(&trade.match_time) {
                 Some(ts) if ts < cutoff => {
                     discards.outside_lookback += 1;
@@ -165,6 +167,8 @@ pub(crate) fn build_fill_reports_from_trades(
                 Some(_) => {}
                 None => age_unknown = true,
             }
+        } else if end.is_some() && parse_timestamp(&trade.match_time).is_none() {
+            age_unknown = true;
         }
 
         let reports_before = reports.len();
@@ -438,7 +442,7 @@ pub(crate) async fn generate_mass_status(
     let trades_before = all_trades.len();
 
     let (mut fill_reports, fills_filtered) =
-        build_fill_reports_from_trades(&all_trades, ctx, instruments, None, cutoff, ts_init);
+        build_fill_reports_from_trades(&all_trades, ctx, instruments, None, cutoff, None, ts_init);
     let trades_after = trades_before - fills_filtered.outside_lookback;
 
     // Snap dust drift on REST fills the same way the WS path does.
@@ -666,6 +670,7 @@ mod tests {
             &instruments,
             None,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
         );
 
@@ -692,6 +697,7 @@ mod tests {
             &[trade],
             &fill_context(),
             &instruments,
+            None,
             None,
             None,
             UnixNanos::from(1_000_000_000u64),
@@ -727,6 +733,7 @@ mod tests {
             &[trade],
             &context,
             &instruments,
+            None,
             None,
             None,
             UnixNanos::from(1_000_000_000u64),
@@ -767,6 +774,7 @@ mod tests {
             &instruments,
             None,
             Some(cutoff),
+            None,
             ts_init,
         );
 
@@ -780,6 +788,7 @@ mod tests {
             &[recent_again, undated_again],
             &fill_context(),
             &instruments,
+            None,
             None,
             None,
             ts_init,
@@ -825,6 +834,7 @@ mod tests {
             &instruments,
             None,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
         );
 
@@ -864,6 +874,7 @@ mod tests {
             &instruments,
             None,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
         );
 
@@ -886,6 +897,7 @@ mod tests {
             &[trade],
             &fill_context(),
             &instruments,
+            None,
             None,
             None,
             UnixNanos::from(1_000_000_000u64),
@@ -913,6 +925,7 @@ mod tests {
             &instruments,
             Some(instrument.id()),
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
         );
 
@@ -931,6 +944,7 @@ mod tests {
             &[trade],
             &fill_context(),
             &instruments,
+            None,
             None,
             None,
             UnixNanos::from(1_000_000_000u64),
@@ -952,7 +966,30 @@ mod tests {
             &instruments,
             None,
             Some(UnixNanos::from(1)),
+            None,
             UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(discards.unknown_age, 1);
+    }
+
+    #[rstest]
+    fn counts_unknown_age_for_an_end_only_window() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.trader_side = PolymarketLiquiditySide::Taker;
+        trade.match_time = "not a timestamp".to_string();
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            None,
+            None,
+            Some(UnixNanos::from(1_000_000_001u64)),
+            ts_init,
         );
 
         assert_eq!(reports.len(), 1);
@@ -976,6 +1013,7 @@ mod tests {
             &instruments,
             None,
             Some(UnixNanos::from(1)),
+            None,
             UnixNanos::from(1_000_000_000u64),
         );
 

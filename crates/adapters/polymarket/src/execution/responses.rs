@@ -1075,6 +1075,7 @@ mod tests {
             &instruments,
             None,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
         );
 
