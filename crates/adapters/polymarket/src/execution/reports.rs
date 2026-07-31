@@ -123,6 +123,35 @@ impl PolymarketExecutionClient {
         }
     }
 
+    fn cached_filled_for_report(&self, report: &OrderStatusReport) -> Option<Quantity> {
+        let cache = self.core.cache();
+        let client_order_id = report
+            .client_order_id
+            .or_else(|| cache.client_order_id(&report.venue_order_id).copied())?;
+        let cached = cache.order(&client_order_id)?;
+        let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
+        let registry_venue_order_id = self.order_identities.venue_order_id(&client_order_id);
+
+        if !cached_order_matches_request(
+            cached.instrument_id(),
+            cached.venue_order_id(),
+            cache_venue_order_id,
+            registry_venue_order_id,
+            report.instrument_id,
+            report.venue_order_id,
+        ) {
+            log::error!(
+                "Cached order {client_order_id} does not match venue report order {} and \
+                 instrument {}; ignoring its filled quantity",
+                report.venue_order_id,
+                report.instrument_id,
+            );
+            return None;
+        }
+
+        Some(cached.filled_qty())
+    }
+
     pub(super) async fn recover_terminal_status_from_trades(
         &self,
         venue_order_id: VenueOrderId,
@@ -629,9 +658,8 @@ impl PolymarketExecutionClient {
         );
 
         let needs_confirmed_fills = reports.iter().any(|report| {
-            let cached_filled = report
-                .client_order_id
-                .and_then(|id| self.core.cache().order(&id).map(|order| order.filled_qty()))
+            let cached_filled = self
+                .cached_filled_for_report(report)
                 .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
             report.filled_qty > cached_filled
         });
@@ -657,15 +685,8 @@ impl PolymarketExecutionClient {
         };
 
         for report in &mut reports {
-            let cached_filled = report
-                .client_order_id
-                .and_then(|id| self.core.cache().order(&id).map(|order| order.filled_qty()))
-                .or_else(|| {
-                    self.core
-                        .cache()
-                        .client_order_id(&report.venue_order_id)
-                        .and_then(|id| self.core.cache().order(id).map(|order| order.filled_qty()))
-                })
+            let cached_filled = self
+                .cached_filled_for_report(report)
                 .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
             let tracked_filled = self
                 .fill_tracker

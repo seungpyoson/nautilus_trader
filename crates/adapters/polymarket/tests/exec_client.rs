@@ -60,12 +60,12 @@ use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::{AccountAny, cash::CashAccount},
     enums::{
-        AccountType, AssetClass, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
-        TriggerType,
+        AccountType, AssetClass, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
+        TimeInForce, TriggerType,
     },
     events::{AccountState, OrderEventAny, OrderPendingCancel},
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TraderId,
+        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TradeId, TraderId,
         VenueOrderId,
     },
     instruments::{BinaryOption, InstrumentAny},
@@ -1208,6 +1208,97 @@ async fn test_generate_order_status_reports_recovers_confirmed_rest_fill() {
     let query = state.last_query.lock().await;
     assert!(!query.contains_key("after"));
     assert!(!query.contains_key("before"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_reports_ignores_a_mismatched_cached_fill() {
+    let venue_order_id_str = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12";
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_orders_page.json")["data"][0].clone();
+    venue_order["id"] = Value::String(venue_order_id_str.to_string());
+    venue_order["status"] = Value::String("MATCHED".to_string());
+    venue_order["original_size"] = Value::String("10.0000".to_string());
+    venue_order["size_matched"] = Value::String("10.0000".to_string());
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [venue_order],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    let reported_instrument_id = InstrumentId::from("REPORTED-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, reported_instrument_id, 4);
+    let reported_instrument = cache
+        .borrow()
+        .instrument(&reported_instrument_id)
+        .unwrap()
+        .clone();
+    client.on_instrument(reported_instrument);
+
+    let cached_instrument_id = InstrumentId::from("CACHED-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, cached_instrument_id, 4);
+    let cached_instrument = cache
+        .borrow()
+        .instrument(&cached_instrument_id)
+        .unwrap()
+        .clone();
+    let client_order_id = ClientOrderId::from("O-BULK-CACHE-MISMATCH");
+    let mut cached_order = make_limit_order(
+        client_order_id.as_str(),
+        cached_instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(cached_order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut cached_order, venue_order_id_str);
+    let cached_fill = TestOrderEventStubs::filled(
+        &cached_order,
+        &cached_instrument,
+        Some(TradeId::from("T-BULK-CACHE-MISMATCH")),
+        None,
+        Some(Price::from("0.5000")),
+        Some(Quantity::from("5.0000")),
+        Some(LiquiditySide::Taker),
+        None,
+        None,
+        Some(AccountId::from("POLYMARKET-001")),
+    );
+    cache.borrow_mut().update_order(&cached_fill).unwrap();
+
+    let reports = client
+        .generate_order_status_reports(&GenerateOrderStatusReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            open_only: false,
+            instrument_id: Some(reported_instrument_id),
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].instrument_id, reported_instrument_id);
+    assert!(
+        reports[0].filled_qty.is_zero(),
+        "a cache entry for {cached_instrument_id} must not become fill evidence for \
+         {reported_instrument_id}"
+    );
 }
 
 #[rstest]
