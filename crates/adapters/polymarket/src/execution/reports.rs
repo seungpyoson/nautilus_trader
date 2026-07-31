@@ -38,7 +38,7 @@ use super::{
         weighted_average_price,
     },
     reconciliation::{
-        FillContext, apply_fill_filters, build_fill_reports_from_trades, build_position_reports,
+        FillContext, build_fill_reports_from_trades, build_position_reports,
         cap_order_report_filled_qty, confirmed_filled_quantities,
         normalize_terminal_order_report_quantity,
     },
@@ -175,13 +175,13 @@ impl PolymarketExecutionClient {
             &ctx,
             &self.shared_token_instruments,
             Some(instrument_id),
+            Some(venue_order_id),
             None,
             None,
             ts_init,
         );
 
         discards.report(log::Level::Debug, "Polymarket order status report");
-        order_fills.retain(|f| f.venue_order_id == venue_order_id);
         self.fill_tracker.snap_fill_reports(&mut order_fills);
 
         if order_fills.is_empty() {
@@ -315,9 +315,23 @@ impl PolymarketExecutionClient {
             .clone()
             .unwrap_or_else(|| self.secrets.address.clone());
         let api_key = self.secrets.credential.api_key().to_string();
-        let cached_filled = cache
-            .order(&client_order_id)
-            .map_or_else(|| Quantity::zero(size_prec), |order| order.filled_qty());
+        let requested_venue_order_id = VenueOrderId::from(venue_order_id.as_str());
+        let cached_filled = match cache.order(&client_order_id) {
+            Some(order)
+                if order.instrument_id() != instrument_id
+                    || order
+                        .venue_order_id()
+                        .is_some_and(|id| id != requested_venue_order_id) =>
+            {
+                log::error!(
+                    "Cached order {client_order_id} does not match requested venue order \
+                     {requested_venue_order_id} and instrument {instrument_id}; reporting nothing"
+                );
+                return;
+            }
+            Some(order) => order.filled_qty(),
+            None => Quantity::zero(size_prec),
+        };
 
         self.spawn_task("query_order", async move {
             match http_client.get_order_optional(&venue_order_id).await {
@@ -348,9 +362,8 @@ impl PolymarketExecutionClient {
                         size_prec,
                         clock.get_time_ns(),
                     );
-                    let venue_order_id = VenueOrderId::from(venue_order_id.as_str());
                     let tracked_filled = fill_tracker
-                        .get_cumulative_filled(&venue_order_id)
+                        .get_cumulative_filled(&requested_venue_order_id)
                         .unwrap_or_else(|| Quantity::zero(size_prec));
                     let local_filled = cached_filled.max(tracked_filled);
                     let confirmed_filled = if report.filled_qty > local_filled {
@@ -373,7 +386,7 @@ impl PolymarketExecutionClient {
                         .await
                         {
                             Ok(fills) => confirmed_filled_quantities(&fills)
-                                .get(&venue_order_id)
+                                .get(&requested_venue_order_id)
                                 .copied(),
                             Err(e) => {
                                 log::warn!(
@@ -469,16 +482,32 @@ impl PolymarketExecutionClient {
                 size_prec,
                 self.clock.get_time_ns(),
             );
-            let cached_filled = cmd
-                .client_order_id
-                .and_then(|id| self.core.cache().order(&id).map(|order| order.filled_qty()))
-                .or_else(|| {
-                    self.core
-                        .cache()
-                        .client_order_id(&venue_order_id)
-                        .and_then(|id| self.core.cache().order(id).map(|order| order.filled_qty()))
-                })
-                .unwrap_or_else(|| Quantity::zero(size_prec));
+            let cached_filled = {
+                let cache = self.core.cache();
+                let cached = cmd
+                    .client_order_id
+                    .and_then(|id| cache.order(&id))
+                    .or_else(|| {
+                        cache
+                            .client_order_id(&venue_order_id)
+                            .and_then(|id| cache.order(id))
+                    });
+
+                if let Some(ref cached) = cached
+                    && (cached.instrument_id() != instrument_id
+                        || cached
+                            .venue_order_id()
+                            .is_some_and(|id| id != venue_order_id))
+                {
+                    log::error!(
+                        "Cached order {} does not match requested venue order {venue_order_id} \
+                         and instrument {instrument_id}; reporting nothing",
+                        cached.client_order_id(),
+                    );
+                    return Ok(None);
+                }
+                cached.map_or_else(|| Quantity::zero(size_prec), |order| order.filled_qty())
+            };
             let tracked_filled = self
                 .fill_tracker
                 .get_cumulative_filled(&venue_order_id)
@@ -619,10 +648,7 @@ impl PolymarketExecutionClient {
             &ctx,
             &self.shared_token_instruments,
             cmd.instrument_id,
-            // The filter below reads the report's `ts_event`, and a trade
-            // whose `match_time` cannot be parsed is stamped with the current
-            // time. Passing the bound here preserves the distinction between
-            // recent trades and trades whose age is unknown.
+            cmd.venue_order_id,
             cmd.start,
             cmd.end,
             self.clock.get_time_ns(),
@@ -634,8 +660,6 @@ impl PolymarketExecutionClient {
         discards.report(log::Level::Warn, "Polymarket fill reports");
 
         self.fill_tracker.snap_fill_reports(&mut reports);
-
-        let reports = apply_fill_filters(reports, cmd.venue_order_id, cmd.start, cmd.end);
 
         log::debug!("Generated {} fill reports", reports.len());
         Ok(reports)
@@ -716,6 +740,7 @@ async fn fetch_confirmed_fill_reports(
         ctx,
         token_instruments,
         instrument_id,
+        None,
         None,
         None,
         ts_init,

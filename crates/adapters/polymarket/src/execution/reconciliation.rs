@@ -68,7 +68,7 @@ pub(crate) struct FillBuildDiscards {
     pub unmapped_instruments: usize,
     /// Confirmed maker trades holding none of the account's own maker orders.
     pub unowned_maker_trades: usize,
-    /// Trades older than the caller's reconciliation window.
+    /// Trades outside the caller's reconciliation window.
     pub outside_lookback: usize,
     /// Trades kept despite an unparsable match time, so their age is unknown.
     ///
@@ -135,15 +135,15 @@ impl FillBuildDiscards {
 /// Converts trade reports into fill reports: single implementation of maker/taker
 /// parsing used by both `generate_fill_reports()` and `generate_mass_status()`.
 ///
-/// `start` applies to the venue's `match_time`; `end` marks an upper-bounded
-/// query whose report filtering happens after construction. A confirmed trade
-/// with an unparsable match time in either bounded query is kept and counted as
+/// `start` and `end` apply to the venue's `match_time`. A confirmed trade with
+/// an unparsable match time in either bounded query is kept and counted as
 /// [`FillBuildDiscards::unknown_age`].
 pub(crate) fn build_fill_reports_from_trades(
     trades: &[PolymarketTradeReport],
     ctx: &FillContext<'_>,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     instrument_filter: Option<InstrumentId>,
+    venue_order_filter: Option<VenueOrderId>,
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
     ts_init: UnixNanos,
@@ -158,17 +158,17 @@ pub(crate) fn build_fill_reports_from_trades(
             continue;
         }
 
-        if let Some(cutoff) = start {
-            match parse_timestamp(&trade.match_time) {
-                Some(ts) if ts < cutoff => {
-                    discards.outside_lookback += 1;
-                    continue;
-                }
-                Some(_) => {}
-                None => age_unknown = true,
+        match parse_timestamp(&trade.match_time) {
+            Some(ts)
+                if start.is_some_and(|cutoff| ts < cutoff)
+                    || end.is_some_and(|cutoff| ts > cutoff) =>
+            {
+                discards.outside_lookback += 1;
+                continue;
             }
-        } else if end.is_some() && parse_timestamp(&trade.match_time).is_none() {
-            age_unknown = true;
+            Some(_) => {}
+            None if start.is_some() || end.is_some() => age_unknown = true,
+            None => {}
         }
 
         let reports_before = reports.len();
@@ -238,7 +238,13 @@ pub(crate) fn build_fill_reports_from_trades(
                     ts_event,
                     ts_init,
                 );
-                reports.push(report);
+
+                if venue_order_filter
+                    .as_ref()
+                    .is_none_or(|id| report.venue_order_id == *id)
+                {
+                    reports.push(report);
+                }
             }
         } else {
             let token_id = Ustr::from(trade.asset_id.as_str());
@@ -273,7 +279,13 @@ pub(crate) fn build_fill_reports_from_trades(
                 taker_fee_rate,
                 ts_init,
             );
-            reports.push(report);
+
+            if venue_order_filter
+                .as_ref()
+                .is_none_or(|id| report.venue_order_id == *id)
+            {
+                reports.push(report);
+            }
         }
 
         if age_unknown && reports.len() > reports_before {
@@ -325,27 +337,6 @@ pub(crate) fn build_order_reports_from_orders(
     }
 
     (reports, filtered)
-}
-
-/// Applies venue_order_id and time-range filters to fill reports.
-pub(crate) fn apply_fill_filters(
-    mut reports: Vec<FillReport>,
-    venue_order_id: Option<VenueOrderId>,
-    start: Option<UnixNanos>,
-    end: Option<UnixNanos>,
-) -> Vec<FillReport> {
-    if let Some(vid) = venue_order_id {
-        reports.retain(|r| r.venue_order_id == vid);
-    }
-
-    match (start, end) {
-        (Some(s), Some(e)) => reports.retain(|r| r.ts_event >= s && r.ts_event <= e),
-        (Some(s), None) => reports.retain(|r| r.ts_event >= s),
-        (None, Some(e)) => reports.retain(|r| r.ts_event <= e),
-        (None, None) => {}
-    }
-
-    reports
 }
 
 /// Builds position status reports from Data API positions, filtering dust.
@@ -441,8 +432,16 @@ pub(crate) async fn generate_mass_status(
 
     let trades_before = all_trades.len();
 
-    let (mut fill_reports, fills_filtered) =
-        build_fill_reports_from_trades(&all_trades, ctx, instruments, None, cutoff, None, ts_init);
+    let (mut fill_reports, fills_filtered) = build_fill_reports_from_trades(
+        &all_trades,
+        ctx,
+        instruments,
+        None,
+        None,
+        cutoff,
+        None,
+        ts_init,
+    );
     let trades_after = trades_before - fills_filtered.outside_lookback;
 
     // Snap dust drift on REST fills the same way the WS path does.
@@ -671,6 +670,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
         );
 
@@ -697,6 +697,7 @@ mod tests {
             &[trade],
             &fill_context(),
             &instruments,
+            None,
             None,
             None,
             None,
@@ -733,6 +734,7 @@ mod tests {
             &[trade],
             &context,
             &instruments,
+            None,
             None,
             None,
             None,
@@ -773,6 +775,7 @@ mod tests {
             &fill_context(),
             &instruments,
             None,
+            None,
             Some(cutoff),
             None,
             ts_init,
@@ -788,6 +791,7 @@ mod tests {
             &[recent_again, undated_again],
             &fill_context(),
             &instruments,
+            None,
             None,
             None,
             None,
@@ -835,6 +839,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
         );
 
@@ -875,6 +880,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
         );
 
@@ -897,6 +903,7 @@ mod tests {
             &[trade],
             &fill_context(),
             &instruments,
+            None,
             None,
             None,
             None,
@@ -926,6 +933,7 @@ mod tests {
             Some(instrument.id()),
             None,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
         );
 
@@ -947,6 +955,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::from(1_000_000_000u64),
         );
 
@@ -964,6 +973,7 @@ mod tests {
             &[trade],
             &fill_context(),
             &instruments,
+            None,
             None,
             Some(UnixNanos::from(1)),
             None,
@@ -986,6 +996,7 @@ mod tests {
             &[trade],
             &fill_context(),
             &instruments,
+            None,
             None,
             None,
             Some(UnixNanos::from(1_000_000_001u64)),
@@ -1011,6 +1022,7 @@ mod tests {
             &[trade],
             &fill_context(),
             &instruments,
+            None,
             None,
             Some(UnixNanos::from(1)),
             None,

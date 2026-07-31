@@ -1237,6 +1237,46 @@ async fn test_generate_fill_reports_empty_without_instruments() {
 
 #[rstest]
 #[tokio::test]
+async fn test_generate_fill_reports_keeps_unknown_age_inside_an_end_only_query() {
+    let venue_order_id =
+        VenueOrderId::from("0xunknownage0000000000000000000000000000000000000000000000000000ff");
+    let state = TestServerState::default();
+    let mut trades = recovery_trades_response(venue_order_id.as_str(), "10.0000", "0.5000");
+    trades["data"][0]["match_time"] = Value::String("not a timestamp".to_string());
+    *state.trades_response_override.lock().await = Some(trades);
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let reports = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            venue_order_id: Some(venue_order_id),
+            start: None,
+            end: Some(UnixNanos::from(1)),
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reports.len(),
+        1,
+        "an unparsable event time must be reported as unknown, not silently filtered by its fallback timestamp"
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_generate_position_status_reports_always_empty() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
@@ -1672,6 +1712,65 @@ async fn test_generate_order_status_report_does_not_relabel_a_cached_order() {
     assert!(
         report.is_none(),
         "a cached order for {cached_instrument_id} must not be reported as {requested_instrument_id}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_rejects_a_live_answer_for_another_cached_order() {
+    let venue_order_id =
+        VenueOrderId::from("0xlive-mismatch000000000000000000000000000000000000000000000000000ff");
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_order.json");
+    venue_order["id"] = Value::String(venue_order_id.to_string());
+    *state.single_order_response.lock().await = Some(venue_order);
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    let cached_instrument_id = InstrumentId::from("CACHED-TOKEN.POLYMARKET");
+    let requested_instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, cached_instrument_id, 4);
+    add_instrument_to_cache_with_size_precision(&cache, requested_instrument_id, 4);
+    let requested = cache
+        .borrow()
+        .instrument(&requested_instrument_id)
+        .unwrap()
+        .clone();
+    client.on_instrument(requested);
+
+    let client_order_id = ClientOrderId::from("O-LIVE-RECOVERY-MISMATCH");
+    let mut cached_order = make_limit_order(
+        client_order_id.as_str(),
+        cached_instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(cached_order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut cached_order, venue_order_id.as_str());
+
+    let report = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(requested_instrument_id),
+            client_order_id: Some(client_order_id),
+            venue_order_id: Some(venue_order_id),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        report.is_none(),
+        "a venue answer for the requested asset must not relabel a cached order from another instrument"
     );
 }
 
