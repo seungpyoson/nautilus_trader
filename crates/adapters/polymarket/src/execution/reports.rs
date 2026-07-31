@@ -153,6 +153,36 @@ impl PolymarketExecutionClient {
         }
     }
 
+    /// Whether the independent cache and adapter indexes agree with the request.
+    ///
+    /// These indexes can outlive or precede the cached order object, so validate
+    /// them before optional order lookup rather than making the object the gate.
+    fn local_order_indexes_match_request(
+        &self,
+        requested_client_order_id: Option<ClientOrderId>,
+        indexed_client_order_id: Option<ClientOrderId>,
+        venue_order_id: VenueOrderId,
+    ) -> bool {
+        if !client_order_ids_match_request(requested_client_order_id, None, indexed_client_order_id)
+        {
+            return false;
+        }
+
+        let Some(client_order_id) = requested_client_order_id.or(indexed_client_order_id) else {
+            return true;
+        };
+        let cache = self.core.cache();
+        let known_venue_order_ids = [
+            cache.venue_order_id(&client_order_id).copied(),
+            self.order_identities.venue_order_id(&client_order_id),
+        ];
+
+        known_venue_order_ids
+            .iter()
+            .flatten()
+            .all(|known| *known == venue_order_id)
+    }
+
     fn cached_filled_for_report(&self, report: &OrderStatusReport) -> Option<Quantity> {
         let cache = self.core.cache();
         let indexed_client_order_id = cache.client_order_id(&report.venue_order_id).copied();
@@ -201,9 +231,13 @@ impl PolymarketExecutionClient {
             .context("failed to fetch trades for order recovery")?;
 
         let indexed_client_order_id = self.core.cache().client_order_id(&venue_order_id).copied();
-        if !client_order_ids_match_request(client_order_id, None, indexed_client_order_id) {
+        if !self.local_order_indexes_match_request(
+            client_order_id,
+            indexed_client_order_id,
+            venue_order_id,
+        ) {
             log::error!(
-                "Requested client order identity does not match the cache index for venue order \
+                "Requested order identity does not match local indexes for venue order \
                  {venue_order_id}; reporting nothing"
             );
             return Ok(None);
@@ -439,10 +473,14 @@ impl PolymarketExecutionClient {
         let api_key = self.secrets.credential.api_key().to_string();
         let requested_venue_order_id = VenueOrderId::from(venue_order_id.as_str());
         let indexed_client_order_id = cache.client_order_id(&requested_venue_order_id).copied();
-        if !client_order_ids_match_request(Some(client_order_id), None, indexed_client_order_id) {
+        if !self.local_order_indexes_match_request(
+            Some(client_order_id),
+            indexed_client_order_id,
+            requested_venue_order_id,
+        ) {
             log::error!(
-                "Requested client order {client_order_id} does not match the cache index for venue \
-                 order {requested_venue_order_id}; reporting nothing"
+                "Requested order {client_order_id} does not match local indexes for venue order \
+                 {requested_venue_order_id}; reporting nothing"
             );
             return;
         }
@@ -589,9 +627,13 @@ impl PolymarketExecutionClient {
             }
         };
         let indexed_client_order_id = self.core.cache().client_order_id(&venue_order_id).copied();
-        if !client_order_ids_match_request(cmd.client_order_id, None, indexed_client_order_id) {
+        if !self.local_order_indexes_match_request(
+            cmd.client_order_id,
+            indexed_client_order_id,
+            venue_order_id,
+        ) {
             log::error!(
-                "Requested client order identity does not match the cache index for venue order \
+                "Requested order identity does not match local indexes for venue order \
                  {venue_order_id}; reporting nothing"
             );
             return Ok(None);

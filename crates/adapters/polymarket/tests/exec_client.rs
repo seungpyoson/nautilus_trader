@@ -1864,6 +1864,46 @@ async fn test_generate_order_status_report_refuses_a_conflicting_cache_index() {
 
 #[rstest]
 #[tokio::test]
+async fn test_generate_order_status_report_refuses_a_forward_index_without_cached_order() {
+    let cached_venue_order_id = VenueOrderId::from("0xcached-forward-venue-order");
+    let requested_venue_order_id = VenueOrderId::from("0xrequested-forward-venue-order");
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_order.json");
+    venue_order["id"] = Value::String(requested_venue_order_id.to_string());
+    *state.single_order_response.lock().await = Some(venue_order);
+    let addr = start_mock_server(state).await;
+    let (client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let client_order_id = ClientOrderId::from("O-FORWARD-INDEX-WITHOUT-ORDER");
+    cache
+        .borrow_mut()
+        .add_venue_order_id(&client_order_id, &cached_venue_order_id, false)
+        .unwrap();
+
+    let report = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            client_order_id: Some(client_order_id),
+            venue_order_id: Some(requested_venue_order_id),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        report.is_none(),
+        "a forward cache index must remain authoritative when the order object is absent"
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_generate_order_status_report_rejects_a_live_answer_for_another_cached_order() {
     let venue_order_id =
         VenueOrderId::from("0xlive-mismatch000000000000000000000000000000000000000000000000000ff");
@@ -6856,6 +6896,50 @@ async fn test_query_order_refuses_a_conflicting_cache_index() {
             .await
             .is_err(),
         "a conflicting cache identity must not emit an order report"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_order_refuses_a_forward_index_without_cached_order() {
+    let cached_venue_order_id = VenueOrderId::from("0xcached-forward-query-order");
+    let requested_venue_order_id = VenueOrderId::from("0xrequested-forward-query-order");
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_order.json");
+    venue_order["id"] = Value::String(requested_venue_order_id.to_string());
+    *state.single_order_response.lock().await = Some(venue_order);
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let client_order_id = ClientOrderId::from("O-FORWARD-QUERY-WITHOUT-ORDER");
+    cache
+        .borrow_mut()
+        .add_venue_order_id(&client_order_id, &cached_venue_order_id, false)
+        .unwrap();
+
+    client
+        .query_order(QueryOrder::new(
+            TraderId::from("TESTER-001"),
+            Some(*POLYMARKET_CLIENT_ID),
+            StrategyId::from("S-001"),
+            instrument_id,
+            client_order_id,
+            Some(requested_venue_order_id),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "a forward cache index must remain authoritative when the order object is absent"
     );
 }
 

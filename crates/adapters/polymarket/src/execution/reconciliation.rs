@@ -161,6 +161,16 @@ pub(crate) fn build_fill_reports_from_trades(
 ) -> (Vec<FillReport>, FillBuildDiscards) {
     let mut reports = Vec::new();
     let mut discards = FillBuildDiscards::default();
+    let requested_asset_ids = instrument_filter.and_then(|filter_id| {
+        let snapshot = instruments.load();
+        let asset_ids = snapshot
+            .iter()
+            .filter_map(|(asset_id, instrument)| {
+                (instrument.id() == filter_id).then_some(*asset_id)
+            })
+            .collect::<Vec<_>>();
+        (!asset_ids.is_empty()).then_some(asset_ids)
+    });
 
     for trade in trades {
         let mut age_unknown = false;
@@ -179,6 +189,22 @@ pub(crate) fn build_fill_reports_from_trades(
             continue;
         }
 
+        let is_maker = trade.trader_side == PolymarketLiquiditySide::Maker;
+        if let Some(asset_ids) = &requested_asset_ids {
+            let mentions_requested_instrument = if is_maker {
+                trade
+                    .maker_orders
+                    .iter()
+                    .any(|mo| asset_ids.contains(&mo.asset_id))
+            } else {
+                asset_ids.contains(&trade.asset_id)
+            };
+
+            if !mentions_requested_instrument {
+                continue;
+            }
+        }
+
         match parse_timestamp(&trade.match_time) {
             Some(ts)
                 if start.is_some_and(|cutoff| ts < cutoff)
@@ -193,7 +219,6 @@ pub(crate) fn build_fill_reports_from_trades(
         }
 
         let reports_before = reports.len();
-        let is_maker = trade.trader_side == PolymarketLiquiditySide::Maker;
 
         if is_maker {
             // `GET /trades` returns the trades of the authenticated account and reports
@@ -202,10 +227,9 @@ pub(crate) fn build_fill_reports_from_trades(
             // cannot be interpreted, and reporting no fill for it would silently
             // understate the filled quantity of a live order.
             //
-            // Ownership is judged across the whole match, before any instrument filter,
-            // because the unified book matches complementary tokens across assets: the
-            // account's own order can sit on the token an instrument-scoped request did
-            // not ask about while a counterparty's sits on the token it did.
+            // Once the match mentions the requested instrument, ownership is judged
+            // across the whole match because the unified book matches complementary
+            // tokens: the account's order can sit on the other outcome token.
             if !trade
                 .maker_orders
                 .iter()
@@ -224,6 +248,13 @@ pub(crate) fn build_fill_reports_from_trades(
 
             for mo in &trade.maker_orders {
                 if !mo.is_owned_by(ctx.user_address, ctx.api_key) {
+                    continue;
+                }
+
+                if requested_asset_ids
+                    .as_ref()
+                    .is_some_and(|asset_ids| !asset_ids.contains(&mo.asset_id))
+                {
                     continue;
                 }
                 let token_id = Ustr::from(mo.asset_id.as_str());
@@ -957,6 +988,78 @@ mod tests {
         assert!(reports.is_empty());
     }
 
+    #[rstest]
+    fn instrument_filter_ignores_an_unmapped_taker_token_for_another_instrument() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.trader_side = PolymarketLiquiditySide::Taker;
+        trade.asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
+
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            Some(instrument.id()),
+            None,
+            None,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(reports.is_empty());
+        assert_eq!(
+            discards.unmapped_instruments, 0,
+            "an unrelated token must not become an unmapped-instrument finding"
+        );
+    }
+
+    #[rstest]
+    fn instrument_filter_ignores_window_diagnostics_for_another_instrument() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.trader_side = PolymarketLiquiditySide::Taker;
+        trade.asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
+        trade.match_time = "1000".to_string();
+
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            Some(instrument.id()),
+            None,
+            Some(UnixNanos::from(2_000 * NANOSECONDS_IN_SECOND)),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(reports.is_empty());
+        assert_eq!(discards.outside_lookback, 0);
+    }
+
+    #[rstest]
+    fn instrument_filter_ignores_unowned_maker_trades_for_another_instrument() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        disown_maker_orders(&mut trade);
+        for maker_order in &mut trade.maker_orders {
+            maker_order.asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
+        }
+
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            Some(instrument.id()),
+            None,
+            None,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(reports.is_empty());
+        assert_eq!(discards.unowned_maker_trades, 0);
+    }
+
     /// A match carries every maker's order, so only the account's own becomes a report.
     #[rstest]
     #[case::owned_by_maker_address(USER_ADDRESS, COUNTERPARTY_API_KEY)]
@@ -996,7 +1099,7 @@ mod tests {
         trade.maker_orders[0].maker_address = USER_ADDRESS.to_string();
         trade.maker_orders[0].asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
 
-        let (reports, _) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades(
             &[trade],
             &fill_context(),
             &instruments,
@@ -1008,6 +1111,10 @@ mod tests {
         );
 
         assert!(reports.is_empty());
+        assert_eq!(
+            discards.unmapped_instruments, 0,
+            "an unrelated token must not become an unmapped-instrument finding"
+        );
     }
 
     /// A taker trade carries no maker order of the account, so the rule must not reach it.
