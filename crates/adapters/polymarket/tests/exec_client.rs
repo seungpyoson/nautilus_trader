@@ -1441,6 +1441,10 @@ async fn test_generate_order_status_report_single_requires_instrument_id() {
 #[tokio::test]
 async fn test_generate_order_status_report_single_returns_report() {
     let state = TestServerState::default();
+    let venue_order_id = VenueOrderId::from("0x123");
+    let mut venue_order = load_json("http_open_order.json");
+    venue_order["id"] = Value::String(venue_order_id.to_string());
+    *state.single_order_response.lock().await = Some(venue_order);
     let addr = start_mock_server(state).await;
     let (mut client, _rx, cache) = create_test_execution_client(addr);
 
@@ -1453,7 +1457,7 @@ async fn test_generate_order_status_report_single_returns_report() {
         ts_init: UnixNanos::default(),
         instrument_id: Some(instrument_id),
         client_order_id: None,
-        venue_order_id: Some(VenueOrderId::from("0x123")),
+        venue_order_id: Some(venue_order_id),
         params: None,
         correlation_id: None,
         causation_id: None,
@@ -1966,6 +1970,92 @@ async fn test_generate_order_status_report_rejects_a_live_answer_for_a_conflicti
     assert!(
         report.is_none(),
         "a live venue answer must not override a conflicting cache identity"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_refuses_a_different_requested_client_order_id() {
+    let venue_order_id = VenueOrderId::from("0xshared-venue-order");
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_order.json");
+    venue_order["id"] = Value::String(venue_order_id.to_string());
+    *state.single_order_response.lock().await = Some(venue_order);
+    let addr = start_mock_server(state).await;
+    let (client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let cached_client_order_id = ClientOrderId::from("O-CACHED-CLIENT");
+    let requested_client_order_id = ClientOrderId::from("O-REQUESTED-CLIENT");
+    let mut cached_order = make_limit_order(
+        cached_client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(cached_order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut cached_order, venue_order_id.as_str());
+
+    let report = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            client_order_id: Some(requested_client_order_id),
+            venue_order_id: Some(venue_order_id),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        report.is_none(),
+        "a venue order indexed to {cached_client_order_id} must not be reported as \
+         {requested_client_order_id}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_refuses_a_different_answered_venue_order_id() {
+    let requested_venue_order_id = VenueOrderId::from("0xrequested-order");
+    let answered_venue_order_id = VenueOrderId::from("0xanswered-order");
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_order.json");
+    venue_order["id"] = Value::String(answered_venue_order_id.to_string());
+    *state.single_order_response.lock().await = Some(venue_order);
+    let addr = start_mock_server(state).await;
+    let (client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let report = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            client_order_id: None,
+            venue_order_id: Some(requested_venue_order_id),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        report.is_none(),
+        "an HTTP answer for {answered_venue_order_id} must not satisfy a request for \
+         {requested_venue_order_id}"
     );
 }
 
@@ -6766,6 +6856,100 @@ async fn test_query_order_refuses_a_conflicting_cache_index() {
             .await
             .is_err(),
         "a conflicting cache identity must not emit an order report"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_order_refuses_a_venue_indexed_to_another_client_order_id() {
+    let venue_order_id = VenueOrderId::from("0xshared-query-venue-order");
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_order.json");
+    venue_order["id"] = Value::String(venue_order_id.to_string());
+    *state.single_order_response.lock().await = Some(venue_order);
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let cached_client_order_id = ClientOrderId::from("O-CACHED-QUERY-CLIENT");
+    let requested_client_order_id = ClientOrderId::from("O-REQUESTED-QUERY-CLIENT");
+    let mut cached_order = make_limit_order(
+        cached_client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(cached_order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut cached_order, venue_order_id.as_str());
+
+    client
+        .query_order(QueryOrder::new(
+            TraderId::from("TESTER-001"),
+            Some(*POLYMARKET_CLIENT_ID),
+            StrategyId::from("S-001"),
+            instrument_id,
+            requested_client_order_id,
+            Some(venue_order_id),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "a venue order indexed to {cached_client_order_id} must not be reported as \
+         {requested_client_order_id}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_order_refuses_a_different_answered_venue_order_id() {
+    let requested_venue_order_id = VenueOrderId::from("0xrequested-query-order");
+    let answered_venue_order_id = VenueOrderId::from("0xanswered-query-order");
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_order.json");
+    venue_order["id"] = Value::String(answered_venue_order_id.to_string());
+    *state.single_order_response.lock().await = Some(venue_order);
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    client
+        .query_order(QueryOrder::new(
+            TraderId::from("TESTER-001"),
+            Some(*POLYMARKET_CLIENT_ID),
+            StrategyId::from("S-001"),
+            instrument_id,
+            ClientOrderId::from("O-QUERY-ANSWER-MISMATCH"),
+            Some(requested_venue_order_id),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "an HTTP answer for {answered_venue_order_id} must not satisfy a request for \
+         {requested_venue_order_id}"
     );
 }
 
