@@ -58,11 +58,12 @@ pub(crate) struct FillContext<'a> {
     pub clock: &'static AtomicTime,
 }
 
-/// What [`build_fill_reports_from_trades`] could not turn into a fill report.
+/// What a reconciliation pass could not turn into or retain as a fill report.
 ///
-/// The builder returns partial results with these counts so each caller can
-/// choose the appropriate severity. `ExecutionMassStatus` has no field for the
-/// counts, so callers currently surface them through logs.
+/// The builder returns its partial-result counts and callers add any later
+/// identity-admission rejections before choosing the appropriate severity.
+/// `ExecutionMassStatus` has no field for the counts, so callers currently
+/// surface them through logs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FillBuildDiscards {
     /// Fill reports rejected because they contradicted a registered own-order identity.
