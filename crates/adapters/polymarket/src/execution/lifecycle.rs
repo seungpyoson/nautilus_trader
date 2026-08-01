@@ -40,10 +40,7 @@ use ustr::Ustr;
 
 use super::PolymarketExecutionClient;
 use crate::{
-    execution::{
-        identity::{OrderIdentity, OrderReportIdentity},
-        reports::fetch_and_emit_account_state,
-    },
+    execution::{identity::OrderIdentity, reports::fetch_and_emit_account_state},
     http::{clob::HeartbeatResponse, error::Error as HttpError},
     websocket::{
         dispatch::{WsDispatchContext, WsDispatchState, dispatch_user_message},
@@ -429,9 +426,11 @@ impl PolymarketExecutionClient {
 
             if self
                 .order_identities
-                .register_order_identity(
+                .restore_accepted_order_identity(
                     venue_order_id,
                     OrderIdentity::from_order(order),
+                    order.quantity(),
+                    order.filled_qty(),
                     &self.fill_tracker,
                 )
                 .is_err()
@@ -441,35 +440,6 @@ impl PolymarketExecutionClient {
                 );
                 continue;
             }
-            if self.order_identities.mark_accepted(venue_order_id).is_err() {
-                log::error!(
-                    "Cached venue order {venue_order_id} was already rejected; refusing restoration"
-                );
-                continue;
-            }
-            let permit = match self
-                .order_identities
-                .admit_tracker_registration(venue_order_id, OrderReportIdentity::from_order(order))
-            {
-                Ok(permit) => permit,
-                Err(_) => {
-                    log::error!(
-                        "Conflicting cached identity for venue order {venue_order_id}; refusing to restore fill tracking"
-                    );
-                    continue;
-                }
-            };
-            if self
-                .fill_tracker
-                .restore_order(&permit, order.quantity(), order.filled_qty())
-                .is_err()
-            {
-                log::error!(
-                    "Conflicting tracker identity for venue order {venue_order_id}; refusing to restore fill tracking"
-                );
-                continue;
-            }
-            drop(permit);
 
             for event in order.events() {
                 match event {

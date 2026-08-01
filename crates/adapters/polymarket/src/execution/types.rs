@@ -69,6 +69,4 @@ pub(crate) struct SignedLimitOrderSubmission {
 pub(crate) struct BatchLimitOrderContext {
     pub(crate) order: OrderAny,
     pub(crate) request: LimitOrderSubmitRequest,
-    pub(crate) size_precision: u8,
-    pub(crate) price_precision: u8,
 }

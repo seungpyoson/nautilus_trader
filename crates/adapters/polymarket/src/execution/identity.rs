@@ -22,10 +22,7 @@
 //! dispatch consults this registry to emit events for tracked orders (reserving reports for
 //! externally-managed orders and reconciliation).
 
-use std::{
-    collections::HashMap,
-    sync::{Mutex, MutexGuard},
-};
+use std::{collections::HashMap, sync::Mutex};
 
 use nautilus_core::MUTEX_POISONED;
 use nautilus_model::{
@@ -103,14 +100,6 @@ impl OrderReportIdentity {
     }
 }
 
-/// Opaque proof that a tracker identity was checked while holding the one
-/// registry/tracker registration gate.
-pub(crate) struct TrackerRegistrationPermit<'a> {
-    _guard: MutexGuard<'a, ()>,
-    pub(crate) venue_order_id: VenueOrderId,
-    pub(crate) identity: OrderReportIdentity,
-}
-
 impl OrderIdentity {
     /// Captures the identity from an order held by the submit path.
     pub(crate) fn from_order(order: &OrderAny) -> Self {
@@ -145,11 +134,11 @@ impl OrderIdentity {
 
 /// Shared process-lifetime registry of tracked own-order identities, keyed by venue order ID.
 ///
-/// Populated by the submit path (which holds the `OrderAny`) and consulted by the WS dispatch
-/// and buffer-drain paths. The `accepted` set deduplicates `OrderAccepted` so acceptance is
-/// emitted exactly once across the submit confirmation and the WS stream, including when a fill
-/// or cancel races ahead of the acceptance message. Entries are not evicted: forgetting a local
-/// venue ID would turn later contradictory evidence into an apparently external order.
+/// Populated atomically with tracker state before submission and consulted by every report and
+/// WebSocket dispatch path. Submission state deduplicates `OrderAccepted` so acceptance is emitted
+/// exactly once across the submit confirmation and the WS stream, including when a fill or cancel
+/// races ahead of the HTTP response. Entries are not evicted: forgetting a local venue ID would
+/// turn later contradictory evidence into an apparently external order.
 #[derive(Debug, Default)]
 pub(crate) struct OrderIdentityRegistry {
     registration_gate: Mutex<()>,
@@ -158,6 +147,13 @@ pub(crate) struct OrderIdentityRegistry {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OrderIdentityConflict;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubmitRejection {
+    Rejected,
+    AlreadyRejected,
+    AlreadyAccepted,
+}
 
 #[derive(Debug, Default)]
 struct RegistryInner {
@@ -174,12 +170,27 @@ enum SubmissionState {
     Rejected,
 }
 
+impl SubmissionState {
+    fn admits_artifacts(self) -> bool {
+        self != Self::Rejected
+    }
+
+    fn outcome_became_unknown(self) -> Result<Self, OrderIdentityConflict> {
+        match self {
+            Self::Pending | Self::OutcomeUnknown => Ok(Self::OutcomeUnknown),
+            Self::Accepted => Ok(Self::Accepted),
+            Self::Rejected => Err(OrderIdentityConflict),
+        }
+    }
+}
+
 impl OrderIdentityRegistry {
     /// Claims the deterministic venue ID before network submission.
     pub(crate) fn register_pending_order_identity(
         &self,
         venue_order_id: VenueOrderId,
         identity: OrderIdentity,
+        submitted_qty: nautilus_model::types::Quantity,
         fill_tracker: &OrderFillTrackerMap,
     ) -> Result<(), OrderIdentityConflict> {
         let _registration = self.registration_gate.lock().expect(MUTEX_POISONED);
@@ -191,89 +202,66 @@ impl OrderIdentityRegistry {
         }
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
         match guard.submission_states.get(&venue_order_id).copied() {
-            None | Some(SubmissionState::Pending) => {
+            None => {
                 register_order_identity_in(&mut guard, venue_order_id, identity)?;
+                if fill_tracker
+                    .register_pending_order(
+                        venue_order_id,
+                        identity.report_identity(),
+                        submitted_qty,
+                    )
+                    .is_err()
+                {
+                    guard.identities.remove(&venue_order_id);
+                    guard.client_to_venue.remove(&identity.client_order_id);
+                    return Err(OrderIdentityConflict);
+                }
                 guard
                     .submission_states
                     .insert(venue_order_id, SubmissionState::Pending);
                 Ok(())
             }
             Some(
-                SubmissionState::OutcomeUnknown
+                SubmissionState::Pending
+                | SubmissionState::OutcomeUnknown
                 | SubmissionState::Accepted
                 | SubmissionState::Rejected,
             ) => Err(OrderIdentityConflict),
         }
     }
 
-    /// Records the identity for a tracked order under its venue order ID.
-    pub(crate) fn register_order_identity(
+    /// Restores one accepted cache order and its tracker state under the registration gate.
+    pub(crate) fn restore_accepted_order_identity(
         &self,
         venue_order_id: VenueOrderId,
         identity: OrderIdentity,
+        submitted_qty: nautilus_model::types::Quantity,
+        filled_qty: nautilus_model::types::Quantity,
         fill_tracker: &OrderFillTrackerMap,
     ) -> Result<(), OrderIdentityConflict> {
         let _registration = self.registration_gate.lock().expect(MUTEX_POISONED);
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        if guard.submission_states.contains_key(&venue_order_id) {
+            return Err(OrderIdentityConflict);
+        }
+        register_order_identity_in(&mut guard, venue_order_id, identity)?;
         if fill_tracker
-            .order_identity_matches(&venue_order_id, identity.report_identity())
-            .is_some_and(|matches| !matches)
+            .restore_registered_order(
+                venue_order_id,
+                identity.report_identity(),
+                submitted_qty,
+                filled_qty,
+            )
+            .is_err()
         {
+            guard.identities.remove(&venue_order_id);
+            guard.client_to_venue.remove(&identity.client_order_id);
             return Err(OrderIdentityConflict);
         }
-        self.register_order_identity_inner(venue_order_id, identity)
-    }
-
-    fn register_order_identity_inner(
-        &self,
-        venue_order_id: VenueOrderId,
-        identity: OrderIdentity,
-    ) -> Result<(), OrderIdentityConflict> {
-        register_order_identity_in(
-            &mut self.inner.lock().expect(MUTEX_POISONED),
-            venue_order_id,
-            identity,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn register_order_identity_for_test(
-        &self,
-        venue_order_id: VenueOrderId,
-        identity: OrderIdentity,
-    ) -> Result<(), OrderIdentityConflict> {
-        self.register_order_identity_inner(venue_order_id, identity)
-    }
-
-    /// Serializes every tracker identity claim with registry registration.
-    pub(crate) fn admit_tracker_registration(
-        &self,
-        venue_order_id: VenueOrderId,
-        mut identity: OrderReportIdentity,
-    ) -> Result<TrackerRegistrationPermit<'_>, OrderIdentityConflict> {
-        let registration = self.registration_gate.lock().expect(MUTEX_POISONED);
-        let guard = self.inner.lock().expect(MUTEX_POISONED);
-        let client_order_id = resolve_order_request_in(
-            &guard,
-            venue_order_id,
-            identity.instrument_id,
-            identity.client_order_id,
-            None,
-        )?;
-        if guard
-            .identities
-            .get(&venue_order_id)
-            .copied()
-            .is_some_and(|registered| !identity.agrees_with_registered(registered))
-        {
-            return Err(OrderIdentityConflict);
-        }
-        drop(guard);
-        identity.client_order_id = client_order_id;
-        Ok(TrackerRegistrationPermit {
-            _guard: registration,
-            venue_order_id,
-            identity,
-        })
+        guard
+            .submission_states
+            .insert(venue_order_id, SubmissionState::Accepted);
+        Ok(())
     }
 
     /// Returns the identity for a tracked order, if known.
@@ -333,10 +321,16 @@ impl OrderIdentityRegistry {
             }
             identity
         };
-        if fill_tracker
-            .fill_identity_matches(&venue_order_id, instrument_id, client_order_id, order_side)
-            .is_some_and(|matches| !matches)
-        {
+        let tracker_identity = fill_tracker.fill_identity_matches(
+            &venue_order_id,
+            instrument_id,
+            client_order_id,
+            order_side,
+        );
+        if !matches!(
+            (identity, tracker_identity),
+            (Some(_), Some(true)) | (None, None)
+        ) {
             return Err(OrderIdentityConflict);
         }
         Ok(identity)
@@ -366,7 +360,17 @@ impl OrderIdentityRegistry {
             }
             identity
         };
-        if !fill_tracker.admit_and_snap_fill_report(report) {
+        let tracker_identity = fill_tracker.fill_identity_matches(
+            &report.venue_order_id,
+            report.instrument_id,
+            report.client_order_id,
+            report.order_side,
+        );
+        if !matches!(
+            (identity, tracker_identity),
+            (Some(_), Some(true)) | (None, None)
+        ) || !fill_tracker.admit_and_snap_fill_report(report)
+        {
             return Err(OrderIdentityConflict);
         }
         Ok(identity)
@@ -397,9 +401,12 @@ impl OrderIdentityRegistry {
             }
             identity
         };
-        fill_tracker
+        let tracked_filled = fill_tracker
             .cumulative_filled_for_report(report)
             .map_err(|_| OrderIdentityConflict)?;
+        if identity.is_some() != tracked_filled.is_some() {
+            return Err(OrderIdentityConflict);
+        }
         Ok(identity)
     }
 
@@ -438,9 +445,12 @@ impl OrderIdentityRegistry {
         }
     }
 
-    /// Rejects a pending deterministic identity exactly once. Acceptance and rejection race under
-    /// the registry lock, so a submit cannot be resurrected after its definitive failure.
-    pub(crate) fn reject_pending_order(
+    /// Marks a deterministic identity rejected exactly once.
+    ///
+    /// The identity remains reserved for the process lifetime, while every artifact admission
+    /// rejects its terminal state. Acceptance and rejection therefore cannot resurrect or relabel
+    /// the venue ID.
+    pub(crate) fn mark_venue_rejected(
         &self,
         venue_order_id: VenueOrderId,
         identity: OrderIdentity,
@@ -451,15 +461,40 @@ impl OrderIdentityRegistry {
             return Err(OrderIdentityConflict);
         }
         match guard.submission_states.get(&venue_order_id).copied() {
-            Some(SubmissionState::Accepted) => Err(OrderIdentityConflict),
             Some(SubmissionState::Rejected) => Ok(false),
-            Some(SubmissionState::Pending | SubmissionState::OutcomeUnknown) => {
-                guard.identities.remove(&venue_order_id);
-                guard.client_to_venue.remove(&identity.client_order_id);
+            Some(
+                SubmissionState::Pending
+                | SubmissionState::OutcomeUnknown
+                | SubmissionState::Accepted,
+            ) => {
                 guard
                     .submission_states
                     .insert(venue_order_id, SubmissionState::Rejected);
                 Ok(true)
+            }
+            None => Err(OrderIdentityConflict),
+        }
+    }
+
+    /// Applies a negative submit response without overriding stronger WebSocket acceptance.
+    pub(crate) fn reject_submit_response(
+        &self,
+        venue_order_id: VenueOrderId,
+        identity: OrderIdentity,
+    ) -> Result<SubmitRejection, OrderIdentityConflict> {
+        let _registration = self.registration_gate.lock().expect(MUTEX_POISONED);
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        if guard.identities.get(&venue_order_id) != Some(&identity) {
+            return Err(OrderIdentityConflict);
+        }
+        match guard.submission_states.get(&venue_order_id).copied() {
+            Some(SubmissionState::Accepted) => Ok(SubmitRejection::AlreadyAccepted),
+            Some(SubmissionState::Rejected) => Ok(SubmitRejection::AlreadyRejected),
+            Some(SubmissionState::Pending | SubmissionState::OutcomeUnknown) => {
+                guard
+                    .submission_states
+                    .insert(venue_order_id, SubmissionState::Rejected);
+                Ok(SubmitRejection::Rejected)
             }
             None => Err(OrderIdentityConflict),
         }
@@ -474,17 +509,14 @@ impl OrderIdentityRegistry {
         if !guard.identities.contains_key(&venue_order_id) {
             return Err(OrderIdentityConflict);
         }
-        match guard.submission_states.get(&venue_order_id).copied() {
-            Some(SubmissionState::Pending | SubmissionState::OutcomeUnknown) => {
-                guard
-                    .submission_states
-                    .insert(venue_order_id, SubmissionState::OutcomeUnknown);
-                Ok(())
-            }
-            None | Some(SubmissionState::Accepted | SubmissionState::Rejected) => {
-                Err(OrderIdentityConflict)
-            }
-        }
+        let current = guard
+            .submission_states
+            .get(&venue_order_id)
+            .copied()
+            .ok_or(OrderIdentityConflict)?;
+        let next = current.outcome_became_unknown()?;
+        guard.submission_states.insert(venue_order_id, next);
+        Ok(())
     }
 }
 
@@ -521,6 +553,13 @@ fn resolve_order_request_in(
     requested_client_order_id: Option<ClientOrderId>,
     indexed_client_order_id: Option<ClientOrderId>,
 ) -> Result<Option<ClientOrderId>, OrderIdentityConflict> {
+    if guard
+        .submission_states
+        .get(&venue_order_id)
+        .is_some_and(|state| !state.admits_artifacts())
+    {
+        return Err(OrderIdentityConflict);
+    }
     let registered_identity = guard.identities.get(&venue_order_id).copied();
     if registered_identity.is_some_and(|identity| identity.instrument_id != instrument_id) {
         return Err(OrderIdentityConflict);
@@ -598,11 +637,12 @@ mod tests {
     #[rstest]
     fn test_register_and_get() {
         let registry = OrderIdentityRegistry::default();
+        let tracker = OrderFillTrackerMap::new();
         let vid = VenueOrderId::from("V-1");
         assert!(registry.get(&vid).is_none());
 
         registry
-            .register_order_identity_for_test(vid, test_identity())
+            .register_pending_order_identity(vid, test_identity(), Quantity::from("10"), &tracker)
             .expect("first identity must register");
         assert_eq!(registry.mark_accepted(vid), Ok(true));
         let identity = registry.get(&vid).expect("identity registered");
@@ -617,10 +657,16 @@ mod tests {
     #[rstest]
     fn test_registered_identity_is_immutable() {
         let registry = OrderIdentityRegistry::default();
+        let tracker = OrderFillTrackerMap::new();
         let venue_order_id = VenueOrderId::from("V-1");
         let identity = test_identity();
         registry
-            .register_order_identity_for_test(venue_order_id, identity)
+            .register_pending_order_identity(
+                venue_order_id,
+                identity,
+                Quantity::from("10"),
+                &tracker,
+            )
             .expect("first identity must register");
 
         let conflicting = OrderIdentity {
@@ -628,14 +674,19 @@ mod tests {
             ..identity
         };
         assert_eq!(
-            registry.register_order_identity_for_test(venue_order_id, conflicting),
+            registry.register_pending_order_identity(
+                venue_order_id,
+                conflicting,
+                Quantity::from("10"),
+                &tracker,
+            ),
             Err(OrderIdentityConflict)
         );
         assert_eq!(registry.get(&venue_order_id), Some(identity));
     }
 
     #[rstest]
-    fn test_fill_identity_uses_tracker_identity_after_registry_eviction() {
+    fn test_fill_identity_rejects_split_registry_and_tracker_ownership() {
         let registry = OrderIdentityRegistry::default();
         let tracker = OrderFillTrackerMap::new();
         let venue_order_id = VenueOrderId::from("V-1");
@@ -657,7 +708,7 @@ mod tests {
                 OrderSide::Buy,
                 &tracker,
             ),
-            Ok(None)
+            Err(OrderIdentityConflict)
         );
         assert_eq!(
             registry.resolve_fill_report(
@@ -672,7 +723,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_registration_cannot_replace_tracker_identity_after_registry_eviction() {
+    fn test_registration_cannot_replace_preexisting_tracker_identity() {
         let registry = OrderIdentityRegistry::default();
         let tracker = OrderFillTrackerMap::new();
         let venue_order_id = VenueOrderId::from("V-EVICTED");
@@ -690,7 +741,12 @@ mod tests {
         };
 
         assert_eq!(
-            registry.register_order_identity(venue_order_id, conflicting, &tracker),
+            registry.register_pending_order_identity(
+                venue_order_id,
+                conflicting,
+                Quantity::from("10"),
+                &tracker,
+            ),
             Err(OrderIdentityConflict)
         );
         assert!(registry.get(&venue_order_id).is_none());
@@ -702,8 +758,13 @@ mod tests {
         let tracker = OrderFillTrackerMap::new();
         let venue_order_id = VenueOrderId::from("V-1");
         registry
-            .register_order_identity_for_test(venue_order_id, test_identity())
-            .expect("identity must register");
+            .register_pending_order_identity(
+                venue_order_id,
+                test_identity(),
+                Quantity::from("10"),
+                &tracker,
+            )
+            .expect("identity and tracker must register");
 
         assert_eq!(
             registry.resolve_order_status_report(&test_report(TimeInForce::Fok), &tracker),
@@ -712,34 +773,37 @@ mod tests {
     }
 
     #[rstest]
-    fn test_tracker_claim_and_registry_registration_are_serialized() {
+    fn test_pending_registration_atomically_installs_and_rejects_tracker_identity() {
         let registry = OrderIdentityRegistry::default();
         let tracker = OrderFillTrackerMap::new();
         let venue_order_id = VenueOrderId::from("V-RACE");
-        let permit = registry
-            .admit_tracker_registration(
-                venue_order_id,
-                OrderReportIdentity {
-                    client_order_id: Some(ClientOrderId::from("O-B")),
-                    instrument_id: InstrumentId::from("B.POLYMARKET"),
-                    order_side: OrderSide::Sell,
-                    order_type: OrderType::Market,
-                    time_in_force: TimeInForce::Ioc,
-                },
-            )
-            .expect("first tracker claimant must acquire the gate");
+        let identity = test_identity();
 
-        std::thread::scope(|scope| {
-            let registration = scope.spawn(|| {
-                registry.register_order_identity(venue_order_id, test_identity(), &tracker)
-            });
-            tracker
-                .register_and_take_pending_fills(&permit, Quantity::from("10"))
-                .expect("permitted tracker identity must register");
-            drop(permit);
-            assert_eq!(registration.join().unwrap(), Err(OrderIdentityConflict));
-        });
-        assert!(registry.get(&venue_order_id).is_none());
+        assert!(!tracker.contains(&venue_order_id));
+
+        registry
+            .register_pending_order_identity(
+                venue_order_id,
+                identity,
+                Quantity::from("10"),
+                &tracker,
+            )
+            .expect("pending identity must register");
+        assert!(tracker.contains(&venue_order_id));
+        registry
+            .mark_venue_rejected(venue_order_id, identity)
+            .expect("venue rejection must transition");
+
+        assert_eq!(
+            registry.resolve_fill_report(
+                venue_order_id,
+                identity.instrument_id,
+                Some(identity.client_order_id),
+                identity.order_side,
+                &tracker,
+            ),
+            Err(OrderIdentityConflict)
+        );
     }
 
     #[rstest]
@@ -748,7 +812,7 @@ mod tests {
         let tracker = OrderFillTrackerMap::new();
         let vid = VenueOrderId::from("V-1");
         registry
-            .register_pending_order_identity(vid, test_identity(), &tracker)
+            .register_pending_order_identity(vid, test_identity(), Quantity::from("10"), &tracker)
             .expect("pending identity must register");
 
         assert_eq!(registry.mark_accepted(vid), Ok(true), "first mark is new");
@@ -766,7 +830,12 @@ mod tests {
         let venue_order_id = VenueOrderId::from("V-UNKNOWN");
         let client_order_id = test_identity().client_order_id;
         registry
-            .register_pending_order_identity(venue_order_id, test_identity(), &tracker)
+            .register_pending_order_identity(
+                venue_order_id,
+                test_identity(),
+                Quantity::from("10"),
+                &tracker,
+            )
             .expect("pending identity must register");
         assert_eq!(registry.venue_order_id(&client_order_id), None);
 
@@ -780,22 +849,55 @@ mod tests {
     }
 
     #[rstest]
+    fn test_unknown_http_result_preserves_prior_websocket_acceptance() {
+        let registry = OrderIdentityRegistry::default();
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("V-WS-FIRST");
+        let identity = test_identity();
+        registry
+            .register_pending_order_identity(
+                venue_order_id,
+                identity,
+                Quantity::from("10"),
+                &tracker,
+            )
+            .expect("pending identity must register");
+        assert_eq!(registry.mark_accepted(venue_order_id), Ok(true));
+
+        assert_eq!(registry.mark_outcome_unknown(venue_order_id), Ok(()));
+        assert_eq!(
+            registry.venue_order_id(&identity.client_order_id),
+            Some(venue_order_id)
+        );
+    }
+
+    #[rstest]
     fn test_rejected_pending_identity_cannot_be_resurrected() {
         let registry = OrderIdentityRegistry::default();
         let tracker = OrderFillTrackerMap::new();
         let venue_order_id = VenueOrderId::from("V-REJECTED");
         let identity = test_identity();
         registry
-            .register_pending_order_identity(venue_order_id, identity, &tracker)
+            .register_pending_order_identity(
+                venue_order_id,
+                identity,
+                Quantity::from("10"),
+                &tracker,
+            )
             .expect("pending identity must register");
 
         assert_eq!(
-            registry.reject_pending_order(venue_order_id, identity),
+            registry.mark_venue_rejected(venue_order_id, identity),
             Ok(true)
         );
-        assert_eq!(registry.get(&venue_order_id), None);
+        assert_eq!(registry.get(&venue_order_id), Some(identity));
         assert_eq!(
-            registry.register_order_identity(venue_order_id, identity, &tracker),
+            registry.register_pending_order_identity(
+                venue_order_id,
+                identity,
+                Quantity::from("10"),
+                &tracker,
+            ),
             Err(OrderIdentityConflict)
         );
         assert_eq!(
@@ -805,20 +907,29 @@ mod tests {
     }
 
     #[rstest]
-    fn test_accepted_pending_identity_cannot_be_rejected() {
+    fn test_definitive_venue_rejection_is_terminal_after_acceptance() {
         let registry = OrderIdentityRegistry::default();
         let tracker = OrderFillTrackerMap::new();
         let venue_order_id = VenueOrderId::from("V-ACCEPTED");
         let identity = test_identity();
         registry
-            .register_pending_order_identity(venue_order_id, identity, &tracker)
+            .register_pending_order_identity(
+                venue_order_id,
+                identity,
+                Quantity::from("10"),
+                &tracker,
+            )
             .expect("pending identity must register");
         assert_eq!(registry.mark_accepted(venue_order_id), Ok(true));
 
         assert_eq!(
-            registry.reject_pending_order(venue_order_id, identity),
-            Err(OrderIdentityConflict)
+            registry.mark_venue_rejected(venue_order_id, identity),
+            Ok(true)
         );
         assert_eq!(registry.get(&venue_order_id), Some(identity));
+        assert_eq!(
+            registry.mark_accepted(venue_order_id),
+            Err(OrderIdentityConflict)
+        );
     }
 }

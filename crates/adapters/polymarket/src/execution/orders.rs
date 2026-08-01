@@ -91,9 +91,6 @@ impl PolymarketExecutionClient {
         let fill_tracker = self.fill_tracker.clone();
         let order_identities = self.order_identities.clone();
         let pending_cancels = self.pending_cancels.clone();
-        let account_id = self.core.account_id;
-        let size_precision = instrument.size_precision();
-        let price_precision = instrument.price_precision();
 
         self.spawn_task("submit_limit_order", async move {
             let submission = match submitter.prepare_limit_order_submission(&request).await {
@@ -109,6 +106,7 @@ impl PolymarketExecutionClient {
                 .register_pending_order_identity(
                     expected_venue_order_id,
                     OrderIdentity::from_order(&order),
+                    order.quantity(),
                     &fill_tracker,
                 )
                 .is_err()
@@ -130,12 +128,8 @@ impl PolymarketExecutionClient {
                         expected_venue_order_id,
                         &emitter,
                         clock,
-                        &fill_tracker,
                         &order_identities,
                         &pending_cancels,
-                        account_id,
-                        size_precision,
-                        price_precision,
                     ) {
                         execute_deferred_cancel(
                             &submitter,
@@ -154,10 +148,6 @@ impl PolymarketExecutionClient {
                         &order,
                         expected_venue_order_id,
                         &e.to_string(),
-                        None,
-                        &emitter,
-                        clock,
-                        &fill_tracker,
                         &order_identities,
                         &pending_cancels,
                     ) {
@@ -273,10 +263,23 @@ impl PolymarketExecutionClient {
                 }
             };
             let expected_venue_order_id = submission.expected_venue_order_id;
+            let Ok(expected_base_qty) =
+                Quantity::from_decimal_dp(submission.expected_base_qty, size_precision)
+            else {
+                reject_submit_order(
+                    &order,
+                    "Prepared market order has an invalid base quantity",
+                    &emitter,
+                    clock,
+                    &pending_cancels,
+                );
+                return Ok(());
+            };
             if order_identities
                 .register_pending_order_identity(
                     expected_venue_order_id,
                     OrderIdentity::from_order(&order),
+                    expected_base_qty,
                     &fill_tracker,
                 )
                 .is_err()
@@ -319,12 +322,8 @@ impl PolymarketExecutionClient {
                         expected_venue_order_id,
                         &emitter,
                         clock,
-                        &fill_tracker,
                         &order_identities,
                         &pending_cancels,
-                        account_id,
-                        size_precision,
-                        price_precision,
                     ) {
                         execute_deferred_cancel(
                             &submitter,
@@ -370,22 +369,10 @@ impl PolymarketExecutionClient {
                             clock,
                         );
 
-                        let fill_tracker_quantity = if is_quote_qty && side == OrderSide::Buy {
-                            unknown
-                                .expected_base_qty
-                                .and_then(|qty| Quantity::from_decimal_dp(qty, size_precision).ok())
-                        } else {
-                            None
-                        };
-
                         if let Some((order_id_str, venue_order_id)) = handle_unknown_submit_result(
                             &order,
                             unknown.expected_venue_order_id,
                             &unknown.reason,
-                            fill_tracker_quantity,
-                            &emitter,
-                            clock,
-                            &fill_tracker,
                             &order_identities,
                             &pending_cancels,
                         ) {
@@ -533,8 +520,6 @@ impl PolymarketExecutionClient {
                     expire_time: order.expire_time(),
                     tick_decimals: instrument.price_precision() as u32,
                 },
-                size_precision: instrument.size_precision(),
-                price_precision: instrument.price_precision(),
                 order,
             });
         }
@@ -556,7 +541,6 @@ impl PolymarketExecutionClient {
         let order_identities = self.order_identities.clone();
         let pending_cancels = self.pending_cancels.clone();
         let pending_tasks = self.pending_tasks.clone();
-        let account_id = self.core.account_id;
 
         self.spawn_task("submit_order_list", async move {
             for batch_order in &batch_orders {
@@ -577,6 +561,7 @@ impl PolymarketExecutionClient {
                             .register_pending_order_identity(
                                 submission.expected_venue_order_id,
                                 OrderIdentity::from_order(&batch_order.order),
+                                batch_order.order.quantity(),
                                 &fill_tracker,
                             )
                             .is_ok()
@@ -628,10 +613,8 @@ impl PolymarketExecutionClient {
                         &submitter,
                         &emitter,
                         clock,
-                        &fill_tracker,
                         &order_identities,
                         &pending_cancels,
-                        account_id,
                     )
                     .await;
                 } else {
@@ -651,11 +634,9 @@ impl PolymarketExecutionClient {
                                 &submitter,
                                 &emitter,
                                 clock,
-                                &fill_tracker,
                                 &order_identities,
                                 &pending_cancels,
                                 &pending_tasks,
-                                account_id,
                             )
                             .await;
                         }
@@ -668,10 +649,6 @@ impl PolymarketExecutionClient {
                                         &batch_order.order,
                                         expected_venue_order_id,
                                         &e.to_string(),
-                                        None,
-                                        &emitter,
-                                        clock,
-                                        &fill_tracker,
                                         &order_identities,
                                         &pending_cancels,
                                     )

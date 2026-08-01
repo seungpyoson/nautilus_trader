@@ -1358,7 +1358,7 @@ mod tests {
         let order_identities = OrderIdentityRegistry::default();
         let fill_tracker = OrderFillTrackerMap::new();
         order_identities
-            .register_order_identity(
+            .register_pending_order_identity(
                 venue_order_id,
                 OrderIdentity {
                     client_order_id: ClientOrderId::from("O-1"),
@@ -1368,6 +1368,7 @@ mod tests {
                     order_type: OrderType::Limit,
                     time_in_force: TimeInForce::Gtc,
                 },
+                Quantity::from("10"),
                 &fill_tracker,
             )
             .expect("identity must register");
@@ -1439,7 +1440,7 @@ mod tests {
         let order_identities = OrderIdentityRegistry::default();
         let fill_tracker = OrderFillTrackerMap::new();
         order_identities
-            .register_order_identity(
+            .register_pending_order_identity(
                 venue_order_id,
                 OrderIdentity {
                     client_order_id: ClientOrderId::from("O-MAKER-CONFLICT"),
@@ -1449,6 +1450,7 @@ mod tests {
                     order_type: OrderType::Limit,
                     time_in_force: TimeInForce::Gtc,
                 },
+                Quantity::from("10"),
                 &fill_tracker,
             )
             .expect("identity must register");
