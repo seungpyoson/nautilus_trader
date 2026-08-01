@@ -29,6 +29,7 @@ use rust_decimal::Decimal;
 use super::{
     PolymarketExecutionClient,
     cancellations::execute_deferred_cancel,
+    identity::OrderIdentity,
     order_builder::PolymarketOrderBuilder,
     parse::{compute_commission, instrument_fee_exponent, instrument_taker_fee},
     reports::fetch_collateral_balance_pusd,
@@ -105,6 +106,7 @@ impl PolymarketExecutionClient {
             };
 
             let expected_venue_order_id = submission.expected_venue_order_id;
+            pending_submits.insert(expected_venue_order_id, OrderIdentity::from_order(&order));
             match submitter.post_limit_order_submission(submission).await {
                 Ok(response) => {
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
@@ -130,6 +132,7 @@ impl PolymarketExecutionClient {
                         )
                         .await;
                     }
+                    pending_submits.remove(&expected_venue_order_id);
                 }
                 Err(e) if e.is_submit_outcome_unknown() => {
                     if let Some((order_id_str, venue_order_id)) = handle_unknown_submit_result(
@@ -143,9 +146,6 @@ impl PolymarketExecutionClient {
                         &order_identities,
                         &pending_submits,
                         &pending_cancels,
-                        account_id,
-                        size_precision,
-                        price_precision,
                     ) {
                         execute_deferred_cancel(
                             &submitter,
@@ -158,8 +158,12 @@ impl PolymarketExecutionClient {
                         )
                         .await;
                     }
+                    if fill_tracker.contains(&expected_venue_order_id) {
+                        pending_submits.remove(&expected_venue_order_id);
+                    }
                 }
                 Err(e) => {
+                    pending_submits.remove(&expected_venue_order_id);
                     reject_submit_order(&order, &format!("{e}"), &emitter, clock, &pending_cancels);
                 }
             }
@@ -232,8 +236,8 @@ impl PolymarketExecutionClient {
                 None
             };
 
-            match submitter
-                .submit_market_order(MarketOrderSubmitRequest {
+            let submission = match submitter
+                .prepare_market_order_submission(MarketOrderSubmitRequest {
                     token_id: token_id.clone(),
                     side,
                     amount,
@@ -244,6 +248,17 @@ impl PolymarketExecutionClient {
                 })
                 .await
             {
+                Ok(submission) => submission,
+                Err(e) => {
+                    let ts_now = clock.get_time_ns();
+                    emitter.emit_order_rejected(&order, &format!("{e}"), ts_now, false);
+                    return Ok(());
+                }
+            };
+            let expected_venue_order_id = submission.expected_venue_order_id;
+            pending_submits.insert(expected_venue_order_id, OrderIdentity::from_order(&order));
+
+            match submitter.post_market_order_submission(submission).await {
                 Ok(result) => {
                     let mut order = order;
                     emit_market_order_submitted(
@@ -301,6 +316,8 @@ impl PolymarketExecutionClient {
                         .await;
                     }
 
+                    pending_submits.remove(&expected_venue_order_id);
+
                     if let Some(order_id) = fok_order_id {
                         check_fok_status(
                             &submitter,
@@ -308,6 +325,7 @@ impl PolymarketExecutionClient {
                             &token_id,
                             &order,
                             &fill_tracker,
+                            &order_identities,
                             &emitter,
                             account_id,
                             size_precision,
@@ -351,9 +369,6 @@ impl PolymarketExecutionClient {
                             &order_identities,
                             &pending_submits,
                             &pending_cancels,
-                            account_id,
-                            size_precision,
-                            price_precision,
                         ) {
                             execute_deferred_cancel(
                                 &submitter,
@@ -366,7 +381,11 @@ impl PolymarketExecutionClient {
                             )
                             .await;
                         }
+                        if fill_tracker.contains(&unknown.expected_venue_order_id) {
+                            pending_submits.remove(&unknown.expected_venue_order_id);
+                        }
                     } else {
+                        pending_submits.remove(&expected_venue_order_id);
                         let ts_now = clock.get_time_ns();
                         emitter.emit_order_rejected(&order, &format!("{e}"), ts_now, false);
                     }
@@ -563,8 +582,16 @@ impl PolymarketExecutionClient {
                     let submission = submissions_chunk.pop().expect("len 1");
                     let expected_venue_order_id = submission.expected_venue_order_id;
                     let batch_order = orders_chunk.pop().expect("len 1");
+                    pending_submits.insert(
+                        expected_venue_order_id,
+                        OrderIdentity::from_order(&batch_order.order),
+                    );
+                    let result = submitter.post_limit_order_submission(submission).await;
+                    let outcome_unknown = result
+                        .as_ref()
+                        .is_err_and(|error| error.is_submit_outcome_unknown());
                     handle_single_order_response(
-                        submitter.post_limit_order_submission(submission).await,
+                        result,
                         batch_order,
                         expected_venue_order_id,
                         &submitter,
@@ -577,11 +604,22 @@ impl PolymarketExecutionClient {
                         account_id,
                     )
                     .await;
+                    if !outcome_unknown || fill_tracker.contains(&expected_venue_order_id) {
+                        pending_submits.remove(&expected_venue_order_id);
+                    }
                 } else {
                     let expected_venue_order_ids: Vec<VenueOrderId> = submissions_chunk
                         .iter()
                         .map(|submission| submission.expected_venue_order_id)
                         .collect();
+                    for (batch_order, expected_venue_order_id) in
+                        orders_chunk.iter().zip(&expected_venue_order_ids)
+                    {
+                        pending_submits.insert(
+                            *expected_venue_order_id,
+                            OrderIdentity::from_order(&batch_order.order),
+                        );
+                    }
 
                     match submitter
                         .post_limit_order_submissions(submissions_chunk)
@@ -591,7 +629,7 @@ impl PolymarketExecutionClient {
                             handle_batch_order_responses(
                                 responses,
                                 orders_chunk,
-                                expected_venue_order_ids,
+                                expected_venue_order_ids.clone(),
                                 &submitter,
                                 &emitter,
                                 clock,
@@ -603,6 +641,9 @@ impl PolymarketExecutionClient {
                                 account_id,
                             )
                             .await;
+                            for venue_order_id in &expected_venue_order_ids {
+                                pending_submits.remove(venue_order_id);
+                            }
                         }
                         Err(e) if e.is_submit_outcome_unknown() => {
                             for (batch_order, expected_venue_order_id) in
@@ -620,9 +661,6 @@ impl PolymarketExecutionClient {
                                         &order_identities,
                                         &pending_submits,
                                         &pending_cancels,
-                                        account_id,
-                                        batch_order.size_precision,
-                                        batch_order.price_precision,
                                     )
                                 {
                                     execute_deferred_cancel(
@@ -636,10 +674,16 @@ impl PolymarketExecutionClient {
                                     )
                                     .await;
                                 }
+                                if fill_tracker.contains(&expected_venue_order_id) {
+                                    pending_submits.remove(&expected_venue_order_id);
+                                }
                             }
                         }
                         Err(e) => {
-                            for batch_order in orders_chunk {
+                            for (batch_order, expected_venue_order_id) in
+                                orders_chunk.into_iter().zip(expected_venue_order_ids)
+                            {
+                                pending_submits.remove(&expected_venue_order_id);
                                 reject_submit_order(
                                     &batch_order.order,
                                     &format!("{e}"),

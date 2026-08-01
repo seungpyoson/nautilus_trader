@@ -19,7 +19,7 @@ use ahash::AHashMap;
 use anyhow::Context;
 use nautilus_core::{UnixNanos, collections::AtomicMap, time::AtomicTime};
 use nautilus_model::{
-    enums::{LiquiditySide, OrderStatus, PositionSideSpecified},
+    enums::{LiquiditySide, OrderSide, OrderStatus, PositionSideSpecified},
     identifiers::{AccountId, ClientId, InstrumentId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -174,16 +174,7 @@ fn admit_and_snap_fill_report(
     order_identities: &OrderIdentityRegistry,
     fill_tracker: &OrderFillTrackerMap,
 ) -> Result<FillReport, OrderIdentityConflict> {
-    order_identities.resolve_fill_report(
-        report.venue_order_id,
-        report.instrument_id,
-        report.client_order_id,
-        report.order_side,
-        fill_tracker,
-    )?;
-    if !fill_tracker.admit_and_snap_fill_report(&mut report) {
-        return Err(OrderIdentityConflict);
-    }
+    order_identities.admit_and_snap_fill_report(&mut report, fill_tracker)?;
     Ok(report)
 }
 
@@ -692,7 +683,11 @@ fn cap_order_reports_to_confirmed_fills(
             report,
             local_filled,
             confirmed_by_order
-                .get(&(report.venue_order_id, report.instrument_id))
+                .get(&(
+                    report.venue_order_id,
+                    report.instrument_id,
+                    report.order_side,
+                ))
                 .copied(),
         );
         true
@@ -701,11 +696,11 @@ fn cap_order_reports_to_confirmed_fills(
 
 pub(crate) fn confirmed_filled_quantities(
     fill_reports: &[FillReport],
-) -> AHashMap<(VenueOrderId, InstrumentId), Decimal> {
+) -> AHashMap<(VenueOrderId, InstrumentId, OrderSide), Decimal> {
     let mut confirmed_by_order = AHashMap::new();
     for fill in fill_reports {
         *confirmed_by_order
-            .entry((fill.venue_order_id, fill.instrument_id))
+            .entry((fill.venue_order_id, fill.instrument_id, fill.order_side))
             .or_default() += fill.last_qty.as_decimal();
     }
 
@@ -1556,6 +1551,32 @@ mod tests {
             venue_order_id,
             TradeId::from("T-OTHER"),
             OrderSide::Buy,
+            Quantity::from("4.0000"),
+            Price::from("0.5000"),
+            Money::new(0.0, Currency::pUSD()),
+            LiquiditySide::Taker,
+            None,
+            None,
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        )];
+
+        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &OrderFillTrackerMap::new());
+
+        assert!(reports[0].filled_qty.is_zero());
+    }
+
+    #[rstest]
+    fn does_not_join_confirmed_fills_from_the_opposite_order_side() {
+        let venue_order_id = VenueOrderId::from("V-SHARED-SIDE");
+        let mut reports = vec![order_report_filled(venue_order_id, "5.0000")];
+        let fills = vec![FillReport::new(
+            AccountId::from("POLY-001"),
+            InstrumentId::from("TEST.POLYMARKET"),
+            venue_order_id,
+            TradeId::from("T-SELL"),
+            OrderSide::Sell,
             Quantity::from("4.0000"),
             Price::from("0.5000"),
             Money::new(0.0, Currency::pUSD()),

@@ -163,7 +163,8 @@ fn dispatch_order_update(
     let ts_init = ctx.clock.get_time_ns();
     let mut report =
         build_ws_order_status_report(order, instrument, ctx.account_id, ts_event, ts_init);
-    let local_client_order_id = ctx.pending_submits.client_order_id(&venue_order_id);
+    let pending_identity = ctx.pending_submits.identity(&venue_order_id);
+    let local_client_order_id = pending_identity.map(|identity| identity.client_order_id);
     if ctx
         .order_identities
         .resolve_fill_report(
@@ -182,6 +183,25 @@ fn dispatch_order_update(
     }
     let mut is_accepted = ctx.fill_tracker.contains(&venue_order_id);
     report.client_order_id = local_client_order_id;
+
+    // A pending submit carries the full immutable identity. Claim it before routing any WS status,
+    // including a rejection which deliberately does not create tracker state.
+    if let Some(pending_identity) = pending_identity
+        && !is_accepted
+        && (!OrderReportIdentity::from_report(&report).agrees_with_registered(pending_identity)
+            || ctx
+                .order_identities
+                .register_order_identity(venue_order_id, pending_identity, ctx.fill_tracker)
+                .is_err())
+    {
+        log::error!(
+            "WebSocket order update for {venue_order_id} contradicts pending submit identity; dropping it"
+        );
+        return;
+    }
+    if pending_identity.is_some() && !is_accepted {
+        ctx.pending_submits.remove(&venue_order_id);
+    }
 
     // A known own order (submit in flight) self-registers on its first WS update
     let buffered_fills = if local_client_order_id.is_some()
@@ -239,10 +259,12 @@ fn dispatch_order_update(
         _ => {}
     }
 
-    // Track cancel reports so we can re-emit them after late-arriving fills.
-    // Saved regardless of acceptance state so that cancels arriving during
-    // the HTTP round-trip are available once the order is later accepted.
-    if report.order_status == OrderStatus::Canceled {
+    // Retain terminal state only for a proven local order generation. An external cancel with no
+    // captured client identity must never be adopted by a later local order that reuses the venue
+    // ID.
+    if report.order_status == OrderStatus::Canceled
+        && (is_accepted || local_client_order_id.is_some())
+    {
         state
             .terminal_cancel_reports
             .insert(venue_order_id, report.clone());
@@ -759,11 +781,17 @@ fn reemit_terminal_cancel(
     state: &WsDispatchState,
     ctx: &WsDispatchContext<'_>,
 ) {
-    if ctx.fill_tracker.is_fully_filled(&venue_order_id) {
-        return;
-    }
-
     if let Some(cancel_report) = state.terminal_cancel_reports.get(&venue_order_id) {
+        match ctx.fill_tracker.is_fully_filled_for_report(cancel_report) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(_) => {
+                log::error!(
+                    "Retained cancel for venue order {venue_order_id} contradicts tracker identity; dropping it"
+                );
+                return;
+            }
+        }
         log::debug!("Re-emitting cancel for {venue_order_id} after fill to restore terminal state");
         match ctx
             .order_identities
@@ -1206,16 +1234,20 @@ mod tests {
         order_identities
             .register_order_identity_for_test(
                 venue_order_id,
-                OrderIdentity {
-                    client_order_id: ClientOrderId::from(client_order_id),
-                    strategy_id: StrategyId::from("S-001"),
-                    instrument_id,
-                    order_side: OrderSide::Buy,
-                    order_type: OrderType::Limit,
-                    time_in_force: TimeInForce::Gtc,
-                },
+                test_order_identity(instrument_id, client_order_id),
             )
             .expect("test identity must register");
+    }
+
+    fn test_order_identity(instrument_id: InstrumentId, client_order_id: &str) -> OrderIdentity {
+        OrderIdentity {
+            client_order_id: ClientOrderId::from(client_order_id),
+            strategy_id: StrategyId::from("S-001"),
+            instrument_id,
+            order_side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+        }
     }
 
     fn load<T: serde::de::DeserializeOwned>(filename: &str) -> T {
@@ -1329,7 +1361,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_dispatch_order_message_buffers_when_not_accepted() {
+    fn test_dispatch_external_order_message_emits_without_buffering() {
         let order: PolymarketUserOrder = load("ws_user_order_placement.json");
         let instrument = test_instrument();
 
@@ -1339,7 +1371,9 @@ mod tests {
         let fill_tracker = OrderFillTrackerMap::new();
         let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
-        let emitter = test_emitter();
+        let mut emitter = test_emitter();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(sender);
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
@@ -1357,9 +1391,14 @@ mod tests {
         let result = dispatch_user_message(&UserWsMessage::Order(order.clone()), &ctx, &mut state);
         assert!(result.is_none());
 
-        // Order not registered in fill_tracker, so should be buffered
+        // An order with no pending or registered identity is external. It must be emitted as a
+        // report, never retained for a future local order that reuses the venue ID.
         let venue_order_id = VenueOrderId::from(order.id.as_str());
-        assert!(fill_tracker.has_pending_report(&venue_order_id));
+        assert!(!fill_tracker.has_pending_report(&venue_order_id));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ExecutionEvent::Report(ExecutionReport::Order(_)))
+        ));
     }
 
     #[rstest]
@@ -1379,12 +1418,9 @@ mod tests {
 
         let venue_order_id = VenueOrderId::from(order.id.as_str());
         let client_order_id = ClientOrderId::from("O-UNKNOWN-SUBMIT");
-        pending_submits.insert(venue_order_id, client_order_id);
-        register_identity(
-            &order_identities,
+        pending_submits.insert(
             venue_order_id,
-            test_instrument().id(),
-            "O-UNKNOWN-SUBMIT",
+            test_order_identity(test_instrument().id(), "O-UNKNOWN-SUBMIT"),
         );
 
         let ctx = WsDispatchContext {
@@ -1412,6 +1448,12 @@ mod tests {
         }
 
         assert!(!fill_tracker.has_pending_report(&venue_order_id));
+        assert_eq!(
+            order_identities
+                .get(&venue_order_id)
+                .map(|identity| identity.client_order_id),
+            Some(client_order_id)
+        );
     }
 
     #[rstest]
@@ -1425,7 +1467,9 @@ mod tests {
         let fill_tracker = OrderFillTrackerMap::new();
         let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
-        let emitter = test_emitter();
+        let mut emitter = test_emitter();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(sender);
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
@@ -1442,13 +1486,19 @@ mod tests {
 
         let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
 
-        // First dispatch processes the trade
+        // First dispatch emits the genuinely external trade without retaining it for a future
+        // local order generation.
         let _ = dispatch_user_message(&UserWsMessage::Trade(trade.clone()), &ctx, &mut state);
-        assert_eq!(fill_tracker.pending_fills_for(&venue_order_id).len(), 1);
+        assert!(fill_tracker.pending_fills_for(&venue_order_id).is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ExecutionEvent::Report(ExecutionReport::Fill(_)))
+        ));
 
-        // Second dispatch should be deduped, no additional fill
+        // Second dispatch is deduped, so no second report is emitted.
         let _ = dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
-        assert_eq!(fill_tracker.pending_fills_for(&venue_order_id).len(), 1);
+        assert!(fill_tracker.pending_fills_for(&venue_order_id).is_empty());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[rstest]
@@ -1459,7 +1509,9 @@ mod tests {
         let fill_tracker = OrderFillTrackerMap::new();
         let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
-        let emitter = test_emitter();
+        let mut emitter = test_emitter();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(sender);
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
@@ -1481,7 +1533,11 @@ mod tests {
 
         assert!(first_result.is_none());
         assert!(replay_result.is_some());
-        assert_eq!(fill_tracker.pending_fills_for(&venue_order_id).len(), 1);
+        assert!(fill_tracker.pending_fills_for(&venue_order_id).is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ExecutionEvent::Report(ExecutionReport::Fill(_)))
+        ));
     }
 
     #[rstest]
@@ -1618,7 +1674,10 @@ mod tests {
 
         let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
         let client_order_id = ClientOrderId::from("O-UNKNOWN-FILL");
-        pending_submits.insert(venue_order_id, client_order_id);
+        pending_submits.insert(
+            venue_order_id,
+            test_order_identity(test_instrument().id(), "O-UNKNOWN-FILL"),
+        );
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
@@ -2173,7 +2232,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_cancel_saved_before_acceptance() {
+    fn test_external_cancel_is_not_retained_for_future_acceptance() {
         let cancel_order: PolymarketUserOrder = load("ws_user_order_cancellation.json");
         let instrument = test_instrument();
 
@@ -2186,7 +2245,9 @@ mod tests {
 
         let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
-        let emitter = test_emitter();
+        let mut emitter = test_emitter();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(sender);
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
@@ -2204,9 +2265,14 @@ mod tests {
         // Dispatch cancel while order is not yet accepted
         dispatch_user_message(&UserWsMessage::Order(cancel_order), &ctx, &mut state);
 
-        // Cancel should be buffered (not emitted) AND saved to terminal_cancel_reports
-        assert!(fill_tracker.has_pending_report(&venue_order_id));
-        assert!(state.terminal_cancel_reports.get(&venue_order_id).is_some());
+        // Without a pending local identity this is an external order. Emit it now and do not
+        // retain it for a later local order generation that happens to reuse the venue ID.
+        assert!(!fill_tracker.has_pending_report(&venue_order_id));
+        assert!(state.terminal_cancel_reports.get(&venue_order_id).is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ExecutionEvent::Report(ExecutionReport::Order(_)))
+        ));
     }
 
     /// Replays the exact 5-message WS sequence from issue #3797.

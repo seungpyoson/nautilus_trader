@@ -81,7 +81,7 @@ impl OrderReportIdentity {
         }
     }
 
-    fn agrees_with_registered(self, registered: OrderIdentity) -> bool {
+    pub(crate) fn agrees_with_registered(self, registered: OrderIdentity) -> bool {
         self.instrument_id == registered.instrument_id
             && self.order_side == registered.order_side
             && self.order_type == registered.order_type
@@ -298,6 +298,36 @@ impl OrderIdentityRegistry {
             .fill_identity_matches(&venue_order_id, instrument_id, client_order_id, order_side)
             .is_some_and(|matches| !matches)
         {
+            return Err(OrderIdentityConflict);
+        }
+        Ok(identity)
+    }
+
+    /// Validates registry and tracker identity and applies tracker snapping under the single
+    /// registration gate. A venue ID therefore cannot acquire a local identity between admission
+    /// and consumption of tracker-owned quantity.
+    pub(crate) fn admit_and_snap_fill_report(
+        &self,
+        report: &mut nautilus_model::reports::FillReport,
+        fill_tracker: &OrderFillTrackerMap,
+    ) -> Result<Option<OrderIdentity>, OrderIdentityConflict> {
+        let _registration = self.registration_gate.lock().expect(MUTEX_POISONED);
+        let identity = {
+            let guard = self.inner.lock().expect(MUTEX_POISONED);
+            resolve_order_request_in(
+                &guard,
+                report.venue_order_id,
+                report.instrument_id,
+                report.client_order_id,
+                None,
+            )?;
+            let identity = guard.identities.get(&report.venue_order_id).copied();
+            if identity.is_some_and(|identity| identity.order_side != report.order_side) {
+                return Err(OrderIdentityConflict);
+            }
+            identity
+        };
+        if !fill_tracker.admit_and_snap_fill_report(report) {
             return Err(OrderIdentityConflict);
         }
         Ok(identity)

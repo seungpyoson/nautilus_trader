@@ -33,7 +33,7 @@ use ustr::Ustr;
 
 use super::{
     PolymarketExecutionClient,
-    identity::{OrderIdentityConflict, OrderIdentityRegistry},
+    identity::{OrderIdentityConflict, OrderIdentityRegistry, OrderReportIdentity},
     order_fill_tracker::OrderFillTrackerMap,
     parse::{
         parse_balance_allowance, parse_order_status_report, sum_filled_quantity,
@@ -394,6 +394,21 @@ impl PolymarketExecutionClient {
             return Ok(None);
         }
 
+        if let Some(cached) = cached.as_ref()
+            && order_fills.iter().any(|fill| {
+                fill.instrument_id != cached.instrument_id()
+                    || fill.order_side != cached.order_side()
+                    || fill
+                        .client_order_id
+                        .is_some_and(|client| client != cached.client_order_id())
+            })
+        {
+            log::error!(
+                "Confirmed fills for venue order {venue_order_id} contradict the complete cached order identity; deferring terminal recovery"
+            );
+            return Ok(None);
+        }
+
         if order_fills.is_empty() {
             let Some(cached) = cached.as_ref() else {
                 log::debug!(
@@ -486,6 +501,17 @@ impl PolymarketExecutionClient {
         report.avg_px = avg_px;
         normalize_terminal_order_report_quantity(&mut report);
 
+        if self
+            .order_identities
+            .resolve_order_status_report(&report, &self.fill_tracker)
+            .is_err()
+        {
+            log::error!(
+                "Recovered terminal order {venue_order_id} contradicts current identity; reporting nothing"
+            );
+            return Ok(None);
+        }
+
         Ok(Some(report))
     }
 
@@ -553,7 +579,7 @@ impl PolymarketExecutionClient {
             );
             return;
         }
-        let cached_filled = match cache.order(&client_order_id) {
+        let (cached_filled, cached_identity) = match cache.order(&client_order_id) {
             Some(order) => {
                 let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
 
@@ -572,9 +598,12 @@ impl PolymarketExecutionClient {
                     );
                     return;
                 }
-                order.filled_qty()
+                (
+                    order.filled_qty(),
+                    Some(OrderReportIdentity::from_order(&order)),
+                )
             }
-            None => Quantity::zero(size_prec),
+            None => (Quantity::zero(size_prec), None),
         };
         let order_identities = self.order_identities.clone();
 
@@ -618,6 +647,14 @@ impl PolymarketExecutionClient {
                         size_prec,
                         clock.get_time_ns(),
                     );
+                    if cached_identity
+                        .is_some_and(|identity| identity != OrderReportIdentity::from_report(&report))
+                    {
+                        log::error!(
+                            "Cached order {client_order_id} contradicts the complete venue report identity for {requested_venue_order_id}; reporting nothing"
+                        );
+                        return Ok(());
+                    }
                     let tracked_filled = match fill_tracker.cumulative_filled_for_report(&report) {
                         Ok(filled) => filled.unwrap_or_else(|| Quantity::zero(size_prec)),
                         Err(_) => {
@@ -652,7 +689,11 @@ impl PolymarketExecutionClient {
                         .await
                         {
                             Ok(fills) => confirmed_filled_quantities(&fills)
-                                .get(&(requested_venue_order_id, instrument_id))
+                                .get(&(
+                                    requested_venue_order_id,
+                                    instrument_id,
+                                    report.order_side,
+                                ))
                                 .copied(),
                             Err(e) => {
                                 log::warn!(
@@ -812,6 +853,14 @@ impl PolymarketExecutionClient {
                         );
                         return Ok(None);
                     }
+                    if OrderReportIdentity::from_order(cached)
+                        != OrderReportIdentity::from_report(&report)
+                    {
+                        log::error!(
+                            "Cached order {client_order_id} contradicts the complete venue report identity for {venue_order_id}; reporting nothing"
+                        );
+                        return Ok(None);
+                    }
                 }
                 cached.map_or_else(|| Quantity::zero(size_prec), |order| order.filled_qty())
             };
@@ -841,7 +890,7 @@ impl PolymarketExecutionClient {
                 .await
                 {
                     Ok(fills) => confirmed_filled_quantities(&fills)
-                        .get(&(venue_order_id, instrument_id))
+                        .get(&(venue_order_id, instrument_id, report.order_side))
                         .copied(),
                     Err(e) => {
                         log::warn!(
@@ -971,7 +1020,11 @@ impl PolymarketExecutionClient {
                 report,
                 cached_filled.max(tracked_filled),
                 confirmed_fills
-                    .get(&(report.venue_order_id, report.instrument_id))
+                    .get(&(
+                        report.venue_order_id,
+                        report.instrument_id,
+                        report.order_side,
+                    ))
                     .copied(),
             );
             true
