@@ -65,6 +65,8 @@ pub(crate) struct FillContext<'a> {
 /// counts, so callers currently surface them through logs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FillBuildDiscards {
+    /// Fill reports rejected because they contradicted a registered own-order identity.
+    pub identity_conflicts: usize,
     /// Entries whose instrument was not loaded, so no report could be built.
     pub unmapped_instruments: usize,
     /// Confirmed maker trades holding none of the account's own maker orders.
@@ -108,6 +110,13 @@ impl FillBuildDiscards {
 
     fn findings(&self) -> Vec<String> {
         let mut findings = Vec::new();
+        if self.identity_conflicts > 0 {
+            findings.push(format!(
+                "{} fill report(s) contradicted registered order identity and were dropped",
+                self.identity_conflicts,
+            ));
+        }
+
         if self.unowned_maker_trades > 0 {
             findings.push(format!(
                 "{} confirmed maker trade(s) held no maker order owned by this account",
@@ -350,6 +359,29 @@ pub(crate) fn build_fill_reports_from_trades(
     (reports, discards)
 }
 
+/// Drops fill reports that contradict a registered own-order identity.
+///
+/// An order absent from the registry is legitimately external and remains
+/// admissible. Registered venue orders must retain their instrument and client
+/// identity before venue-order-keyed tracker state can affect the report.
+pub(crate) fn retain_identity_admitted_fill_reports(
+    reports: &mut Vec<FillReport>,
+    order_identities: &OrderIdentityRegistry,
+) -> usize {
+    let reports_before = reports.len();
+    reports.retain(|report| {
+        order_identities
+            .resolve_order_request(
+                report.venue_order_id,
+                report.instrument_id,
+                report.client_order_id,
+                None,
+            )
+            .is_ok()
+    });
+    reports_before - reports.len()
+}
+
 /// Converts open orders into order status reports.
 pub(crate) fn build_order_reports_from_orders(
     orders: &[PolymarketOpenOrder],
@@ -487,7 +519,7 @@ pub(crate) async fn generate_mass_status(
 
     let trades_before = all_trades.len();
 
-    let (mut fill_reports, fills_filtered) = build_fill_reports_from_trades(
+    let (mut fill_reports, mut fills_filtered) = build_fill_reports_from_trades(
         &all_trades,
         ctx,
         instruments,
@@ -498,6 +530,9 @@ pub(crate) async fn generate_mass_status(
         ts_init,
     );
     let trades_after = trades_before - fills_filtered.outside_lookback;
+
+    fills_filtered.identity_conflicts +=
+        retain_identity_admitted_fill_reports(&mut fill_reports, order_identities);
 
     // Snap dust drift on REST fills the same way the WS path does.
     // Commission stays as venue-reported.
@@ -951,6 +986,15 @@ mod tests {
         assert!(
             !windowed_out_only.lost_anything(),
             "a windowed-out trade on its own is the window working, not a loss"
+        );
+
+        let identity_conflict = FillBuildDiscards {
+            identity_conflicts: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            identity_conflict.findings(),
+            ["1 fill report(s) contradicted registered order identity and were dropped"]
         );
     }
 

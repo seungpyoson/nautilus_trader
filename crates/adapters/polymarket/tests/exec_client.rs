@@ -1491,7 +1491,7 @@ async fn test_generate_order_status_reports_drop_a_registered_instrument_conflic
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_mass_status_drops_a_registered_instrument_conflict() {
+async fn test_fill_and_mass_status_drop_a_registered_instrument_conflict() {
     let venue_order_id_str = DEFAULT_ACCEPTED_ORDER_ID;
     let state = TestServerState::default();
     let mut venue_order = load_json("http_open_orders_page.json")["data"][0].clone();
@@ -1500,10 +1500,11 @@ async fn test_generate_mass_status_drops_a_registered_instrument_conflict() {
         "data": [venue_order],
         "next_cursor": "LTE=",
     }));
-    *state.trades_response_override.lock().await = Some(json!({
-        "data": [],
-        "next_cursor": "LTE=",
-    }));
+    *state.trades_response_override.lock().await = Some(recovery_trades_response(
+        venue_order_id_str,
+        "10.0050",
+        "0.5000",
+    ));
     let addr = start_mock_server(state).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
     client.start().unwrap();
@@ -1545,14 +1546,41 @@ async fn test_generate_mass_status_drops_a_registered_instrument_conflict() {
         .clone();
     client.on_instrument(reported_instrument);
 
+    let fill_reports = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(reported_instrument_id),
+            venue_order_id: Some(VenueOrderId::from(venue_order_id_str)),
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
 
+    assert!(
+        fill_reports.is_empty(),
+        "standalone reconciliation must not relabel registered venue order \
+         {venue_order_id_str} from {registered_instrument_id} to {reported_instrument_id}"
+    );
     assert!(
         !mass_status
             .order_reports()
             .contains_key(&VenueOrderId::from(venue_order_id_str)),
         "mass status must not relabel registered venue order {venue_order_id_str} from \
          {registered_instrument_id} to {reported_instrument_id}"
+    );
+    assert!(
+        !mass_status
+            .fill_reports()
+            .contains_key(&VenueOrderId::from(venue_order_id_str)),
+        "mass status must not relabel a fill for registered venue order \
+         {venue_order_id_str} from {registered_instrument_id} to {reported_instrument_id}"
     );
 }
 

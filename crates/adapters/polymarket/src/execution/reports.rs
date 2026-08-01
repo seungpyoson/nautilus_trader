@@ -41,7 +41,7 @@ use super::{
     reconciliation::{
         FillContext, build_fill_reports_from_trades, build_position_reports,
         cap_order_report_filled_qty, confirmed_filled_quantities,
-        normalize_terminal_order_report_quantity,
+        normalize_terminal_order_report_quantity, retain_identity_admitted_fill_reports,
     },
 };
 use crate::{
@@ -333,7 +333,7 @@ impl PolymarketExecutionClient {
             return Ok(Some(report));
         }
 
-        let (mut order_fills, discards) = build_fill_reports_from_trades(
+        let (mut order_fills, mut discards) = build_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
@@ -344,6 +344,8 @@ impl PolymarketExecutionClient {
             ts_init,
         );
 
+        discards.identity_conflicts +=
+            retain_identity_admitted_fill_reports(&mut order_fills, &self.order_identities);
         discards.report(log::Level::Debug, "Polymarket order status report");
         self.fill_tracker.snap_fill_reports(&mut order_fills);
 
@@ -928,7 +930,7 @@ impl PolymarketExecutionClient {
             .context("failed to fetch trades")?;
 
         let ctx = self.fill_context();
-        let (mut reports, discards) = build_fill_reports_from_trades(
+        let (mut reports, mut discards) = build_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
@@ -938,6 +940,9 @@ impl PolymarketExecutionClient {
             cmd.end,
             self.clock.get_time_ns(),
         );
+
+        discards.identity_conflicts +=
+            retain_identity_admitted_fill_reports(&mut reports, &self.order_identities);
 
         // A bounded query that answered with trades it could not place in time
         // has weakened the caller's window, which is worth more than a line the
