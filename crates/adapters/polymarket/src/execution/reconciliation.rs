@@ -29,6 +29,7 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use super::{
+    identity::OrderIdentityRegistry,
     order_fill_tracker::OrderFillTrackerMap,
     parse::{
         build_maker_fill_report, instrument_taker_fee, parse_fill_report,
@@ -448,6 +449,7 @@ pub(crate) async fn generate_mass_status(
     data_api_client: &PolymarketDataApiHttpClient,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     fill_tracker: &OrderFillTrackerMap,
+    order_identities: &OrderIdentityRegistry,
     ctx: &FillContext<'_>,
     client_id: ClientId,
     venue: Venue,
@@ -552,6 +554,27 @@ pub(crate) async fn generate_mass_status(
         ),
     );
 
+    order_reports.retain(|report| {
+        if order_identities
+            .resolve_order_request(
+                report.venue_order_id,
+                report.instrument_id,
+                report.client_order_id,
+                None,
+            )
+            .is_ok()
+        {
+            true
+        } else {
+            log::error!(
+                "Registered identity contradicts mass-status order {} and instrument {}; \
+                 dropping the report",
+                report.venue_order_id,
+                report.instrument_id,
+            );
+            false
+        }
+    });
     cap_order_reports_to_confirmed_fills(&mut order_reports, &fill_reports, fill_tracker);
 
     let mut mass_status = ExecutionMassStatus::new(client_id, ctx.account_id, venue, ts_init, None);
@@ -586,17 +609,21 @@ fn cap_order_reports_to_confirmed_fills(
         cap_order_report_filled_qty(
             report,
             local_filled,
-            confirmed_by_order.get(&report.venue_order_id).copied(),
+            confirmed_by_order
+                .get(&(report.venue_order_id, report.instrument_id))
+                .copied(),
         );
     }
 }
 
 pub(crate) fn confirmed_filled_quantities(
     fill_reports: &[FillReport],
-) -> AHashMap<VenueOrderId, Decimal> {
+) -> AHashMap<(VenueOrderId, InstrumentId), Decimal> {
     let mut confirmed_by_order = AHashMap::new();
     for fill in fill_reports {
-        *confirmed_by_order.entry(fill.venue_order_id).or_default() += fill.last_qty.as_decimal();
+        *confirmed_by_order
+            .entry((fill.venue_order_id, fill.instrument_id))
+            .or_default() += fill.last_qty.as_decimal();
     }
 
     confirmed_by_order
@@ -1283,6 +1310,32 @@ mod tests {
         cap_order_reports_to_confirmed_fills(&mut reports, &fills, &OrderFillTrackerMap::new());
 
         assert_eq!(reports[0].filled_qty, Quantity::from("4.0000"));
+    }
+
+    #[rstest]
+    fn does_not_join_confirmed_fills_from_another_instrument() {
+        let venue_order_id = VenueOrderId::from("V-SHARED");
+        let mut reports = vec![order_report_filled(venue_order_id, "5.0000")];
+        let fills = vec![FillReport::new(
+            AccountId::from("POLY-001"),
+            InstrumentId::from("OTHER.POLYMARKET"),
+            venue_order_id,
+            TradeId::from("T-OTHER"),
+            OrderSide::Buy,
+            Quantity::from("4.0000"),
+            Price::from("0.5000"),
+            Money::new(0.0, Currency::pUSD()),
+            LiquiditySide::Taker,
+            None,
+            None,
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        )];
+
+        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &OrderFillTrackerMap::new());
+
+        assert!(reports[0].filled_qty.is_zero());
     }
 
     /// Builds a partially filled report for an order the venue says filled `filled`.

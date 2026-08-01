@@ -1306,7 +1306,7 @@ async fn test_generate_order_status_reports_ignores_a_mismatched_cached_fill() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_ignore_a_reverse_registry_conflict() {
+async fn test_generate_order_status_reports_drop_a_reverse_registry_conflict() {
     let venue_order_id_str = DEFAULT_ACCEPTED_ORDER_ID;
     let state = TestServerState::default();
     let mut venue_order = load_json("http_open_orders_page.json")["data"][0].clone();
@@ -1399,11 +1399,160 @@ async fn test_generate_order_status_reports_ignore_a_reverse_registry_conflict()
         .await
         .unwrap();
 
-    assert_eq!(reports.len(), 1);
     assert!(
-        reports[0].filled_qty.is_zero(),
-        "cached fill for {conflicting_client_order_id} must not override the registry owner \
-         {registered_client_order_id} of venue order {venue_order_id_str}"
+        reports.is_empty(),
+        "venue order {venue_order_id_str} belongs to registry owner \
+         {registered_client_order_id}, so a report resolved through conflicting cache owner \
+         {conflicting_client_order_id} must be dropped"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_reports_drop_a_registered_instrument_conflict() {
+    let venue_order_id_str = DEFAULT_ACCEPTED_ORDER_ID;
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_orders_page.json")["data"][0].clone();
+    venue_order["id"] = Value::String(venue_order_id_str.to_string());
+    venue_order["status"] = Value::String("MATCHED".to_string());
+    venue_order["original_size"] = Value::String("10.0000".to_string());
+    venue_order["size_matched"] = Value::String("10.0000".to_string());
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [venue_order],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let registered_instrument_id = InstrumentId::from("REGISTERED-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, registered_instrument_id, 4);
+    let registered_instrument = cache
+        .borrow()
+        .instrument(&registered_instrument_id)
+        .unwrap()
+        .clone();
+    client.on_instrument(registered_instrument);
+    let registered_order = make_limit_order(
+        "O-BULK-REGISTERED-INSTRUMENT",
+        registered_instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(registered_order.clone(), None, None, false)
+        .unwrap();
+    client
+        .submit_order(make_submit_cmd(&registered_order, registered_instrument_id))
+        .unwrap();
+    assert_order_event(rx.try_recv().unwrap(), "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+
+    cache.borrow_mut().reset();
+    let reported_instrument_id = InstrumentId::from("REPORTED-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, reported_instrument_id, 4);
+    let reported_instrument = cache
+        .borrow()
+        .instrument(&reported_instrument_id)
+        .unwrap()
+        .clone();
+    client.on_instrument(reported_instrument);
+
+    let reports = client
+        .generate_order_status_reports(&GenerateOrderStatusReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            open_only: false,
+            instrument_id: Some(reported_instrument_id),
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        reports.is_empty(),
+        "venue order {venue_order_id_str} is registered to {registered_instrument_id}, so a \
+         report labeling it {reported_instrument_id} must be dropped"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_drops_a_registered_instrument_conflict() {
+    let venue_order_id_str = DEFAULT_ACCEPTED_ORDER_ID;
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_orders_page.json")["data"][0].clone();
+    venue_order["id"] = Value::String(venue_order_id_str.to_string());
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [venue_order],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let registered_instrument_id = InstrumentId::from("REGISTERED-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, registered_instrument_id, 4);
+    let registered_instrument = cache
+        .borrow()
+        .instrument(&registered_instrument_id)
+        .unwrap()
+        .clone();
+    client.on_instrument(registered_instrument);
+    let registered_order = make_limit_order(
+        "O-MASS-REGISTERED-INSTRUMENT",
+        registered_instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(registered_order.clone(), None, None, false)
+        .unwrap();
+    client
+        .submit_order(make_submit_cmd(&registered_order, registered_instrument_id))
+        .unwrap();
+    assert_order_event(rx.try_recv().unwrap(), "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+
+    cache.borrow_mut().reset();
+    let reported_instrument_id = InstrumentId::from("REPORTED-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, reported_instrument_id, 4);
+    let reported_instrument = cache
+        .borrow()
+        .instrument(&reported_instrument_id)
+        .unwrap()
+        .clone();
+    client.on_instrument(reported_instrument);
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+
+    assert!(
+        !mass_status
+            .order_reports()
+            .contains_key(&VenueOrderId::from(venue_order_id_str)),
+        "mass status must not relabel registered venue order {venue_order_id_str} from \
+         {registered_instrument_id} to {reported_instrument_id}"
     );
 }
 
