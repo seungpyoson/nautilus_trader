@@ -29,13 +29,14 @@ use rust_decimal::Decimal;
 use super::{
     PolymarketExecutionClient,
     cancellations::execute_deferred_cancel,
+    local_orders::OrderIdentity,
     order_builder::PolymarketOrderBuilder,
     parse::{compute_commission, instrument_fee_exponent, instrument_taker_fee},
     reports::fetch_collateral_balance_pusd,
     responses::{
-        check_fok_status, emit_market_order_submitted, handle_batch_order_responses,
-        handle_order_response, handle_single_order_response, handle_unknown_submit_result,
-        reject_submit_order,
+        check_fok_status, deny_preparing_order, emit_market_order_submitted,
+        handle_batch_order_responses, handle_order_response, handle_single_order_response,
+        handle_unknown_submit_result, reject_claimed_submit_order_and_cancel, reject_submit_order,
     },
     submitter::{MarketBuyFeeContext, MarketOrderSubmitRequest, UnknownSubmitError},
     types::{BatchLimitOrderContext, LimitOrderSubmitRequest},
@@ -82,42 +83,59 @@ impl PolymarketExecutionClient {
             tick_decimals,
         };
 
+        let identity = OrderIdentity::from_order(&order);
+        if self.local_orders.begin_submission(identity).is_err() {
+            self.emitter.emit_order_denied(
+                &order,
+                "Local order identity conflicts with an active submission",
+            );
+            return;
+        }
+
         self.emitter.emit_order_submitted(&order);
 
         let submitter = self.submitter.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
-        let fill_tracker = self.fill_tracker.clone();
-        let order_identities = self.order_identities.clone();
-        let pending_submits = self.pending_submits.clone();
-        let pending_cancels = self.pending_cancels.clone();
-        let account_id = self.core.account_id;
-        let size_precision = instrument.size_precision();
-        let price_precision = instrument.price_precision();
+        let local_orders = self.local_orders.clone();
 
         self.spawn_task("submit_limit_order", async move {
             let submission = match submitter.prepare_limit_order_submission(&request).await {
                 Ok(submission) => submission,
                 Err(e) => {
-                    reject_submit_order(&order, &format!("{e}"), &emitter, clock, &pending_cancels);
+                    reject_submit_order(&order, &format!("{e}"), &emitter, clock, &local_orders);
                     return Ok(());
                 }
             };
 
             let expected_venue_order_id = submission.expected_venue_order_id;
+            if local_orders
+                .claim_submission(
+                    expected_venue_order_id,
+                    identity,
+                    order.quantity(),
+                    order.price(),
+                )
+                .is_err()
+            {
+                reject_submit_order(
+                    &order,
+                    "Local order identity conflicts with an active submission",
+                    &emitter,
+                    clock,
+                    &local_orders,
+                );
+                return Ok(());
+            }
             match submitter.post_limit_order_submission(submission).await {
                 Ok(response) => {
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
                         Ok(response),
+                        expected_venue_order_id,
                         &order,
                         &emitter,
                         clock,
-                        &fill_tracker,
-                        &order_identities,
-                        &pending_cancels,
-                        account_id,
-                        size_precision,
-                        price_precision,
+                        &local_orders,
                     ) {
                         execute_deferred_cancel(
                             &submitter,
@@ -125,7 +143,6 @@ impl PolymarketExecutionClient {
                             &order_id_str,
                             venue_order_id,
                             &emitter,
-                            &pending_cancels,
                             clock,
                         )
                         .await;
@@ -136,16 +153,7 @@ impl PolymarketExecutionClient {
                         &order,
                         expected_venue_order_id,
                         &e.to_string(),
-                        None,
-                        &emitter,
-                        clock,
-                        &fill_tracker,
-                        &order_identities,
-                        &pending_submits,
-                        &pending_cancels,
-                        account_id,
-                        size_precision,
-                        price_precision,
+                        &local_orders,
                     ) {
                         execute_deferred_cancel(
                             &submitter,
@@ -153,14 +161,21 @@ impl PolymarketExecutionClient {
                             &order_id_str,
                             venue_order_id,
                             &emitter,
-                            &pending_cancels,
                             clock,
                         )
                         .await;
                     }
                 }
                 Err(e) => {
-                    reject_submit_order(&order, &format!("{e}"), &emitter, clock, &pending_cancels);
+                    reject_claimed_submit_order_and_cancel(
+                        &submitter,
+                        &order,
+                        &format!("{e}"),
+                        &emitter,
+                        clock,
+                        &local_orders,
+                    )
+                    .await;
                 }
             }
             Ok(())
@@ -203,13 +218,19 @@ impl PolymarketExecutionClient {
         let signature_type = self.config.signature_type;
         let emitter = self.emitter.clone();
         let clock = self.clock;
-        let fill_tracker = self.fill_tracker.clone();
-        let order_identities = self.order_identities.clone();
-        let pending_submits = self.pending_submits.clone();
-        let pending_cancels = self.pending_cancels.clone();
+        let local_orders = self.local_orders.clone();
         let account_id = self.core.account_id;
         let size_precision = instrument.size_precision();
         let price_precision = instrument.price_precision();
+
+        let identity = OrderIdentity::from_order(&order);
+        if local_orders.begin_submission(identity).is_err() {
+            emitter.emit_order_denied(
+                &order,
+                "Local order identity conflicts with an active submission",
+            );
+            return;
+        }
 
         self.spawn_task("submit_market_order", async move {
             let fee_context = if needs_fee_adjustment {
@@ -221,9 +242,11 @@ impl PolymarketExecutionClient {
                         builder_taker_fee_rate: Decimal::ZERO,
                     }),
                     Err(e) => {
-                        emitter.emit_order_denied(
+                        deny_preparing_order(
                             &order,
                             &format!("Failed to fetch pUSD balance for fee adjustment: {e}"),
+                            &emitter,
+                            &local_orders,
                         );
                         return Ok(());
                     }
@@ -232,9 +255,9 @@ impl PolymarketExecutionClient {
                 None
             };
 
-            match submitter
-                .submit_market_order(MarketOrderSubmitRequest {
-                    token_id,
+            let submission = match submitter
+                .prepare_market_order_submission(MarketOrderSubmitRequest {
+                    token_id: token_id.clone(),
                     side,
                     amount,
                     time_in_force,
@@ -244,6 +267,42 @@ impl PolymarketExecutionClient {
                 })
                 .await
             {
+                Ok(submission) => submission,
+                Err(e) => {
+                    reject_submit_order(&order, &format!("{e}"), &emitter, clock, &local_orders);
+                    return Ok(());
+                }
+            };
+            let expected_venue_order_id = submission.expected_venue_order_id;
+            let Ok(expected_base_qty) =
+                Quantity::from_decimal_dp(submission.expected_base_qty, size_precision)
+            else {
+                reject_submit_order(
+                    &order,
+                    "Prepared market order has an invalid base quantity",
+                    &emitter,
+                    clock,
+                    &local_orders,
+                );
+                return Ok(());
+            };
+            if local_orders
+                .claim_submission(
+                    expected_venue_order_id,
+                    OrderIdentity::from_order(&order),
+                    expected_base_qty,
+                    order.price(),
+                )
+                .is_err()
+            {
+                emitter.emit_order_denied(
+                    &order,
+                    "Local order identity conflicts with an active submission",
+                );
+                return Ok(());
+            }
+
+            match submitter.post_market_order_submission(submission).await {
                 Ok(result) => {
                     let mut order = order;
                     emit_market_order_submitted(
@@ -279,15 +338,11 @@ impl PolymarketExecutionClient {
 
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
                         Ok(result.response),
+                        result.expected_venue_order_id,
                         &order,
                         &emitter,
                         clock,
-                        &fill_tracker,
-                        &order_identities,
-                        &pending_cancels,
-                        account_id,
-                        size_precision,
-                        price_precision,
+                        &local_orders,
                     ) {
                         execute_deferred_cancel(
                             &submitter,
@@ -295,7 +350,6 @@ impl PolymarketExecutionClient {
                             &order_id_str,
                             venue_order_id,
                             &emitter,
-                            &pending_cancels,
                             clock,
                         )
                         .await;
@@ -305,8 +359,9 @@ impl PolymarketExecutionClient {
                         check_fok_status(
                             &submitter,
                             &order_id,
+                            &token_id,
                             &order,
-                            &fill_tracker,
+                            &local_orders,
                             &emitter,
                             account_id,
                             size_precision,
@@ -331,28 +386,11 @@ impl PolymarketExecutionClient {
                             clock,
                         );
 
-                        let fill_tracker_quantity = if is_quote_qty && side == OrderSide::Buy {
-                            unknown
-                                .expected_base_qty
-                                .and_then(|qty| Quantity::from_decimal_dp(qty, size_precision).ok())
-                        } else {
-                            None
-                        };
-
                         if let Some((order_id_str, venue_order_id)) = handle_unknown_submit_result(
                             &order,
                             unknown.expected_venue_order_id,
                             &unknown.reason,
-                            fill_tracker_quantity,
-                            &emitter,
-                            clock,
-                            &fill_tracker,
-                            &order_identities,
-                            &pending_submits,
-                            &pending_cancels,
-                            account_id,
-                            size_precision,
-                            price_precision,
+                            &local_orders,
                         ) {
                             execute_deferred_cancel(
                                 &submitter,
@@ -360,14 +398,20 @@ impl PolymarketExecutionClient {
                                 &order_id_str,
                                 venue_order_id,
                                 &emitter,
-                                &pending_cancels,
                                 clock,
                             )
                             .await;
                         }
                     } else {
-                        let ts_now = clock.get_time_ns();
-                        emitter.emit_order_rejected(&order, &format!("{e}"), ts_now, false);
+                        reject_claimed_submit_order_and_cancel(
+                            &submitter,
+                            &order,
+                            &format!("{e}"),
+                            &emitter,
+                            clock,
+                            &local_orders,
+                        )
+                        .await;
                     }
                 }
             }
@@ -491,8 +535,6 @@ impl PolymarketExecutionClient {
                     expire_time: order.expire_time(),
                     tick_decimals: instrument.price_precision() as u32,
                 },
-                size_precision: instrument.size_precision(),
-                price_precision: instrument.price_precision(),
                 order,
             });
         }
@@ -507,31 +549,66 @@ impl PolymarketExecutionClient {
             return;
         }
 
+        let mut admitted_batch_orders = Vec::with_capacity(batch_orders.len());
+        for batch_order in batch_orders {
+            if self
+                .local_orders
+                .begin_submission(OrderIdentity::from_order(&batch_order.order))
+                .is_ok()
+            {
+                admitted_batch_orders.push(batch_order);
+            } else {
+                self.emitter.emit_order_denied(
+                    &batch_order.order,
+                    "Local order identity conflicts with an active submission",
+                );
+            }
+        }
+        if admitted_batch_orders.is_empty() {
+            return;
+        }
+
         let submitter = self.submitter.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
-        let fill_tracker = self.fill_tracker.clone();
-        let order_identities = self.order_identities.clone();
-        let pending_submits = self.pending_submits.clone();
-        let pending_cancels = self.pending_cancels.clone();
+        let local_orders = self.local_orders.clone();
         let pending_tasks = self.pending_tasks.clone();
-        let account_id = self.core.account_id;
 
         self.spawn_task("submit_order_list", async move {
-            for batch_order in &batch_orders {
+            for batch_order in &admitted_batch_orders {
                 emitter.emit_order_submitted(&batch_order.order);
             }
 
-            let requests: Vec<LimitOrderSubmitRequest> =
-                batch_orders.iter().map(|bo| bo.request.clone()).collect();
+            let requests: Vec<LimitOrderSubmitRequest> = admitted_batch_orders
+                .iter()
+                .map(|bo| bo.request.clone())
+                .collect();
             let prepare_results = submitter.prepare_limit_order_submissions(&requests).await;
 
-            let mut prepared_orders = Vec::with_capacity(batch_orders.len());
-            let mut submissions = Vec::with_capacity(batch_orders.len());
+            let mut prepared_orders = Vec::with_capacity(requests.len());
+            let mut submissions = Vec::with_capacity(requests.len());
 
-            for (batch_order, result) in batch_orders.into_iter().zip(prepare_results) {
+            for (batch_order, result) in admitted_batch_orders.into_iter().zip(prepare_results) {
                 match result {
                     Ok(submission) => {
+                        if local_orders
+                            .claim_submission(
+                                submission.expected_venue_order_id,
+                                OrderIdentity::from_order(&batch_order.order),
+                                batch_order.order.quantity(),
+                                batch_order.order.price(),
+                            )
+                            .is_err()
+                        {
+                            reject_submit_order(
+                                &batch_order.order,
+                                "Local order identity conflicts with an active submission",
+                                &emitter,
+                                clock,
+                                &local_orders,
+                            );
+                            continue;
+                        }
                         prepared_orders.push(batch_order);
                         submissions.push(submission);
                     }
@@ -541,7 +618,7 @@ impl PolymarketExecutionClient {
                             &format!("{e}"),
                             &emitter,
                             clock,
-                            &pending_cancels,
+                            &local_orders,
                         );
                     }
                 }
@@ -569,11 +646,7 @@ impl PolymarketExecutionClient {
                         &submitter,
                         &emitter,
                         clock,
-                        &fill_tracker,
-                        &order_identities,
-                        &pending_submits,
-                        &pending_cancels,
-                        account_id,
+                        &local_orders,
                     )
                     .await;
                 } else {
@@ -594,12 +667,8 @@ impl PolymarketExecutionClient {
                                 &submitter,
                                 &emitter,
                                 clock,
-                                &fill_tracker,
-                                &order_identities,
-                                &pending_submits,
-                                &pending_cancels,
+                                &local_orders,
                                 &pending_tasks,
-                                account_id,
                             )
                             .await;
                         }
@@ -612,16 +681,7 @@ impl PolymarketExecutionClient {
                                         &batch_order.order,
                                         expected_venue_order_id,
                                         &e.to_string(),
-                                        None,
-                                        &emitter,
-                                        clock,
-                                        &fill_tracker,
-                                        &order_identities,
-                                        &pending_submits,
-                                        &pending_cancels,
-                                        account_id,
-                                        batch_order.size_precision,
-                                        batch_order.price_precision,
+                                        &local_orders,
                                     )
                                 {
                                     execute_deferred_cancel(
@@ -630,7 +690,6 @@ impl PolymarketExecutionClient {
                                         &order_id_str,
                                         venue_order_id,
                                         &emitter,
-                                        &pending_cancels,
                                         clock,
                                     )
                                     .await;
@@ -639,13 +698,15 @@ impl PolymarketExecutionClient {
                         }
                         Err(e) => {
                             for batch_order in orders_chunk {
-                                reject_submit_order(
+                                reject_claimed_submit_order_and_cancel(
+                                    &submitter,
                                     &batch_order.order,
                                     &format!("{e}"),
                                     &emitter,
                                     clock,
-                                    &pending_cancels,
-                                );
+                                    &local_orders,
+                                )
+                                .await;
                             }
                         }
                     }

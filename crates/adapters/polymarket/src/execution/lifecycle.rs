@@ -40,7 +40,7 @@ use ustr::Ustr;
 
 use super::PolymarketExecutionClient;
 use crate::{
-    execution::{identity::OrderIdentity, reports::fetch_and_emit_account_state},
+    execution::{local_orders::OrderIdentity, reports::fetch_and_emit_account_state},
     http::{clob::HeartbeatResponse, error::Error as HttpError},
     websocket::{
         dispatch::{WsDispatchContext, WsDispatchState, dispatch_user_message},
@@ -274,17 +274,13 @@ impl PolymarketExecutionClient {
             .unwrap_or_else(|| self.secrets.address.clone());
         let user_api_key = self.secrets.credential.api_key().to_string();
 
-        let fill_tracker = self.fill_tracker.clone();
-        let pending_submits = self.pending_submits.clone();
-        let order_identities = self.order_identities.clone();
+        let local_orders = self.local_orders.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
 
         let handle = get_runtime().spawn(async move {
             let ctx = WsDispatchContext {
                 token_instruments: &token_instruments,
-                fill_tracker: &fill_tracker,
-                pending_submits: &pending_submits,
-                order_identities: &order_identities,
+                local_orders: &local_orders,
                 emitter: &emitter,
                 account_id,
                 clock,
@@ -416,15 +412,23 @@ impl PolymarketExecutionClient {
                 continue;
             };
 
-            self.order_identities
-                .register_order_identity(venue_order_id, OrderIdentity::from_order(order));
-            self.order_identities.mark_accepted(venue_order_id);
-            self.fill_tracker.restore_order(
-                venue_order_id,
-                order.quantity(),
-                order.filled_qty(),
-                order.order_side(),
-            );
+            if self
+                .local_orders
+                .restore_order(
+                    venue_order_id,
+                    OrderIdentity::from_order(order),
+                    order.quantity(),
+                    order.filled_qty(),
+                    order.price(),
+                )
+                .is_err()
+            {
+                log::error!(
+                    "Cannot restore local order {}: identity conflicts with active coordinator state",
+                    order.client_order_id(),
+                );
+                continue;
+            }
 
             for event in order.events() {
                 match event {
@@ -1116,15 +1120,22 @@ mod tests {
 
         let key = "trade-restart-V-001";
         let identity = client
-            .order_identities
-            .get(&venue_order_id)
+            .local_orders
+            .identity(&venue_order_id)
             .expect("order identity restored");
         let state = client.ws_dispatch_state.lock().expect(MUTEX_POISONED);
 
         assert_eq!(identity.client_order_id, order.client_order_id());
-        assert!(!client.order_identities.mark_accepted(venue_order_id));
         assert_eq!(
-            client.fill_tracker.get_cumulative_filled(&venue_order_id),
+            client
+                .local_orders
+                .accept_submission(venue_order_id, identity),
+            Ok(false)
+        );
+        assert_eq!(
+            client
+                .local_orders
+                .cumulative_filled_for_test(&venue_order_id),
             Some(order.filled_qty())
         );
         assert_eq!(order.status(), OrderStatus::Voided);

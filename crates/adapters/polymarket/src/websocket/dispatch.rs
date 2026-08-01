@@ -18,12 +18,12 @@
 //! Routes user-channel WS messages (order updates and trades) for orders submitted through this
 //! client into Nautilus order events (`OrderAccepted` / `OrderFilled` / `OrderFillVoided` /
 //! `OrderCanceled` / `OrderRejected` / `OrderExpired`), building them from the identity captured at
-//! submit (`OrderIdentityRegistry`). Order-channel messages drive lifecycle events; trade-channel
+//! submit (`LocalOrderCoordinator`). Order-channel messages drive lifecycle events; trade-channel
 //! messages drive fills, and acceptance is synthesized before a fill or cancel that races ahead.
-//! Messages are emitted once the order is known (accepted, or with a submit in flight), otherwise
-//! buffered until acceptance. Reports are reserved for the `generate_*` query and reconciliation
-//! methods. Trade fills are emitted at `MATCHED`, retained until terminal settlement, and reversed
-//! with `OrderFillVoided` if the trade reaches `FAILED`.
+//! The coordinator admits local artifacts against the identity claimed before submission;
+//! untracked provisional fills are retained until the trade confirms. Reports are reserved for the
+//! `generate_*` query and reconciliation methods. Trade fills are emitted at `MATCHED`, retained
+//! until terminal settlement, and reversed with `OrderFillVoided` if the trade reaches `FAILED`.
 
 use std::str::FromStr;
 
@@ -56,13 +56,11 @@ use crate::{
     },
     execution::{
         get_pusd_currency,
-        identity::{OrderIdentity, OrderIdentityRegistry},
-        order_fill_tracker::{BufferedFill, FillCorrectionMetadata, OrderFillTrackerMap},
+        local_orders::{ArtifactAdmission, LocalOrderCoordinator, OrderIdentity},
         parse::{
             build_maker_fill_report, compute_commission, determine_order_side,
             instrument_fee_exponent, instrument_taker_fee, parse_liquidity_side,
         },
-        pending::PendingSubmitTracker,
     },
 };
 
@@ -77,6 +75,7 @@ pub(crate) struct WsDispatchState {
     matched_fills: FifoCacheMap<String, Vec<OrderFilled>, 10_000>,
     voided_trades: FifoCache<String, 10_000>,
     confirmed_trades: FifoCache<String, 10_000>,
+    pending_untracked_fills: FifoCacheMap<String, Vec<FillReport>, 10_000>,
     pending_terminal_orders: FifoCacheMap<VenueOrderId, PendingTerminalOrder, 10_000>,
     /// Cancel reports saved for orders known to be terminal at the venue.
     /// Re-emitted after a fill to restore terminal state when fills race
@@ -118,9 +117,7 @@ struct PendingTerminalOrder {
 #[derive(Debug)]
 pub(crate) struct WsDispatchContext<'a> {
     pub token_instruments: &'a AtomicMap<Ustr, InstrumentAny>,
-    pub fill_tracker: &'a OrderFillTrackerMap,
-    pub pending_submits: &'a PendingSubmitTracker,
-    pub order_identities: &'a OrderIdentityRegistry,
+    pub local_orders: &'a LocalOrderCoordinator,
     pub emitter: &'a ExecutionEventEmitter,
     pub account_id: AccountId,
     pub clock: &'static AtomicTime,
@@ -161,82 +158,29 @@ fn dispatch_order_update(
     let venue_order_id = VenueOrderId::from(order.id.as_str());
 
     let ts_init = ctx.clock.get_time_ns();
-    let mut report =
-        build_ws_order_status_report(order, instrument, ctx.account_id, ts_event, ts_init);
-    let local_client_order_id = ctx.pending_submits.client_order_id(&venue_order_id);
-    let mut is_accepted = ctx.fill_tracker.contains(&venue_order_id);
-    report.client_order_id = local_client_order_id;
-
-    // A known own order (submit in flight) self-registers on its first WS update
-    let buffered_fills = if local_client_order_id.is_some()
-        && !is_accepted
-        && report.order_status != OrderStatus::Rejected
-    {
-        is_accepted = true;
-        ctx.fill_tracker.register_and_take_pending_fills(
-            venue_order_id,
-            local_client_order_id,
-            report.quantity,
-            report.order_side,
-        )
-    } else if is_accepted {
-        ctx.fill_tracker
-            .take_pending_fills(venue_order_id, local_client_order_id)
-    } else {
-        Vec::new()
+    let report = build_ws_order_status_report(order, instrument, ctx.account_id, ts_event, ts_init);
+    let is_local_order = match ctx.local_orders.admit_order_report(report) {
+        ArtifactAdmission::Owned { artifact, identity } => {
+            if artifact.order_status == OrderStatus::Canceled {
+                state
+                    .terminal_cancel_reports
+                    .insert(venue_order_id, artifact.clone());
+            }
+            emit_tracked_order_status(&artifact, &identity, ts_event, ctx);
+            true
+        }
+        ArtifactAdmission::Untracked(report) => {
+            ctx.emitter.send_order_status_report(report);
+            false
+        }
+        ArtifactAdmission::Conflict(_) => {
+            log::error!("Rejecting WebSocket order update for {venue_order_id}: identity conflict");
+            false
+        }
     };
 
-    // Order updates can race ahead of trade messages, so cap filled_qty
-    // to what the fill tracker has recorded to prevent duplicate inferred fills
-    if let Some(tracked_filled) = ctx.fill_tracker.get_cumulative_filled(&venue_order_id)
-        && report.filled_qty > tracked_filled
-    {
-        log::debug!(
-            "Capping filled_qty for {venue_order_id} from {} to {} (awaiting trade messages)",
-            report.filled_qty,
-            tracked_filled,
-        );
-        report.filled_qty = tracked_filled;
-    }
-
-    // Track cancel reports so we can re-emit them after late-arriving fills.
-    // Saved regardless of acceptance state so that cancels arriving during
-    // the HTTP round-trip are available once the order is later accepted.
-    if report.order_status == OrderStatus::Canceled {
-        state
-            .terminal_cancel_reports
-            .insert(venue_order_id, report.clone());
-    }
-
-    // Tracked own orders route through order events; externally-managed orders
-    // (no captured identity) buffer until accepted or fall back to reports.
-    let identity = ctx.order_identities.get(&venue_order_id);
-    if is_accepted || local_client_order_id.is_some() {
-        match identity {
-            Some(identity) => emit_tracked_order_status(&report, &identity, ts_event, ctx),
-            None => ctx.emitter.send_order_status_report(report),
-        }
-    } else if let Some(report) = ctx
-        .fill_tracker
-        .accept_or_buffer_report(venue_order_id, report)
-    {
-        // Registered between the early accepted-check and here: emit rather than buffer
-        match ctx.order_identities.get(&venue_order_id) {
-            Some(identity) => emit_tracked_order_status(&report, &identity, ts_event, ctx),
-            None => ctx.emitter.send_order_status_report(report),
-        }
-    }
-
-    for fill in buffered_fills {
-        match identity {
-            Some(identity) => {
-                emit_buffered_order_filled(&identity, &fill, ctx);
-            }
-            None => ctx.emitter.send_fill_report(fill.report),
-        }
-    }
-
-    if order.status == PolymarketOrderStatus::Matched
+    if is_local_order
+        && order.status == PolymarketOrderStatus::Matched
         && let Some(trade_ids) = order.associate_trades.clone().filter(|ids| !ids.is_empty())
     {
         state.pending_terminal_orders.insert(
@@ -250,34 +194,6 @@ fn dispatch_order_update(
     }
 }
 
-fn emit_buffered_order_filled(
-    identity: &OrderIdentity,
-    buffered: &BufferedFill,
-    ctx: &WsDispatchContext<'_>,
-) {
-    let fill = &buffered.report;
-    ensure_accepted(identity, fill.venue_order_id, fill.ts_event, ctx);
-
-    let info = buffered
-        .correction
-        .as_ref()
-        .and_then(|correction| correction.info.clone());
-    let filled = build_order_filled(identity, fill, info, ctx);
-    ctx.fill_tracker
-        .emit_buffered_fill(filled, buffered.correction.as_ref(), |filled, new_qty| {
-            if let Some(new_qty) = new_qty {
-                emit_buy_overfill_update(
-                    identity,
-                    fill.venue_order_id,
-                    new_qty,
-                    fill.ts_event,
-                    ctx,
-                );
-            }
-            ctx.emitter.send_order_event(OrderEventAny::Filled(filled));
-        });
-}
-
 fn emit_quantity_normalization_if_ready(
     venue_order_id: VenueOrderId,
     ctx: &WsDispatchContext<'_>,
@@ -287,10 +203,11 @@ fn emit_quantity_normalization_if_ready(
         .pending_terminal_orders
         .get(&venue_order_id)
         .is_some_and(|pending| {
-            pending
-                .trade_ids
-                .iter()
-                .all(|trade_id| state.confirmed_trades.contains(trade_id))
+            pending.trade_ids.iter().all(|trade_id| {
+                state
+                    .confirmed_trades
+                    .contains(&confirmed_trade_key(trade_id, venue_order_id))
+            })
         });
 
     if !is_ready {
@@ -301,13 +218,13 @@ fn emit_quantity_normalization_if_ready(
         return;
     };
 
-    let Some(identity) = ctx.order_identities.get(&venue_order_id) else {
+    let Some(identity) = ctx.local_orders.identity(&venue_order_id) else {
         log::warn!("Cannot normalize terminal order {venue_order_id} without a local identity");
         return;
     };
 
     if let Some(quantity) = ctx
-        .fill_tracker
+        .local_orders
         .check_terminal_quantity_normalization(&venue_order_id)
     {
         emit_terminal_quantity_update(&identity, venue_order_id, quantity, pending.ts_event, ctx);
@@ -326,13 +243,13 @@ fn emit_taker_terminal_status(
 ) {
     let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
 
-    let Some(identity) = ctx.order_identities.get(&venue_order_id) else {
+    let Some(identity) = ctx.local_orders.identity(&venue_order_id) else {
         return;
     };
 
     if identity.requires_terminal_quantity_normalization() {
         if let Some(quantity) = ctx
-            .fill_tracker
+            .local_orders
             .check_terminal_quantity_normalization(&venue_order_id)
         {
             emit_terminal_quantity_update(&identity, venue_order_id, quantity, ts_event, ctx);
@@ -342,7 +259,7 @@ fn emit_taker_terminal_status(
 
     if identity.time_in_force == TimeInForce::Ioc
         && let Some(remainder) = ctx
-            .fill_tracker
+            .local_orders
             .take_terminal_ioc_remainder(&venue_order_id)
     {
         log::debug!(
@@ -402,19 +319,20 @@ fn void_failed_trade(
 
     let direct_fills = state.matched_fills.remove(&dedup_key).unwrap_or_default();
     for fill in &direct_fills {
-        ctx.fill_tracker
+        ctx.local_orders
             .reverse_fill(&fill.venue_order_id, fill.last_qty);
+        state
+            .confirmed_trades
+            .remove(&confirmed_trade_key(&trade.id, fill.venue_order_id));
     }
 
-    let mut fills = direct_fills;
-    fills.extend(ctx.fill_tracker.void_buffered_trade(&dedup_key));
-    for fill in fills {
+    state.pending_untracked_fills.remove(&dedup_key);
+    for fill in direct_fills {
         emit_order_fill_voided(&fill, trade, Some(fill.event_id), ctx);
     }
 
     state.processed_fills.add(dedup_key.clone());
     state.voided_trades.add(dedup_key);
-    state.confirmed_trades.remove(&trade.id);
 }
 
 fn has_unknown_trade_instrument(trade: &PolymarketUserTrade, ctx: &WsDispatchContext<'_>) -> bool {
@@ -462,28 +380,55 @@ fn confirm_trade(
     state: &mut WsDispatchState,
 ) {
     let ts_event = parse_timestamp_ms(&trade.timestamp).unwrap_or_else(|_| ctx.clock.get_time_ns());
-    ctx.fill_tracker.mark_trade_confirmed(dedup_key);
-    state.confirmed_trades.add(trade.id.clone());
-    if trade.trader_side == PolymarketLiquiditySide::Maker {
-        for order in trade
-            .maker_orders
-            .iter()
-            .filter(|order| is_user_maker_order(order, ctx))
-        {
-            emit_quantity_normalization_if_ready(
-                VenueOrderId::from(order.order_id.as_str()),
-                ctx,
-                state,
-            );
+    let mut newly_owned = Vec::new();
+    if let Some(reports) = state.pending_untracked_fills.remove(&dedup_key.to_string()) {
+        for report in reports {
+            let venue_order_id = report.venue_order_id;
+            match ctx.local_orders.admit_fill_report(report) {
+                ArtifactAdmission::Owned { artifact, identity } => {
+                    newly_owned.push(emit_order_filled(&identity, &artifact, None, ctx));
+                }
+                ArtifactAdmission::Untracked(report) => ctx.emitter.send_fill_report(report),
+                ArtifactAdmission::Conflict(_) => log::error!(
+                    "Rejecting retained fill for {venue_order_id}: local order identity conflict"
+                ),
+            }
         }
-    } else {
-        emit_quantity_normalization_if_ready(
-            VenueOrderId::from(trade.taker_order_id.as_str()),
-            ctx,
-            state,
-        );
+    }
+
+    if !newly_owned.is_empty() {
+        let key = dedup_key.to_string();
+        let mut fills = state.matched_fills.remove(&key).unwrap_or_default();
+        fills.extend(newly_owned);
+        state.matched_fills.insert(key, fills);
+    }
+
+    let mut confirmed_local_venues = Vec::new();
+    if let Some(fills) = state.matched_fills.get(&dedup_key.to_string()) {
+        for fill in fills {
+            if !confirmed_local_venues.contains(&fill.venue_order_id) {
+                confirmed_local_venues.push(fill.venue_order_id);
+            }
+        }
+    }
+
+    for venue_order_id in &confirmed_local_venues {
+        state
+            .confirmed_trades
+            .add(confirmed_trade_key(&trade.id, *venue_order_id));
+        emit_quantity_normalization_if_ready(*venue_order_id, ctx, state);
+    }
+
+    let taker_venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
+    if trade.trader_side != PolymarketLiquiditySide::Maker
+        && confirmed_local_venues.contains(&taker_venue_order_id)
+    {
         emit_taker_terminal_status(trade, ctx, ts_event);
     }
+}
+
+fn confirmed_trade_key(trade_id: &str, venue_order_id: VenueOrderId) -> String {
+    format!("{trade_id}-{venue_order_id}")
 }
 
 fn dispatch_maker_fills(
@@ -491,7 +436,7 @@ fn dispatch_maker_fills(
     correction_key: &str,
     is_confirmed: bool,
     ctx: &WsDispatchContext<'_>,
-    state: &WsDispatchState,
+    state: &mut WsDispatchState,
 ) -> Vec<OrderFilled> {
     let user_orders: Vec<_> = trade
         .maker_orders
@@ -520,7 +465,7 @@ fn dispatch_maker_fills(
                 continue;
             }
         };
-        let mut report = build_maker_fill_report(
+        let report = build_maker_fill_report(
             mo,
             &trade.id,
             trade.trader_side,
@@ -536,32 +481,22 @@ fn dispatch_maker_fills(
             ts_init,
         );
         let maker_venue_order_id = report.venue_order_id;
-        report.client_order_id = ctx.pending_submits.client_order_id(&maker_venue_order_id);
-        report.last_qty = ctx
-            .fill_tracker
-            .snap_fill_qty(&maker_venue_order_id, report.last_qty);
-
-        if let Some(report) = ctx.fill_tracker.accept_or_buffer_fill(
-            maker_venue_order_id,
-            report,
-            FillCorrectionMetadata {
-                correction_key: correction_key.to_string(),
-                info: fill_info.clone(),
-                is_confirmed,
-            },
-        ) {
-            match ctx.order_identities.get(&maker_venue_order_id) {
-                Some(identity) => {
-                    fills.push(emit_order_filled(
-                        &identity,
-                        &report,
-                        fill_info.clone(),
-                        ctx,
-                    ));
-                }
-                None => ctx.emitter.send_fill_report(report),
+        match ctx.local_orders.admit_fill_report(report) {
+            ArtifactAdmission::Owned { artifact, identity } => {
+                fills.push(emit_order_filled(
+                    &identity,
+                    &artifact,
+                    fill_info.clone(),
+                    ctx,
+                ));
+                reemit_terminal_cancel(maker_venue_order_id, state, ctx);
             }
-            reemit_terminal_cancel(maker_venue_order_id, state, ctx);
+            ArtifactAdmission::Untracked(report) => {
+                emit_or_retain_untracked_fill(report, correction_key, is_confirmed, ctx, state);
+            }
+            ArtifactAdmission::Conflict(_) => log::error!(
+                "Rejecting maker fill for {maker_venue_order_id}: local order identity conflict"
+            ),
         }
     }
     fills
@@ -576,7 +511,7 @@ fn dispatch_taker_fill(
     correction_key: &str,
     is_confirmed: bool,
     ctx: &WsDispatchContext<'_>,
-    state: &WsDispatchState,
+    state: &mut WsDispatchState,
 ) -> Vec<OrderFilled> {
     let instruments = ctx.token_instruments.load();
     let instrument = match instruments.get(&trade.asset_id) {
@@ -592,7 +527,7 @@ fn dispatch_taker_fill(
     let ts_event = parse_timestamp_ms(&trade.timestamp).unwrap_or_else(|_| ctx.clock.get_time_ns());
     let ts_init = ctx.clock.get_time_ns();
 
-    let mut report = build_ws_taker_fill_report(
+    let report = build_ws_taker_fill_report(
         trade,
         instrument,
         ctx.account_id,
@@ -600,31 +535,41 @@ fn dispatch_taker_fill(
         ts_event,
         ts_init,
     );
-    report.client_order_id = ctx.pending_submits.client_order_id(&venue_order_id);
-    report.last_qty = ctx
-        .fill_tracker
-        .snap_fill_qty(&venue_order_id, report.last_qty);
-
-    if let Some(report) = ctx.fill_tracker.accept_or_buffer_fill(
-        venue_order_id,
-        report,
-        FillCorrectionMetadata {
-            correction_key: correction_key.to_string(),
-            info: trade_fill_info(trade),
-            is_confirmed,
-        },
-    ) {
-        match ctx.order_identities.get(&venue_order_id) {
-            Some(identity) => {
-                let fill = emit_order_filled(&identity, &report, trade_fill_info(trade), ctx);
-                reemit_terminal_cancel(venue_order_id, state, ctx);
-                return vec![fill];
-            }
-            None => ctx.emitter.send_fill_report(report),
+    match ctx.local_orders.admit_fill_report(report) {
+        ArtifactAdmission::Owned { artifact, identity } => {
+            let fill = emit_order_filled(&identity, &artifact, trade_fill_info(trade), ctx);
+            reemit_terminal_cancel(venue_order_id, state, ctx);
+            vec![fill]
         }
-        reemit_terminal_cancel(venue_order_id, state, ctx);
+        ArtifactAdmission::Untracked(report) => {
+            emit_or_retain_untracked_fill(report, correction_key, is_confirmed, ctx, state);
+            Vec::new()
+        }
+        ArtifactAdmission::Conflict(_) => {
+            log::error!("Rejecting taker fill for {venue_order_id}: local order identity conflict");
+            Vec::new()
+        }
     }
-    Vec::new()
+}
+
+fn emit_or_retain_untracked_fill(
+    report: FillReport,
+    correction_key: &str,
+    is_confirmed: bool,
+    ctx: &WsDispatchContext<'_>,
+    state: &mut WsDispatchState,
+) {
+    if is_confirmed {
+        ctx.emitter.send_fill_report(report);
+        return;
+    }
+    let key = correction_key.to_string();
+    let mut reports = state
+        .pending_untracked_fills
+        .remove(&key)
+        .unwrap_or_default();
+    reports.push(report);
+    state.pending_untracked_fills.insert(key, reports);
 }
 
 /// Re-emits a saved cancel report after a fill to restore terminal state.
@@ -633,7 +578,7 @@ fn dispatch_taker_fill(
 /// get stuck in `PartiallyFilled`. This re-emission ensures the execution
 /// engine transitions the order back to `Canceled`.
 ///
-/// Skips re-emission when the fill tracker shows the order is fully filled,
+/// Skips re-emission when the coordinator shows the order is fully filled,
 /// because `Filled` is already terminal and a spurious cancel would fail
 /// the `Filled -> Canceled` state transition.
 fn reemit_terminal_cancel(
@@ -641,17 +586,20 @@ fn reemit_terminal_cancel(
     state: &WsDispatchState,
     ctx: &WsDispatchContext<'_>,
 ) {
-    if ctx.fill_tracker.is_fully_filled(&venue_order_id) {
+    if ctx.local_orders.is_fully_filled(&venue_order_id) {
         return;
     }
 
     if let Some(cancel_report) = state.terminal_cancel_reports.get(&venue_order_id) {
         log::debug!("Re-emitting cancel for {venue_order_id} after fill to restore terminal state");
-        match ctx.order_identities.get(&venue_order_id) {
-            Some(identity) => {
-                emit_order_canceled(&identity, venue_order_id, cancel_report.ts_last, ctx);
+        match ctx.local_orders.admit_order_report(cancel_report.clone()) {
+            ArtifactAdmission::Owned { artifact, identity } => {
+                emit_order_canceled(&identity, venue_order_id, artifact.ts_last, ctx);
             }
-            None => ctx.emitter.send_order_status_report(cancel_report.clone()),
+            ArtifactAdmission::Untracked(report) => ctx.emitter.send_order_status_report(report),
+            ArtifactAdmission::Conflict(_) => log::error!(
+                "Rejecting retained cancel for {venue_order_id}: local order identity conflict"
+            ),
         }
     }
 }
@@ -796,7 +744,7 @@ fn emit_tracked_order_status(
 
 /// Emits `OrderAccepted` for a tracked order if acceptance has not yet been emitted.
 ///
-/// Acceptance is also emitted on the submit happy path; the registry's dedup set ensures it
+/// Acceptance is also emitted on the submit happy path; the coordinator's submission state ensures it
 /// fires exactly once across the submit confirmation and the WS stream, including when a fill or
 /// cancel races ahead of the acceptance message.
 fn ensure_accepted(
@@ -805,7 +753,14 @@ fn ensure_accepted(
     ts_event: UnixNanos,
     ctx: &WsDispatchContext<'_>,
 ) {
-    if !ctx.order_identities.mark_accepted(venue_order_id) {
+    let Ok(is_new) = ctx
+        .local_orders
+        .accept_submission(venue_order_id, *identity)
+    else {
+        log::error!("Cannot accept {venue_order_id}: local order identity conflict");
+        return;
+    };
+    if !is_new {
         return;
     }
     let accepted = OrderAccepted::new(
@@ -836,7 +791,7 @@ fn emit_order_filled(
 ) -> OrderFilled {
     ensure_accepted(identity, fill.venue_order_id, fill.ts_event, ctx);
 
-    if let Some(new_qty) = ctx.fill_tracker.buy_overfill_bump(&fill.venue_order_id) {
+    if let Some(new_qty) = ctx.local_orders.buy_overfill_bump(&fill.venue_order_id) {
         emit_buy_overfill_update(identity, fill.venue_order_id, new_qty, fill.ts_event, ctx);
     }
 
@@ -1062,12 +1017,12 @@ fn emit_order_rejected(
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::messages::{ExecutionEvent, ExecutionReport};
+    use nautilus_common::messages::ExecutionEvent;
     use nautilus_core::time::AtomicTime;
     use nautilus_model::{
         enums::{AccountType, OrderStatus},
         events::OrderEventAny,
-        identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId},
+        identifiers::{ClientOrderId, StrategyId, TraderId},
         types::Currency,
     };
     use rstest::rstest;
@@ -1077,26 +1032,6 @@ mod tests {
         models::GammaMarket,
         parse::{create_instrument_from_def, parse_gamma_market},
     };
-
-    /// Registers a tracked-order identity so the dispatch routes the order through events.
-    fn register_identity(
-        order_identities: &OrderIdentityRegistry,
-        venue_order_id: VenueOrderId,
-        instrument_id: InstrumentId,
-        client_order_id: &str,
-    ) {
-        order_identities.register_order_identity(
-            venue_order_id,
-            OrderIdentity {
-                client_order_id: ClientOrderId::from(client_order_id),
-                strategy_id: StrategyId::from("S-001"),
-                instrument_id,
-                order_side: OrderSide::Buy,
-                order_type: OrderType::Limit,
-                time_in_force: TimeInForce::Gtc,
-            },
-        );
-    }
 
     fn load<T: serde::de::DeserializeOwned>(filename: &str) -> T {
         let path = format!("test_data/{filename}");
@@ -1218,230 +1153,27 @@ mod tests {
     }
 
     #[rstest]
-    fn test_dispatch_order_message_buffers_when_not_accepted() {
-        let order: PolymarketUserOrder = load("ws_user_order_placement.json");
-        let instrument = test_instrument();
-
-        let token_instruments = AtomicMap::new();
-        token_instruments.insert(order.asset_id, instrument);
-
-        let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        let emitter = test_emitter();
-
-        let ctx = WsDispatchContext {
-            token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
-            emitter: &emitter,
-            account_id: AccountId::from("POLY-001"),
-            clock: nautilus_core::time::get_atomic_clock_realtime(),
-            user_address: "0xtest",
-            user_api_key: "test-key",
-        };
-        let mut state = WsDispatchState::default();
-
-        let result = dispatch_user_message(&UserWsMessage::Order(order.clone()), &ctx, &mut state);
-        assert!(result.is_none());
-
-        // Order not registered in fill_tracker, so should be buffered
-        let venue_order_id = VenueOrderId::from(order.id.as_str());
-        assert!(fill_tracker.has_pending_report(&venue_order_id));
-    }
-
-    #[rstest]
-    fn test_dispatch_order_message_uses_pending_submit_client_order_id() {
-        let order: PolymarketUserOrder = load("ws_user_order_placement.json");
-        let instrument = test_instrument();
-
-        let token_instruments = AtomicMap::new();
-        token_instruments.insert(order.asset_id, instrument);
-
-        let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        let mut emitter = test_emitter();
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        emitter.set_sender(sender);
-
-        let venue_order_id = VenueOrderId::from(order.id.as_str());
-        let client_order_id = ClientOrderId::from("O-UNKNOWN-SUBMIT");
-        pending_submits.insert(venue_order_id, client_order_id);
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            test_instrument().id(),
-            "O-UNKNOWN-SUBMIT",
-        );
-
-        let ctx = WsDispatchContext {
-            token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
-            emitter: &emitter,
-            account_id: AccountId::from("POLY-001"),
-            clock: nautilus_core::time::get_atomic_clock_realtime(),
-            user_address: "0xtest",
-            user_api_key: "test-key",
-        };
-        let mut state = WsDispatchState::default();
-
-        let _ = dispatch_user_message(&UserWsMessage::Order(order), &ctx, &mut state);
-
-        // The tracked own order emits an OrderAccepted event carrying the client order ID.
-        let event = receiver.try_recv().expect("expected accepted event");
-        match event {
-            ExecutionEvent::Order(OrderEventAny::Accepted(accepted)) => {
-                assert_eq!(accepted.client_order_id, client_order_id);
-            }
-            other => panic!("Expected accepted event, was {other:?}"),
-        }
-
-        assert!(!fill_tracker.has_pending_report(&venue_order_id));
-    }
-
-    #[rstest]
-    fn test_dispatch_trade_dedup() {
-        let trade: PolymarketUserTrade = load("ws_user_trade.json");
-        let instrument = test_instrument();
-
-        let token_instruments = AtomicMap::new();
-        token_instruments.insert(trade.asset_id, instrument);
-
-        let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        let emitter = test_emitter();
-
-        let ctx = WsDispatchContext {
-            token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
-            emitter: &emitter,
-            account_id: AccountId::from("POLY-001"),
-            clock: nautilus_core::time::get_atomic_clock_realtime(),
-            user_address: "0xtest",
-            user_api_key: "test-key",
-        };
-        let mut state = WsDispatchState::default();
-
-        let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
-
-        // First dispatch processes the trade
-        let _ = dispatch_user_message(&UserWsMessage::Trade(trade.clone()), &ctx, &mut state);
-        assert_eq!(fill_tracker.pending_fills_for(&venue_order_id).len(), 1);
-
-        // Second dispatch should be deduped, no additional fill
-        let _ = dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
-        assert_eq!(fill_tracker.pending_fills_for(&venue_order_id).len(), 1);
-    }
-
-    #[rstest]
-    fn test_dispatch_trade_replays_after_instrument_becomes_available() {
-        let trade: PolymarketUserTrade = load("ws_user_trade.json");
-        let instrument = test_instrument();
-        let token_instruments = AtomicMap::new();
-        let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        let emitter = test_emitter();
-        let ctx = WsDispatchContext {
-            token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
-            emitter: &emitter,
-            account_id: AccountId::from("POLY-001"),
-            clock: nautilus_core::time::get_atomic_clock_realtime(),
-            user_address: "0xtest",
-            user_api_key: "test-key",
-        };
-        let mut state = WsDispatchState::default();
-        let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
-
-        let first_result =
-            dispatch_user_message(&UserWsMessage::Trade(trade.clone()), &ctx, &mut state);
-        token_instruments.insert(trade.asset_id, instrument);
-        let replay_result = dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
-
-        assert!(first_result.is_none());
-        assert!(replay_result.is_some());
-        assert_eq!(fill_tracker.pending_fills_for(&venue_order_id).len(), 1);
-    }
-
-    #[rstest]
-    #[case(crate::common::enums::PolymarketTradeStatus::Mined)]
-    #[case(crate::common::enums::PolymarketTradeStatus::Retrying)]
-    fn test_dispatch_trade_ignores_pending_settlement_status(
-        #[case] status: crate::common::enums::PolymarketTradeStatus,
-    ) {
-        let mut trade: PolymarketUserTrade = load("ws_user_trade.json");
-        trade.status = status;
-        let instrument = test_instrument();
-        let token_instruments = AtomicMap::new();
-        token_instruments.insert(trade.asset_id, instrument);
-        let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        let emitter = test_emitter();
-        let ctx = WsDispatchContext {
-            token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
-            emitter: &emitter,
-            account_id: AccountId::from("POLY-001"),
-            clock: nautilus_core::time::get_atomic_clock_realtime(),
-            user_address: "0xtest",
-            user_api_key: "test-key",
-        };
-        let mut state = WsDispatchState::default();
-        let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
-
-        let result = dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
-
-        assert!(result.is_none());
-        assert!(fill_tracker.pending_fills_for(&venue_order_id).is_empty());
-    }
-
-    #[rstest]
     fn test_dispatch_matched_trade_emits_fill_and_failed_trade_voids_it() {
         let mut trade: PolymarketUserTrade = load("ws_user_trade.json");
         trade.status = crate::common::enums::PolymarketTradeStatus::Matched;
         let instrument = test_instrument();
         let token_instruments = AtomicMap::new();
         token_instruments.insert(trade.asset_id, instrument.clone());
-        let fill_tracker = OrderFillTrackerMap::new();
+        let local_orders = LocalOrderCoordinator::new();
         let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
-        fill_tracker.register(
+        local_orders.register(
             venue_order_id,
+            ClientOrderId::from("O-MATCHED-FAILED"),
             Quantity::from("100"),
             OrderSide::Buy,
             instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
         );
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            instrument.id(),
-            "O-MATCHED-FAILED",
-        );
-        order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
+            local_orders: &local_orders,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
@@ -1484,250 +1216,12 @@ mod tests {
         assert!(!voided.is_reopened);
         assert_eq!(voided.causation_id, Some(filled.event_id));
         assert_eq!(
-            fill_tracker.get_cumulative_filled(&venue_order_id),
+            local_orders.cumulative_filled_for_test(&venue_order_id),
             Some(Quantity::zero(instrument.size_precision()))
         );
         assert!(failed_first_state.processed_fills.contains(&dedup_key));
         assert!(failed_first_state.is_voided_trade(&dedup_key));
         assert!(receiver.try_recv().is_err());
-    }
-
-    #[rstest]
-    fn test_dispatch_trade_uses_pending_submit_client_order_id() {
-        let trade: PolymarketUserTrade = load("ws_user_trade.json");
-        let instrument = test_instrument();
-
-        let token_instruments = AtomicMap::new();
-        token_instruments.insert(trade.asset_id, instrument);
-
-        let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        let emitter = test_emitter();
-
-        let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
-        let client_order_id = ClientOrderId::from("O-UNKNOWN-FILL");
-        pending_submits.insert(venue_order_id, client_order_id);
-
-        let ctx = WsDispatchContext {
-            token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
-            emitter: &emitter,
-            account_id: AccountId::from("POLY-001"),
-            clock: nautilus_core::time::get_atomic_clock_realtime(),
-            user_address: "0xtest",
-            user_api_key: "test-key",
-        };
-        let mut state = WsDispatchState::default();
-
-        let _ = dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
-
-        let fills = fill_tracker.pending_fills_for(&venue_order_id);
-        assert_eq!(fills[0].client_order_id, Some(client_order_id));
-    }
-
-    #[rstest]
-    fn test_dispatch_late_fill_falls_back_to_report_after_identity_eviction() {
-        let trade: PolymarketUserTrade = load("ws_user_trade.json");
-        let market: GammaMarket = load("gamma_market_sports_market_money_line.json");
-        let defs = parse_gamma_market(&market).unwrap();
-        let instrument =
-            create_instrument_from_def(&defs[0], UnixNanos::from(1_000_000_000u64)).unwrap();
-        let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
-
-        let token_instruments = AtomicMap::new();
-        token_instruments.insert(trade.asset_id, instrument.clone());
-
-        let fill_tracker = OrderFillTrackerMap::new();
-        fill_tracker.register(
-            venue_order_id,
-            Quantity::from("100"),
-            OrderSide::Buy,
-            instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
-        );
-
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            instrument.id(),
-            "O-LATE-FILL",
-        );
-        assert!(order_identities.get(&venue_order_id).is_some());
-
-        for index in 0..10_000 {
-            let eviction_venue_order_id = VenueOrderId::from(format!("V-EVICT-{index}").as_str());
-            let eviction_client_order_id = format!("O-EVICT-{index}");
-            register_identity(
-                &order_identities,
-                eviction_venue_order_id,
-                instrument.id(),
-                &eviction_client_order_id,
-            );
-        }
-        assert!(order_identities.get(&venue_order_id).is_none());
-
-        let mut emitter = test_emitter();
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        emitter.set_sender(sender);
-
-        let ctx = WsDispatchContext {
-            token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
-            emitter: &emitter,
-            account_id: AccountId::from("POLY-001"),
-            clock: nautilus_core::time::get_atomic_clock_realtime(),
-            user_address: "0xtest",
-            user_api_key: "test-key",
-        };
-        let mut state = WsDispatchState::default();
-
-        dispatch_user_message(&UserWsMessage::Trade(trade.clone()), &ctx, &mut state);
-
-        let event = receiver.try_recv().expect("expected late fill report");
-        let ExecutionEvent::Report(ExecutionReport::Fill(report)) = event else {
-            panic!("expected fill report for evicted identity, was {event:?}");
-        };
-
-        assert_eq!(report.venue_order_id, venue_order_id);
-        assert_eq!(report.trade_id, TradeId::from(trade.id.as_str()));
-        assert_eq!(report.instrument_id, instrument.id());
-        assert_eq!(
-            report.last_qty.as_decimal(),
-            Decimal::from_str_exact(&trade.size).unwrap()
-        );
-        assert_eq!(
-            report.last_px.as_decimal(),
-            Decimal::from_str_exact(&trade.price).unwrap()
-        );
-        assert_eq!(report.order_side, OrderSide::Buy);
-        assert_eq!(report.liquidity_side, LiquiditySide::Taker);
-        assert_eq!(
-            report.commission.as_decimal(),
-            Decimal::from_str_exact("0.1875").unwrap()
-        );
-        assert_eq!(report.commission.currency, Currency::pUSD());
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[rstest]
-    fn test_dispatch_order_matched_caps_filled_qty_when_no_trades_tracked() {
-        let order: PolymarketUserOrder = load("ws_user_order_matched.json");
-        let instrument = test_instrument();
-
-        let token_instruments = AtomicMap::new();
-        token_instruments.insert(order.asset_id, instrument.clone());
-
-        let fill_tracker = OrderFillTrackerMap::new();
-        let venue_order_id = VenueOrderId::from(order.id.as_str());
-
-        // Register order so it is "accepted" but with no fills tracked
-        fill_tracker.register(
-            venue_order_id,
-            Quantity::from("100"),
-            OrderSide::Buy,
-            instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
-        );
-
-        let pending_submits = PendingSubmitTracker::default();
-        // No identity registered, so the order surfaces as a report (the external/reconciliation
-        // fallback), where filled_qty is capped to tracked fills.
-        let order_identities = OrderIdentityRegistry::default();
-        let mut emitter = test_emitter();
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        emitter.set_sender(sender);
-
-        let ctx = WsDispatchContext {
-            token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
-            emitter: &emitter,
-            account_id: AccountId::from("POLY-001"),
-            clock: nautilus_core::time::get_atomic_clock_realtime(),
-            user_address: "0xtest",
-            user_api_key: "test-key",
-        };
-        let mut state = WsDispatchState::default();
-
-        dispatch_user_message(&UserWsMessage::Order(order), &ctx, &mut state);
-
-        let event = receiver.try_recv().expect("Expected report");
-        match event {
-            ExecutionEvent::Report(report) => match report {
-                ExecutionReport::Order(order_report) => {
-                    assert_eq!(order_report.filled_qty, Quantity::from("0"));
-                }
-                other => panic!("Expected order report, was {other:?}"),
-            },
-            other => panic!("Expected report event, was {other:?}"),
-        }
-    }
-
-    #[rstest]
-    fn test_dispatch_order_matched_uses_tracked_fills_for_filled_qty() {
-        let order: PolymarketUserOrder = load("ws_user_order_matched.json");
-        let instrument = test_instrument();
-
-        let token_instruments = AtomicMap::new();
-        token_instruments.insert(order.asset_id, instrument.clone());
-
-        let fill_tracker = OrderFillTrackerMap::new();
-        let venue_order_id = VenueOrderId::from(order.id.as_str());
-
-        // Register and record a partial fill (50 of 100)
-        fill_tracker.register(
-            venue_order_id,
-            Quantity::from("100"),
-            OrderSide::Buy,
-            instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
-        );
-        fill_tracker.record_fill(&venue_order_id, Quantity::new(50.0, 6));
-
-        let pending_submits = PendingSubmitTracker::default();
-        // No identity registered, so the order surfaces as a report (the external/reconciliation
-        // fallback), where filled_qty is capped to tracked fills.
-        let order_identities = OrderIdentityRegistry::default();
-        let mut emitter = test_emitter();
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        emitter.set_sender(sender);
-
-        let ctx = WsDispatchContext {
-            token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
-            emitter: &emitter,
-            account_id: AccountId::from("POLY-001"),
-            clock: nautilus_core::time::get_atomic_clock_realtime(),
-            user_address: "0xtest",
-            user_api_key: "test-key",
-        };
-        let mut state = WsDispatchState::default();
-
-        dispatch_user_message(&UserWsMessage::Order(order), &ctx, &mut state);
-
-        let event = receiver.try_recv().expect("Expected report");
-        match event {
-            ExecutionEvent::Report(report) => match report {
-                ExecutionReport::Order(order_report) => {
-                    assert_eq!(order_report.filled_qty, Quantity::from("50"));
-                }
-                other => panic!("Expected order report, was {other:?}"),
-            },
-            other => panic!("Expected report event, was {other:?}"),
-        }
     }
 
     #[rstest]
@@ -1738,27 +1232,16 @@ mod tests {
         let token_instruments = AtomicMap::new();
         token_instruments.insert(order.asset_id, instrument.clone());
 
-        let fill_tracker = OrderFillTrackerMap::new();
+        let local_orders = LocalOrderCoordinator::new();
         let venue_order_id = VenueOrderId::from(order.id.as_str());
-        fill_tracker.register(
+        local_orders.register(
             venue_order_id,
+            ClientOrderId::from("O-MATCHED"),
             Quantity::from("100"),
             OrderSide::Buy,
             instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
         );
-        fill_tracker.record_fill(&venue_order_id, Quantity::new(99.995, 6));
-
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            instrument.id(),
-            "O-MATCHED",
-        );
-        order_identities.mark_accepted(venue_order_id);
+        local_orders.record_fill(&venue_order_id, Quantity::new(99.995, 6));
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
@@ -1770,9 +1253,7 @@ mod tests {
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
+            local_orders: &local_orders,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
             clock,
@@ -1780,7 +1261,10 @@ mod tests {
             user_api_key: "test-key",
         };
         let mut state = WsDispatchState::default();
-        state.confirmed_trades.add("trade-0xfill1".to_string());
+        state.confirmed_trades.add(confirmed_trade_key(
+            "trade-0xfill1",
+            VenueOrderId::from(order.id.as_str()),
+        ));
 
         dispatch_user_message(&UserWsMessage::Order(order), &ctx, &mut state);
 
@@ -1811,33 +1295,21 @@ mod tests {
 
         let token_instruments = AtomicMap::new();
         token_instruments.insert(order.asset_id, instrument.clone());
-        let fill_tracker = OrderFillTrackerMap::new();
+        let local_orders = LocalOrderCoordinator::new();
         let venue_order_id = VenueOrderId::from(order.id.as_str());
-        fill_tracker.register(
+        local_orders.register(
             venue_order_id,
+            ClientOrderId::from("O-CONFIRMED-DUST"),
             Quantity::from("100"),
             OrderSide::Buy,
             instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
         );
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            instrument.id(),
-            "O-CONFIRMED-DUST",
-        );
-        order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
+            local_orders: &local_orders,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
@@ -1879,37 +1351,24 @@ mod tests {
         let token_instruments = AtomicMap::new();
         token_instruments.insert(cancel_order.asset_id, instrument.clone());
 
-        let fill_tracker = OrderFillTrackerMap::new();
+        let local_orders = LocalOrderCoordinator::new();
         let venue_order_id = VenueOrderId::from(cancel_order.id.as_str());
 
         // Register order as accepted with original qty=100
-        fill_tracker.register(
+        local_orders.register(
             venue_order_id,
+            ClientOrderId::from("O-CANCEL"),
             Quantity::from("100"),
             OrderSide::Buy,
             instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            instrument.id(),
-            "O-CANCEL",
-        );
-        order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
+            local_orders: &local_orders,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
@@ -1961,37 +1420,24 @@ mod tests {
         let token_instruments = AtomicMap::new();
         token_instruments.insert(cancel_order.asset_id, instrument.clone());
 
-        let fill_tracker = OrderFillTrackerMap::new();
+        let local_orders = LocalOrderCoordinator::new();
         let venue_order_id = VenueOrderId::from(cancel_order.id.as_str());
 
         // Register with qty=25 matching the trade size so the fill completes the order
-        fill_tracker.register(
+        local_orders.register(
             venue_order_id,
+            ClientOrderId::from("O-CANCEL-FULL"),
             Quantity::from("25"),
             OrderSide::Buy,
             instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            instrument.id(),
-            "O-CANCEL-FULL",
-        );
-        order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
+            local_orders: &local_orders,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
@@ -2020,21 +1466,31 @@ mod tests {
         let instrument = test_instrument();
 
         let token_instruments = AtomicMap::new();
-        token_instruments.insert(cancel_order.asset_id, instrument);
+        token_instruments.insert(cancel_order.asset_id, instrument.clone());
 
-        // Fill tracker has NO registration (simulates HTTP still in-flight)
-        let fill_tracker = OrderFillTrackerMap::new();
+        // The local identity is prepared synchronously, then claimed from the signed
+        // venue order id before the HTTP request, but is not yet accepted.
+        let local_orders = LocalOrderCoordinator::new();
         let venue_order_id = VenueOrderId::from(cancel_order.id.as_str());
-
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        let emitter = test_emitter();
+        let identity = OrderIdentity {
+            client_order_id: ClientOrderId::from("O-CANCEL-IN-FLIGHT"),
+            strategy_id: StrategyId::from("S-001"),
+            instrument_id: instrument.id(),
+            order_side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+        };
+        local_orders.begin_submission(identity).unwrap();
+        local_orders
+            .claim_submission(venue_order_id, identity, Quantity::from("100"), None)
+            .unwrap();
+        let mut emitter = test_emitter();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(sender);
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
+            local_orders: &local_orders,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
@@ -2043,11 +1499,17 @@ mod tests {
         };
         let mut state = WsDispatchState::default();
 
-        // Dispatch cancel while order is not yet accepted
+        // Dispatch cancel while the HTTP response is still pending.
         dispatch_user_message(&UserWsMessage::Order(cancel_order), &ctx, &mut state);
 
-        // Cancel should be buffered (not emitted) AND saved to terminal_cancel_reports
-        assert!(fill_tracker.has_pending_report(&venue_order_id));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ExecutionEvent::Order(OrderEventAny::Accepted(_))
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ExecutionEvent::Order(OrderEventAny::Canceled(_))
+        ));
         assert!(state.terminal_cancel_reports.get(&venue_order_id).is_some());
     }
 
@@ -2083,29 +1545,21 @@ mod tests {
         let token_instruments = AtomicMap::new();
         token_instruments.insert(asset_id, instrument.clone());
 
-        let fill_tracker = OrderFillTrackerMap::new();
-        fill_tracker.register(
+        let local_orders = LocalOrderCoordinator::new();
+        local_orders.register(
             venue_order_id,
+            ClientOrderId::from("O-3797"),
             Quantity::from("20"),
             OrderSide::Buy,
             instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        register_identity(&order_identities, venue_order_id, instrument.id(), "O-3797");
-        order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
+            local_orders: &local_orders,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
@@ -2160,7 +1614,7 @@ mod tests {
             outcome: PolymarketOutcome::yes(),
             owner: Ustr::from("other-owner"),
             price: "0.82".to_string(),
-            side: PolymarketOrderSide::Buy,
+            side: PolymarketOrderSide::Sell,
             size: "1.219511".to_string(),
             status: PolymarketTradeStatus::Confirmed,
             taker_order_id: "0xtaker01".to_string(),
@@ -2270,37 +1724,24 @@ mod tests {
         let token_instruments = AtomicMap::new();
         token_instruments.insert(asset_id, instrument.clone());
 
-        let fill_tracker = OrderFillTrackerMap::new();
+        let local_orders = LocalOrderCoordinator::new();
         let venue_order_id = VenueOrderId::from("0xtaker-overfill");
         // Submitted qty truncated to USDC scale.
         let submitted = Quantity::new(714.285710, instrument.size_precision());
-        fill_tracker.register(
+        local_orders.register(
             venue_order_id,
+            ClientOrderId::from("O-OVERFILL"),
             submitted,
             OrderSide::Buy,
             instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            instrument.id(),
-            "O-OVERFILL",
-        );
-        order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
+            local_orders: &local_orders,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
@@ -2337,11 +1778,11 @@ mod tests {
 
         dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
 
-        // The dispatcher must record the snapped quantity in the tracker so
+        // The dispatcher must record the snapped quantity in the coordinator so
         // any subsequent ORDER MATCHED with size_matched > submitted_qty is
         // capped to it. record_fill happens before the FillReport is sent.
-        let cumulative = fill_tracker
-            .get_cumulative_filled(&venue_order_id)
+        let cumulative = local_orders
+            .cumulative_filled_for_test(&venue_order_id)
             .expect("order must be registered");
         assert_eq!(cumulative, submitted);
 
@@ -2427,45 +1868,37 @@ mod tests {
         let token_instruments = AtomicMap::new();
         token_instruments.insert(asset_id, instrument.clone());
 
-        let fill_tracker = OrderFillTrackerMap::new();
+        let local_orders = LocalOrderCoordinator::new();
         let venue_order_id = VenueOrderId::from("0xtaker-one-shot-dust");
         let submitted = Quantity::from_decimal_dp(
             Decimal::from_str_exact(submitted_qty).unwrap(),
             instrument.size_precision(),
         )
         .unwrap();
-        fill_tracker.register(
-            venue_order_id,
-            submitted,
+        let identity = OrderIdentity {
+            client_order_id: ClientOrderId::from("O-ONE-SHOT"),
+            strategy_id: StrategyId::from("S-001"),
+            instrument_id: instrument.id(),
             order_side,
-            instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
-        );
-
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        order_identities.register_order_identity(
-            venue_order_id,
-            OrderIdentity {
-                client_order_id: ClientOrderId::from("O-ONE-SHOT"),
-                strategy_id: StrategyId::from("S-001"),
-                instrument_id: instrument.id(),
-                order_side,
-                order_type,
-                time_in_force,
-            },
-        );
-        order_identities.mark_accepted(venue_order_id);
+            order_type,
+            time_in_force,
+        };
+        local_orders
+            .restore_order(
+                venue_order_id,
+                identity,
+                submitted,
+                Quantity::zero(instrument.size_precision()),
+                None,
+            )
+            .expect("test order restoration should succeed");
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
+            local_orders: &local_orders,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
@@ -2532,12 +1965,7 @@ mod tests {
                 }
                 other => panic!("expected updated event, was {other:?}"),
             }
-            assert!(
-                fill_tracker
-                    .get_cumulative_filled(&venue_order_id)
-                    .is_none(),
-                "order must be settled and removed from the tracker",
-            );
+            assert_eq!(local_orders.identity(&venue_order_id), Some(identity));
         } else if expect_cancel {
             let event = receiver.try_recv().expect("expected IOC cancellation");
             match event {
@@ -2546,20 +1974,15 @@ mod tests {
                 }
                 other => panic!("expected canceled event, was {other:?}"),
             }
-            assert!(
-                fill_tracker
-                    .get_cumulative_filled(&venue_order_id)
-                    .is_none(),
-                "canceled IOC must be settled and removed from the tracker",
-            );
+            assert_eq!(local_orders.identity(&venue_order_id), Some(identity));
         } else {
             assert!(
                 receiver.try_recv().is_err(),
                 "resting order must not receive a terminal event",
             );
             assert!(
-                fill_tracker
-                    .get_cumulative_filled(&venue_order_id)
+                local_orders
+                    .cumulative_filled_for_test(&venue_order_id)
                     .is_some(),
                 "ineligible order must stay tracked with open leaves",
             );
@@ -2581,36 +2004,23 @@ mod tests {
         let token_instruments = AtomicMap::new();
         token_instruments.insert(asset_id, instrument.clone());
 
-        let fill_tracker = OrderFillTrackerMap::new();
+        let local_orders = LocalOrderCoordinator::new();
         let venue_order_id = VenueOrderId::from("0xtaker-gross-overfill");
         let submitted = Quantity::new(30.0, size_precision);
-        fill_tracker.register(
+        local_orders.register(
             venue_order_id,
+            ClientOrderId::from(venue_order_id.as_str()),
             submitted,
             OrderSide::Buy,
             instrument.id(),
-            size_precision,
-            instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            instrument.id(),
-            "O-GROSS-OVERFILL",
-        );
-        order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
+            local_orders: &local_orders,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
@@ -2690,34 +2100,31 @@ mod tests {
         let token_instruments = AtomicMap::new();
         token_instruments.insert(asset_id, instrument.clone());
 
-        let fill_tracker = OrderFillTrackerMap::new();
-        fill_tracker.register(
-            venue_order_id,
-            Quantity::from("10"),
-            OrderSide::Buy,
-            instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
-        );
-
-        let pending_submits = PendingSubmitTracker::default();
-        let order_identities = OrderIdentityRegistry::default();
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            instrument.id(),
-            "O-TERMINAL",
-        );
-        order_identities.mark_accepted(venue_order_id);
+        let local_orders = LocalOrderCoordinator::new();
+        let identity = OrderIdentity {
+            client_order_id: ClientOrderId::from("O-TERMINAL"),
+            strategy_id: StrategyId::from("S-TEST"),
+            instrument_id: instrument.id(),
+            order_side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Fok,
+        };
+        local_orders
+            .restore_order(
+                venue_order_id,
+                identity,
+                Quantity::from("10"),
+                Quantity::zero(instrument.size_precision()),
+                None,
+            )
+            .expect("test order restoration should succeed");
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
-            fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
-            order_identities: &order_identities,
+            local_orders: &local_orders,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
             clock: nautilus_core::time::get_atomic_clock_realtime(),

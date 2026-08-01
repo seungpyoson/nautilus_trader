@@ -101,6 +101,8 @@ const TEST_CHUNK_DOWNGRADE_PRIVATE_KEY: &str =
     "0x5234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 const TEST_SIGNER_ADDRESS: &str = "0x1be31a94361a391bbafb2a4ccd704f57dc04d4bb";
 const TEST_API_SECRET_B64: &str = "dGVzdF9zZWNyZXRfa2V5XzMyYnl0ZXNfcGFkMTIzNDU=";
+const TEST_TOKEN_ASSET_ID: &str =
+    "71321045679252212594626385532706912750332728571942532289631379312455583992563";
 const DEFAULT_ACCEPTED_ORDER_ID: &str =
     "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12";
 const CANCEL_ALREADY_DONE_ORDER_ID: &str =
@@ -461,7 +463,8 @@ async fn handle_post_order(
         .collect();
     *state.order_post_count.lock().await += 1;
 
-    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+    let request = serde_json::from_slice::<Value>(&body).ok();
+    if let Some(v) = request.clone() {
         *state.last_body.lock().await = Some(v);
     }
 
@@ -480,9 +483,18 @@ async fn handle_post_order(
 
     let status = *state.order_response_status.lock().await;
     let resp = state.order_response.lock().await;
-    let body = resp
+    let mut body = resp
         .clone()
         .unwrap_or_else(|| load_json("http_order_response_ok.json"));
+    if body.get("success").and_then(Value::as_bool) == Some(true)
+        && body
+            .get("orderID")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        && let Some(order_id) = request.as_ref().and_then(expected_order_id_from_submission)
+    {
+        body["orderID"] = Value::String(order_id);
+    }
     record_open_order_ids(&state, std::slice::from_ref(&body)).await;
     (status, Json(body)).into_response()
 }
@@ -509,7 +521,7 @@ async fn handle_post_orders(
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
 
-    if let Some(v) = parsed {
+    if let Some(v) = parsed.clone() {
         *state.last_body.lock().await = Some(v);
     }
 
@@ -517,7 +529,7 @@ async fn handle_post_orders(
 
     let status = *state.batch_order_response_status.lock().await;
     let resp = state.batch_order_response.lock().await;
-    let body = resp.clone().unwrap_or_else(|| {
+    let mut body = resp.clone().unwrap_or_else(|| {
         // Namespace by POST count so order IDs are globally unique across chunks, matching the
         // venue (each order receives a distinct ID); a per-chunk index alone would collide.
         let entries: Vec<Value> = (0..request_count.max(1))
@@ -531,6 +543,22 @@ async fn handle_post_orders(
             .collect();
         Value::Array(entries)
     });
+    if let (Some(requests), Some(responses)) = (
+        parsed.as_ref().and_then(Value::as_array),
+        body.as_array_mut(),
+    ) {
+        for (request, response) in requests.iter().zip(responses) {
+            if response.get("success").and_then(Value::as_bool) == Some(true)
+                && response
+                    .get("orderID")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+                && let Some(order_id) = expected_order_id_from_submission(request)
+            {
+                response["orderID"] = Value::String(order_id);
+            }
+        }
+    }
 
     if let Some(responses) = body.as_array() {
         record_open_order_ids(&state, responses).await;
@@ -538,11 +566,19 @@ async fn handle_post_orders(
     (status, Json(body)).into_response()
 }
 
+fn expected_order_id_from_submission(submission: &Value) -> Option<String> {
+    let order: PolymarketOrder = serde_json::from_value(submission.get("order")?.clone()).ok()?;
+    order_hash(&order, false)
+        .ok()
+        .map(|hash| format!("{hash:#x}"))
+}
+
 async fn handle_delete_order(State(state): State<TestServerState>, body: Bytes) -> Response {
     *state.last_path.lock().await = "/order".to_string();
     *state.cancel_delete_count.lock().await += 1;
 
-    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+    let request = serde_json::from_slice::<Value>(&body).ok();
+    if let Some(v) = request.clone() {
         *state.last_body.lock().await = Some(v);
     }
 
@@ -550,9 +586,39 @@ async fn handle_delete_order(State(state): State<TestServerState>, body: Bytes) 
 
     let status = *state.cancel_response_status.lock().await;
     let resp = state.cancel_response.lock().await;
-    let body = resp
+    let mut body = resp
         .clone()
         .unwrap_or_else(|| load_json("http_cancel_response_ok.json"));
+    if body
+        .get("not_canceled")
+        .and_then(Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+        && body
+            .get("canceled")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| !ids.is_empty())
+        && let Some(order_id) = request
+            .as_ref()
+            .and_then(|value| value.get("orderID"))
+            .and_then(Value::as_str)
+    {
+        body["canceled"] = json!([order_id]);
+    }
+    if body
+        .get("canceled")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+        && let Some(not_canceled) = body.get_mut("not_canceled").and_then(Value::as_object_mut)
+        && not_canceled.len() == 1
+        && let Some(order_id) = request
+            .as_ref()
+            .and_then(|value| value.get("orderID"))
+            .and_then(Value::as_str)
+        && let Some(reason) = not_canceled.values().next().cloned()
+    {
+        not_canceled.clear();
+        not_canceled.insert(order_id.to_string(), reason);
+    }
     record_canceled_order_ids(&state, &body).await;
     (status, Json(body)).into_response()
 }
@@ -579,7 +645,7 @@ async fn handle_delete_orders(State(state): State<TestServerState>, body: Bytes)
     } else {
         *state.batch_cancel_response_status.lock().await
     };
-    let body = if state.batch_cancel_echo_rejections.load(Ordering::Acquire) {
+    let mut body = if state.batch_cancel_echo_rejections.load(Ordering::Acquire) {
         let not_canceled = request
             .as_ref()
             .and_then(Value::as_array)
@@ -597,6 +663,18 @@ async fn handle_delete_orders(State(state): State<TestServerState>, body: Bytes)
             .clone()
             .unwrap_or_else(|| load_json("http_batch_cancel_response.json"))
     };
+    if body
+        .get("not_canceled")
+        .and_then(Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+        && body
+            .get("canceled")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| !ids.is_empty())
+        && let Some(order_ids) = request.as_ref().and_then(Value::as_array)
+    {
+        body["canceled"] = Value::Array(order_ids.clone());
+    }
     record_canceled_order_ids(&state, &body).await;
     let mut response = (status, Json(body)).into_response();
     response.headers_mut().extend(
@@ -647,7 +725,14 @@ async fn handle_user_socket(mut socket: WebSocket) {
 
 async fn handle_cancel_all(State(state): State<TestServerState>) -> Response {
     *state.last_path.lock().await = "/cancel-all".to_string();
-    Json(load_json("http_batch_cancel_response.json")).into_response()
+    let canceled = {
+        let mut open_order_ids = state.open_order_ids.lock().await;
+        open_order_ids
+            .drain()
+            .map(Value::String)
+            .collect::<Vec<_>>()
+    };
+    Json(json!({"canceled": canceled, "not_canceled": {}})).into_response()
 }
 
 async fn handle_gamma_markets(State(state): State<TestServerState>) -> Response {
@@ -1369,9 +1454,10 @@ async fn test_generate_order_status_report_single_requires_instrument_id() {
 async fn test_generate_order_status_report_single_returns_report() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
-    let (client, _rx, _cache) = create_test_execution_client(addr);
+    let (client, _rx, cache) = create_test_execution_client(addr);
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
     let cmd = GenerateOrderStatusReport {
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
@@ -1427,6 +1513,7 @@ async fn test_generate_order_status_report_defers_while_trade_is_unconfirmed() {
         .add_order(order.clone(), None, None, false)
         .unwrap();
     submit_and_accept_order(&cache, &mut order, venue_order_id_str);
+    connect_and_restore_local_orders(&mut client, &cache).await;
     let cmd = GenerateOrderStatusReport {
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
@@ -1559,6 +1646,7 @@ async fn test_generate_order_status_report_recovers_filled_from_trades() {
         .add_order(order.clone(), None, None, false)
         .unwrap();
     submit_and_accept_order(&cache, &mut order, venue_order_id.as_str());
+    connect_and_restore_local_orders(&mut client, &cache).await;
 
     let cmd = GenerateOrderStatusReport {
         command_id: UUID4::new(),
@@ -1636,6 +1724,7 @@ async fn test_generate_order_status_report_recovers_canceled_when_no_trades() {
         .add_order(order.clone(), None, None, false)
         .unwrap();
     submit_and_accept_order(&cache, &mut order, venue_order_id.as_str());
+    connect_and_restore_local_orders(&mut client, &cache).await;
 
     let cmd = GenerateOrderStatusReport {
         command_id: UUID4::new(),
@@ -1775,6 +1864,7 @@ async fn test_generate_order_status_report_recovers_filled_with_dust_snap() {
         .add_order(order.clone(), None, None, false)
         .unwrap();
     submit_and_accept_order(&cache, &mut order, venue_order_id_str);
+    connect_and_restore_local_orders(&mut client, &cache).await;
 
     let cmd = GenerateOrderStatusReport {
         command_id: UUID4::new(),
@@ -1853,6 +1943,7 @@ async fn test_generate_order_status_report_recovers_canceled_with_partial_fill()
         .add_order(order.clone(), None, None, false)
         .unwrap();
     submit_and_accept_order(&cache, &mut order, venue_order_id_str);
+    connect_and_restore_local_orders(&mut client, &cache).await;
 
     let cmd = GenerateOrderStatusReport {
         command_id: UUID4::new(),
@@ -1934,6 +2025,7 @@ async fn test_generate_order_status_report_resolves_via_venue_order_id_index() {
         .add_order(order.clone(), None, None, false)
         .unwrap();
     submit_and_accept_order(&cache, &mut order, venue_order_id_str);
+    connect_and_restore_local_orders(&mut client, &cache).await;
 
     let cmd = GenerateOrderStatusReport {
         command_id: UUID4::new(),
@@ -2710,10 +2802,10 @@ async fn test_fok_deferred_check_emits_terminal_event(
         "price": "0.5100",
         "side": "BUY",
         "size_matched": "0.0000",
-        "asset_id": "TEST-TOKEN",
+        "asset_id": TEST_TOKEN_ASSET_ID,
         "expiration": null,
         "order_type": "FOK",
-        "created_at": 1_703_875_200_000_i64
+        "created_at": 1_703_875_200_i64
     }));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -2756,7 +2848,12 @@ async fn test_fok_deferred_check_emits_terminal_event(
         .await
         .unwrap()
         .unwrap();
-    assert_order_event(event, "Accepted");
+    let accepted = assert_order_event(event, "Accepted");
+    let OrderEventAny::Accepted(accepted) = accepted else {
+        unreachable!();
+    };
+    state.single_order_response.lock().await.as_mut().unwrap()["id"] =
+        Value::String(accepted.venue_order_id.to_string());
 
     // Deferred FOK check: after ~5s, the own order resolves via REST to a terminal state and
     // emits the matching order event (the order was submitted through this client, so it is
@@ -2785,10 +2882,10 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
         "price": "0.5100",
         "side": "BUY",
         "size_matched": "10.0000",
-        "asset_id": "TEST-TOKEN",
+        "asset_id": TEST_TOKEN_ASSET_ID,
         "expiration": null,
         "order_type": "FOK",
-        "created_at": 1_703_875_200_000_i64
+        "created_at": 1_703_875_200_i64
     }));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -2812,13 +2909,19 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
 
     client.submit_order(cmd).unwrap();
 
-    for expected in ["Submitted", "Updated", "Accepted"] {
+    for expected in ["Submitted", "Updated"] {
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_order_event(event, expected);
     }
+    let accepted = assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+    let OrderEventAny::Accepted(accepted) = accepted else {
+        unreachable!();
+    };
+    state.single_order_response.lock().await.as_mut().unwrap()["id"] =
+        Value::String(accepted.venue_order_id.to_string());
 
     // Venue Filled with no confirmed local fills surfaces no fill quantity
     let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
@@ -3041,7 +3144,7 @@ fn add_instrument_to_cache_with_tick(
     tick_size: &str,
     size_precision: u8,
 ) {
-    let symbol = "71321045679252212594626385532706912750332728571942532289631379312455583992563";
+    let symbol = TEST_TOKEN_ASSET_ID;
     let price_increment = Price::from(tick_size);
     let size_increment = if size_precision == 0 {
         Quantity::from("1")
@@ -3094,6 +3197,38 @@ fn submit_and_accept_order(cache: &Rc<RefCell<Cache>>, order: &mut OrderAny, ven
     *order = cache.borrow_mut().update_order(&submitted).unwrap();
     let accepted = TestOrderEventStubs::accepted(order, account_id, vid);
     *order = cache.borrow_mut().update_order(&accepted).unwrap();
+}
+
+async fn submit_order_through_client(
+    client: &PolymarketExecutionClient,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    cache: &Rc<RefCell<Cache>>,
+    order: &mut OrderAny,
+) -> VenueOrderId {
+    let instrument_id = order.instrument_id();
+    if cache.borrow().instrument(&instrument_id).is_none() {
+        add_instrument_to_cache(cache, instrument_id);
+    }
+
+    client
+        .submit_order(make_submit_cmd(order, instrument_id))
+        .unwrap();
+    let submitted = assert_order_event(recv_execution_event(rx).await, "Submitted");
+    *order = cache.borrow_mut().update_order(&submitted).unwrap();
+    let accepted = assert_order_event(recv_execution_event(rx).await, "Accepted");
+    *order = cache.borrow_mut().update_order(&accepted).unwrap();
+    order
+        .venue_order_id()
+        .expect("accepted order must carry the signed venue order ID")
+}
+
+async fn connect_and_restore_local_orders(
+    client: &mut PolymarketExecutionClient,
+    cache: &Rc<RefCell<Cache>>,
+) {
+    add_test_account_to_cache(cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
 }
 
 fn assert_order_event(event: ExecutionEvent, expected: &str) -> OrderEventAny {
@@ -4995,7 +5130,7 @@ async fn test_cancel_order_success_no_rejection_event() {
         .borrow_mut()
         .add_order(order.clone(), None, None, false)
         .unwrap();
-    submit_and_accept_order(&cache, &mut order, "0xvenue-cancel-ok");
+    submit_order_through_client(&client, &mut rx, &cache, &mut order).await;
 
     let cmd = make_cancel_cmd("O-CANCEL-OK", instrument_id);
     client.cancel_order(cmd).unwrap();
@@ -5036,7 +5171,7 @@ async fn test_cancel_order_ambiguous_http_failure_does_not_emit_cancel_rejected(
         .borrow_mut()
         .add_order(order.clone(), None, None, false)
         .unwrap();
-    submit_and_accept_order(&cache, &mut order, "0xvenue-cancel-ambiguous");
+    submit_order_through_client(&client, &mut rx, &cache, &mut order).await;
 
     let cmd = make_cancel_cmd("O-CANCEL-AMBIGUOUS", instrument_id);
     client.cancel_order(cmd).unwrap();
@@ -5076,7 +5211,7 @@ async fn test_cancel_order_parse_failure_after_send_does_not_emit_cancel_rejecte
         .borrow_mut()
         .add_order(order.clone(), None, None, false)
         .unwrap();
-    submit_and_accept_order(&cache, &mut order, "0xvenue-cancel-parse");
+    submit_order_through_client(&client, &mut rx, &cache, &mut order).await;
 
     let cmd = make_cancel_cmd("O-CANCEL-PARSE", instrument_id);
     client.cancel_order(cmd).unwrap();
@@ -5116,7 +5251,7 @@ async fn test_cancel_order_already_done_suppresses_rejection() {
         .borrow_mut()
         .add_order(order.clone(), None, None, false)
         .unwrap();
-    submit_and_accept_order(&cache, &mut order, CANCEL_ALREADY_DONE_ORDER_ID);
+    submit_order_through_client(&client, &mut rx, &cache, &mut order).await;
 
     let cmd = make_cancel_cmd("O-CANCEL-DONE", instrument_id);
     client.cancel_order(cmd).unwrap();
@@ -5161,7 +5296,7 @@ async fn test_cancel_order_explicit_structured_rejection_emits_cancel_rejected()
         .borrow_mut()
         .add_order(order.clone(), None, None, false)
         .unwrap();
-    submit_and_accept_order(&cache, &mut order, "0xvenue-cancel-fail");
+    submit_order_through_client(&client, &mut rx, &cache, &mut order).await;
 
     let cmd = make_cancel_cmd("O-CANCEL-FAIL", instrument_id);
     client.cancel_order(cmd).unwrap();
@@ -5354,6 +5489,8 @@ async fn test_group_cancel_orders_bounds_retries_and_result_processing(
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
     let mut cancels = Vec::with_capacity(order_count);
     let mut expected_client_order_ids = HashSet::with_capacity(order_count);
     let mut venue_order_ids = Vec::with_capacity(order_count);
@@ -5378,6 +5515,11 @@ async fn test_group_cancel_orders_bounds_retries_and_result_processing(
         expected_client_order_ids.insert(client_order_id);
         venue_order_ids.push(venue_order_id);
     }
+
+    // Exercise the production restart boundary: accepted cache orders are
+    // restored into the single local-order coordinator before commands run.
+    client.connect().await.unwrap();
+    while rx.try_recv().is_ok() {}
 
     match mode {
         ShutdownCancelMode::Batch => client
@@ -5505,7 +5647,7 @@ async fn test_batch_cancel_orders_whole_http_failure_does_not_emit_cancel_reject
         .borrow_mut()
         .add_order(order1.clone(), None, None, false)
         .unwrap();
-    submit_and_accept_order(&cache, &mut order1, "0xvenue-batch-fail-1");
+    submit_order_through_client(&client, &mut rx, &cache, &mut order1).await;
 
     let mut order2 = make_limit_order(
         "O-BATCH-FAIL-2",
@@ -5520,7 +5662,7 @@ async fn test_batch_cancel_orders_whole_http_failure_does_not_emit_cancel_reject
         .borrow_mut()
         .add_order(order2.clone(), None, None, false)
         .unwrap();
-    submit_and_accept_order(&cache, &mut order2, "0xvenue-batch-fail-2");
+    submit_order_through_client(&client, &mut rx, &cache, &mut order2).await;
 
     let cancels = vec![
         make_cancel_cmd("O-BATCH-FAIL-1", instrument_id),
@@ -5559,6 +5701,9 @@ async fn test_batch_cancel_orders_whole_http_failure_does_not_emit_cancel_reject
 #[tokio::test]
 async fn test_stop_does_not_abort_shutdown_cancel_response(#[case] mode: ShutdownCancelMode) {
     let state = TestServerState::default();
+    state
+        .batch_cancel_echo_rejections
+        .store(true, Ordering::Release);
     let venue_order_id = "0xvenue-shutdown-cancel";
     let rejection = json!({
         "canceled": [],
@@ -5587,7 +5732,7 @@ async fn test_stop_does_not_abort_shutdown_cancel_response(#[case] mode: Shutdow
         .borrow_mut()
         .add_order(order.clone(), None, None, false)
         .unwrap();
-    submit_and_accept_order(&cache, &mut order, venue_order_id);
+    submit_order_through_client(&client, &mut rx, &cache, &mut order).await;
 
     let cancel = make_cancel_cmd("O-SHUTDOWN-CANCEL", instrument_id);
     match mode {
@@ -5678,7 +5823,7 @@ async fn test_disconnect_waits_for_shutdown_cancel_response() {
         .borrow_mut()
         .add_order(order.clone(), None, None, false)
         .unwrap();
-    submit_and_accept_order(&cache, &mut order, venue_order_id);
+    submit_order_through_client(&client, &mut rx, &cache, &mut order).await;
     client
         .cancel_order(make_cancel_cmd("O-DISCONNECT-CANCEL", instrument_id))
         .unwrap();
@@ -6403,13 +6548,12 @@ async fn test_cancel_order_deferred_explicit_structured_rejection_emits_cancel_r
 
 #[rstest]
 #[tokio::test]
-async fn test_cancel_order_uses_cache_index_fallback() {
-    // Simulates the window where _post_signed_order completed (venue_order_id
-    // cached in the index) but OrderAccepted has not yet been applied to the
-    // order object. cancel_order should find the ID via the cache index and
-    // proceed with the cancel directly, bypassing the deferred mechanism.
+async fn test_cancel_order_does_not_trust_a_cache_only_venue_index() {
+    // A cache-only venue ID is not local-order authority. The explicit cancel
+    // intent may be retained for a future matching submit, but the cache index
+    // can never authorize a venue request.
     let state = TestServerState::default();
-    let addr = start_mock_server(state).await;
+    let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
     client.start().unwrap();
 
@@ -6442,21 +6586,16 @@ async fn test_cancel_order_uses_cache_index_fallback() {
         .add_venue_order_id(&ClientOrderId::from("O-CACHE-FALLBACK"), &vid, false)
         .unwrap();
 
-    // cancel_order should find the venue_order_id in the cache index
-    // and send the cancel HTTP request directly (no deferred mechanism)
     let cmd = make_cancel_cmd("O-CACHE-FALLBACK", instrument_id);
     client.cancel_order(cmd).unwrap();
 
-    // A successful cancel via the mock server produces no rejection event
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(rx.try_recv().is_err());
+    assert_no_execution_event(&mut rx).await;
+    assert_eq!(*state.cancel_delete_count.lock().await, 0);
 }
 
 #[rstest]
 #[tokio::test]
-async fn test_cancel_order_cache_fallback_with_rejection() {
-    // Same cache index fallback path, but the venue returns an error so we
-    // can verify a CancelRejected event is emitted.
+async fn test_cancel_order_does_not_send_a_cache_only_identity_to_the_venue() {
     let state = TestServerState::default();
     *state.cancel_response.lock().await = Some(json!({
         "canceled": [],
@@ -6464,7 +6603,7 @@ async fn test_cancel_order_cache_fallback_with_rejection() {
             "0xvenue-cache-reject": "order not found"
         }
     }));
-    let addr = start_mock_server(state).await;
+    let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
     client.start().unwrap();
 
@@ -6496,12 +6635,8 @@ async fn test_cancel_order_cache_fallback_with_rejection() {
     let cmd = make_cancel_cmd("O-CACHE-REJECT", instrument_id);
     client.cancel_order(cmd).unwrap();
 
-    // The cancel hit the venue, received "order not found", emits CancelRejected
-    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_order_event(event, "CancelRejected");
+    assert_no_execution_event(&mut rx).await;
+    assert_eq!(*state.cancel_delete_count.lock().await, 0);
 }
 
 #[rstest]
@@ -6556,7 +6691,7 @@ async fn test_query_order_excludes_unconfirmed_matched_quantity() {
         "price": "0.5100",
         "side": "BUY",
         "size_matched": "10.0000",
-        "asset_id": "TEST-TOKEN",
+        "asset_id": TEST_TOKEN_ASSET_ID,
         "expiration": null,
         "order_type": "GTC",
         "created_at": 1_703_875_200_i64

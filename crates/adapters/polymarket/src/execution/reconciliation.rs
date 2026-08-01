@@ -29,7 +29,7 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use super::{
-    order_fill_tracker::OrderFillTrackerMap,
+    local_orders::LocalOrderCoordinator,
     parse::{
         build_maker_fill_report, instrument_fee_exponent, instrument_taker_fee, parse_fill_report,
         parse_order_status_report, parse_timestamp,
@@ -278,7 +278,7 @@ pub(crate) async fn generate_mass_status(
     http_client: &PolymarketClobHttpClient,
     data_api_client: &PolymarketDataApiHttpClient,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
-    fill_tracker: &OrderFillTrackerMap,
+    local_orders: &LocalOrderCoordinator,
     ctx: &FillContext<'_>,
     client_id: ClientId,
     venue: Venue,
@@ -292,8 +292,10 @@ pub(crate) async fn generate_mass_status(
         .await
         .context("failed to fetch orders for mass status")?;
 
-    let (mut order_reports, orders_filtered) =
+    let (order_reports, orders_filtered) =
         build_order_reports_from_orders(&orders, instruments, ctx.account_id, None, ts_init);
+    let admitted_orders = local_orders.admit_reconciliation_order_reports(order_reports);
+    let mut order_reports = admitted_orders.artifacts;
 
     // Fetch and parse fill reports
     let trades = http_client
@@ -301,12 +303,10 @@ pub(crate) async fn generate_mass_status(
         .await
         .context("failed to fetch trades for mass status")?;
 
-    let (mut fill_reports, fills_filtered) =
+    let (fill_reports, fills_filtered) =
         build_fill_reports_from_trades(&trades, ctx, instruments, None, ts_init);
-
-    // Snap dust drift on REST fills the same way the WS path does.
-    // Commission stays as venue-reported.
-    fill_tracker.snap_fill_reports(&mut fill_reports);
+    let admitted_fills = local_orders.admit_reconciliation_fill_reports(fill_reports);
+    let mut fill_reports = admitted_fills.artifacts;
 
     // Position reports from Data API
     let positions = data_api_client
@@ -315,6 +315,22 @@ pub(crate) async fn generate_mass_status(
         .context("failed to fetch positions for mass status")?;
 
     let position_reports = build_position_reports(&positions, ctx.account_id, ts_init);
+
+    // Identity may be claimed while the position request is in flight. Re-enter the same
+    // point-of-use admission boundary before any venue-keyed joins or emission.
+    let final_orders = local_orders.admit_reconciliation_order_reports(order_reports);
+    order_reports = final_orders.artifacts;
+    let final_fills = local_orders.admit_reconciliation_fill_reports(fill_reports);
+    fill_reports = final_fills.artifacts;
+    let identity_conflicts = admitted_orders.conflicts
+        + admitted_fills.conflicts
+        + final_orders.conflicts
+        + final_fills.conflicts;
+    if identity_conflicts > 0 {
+        log::warn!(
+            "Rejected {identity_conflicts} reconciliation artifacts with conflicting local order identity"
+        );
+    }
 
     // Apply lookback filter
     if let Some(mins) = lookback_mins {
@@ -351,7 +367,7 @@ pub(crate) async fn generate_mass_status(
         );
     }
 
-    cap_order_reports_to_confirmed_fills(&mut order_reports, &fill_reports);
+    cap_order_reports_to_confirmed_fills(&mut order_reports, &fill_reports, local_orders);
 
     let mut mass_status = ExecutionMassStatus::new(client_id, ctx.account_id, venue, ts_init, None);
 
@@ -365,25 +381,38 @@ pub(crate) async fn generate_mass_status(
 fn cap_order_reports_to_confirmed_fills(
     order_reports: &mut [OrderStatusReport],
     fill_reports: &[FillReport],
+    local_orders: &LocalOrderCoordinator,
 ) {
     let confirmed_by_order = confirmed_filled_quantities(fill_reports);
 
     for report in order_reports {
-        let local_filled = Quantity::zero(report.quantity.precision);
+        let venue_filled = report.filled_qty;
+        let local_filled = local_orders
+            .snapshot(&report.venue_order_id)
+            .filter(|local| local.identity.instrument_id == report.instrument_id)
+            .map_or_else(
+                || Quantity::zero(report.quantity.precision),
+                |local| local.filled_qty,
+            );
         cap_order_report_filled_qty(
             report,
+            venue_filled,
             local_filled,
-            confirmed_by_order.get(&report.venue_order_id).copied(),
+            confirmed_by_order
+                .get(&(report.venue_order_id, report.instrument_id))
+                .copied(),
         );
     }
 }
 
 pub(crate) fn confirmed_filled_quantities(
     fill_reports: &[FillReport],
-) -> AHashMap<VenueOrderId, Decimal> {
+) -> AHashMap<(VenueOrderId, InstrumentId), Decimal> {
     let mut confirmed_by_order = AHashMap::new();
     for fill in fill_reports {
-        *confirmed_by_order.entry(fill.venue_order_id).or_default() += fill.last_qty.as_decimal();
+        *confirmed_by_order
+            .entry((fill.venue_order_id, fill.instrument_id))
+            .or_default() += fill.last_qty.as_decimal();
     }
 
     confirmed_by_order
@@ -391,13 +420,14 @@ pub(crate) fn confirmed_filled_quantities(
 
 pub(crate) fn cap_order_report_filled_qty(
     report: &mut OrderStatusReport,
+    venue_filled: Quantity,
     local_filled: Quantity,
     confirmed_filled: Option<Decimal>,
 ) {
     let confirmed_filled = confirmed_filled
         .and_then(|qty| Quantity::from_decimal_dp(qty, report.quantity.precision).ok())
         .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
-    let capped = report.filled_qty.min(local_filled.max(confirmed_filled));
+    let capped = venue_filled.min(local_filled.max(confirmed_filled));
     report.filled_qty = capped;
     normalize_terminal_order_report_quantity(report);
 }
@@ -471,7 +501,7 @@ mod tests {
             None,
         )];
 
-        cap_order_reports_to_confirmed_fills(&mut reports, &fills);
+        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &LocalOrderCoordinator::new());
 
         assert_eq!(reports[0].filled_qty, Quantity::from("4.0000"));
     }
@@ -519,7 +549,7 @@ mod tests {
             None,
         )];
 
-        cap_order_reports_to_confirmed_fills(&mut reports, &fills);
+        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &LocalOrderCoordinator::new());
 
         assert_eq!(reports[0].quantity, Quantity::from(expected_quantity));
         assert_eq!(reports[0].filled_qty, Quantity::from(confirmed));

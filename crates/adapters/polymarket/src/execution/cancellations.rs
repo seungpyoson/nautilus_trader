@@ -22,7 +22,10 @@ use nautilus_model::{
     orders::{Order, OrderAny},
 };
 
-use super::{PolymarketExecutionClient, pending::PendingCancelTracker};
+use super::{
+    PolymarketExecutionClient,
+    local_orders::{CancelAdmission, OrderIdentity},
+};
 use crate::{execution::types::CancelOutcome, http::query::CancelResponse};
 
 impl PolymarketExecutionClient {
@@ -51,27 +54,32 @@ impl PolymarketExecutionClient {
             return;
         }
 
-        let venue_order_id = match order_ref.venue_order_id() {
-            Some(id) => id,
-            None => match self
-                .order_identities
-                .venue_order_id(&cmd.client_order_id)
-                .or_else(|| {
-                    self.core
-                        .cache()
-                        .venue_order_id(&cmd.client_order_id)
-                        .copied()
-                }) {
-                Some(id) => id,
-                None => {
-                    log::debug!(
-                        "Cancel for {} deferred, venue_order_id not yet available",
-                        cmd.client_order_id
-                    );
-                    self.pending_cancels.insert(cmd.client_order_id);
-                    return;
+        let venue_order_id = match self
+            .local_orders
+            .admit_cancel(OrderIdentity::from_order(order_ref))
+        {
+            CancelAdmission::Ready(id) => id,
+            CancelAdmission::Pending | CancelAdmission::Unclaimed => {
+                log::debug!(
+                    "Cancel for {} deferred until its local identity is accepted",
+                    cmd.client_order_id
+                );
+                if self
+                    .local_orders
+                    .defer_cancel(OrderIdentity::from_order(order_ref))
+                    .is_err()
+                {
+                    log::error!("Cancel intent conflicts with the retained order identity");
                 }
-            },
+                return;
+            }
+            CancelAdmission::Conflict => {
+                log::error!(
+                    "Cancel for {} rejected: local order identity is missing or conflicting",
+                    cmd.client_order_id
+                );
+                return;
+            }
         };
 
         let clock = self.clock;
@@ -124,23 +132,36 @@ impl PolymarketExecutionClient {
         let mut orders = Vec::new();
 
         for order in open_orders {
-            if let Some(venue_order_id) = order.venue_order_id().or_else(|| {
-                self.order_identities
-                    .venue_order_id(&order.client_order_id())
-            }) {
-                venue_order_ids.push(venue_order_id.to_string());
-                orders.push((venue_order_id, order.clone()));
-            } else {
-                log::debug!(
-                    "Cancel all for {} deferred, venue_order_id not yet available",
+            match self
+                .local_orders
+                .admit_cancel(OrderIdentity::from_order(&order))
+            {
+                CancelAdmission::Ready(venue_order_id) => {
+                    venue_order_ids.push(venue_order_id.to_string());
+                    orders.push((venue_order_id, order.clone()));
+                }
+                CancelAdmission::Pending | CancelAdmission::Unclaimed => {
+                    log::debug!(
+                        "Cancel all for {} deferred until its local identity is accepted",
+                        order.client_order_id()
+                    );
+                    if self
+                        .local_orders
+                        .defer_cancel(OrderIdentity::from_order(&order))
+                        .is_err()
+                    {
+                        log::error!("Cancel-all intent conflicts with the retained order identity");
+                    }
+                }
+                CancelAdmission::Conflict => log::error!(
+                    "Cancel all skipped {}: local order identity is missing or conflicting",
                     order.client_order_id()
-                );
-                self.pending_cancels.insert(order.client_order_id());
+                ),
             }
         }
 
         if venue_order_ids.is_empty() {
-            log::debug!("All matching orders are awaiting venue order IDs");
+            log::debug!("No matching cancel has an admitted local order identity");
             return;
         }
 
@@ -181,23 +202,38 @@ impl PolymarketExecutionClient {
 
         for c in &cmd.cancels {
             if let Some(order) = self.core.cache().order(&c.client_order_id) {
-                if let Some(venue_order_id) = order
-                    .venue_order_id()
-                    .or_else(|| self.order_identities.venue_order_id(&c.client_order_id))
+                match self
+                    .local_orders
+                    .admit_cancel(OrderIdentity::from_order(&order))
                 {
-                    venue_to_order.push((venue_order_id.to_string(), order.clone()));
-                } else {
-                    log::debug!(
-                        "Batch cancel for {} deferred, venue_order_id not yet available",
+                    CancelAdmission::Ready(venue_order_id) => {
+                        venue_to_order.push((venue_order_id.to_string(), order.clone()));
+                    }
+                    CancelAdmission::Pending | CancelAdmission::Unclaimed => {
+                        log::debug!(
+                            "Batch cancel for {} deferred until its local identity is accepted",
+                            c.client_order_id
+                        );
+                        if self
+                            .local_orders
+                            .defer_cancel(OrderIdentity::from_order(&order))
+                            .is_err()
+                        {
+                            log::error!(
+                                "Batch-cancel intent conflicts with the retained order identity"
+                            );
+                        }
+                    }
+                    CancelAdmission::Conflict => log::error!(
+                        "Batch cancel skipped {}: local order identity is missing or conflicting",
                         c.client_order_id
-                    );
-                    self.pending_cancels.insert(c.client_order_id);
+                    ),
                 }
             }
         }
 
         if venue_to_order.is_empty() {
-            log::debug!("All batch cancels are awaiting venue order IDs");
+            log::debug!("No batch cancel has an admitted local order identity");
             return;
         }
 
@@ -277,12 +313,11 @@ pub(super) async fn execute_deferred_cancel(
     order_id_str: &str,
     venue_order_id: VenueOrderId,
     emitter: &ExecutionEventEmitter,
-    pending_cancels: &PendingCancelTracker,
     clock: &'static AtomicTime,
 ) {
     match submitter.cancel_order(order_id_str).await {
         Ok(response) => {
-            let status = process_cancel_result(
+            process_cancel_result(
                 &response,
                 order_id_str,
                 order,
@@ -290,10 +325,6 @@ pub(super) async fn execute_deferred_cancel(
                 emitter,
                 clock,
             );
-
-            if status == CancelResponseStatus::PerOrderResult {
-                pending_cancels.remove(&order.client_order_id());
-            }
         }
         Err(e) => {
             log::warn!(

@@ -56,7 +56,7 @@ use crate::{
 
 /// Fee-adjustment context for market BUYs sized to the user's pUSD balance.
 ///
-/// When supplied to [`OrderSubmitter::submit_market_order`] alongside
+/// When supplied to [`OrderSubmitter::prepare_market_order_submission`] alongside
 /// `OrderSide::Buy`, the submitter shrinks `amount` so `amount + fees`
 /// fits within `user_pusd_balance`, mirroring the SDK behaviour. SELL
 /// orders ignore this context.
@@ -82,6 +82,14 @@ pub(crate) struct MarketOrderSubmitRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct MarketOrderSubmitResult {
     pub response: OrderResponse,
+    pub expected_base_qty: Decimal,
+    pub expected_venue_order_id: VenueOrderId,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedMarketOrderSubmission {
+    poly_order: PolymarketOrder,
+    order_type: PolymarketOrderType,
     pub expected_base_qty: Decimal,
     pub expected_venue_order_id: VenueOrderId,
 }
@@ -148,10 +156,10 @@ impl OrderSubmitter {
     /// `request.fee_context`, when supplied with `OrderSide::Buy`, is used to shrink
     /// `amount` for taker fees before signing so balance-sized BUYs are not
     /// rejected by the venue. SELL ignores the context.
-    pub(crate) async fn submit_market_order(
+    pub(crate) async fn prepare_market_order_submission(
         &self,
         request: MarketOrderSubmitRequest,
-    ) -> anyhow::Result<MarketOrderSubmitResult> {
+    ) -> anyhow::Result<PreparedMarketOrderSubmission> {
         let MarketOrderSubmitRequest {
             token_id,
             side,
@@ -217,6 +225,25 @@ impl OrderSubmitter {
             .order_builder
             .expected_order_id(&poly_order, neg_risk)?;
 
+        Ok(PreparedMarketOrderSubmission {
+            poly_order,
+            order_type,
+            expected_base_qty: signed_base_qty,
+            expected_venue_order_id,
+        })
+    }
+
+    pub(crate) async fn post_market_order_submission(
+        &self,
+        submission: PreparedMarketOrderSubmission,
+    ) -> anyhow::Result<MarketOrderSubmitResult> {
+        let PreparedMarketOrderSubmission {
+            poly_order,
+            order_type,
+            expected_base_qty,
+            expected_venue_order_id,
+        } = submission;
+
         let http_client = self.http_client.clone();
         let saw_unknown_outcome = Arc::new(AtomicBool::new(false));
 
@@ -249,7 +276,7 @@ impl OrderSubmitter {
                 return Err(UnknownSubmitError {
                     reason: e.to_string(),
                     expected_venue_order_id,
-                    expected_base_qty: Some(signed_base_qty),
+                    expected_base_qty: Some(expected_base_qty),
                 }
                 .into());
             }
@@ -258,7 +285,7 @@ impl OrderSubmitter {
 
         Ok(MarketOrderSubmitResult {
             response,
-            expected_base_qty: signed_base_qty,
+            expected_base_qty,
             expected_venue_order_id,
         })
     }
