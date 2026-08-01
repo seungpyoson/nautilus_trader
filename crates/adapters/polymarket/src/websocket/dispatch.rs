@@ -170,6 +170,7 @@ fn dispatch_order_update(
             venue_order_id,
             report.instrument_id,
             local_client_order_id,
+            report.order_side,
             ctx.fill_tracker,
         )
         .is_err()
@@ -188,13 +189,21 @@ fn dispatch_order_update(
         && report.order_status != OrderStatus::Rejected
     {
         is_accepted = true;
-        ctx.fill_tracker.register_and_take_pending_fills(
+        match ctx.fill_tracker.register_and_take_pending_fills(
             venue_order_id,
             local_client_order_id,
             report.quantity,
             report.order_side,
             report.instrument_id,
-        )
+        ) {
+            Ok(fills) => fills,
+            Err(_) => {
+                log::error!(
+                    "WebSocket order update for {venue_order_id} contradicts tracker identity; dropping it"
+                );
+                return;
+            }
+        }
     } else if is_accepted {
         ctx.fill_tracker.take_pending_fills(venue_order_id)
     } else {
@@ -203,15 +212,22 @@ fn dispatch_order_update(
 
     // Order updates can race ahead of trade messages, so cap filled_qty
     // to what the fill tracker has recorded to prevent duplicate inferred fills
-    if let Some(tracked_filled) = ctx.fill_tracker.get_cumulative_filled(&venue_order_id)
-        && report.filled_qty > tracked_filled
-    {
-        log::debug!(
-            "Capping filled_qty for {venue_order_id} from {} to {} (awaiting trade messages)",
-            report.filled_qty,
-            tracked_filled,
-        );
-        report.filled_qty = tracked_filled;
+    match ctx.fill_tracker.cumulative_filled_for_report(&report) {
+        Ok(Some(tracked_filled)) if report.filled_qty > tracked_filled => {
+            log::debug!(
+                "Capping filled_qty for {venue_order_id} from {} to {} (awaiting trade messages)",
+                report.filled_qty,
+                tracked_filled,
+            );
+            report.filled_qty = tracked_filled;
+        }
+        Err(_) => {
+            log::error!(
+                "WebSocket order update for {venue_order_id} contradicts tracker identity; dropping it"
+            );
+            return;
+        }
+        _ => {}
     }
 
     // Track cancel reports so we can re-emit them after late-arriving fills.
@@ -247,6 +263,7 @@ fn dispatch_order_update(
             fill.report.venue_order_id,
             fill.report.instrument_id,
             fill.report.client_order_id,
+            fill.report.order_side,
             ctx.fill_tracker,
         ) {
             Ok(Some(identity)) => emit_buffered_order_filled(&identity, &fill, ctx),
@@ -576,6 +593,7 @@ fn dispatch_maker_fills(
                 maker_venue_order_id,
                 report.instrument_id,
                 report.client_order_id,
+                report.order_side,
                 ctx.fill_tracker,
             )
             .is_err()
@@ -598,6 +616,7 @@ fn dispatch_maker_fills(
                 maker_venue_order_id,
                 report.instrument_id,
                 report.client_order_id,
+                report.order_side,
                 ctx.fill_tracker,
             ) {
                 Ok(Some(identity)) => {
@@ -664,6 +683,7 @@ fn dispatch_taker_fill(
             venue_order_id,
             report.instrument_id,
             report.client_order_id,
+            report.order_side,
             ctx.fill_tracker,
         )
         .is_err()
@@ -686,6 +706,7 @@ fn dispatch_taker_fill(
             venue_order_id,
             report.instrument_id,
             report.client_order_id,
+            report.order_side,
             ctx.fill_tracker,
         ) {
             Ok(Some(identity)) => {
@@ -728,11 +749,17 @@ fn reemit_terminal_cancel(
 
     if let Some(cancel_report) = state.terminal_cancel_reports.get(&venue_order_id) {
         log::debug!("Re-emitting cancel for {venue_order_id} after fill to restore terminal state");
-        match ctx.order_identities.get(&venue_order_id) {
-            Some(identity) => {
+        match ctx
+            .order_identities
+            .resolve_order_status_report(cancel_report, ctx.fill_tracker)
+        {
+            Ok(Some(identity)) => {
                 emit_order_canceled(&identity, venue_order_id, cancel_report.ts_last, ctx);
             }
-            None => ctx.emitter.send_order_status_report(cancel_report.clone()),
+            Ok(None) => ctx.emitter.send_order_status_report(cancel_report.clone()),
+            Err(_) => log::error!(
+                "Retained cancel for venue order {venue_order_id} contradicts current identity; dropping it"
+            ),
         }
     }
 }
@@ -1161,7 +1188,7 @@ mod tests {
         client_order_id: &str,
     ) {
         order_identities
-            .register_order_identity(
+            .register_order_identity_for_test(
                 venue_order_id,
                 OrderIdentity {
                     client_order_id: ClientOrderId::from(client_order_id),
@@ -2275,7 +2302,9 @@ mod tests {
             outcome: PolymarketOutcome::yes(),
             owner: Ustr::from("other-owner"),
             price: "0.82".to_string(),
-            side: PolymarketOrderSide::Buy,
+            // Same-asset maker side is opposite the taker side. The tracked order is Buy,
+            // so the venue trade must report a Sell taker.
+            side: PolymarketOrderSide::Sell,
             size: "1.219511".to_string(),
             status: PolymarketTradeStatus::Confirmed,
             taker_order_id: "0xtaker01".to_string(),
@@ -2559,7 +2588,7 @@ mod tests {
         let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         order_identities
-            .register_order_identity(
+            .register_order_identity_for_test(
                 venue_order_id,
                 OrderIdentity {
                     client_order_id: ClientOrderId::from("O-ONE-SHOT"),

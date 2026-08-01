@@ -599,9 +599,15 @@ impl PolymarketExecutionClient {
                         size_prec,
                         clock.get_time_ns(),
                     );
-                    let tracked_filled = fill_tracker
-                        .get_cumulative_filled(&requested_venue_order_id)
-                        .unwrap_or_else(|| Quantity::zero(size_prec));
+                    let tracked_filled = match fill_tracker.cumulative_filled_for_report(&report) {
+                        Ok(filled) => filled.unwrap_or_else(|| Quantity::zero(size_prec)),
+                        Err(_) => {
+                            log::error!(
+                                "Tracker identity changed while querying venue order {requested_venue_order_id}; reporting nothing"
+                            );
+                            return Ok(());
+                        }
+                    };
                     let local_filled = cached_filled.max(tracked_filled);
                     let confirmed_filled = if report.filled_qty > local_filled {
                         let ctx = FillContext {
@@ -795,10 +801,15 @@ impl PolymarketExecutionClient {
                 }
                 cached.map_or_else(|| Quantity::zero(size_prec), |order| order.filled_qty())
             };
-            let tracked_filled = self
-                .fill_tracker
-                .get_cumulative_filled(&venue_order_id)
-                .unwrap_or_else(|| Quantity::zero(size_prec));
+            let tracked_filled = match self.fill_tracker.cumulative_filled_for_report(&report) {
+                Ok(filled) => filled.unwrap_or_else(|| Quantity::zero(size_prec)),
+                Err(_) => {
+                    log::error!(
+                        "Tracker identity contradicts venue order {venue_order_id}; reporting nothing"
+                    );
+                    return Ok(None);
+                }
+            };
             let local_filled = cached_filled.max(tracked_filled);
             let confirmed_filled = if report.filled_qty > local_filled {
                 match fetch_confirmed_fill_reports(
@@ -932,10 +943,19 @@ impl PolymarketExecutionClient {
                     return false;
                 }
             };
-            let tracked_filled = self
-                .fill_tracker
-                .get_cumulative_filled(&report.venue_order_id)
-                .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
+            let tracked_filled = match self.fill_tracker.cumulative_filled_for_report(report) {
+                Ok(filled) => {
+                    filled.unwrap_or_else(|| Quantity::zero(report.quantity.precision))
+                }
+                Err(_) => {
+                    log::error!(
+                        "Tracker identity contradicts venue report order {} and instrument {}; dropping the report",
+                        report.venue_order_id,
+                        report.instrument_id,
+                    );
+                    return false;
+                }
+            };
             cap_order_report_filled_qty(
                 report,
                 cached_filled.max(tracked_filled),

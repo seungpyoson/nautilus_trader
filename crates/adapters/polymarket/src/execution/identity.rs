@@ -30,6 +30,7 @@ use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId, StrategyId, VenueOrderId},
     orders::{Order, OrderAny},
+    reports::OrderStatusReport,
 };
 
 use super::order_fill_tracker::OrderFillTrackerMap;
@@ -98,6 +99,26 @@ impl OrderIdentityRegistry {
         &self,
         venue_order_id: VenueOrderId,
         identity: OrderIdentity,
+        fill_tracker: &OrderFillTrackerMap,
+    ) -> Result<(), OrderIdentityConflict> {
+        if fill_tracker
+            .fill_identity_matches(
+                &venue_order_id,
+                identity.instrument_id,
+                Some(identity.client_order_id),
+                identity.order_side,
+            )
+            .is_some_and(|matches| !matches)
+        {
+            return Err(OrderIdentityConflict);
+        }
+        self.register_order_identity_inner(venue_order_id, identity)
+    }
+
+    fn register_order_identity_inner(
+        &self,
+        venue_order_id: VenueOrderId,
+        identity: OrderIdentity,
     ) -> Result<(), OrderIdentityConflict> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
         if guard
@@ -116,6 +137,15 @@ impl OrderIdentityRegistry {
             .client_to_venue
             .insert(identity.client_order_id, venue_order_id);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_order_identity_for_test(
+        &self,
+        venue_order_id: VenueOrderId,
+        identity: OrderIdentity,
+    ) -> Result<(), OrderIdentityConflict> {
+        self.register_order_identity_inner(venue_order_id, identity)
     }
 
     /// Returns the identity for a tracked order, if known.
@@ -160,19 +190,51 @@ impl OrderIdentityRegistry {
         venue_order_id: VenueOrderId,
         instrument_id: InstrumentId,
         client_order_id: Option<ClientOrderId>,
+        order_side: OrderSide,
         fill_tracker: &OrderFillTrackerMap,
     ) -> Result<Option<OrderIdentity>, OrderIdentityConflict> {
         let identity = {
             let guard = self.inner.lock().expect(MUTEX_POISONED);
             resolve_order_request_in(&guard, venue_order_id, instrument_id, client_order_id, None)?;
-            guard.identities.get(&venue_order_id).copied()
+            let identity = guard.identities.get(&venue_order_id).copied();
+            if identity.is_some_and(|identity| identity.order_side != order_side) {
+                return Err(OrderIdentityConflict);
+            }
+            identity
         };
         if fill_tracker
-            .fill_identity_matches(&venue_order_id, instrument_id, client_order_id)
+            .fill_identity_matches(&venue_order_id, instrument_id, client_order_id, order_side)
             .is_some_and(|matches| !matches)
         {
             return Err(OrderIdentityConflict);
         }
+        Ok(identity)
+    }
+
+    /// Admits an order report only when registry and tracker identity agree.
+    pub(crate) fn resolve_order_status_report(
+        &self,
+        report: &OrderStatusReport,
+        fill_tracker: &OrderFillTrackerMap,
+    ) -> Result<Option<OrderIdentity>, OrderIdentityConflict> {
+        let identity = {
+            let guard = self.inner.lock().expect(MUTEX_POISONED);
+            resolve_order_request_in(
+                &guard,
+                report.venue_order_id,
+                report.instrument_id,
+                report.client_order_id,
+                None,
+            )?;
+            let identity = guard.identities.get(&report.venue_order_id).copied();
+            if identity.is_some_and(|identity| identity.order_side != report.order_side) {
+                return Err(OrderIdentityConflict);
+            }
+            identity
+        };
+        fill_tracker
+            .cumulative_filled_for_report(report)
+            .map_err(|_| OrderIdentityConflict)?;
         Ok(identity)
     }
 
@@ -267,7 +329,7 @@ mod tests {
         assert!(registry.get(&vid).is_none());
 
         registry
-            .register_order_identity(vid, test_identity())
+            .register_order_identity_for_test(vid, test_identity())
             .expect("first identity must register");
         let identity = registry.get(&vid).expect("identity registered");
         assert_eq!(identity.client_order_id, ClientOrderId::from("O-1"));
@@ -284,7 +346,7 @@ mod tests {
         let venue_order_id = VenueOrderId::from("V-1");
         let identity = test_identity();
         registry
-            .register_order_identity(venue_order_id, identity)
+            .register_order_identity_for_test(venue_order_id, identity)
             .expect("first identity must register");
 
         let conflicting = OrderIdentity {
@@ -292,7 +354,7 @@ mod tests {
             ..identity
         };
         assert_eq!(
-            registry.register_order_identity(venue_order_id, conflicting),
+            registry.register_order_identity_for_test(venue_order_id, conflicting),
             Err(OrderIdentityConflict)
         );
         assert_eq!(registry.get(&venue_order_id), Some(identity));
@@ -314,7 +376,13 @@ mod tests {
         );
 
         assert_eq!(
-            registry.resolve_fill_report(venue_order_id, instrument_id, None, &tracker,),
+            registry.resolve_fill_report(
+                venue_order_id,
+                instrument_id,
+                None,
+                OrderSide::Buy,
+                &tracker,
+            ),
             Ok(None)
         );
         assert_eq!(
@@ -322,10 +390,36 @@ mod tests {
                 venue_order_id,
                 InstrumentId::from("OTHER.POLYMARKET"),
                 None,
+                OrderSide::Buy,
                 &tracker,
             ),
             Err(OrderIdentityConflict)
         );
+    }
+
+    #[rstest]
+    fn test_registration_cannot_replace_tracker_identity_after_registry_eviction() {
+        let registry = OrderIdentityRegistry::default();
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("V-EVICTED");
+        tracker.register(
+            venue_order_id,
+            Quantity::from("10"),
+            OrderSide::Buy,
+            InstrumentId::from("ORIGINAL.POLYMARKET"),
+            4,
+            4,
+        );
+        let conflicting = OrderIdentity {
+            instrument_id: InstrumentId::from("REPLACEMENT.POLYMARKET"),
+            ..test_identity()
+        };
+
+        assert_eq!(
+            registry.register_order_identity(venue_order_id, conflicting, &tracker),
+            Err(OrderIdentityConflict)
+        );
+        assert!(registry.get(&venue_order_id).is_none());
     }
 
     #[rstest]

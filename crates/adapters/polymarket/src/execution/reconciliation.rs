@@ -169,6 +169,7 @@ fn admit_and_snap_fill_report(
         report.venue_order_id,
         report.instrument_id,
         report.client_order_id,
+        report.order_side,
         fill_tracker,
     )?;
     if !fill_tracker.admit_and_snap_fill_report(&mut report) {
@@ -284,9 +285,10 @@ pub(crate) fn build_identity_admitted_fill_reports_from_trades(
                     continue;
                 }
 
-                if requested_asset_ids
-                    .as_ref()
-                    .is_some_and(|asset_ids| !asset_ids.contains(&mo.asset_id))
+                if venue_order_filter.is_none()
+                    && requested_asset_ids
+                        .as_ref()
+                        .is_some_and(|asset_ids| !asset_ids.contains(&mo.asset_id))
                 {
                     continue;
                 }
@@ -667,16 +669,24 @@ pub(crate) async fn generate_mass_status(
 /// saw fill; this path must agree with it, or the same order is described
 /// differently depending on which one produced the report.
 fn cap_order_reports_to_confirmed_fills(
-    order_reports: &mut [OrderStatusReport],
+    order_reports: &mut Vec<OrderStatusReport>,
     fill_reports: &[FillReport],
     fill_tracker: &OrderFillTrackerMap,
 ) {
     let confirmed_by_order = confirmed_filled_quantities(fill_reports);
 
-    for report in order_reports {
-        let local_filled = fill_tracker
-            .get_cumulative_filled(&report.venue_order_id)
-            .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
+    order_reports.retain_mut(|report| {
+        let local_filled = match fill_tracker.cumulative_filled_for_report(report) {
+            Ok(filled) => filled.unwrap_or_else(|| Quantity::zero(report.quantity.precision)),
+            Err(_) => {
+                log::error!(
+                    "Tracker identity contradicts mass-status order {} and instrument {}; dropping the report",
+                    report.venue_order_id,
+                    report.instrument_id,
+                );
+                return false;
+            }
+        };
         cap_order_report_filled_qty(
             report,
             local_filled,
@@ -684,7 +694,8 @@ fn cap_order_reports_to_confirmed_fills(
                 .get(&(report.venue_order_id, report.instrument_id))
                 .copied(),
         );
-    }
+        true
+    });
 }
 
 pub(crate) fn confirmed_filled_quantities(
@@ -1332,6 +1343,7 @@ mod tests {
         trade.match_time = "not a timestamp".to_string();
         let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
         let order_identities = OrderIdentityRegistry::default();
+        let fill_tracker = OrderFillTrackerMap::new();
         order_identities
             .register_order_identity(
                 venue_order_id,
@@ -1343,9 +1355,9 @@ mod tests {
                     order_type: OrderType::Limit,
                     time_in_force: TimeInForce::Gtc,
                 },
+                &fill_tracker,
             )
             .expect("identity must register");
-        let fill_tracker = OrderFillTrackerMap::new();
 
         let (reports, discards) = build_identity_admitted_fill_reports_from_trades(
             &[trade],
@@ -1363,6 +1375,84 @@ mod tests {
         assert!(reports.is_empty());
         assert_eq!(discards.identity_conflicts, 1);
         assert_eq!(discards.unknown_age, 0);
+    }
+
+    #[rstest]
+    fn maker_identity_conflict_is_not_hidden_by_the_requested_instrument_filter() {
+        use nautilus_model::{enums::AssetClass, identifiers::Symbol, instruments::BinaryOption};
+
+        let (instruments, requested_instrument) = mapped_instrument();
+        let conflicting_instrument_id = InstrumentId::from("CONFLICTING.POLYMARKET");
+        let conflicting_raw_symbol = Symbol::from(COMPLEMENTARY_TOKEN);
+        let conflicting_instrument = InstrumentAny::BinaryOption(BinaryOption::new(
+            conflicting_instrument_id,
+            conflicting_raw_symbol,
+            AssetClass::Alternative,
+            Currency::pUSD(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            4,
+            4,
+            Price::from("0.0001"),
+            Quantity::from("0.0001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ));
+        instruments.insert(
+            Ustr::from(conflicting_instrument.raw_symbol().as_str()),
+            conflicting_instrument.clone(),
+        );
+
+        let mut trade = confirmed_maker_trade_for(&conflicting_instrument);
+        disown_maker_orders(&mut trade);
+        trade.maker_orders[0].maker_address = USER_ADDRESS.to_string();
+        let venue_order_id = VenueOrderId::from(trade.maker_orders[0].order_id.as_str());
+        let order_identities = OrderIdentityRegistry::default();
+        let fill_tracker = OrderFillTrackerMap::new();
+        order_identities
+            .register_order_identity(
+                venue_order_id,
+                OrderIdentity {
+                    client_order_id: ClientOrderId::from("O-MAKER-CONFLICT"),
+                    strategy_id: nautilus_model::identifiers::StrategyId::from("S-1"),
+                    instrument_id: requested_instrument.id(),
+                    order_side: OrderSide::Sell,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::Gtc,
+                },
+                &fill_tracker,
+            )
+            .expect("identity must register");
+
+        let (reports, discards) = build_identity_admitted_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            &order_identities,
+            &fill_tracker,
+            Some(requested_instrument.id()),
+            Some(venue_order_id),
+            None,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(reports.is_empty());
+        assert_eq!(discards.identity_conflicts, 1);
     }
 
     #[rstest]
@@ -1488,18 +1578,46 @@ mod tests {
         // Fills that have matched but not settled produce no confirmed fill
         // report, so a zero floor would erase them.
         let tracker = OrderFillTrackerMap::new();
-        tracker.restore_order(
-            venue_order_id,
-            Quantity::from("10.0000"),
-            Quantity::from("6.0000"),
-            OrderSide::Buy,
-            InstrumentId::from("TEST.POLYMARKET"),
-            ClientOrderId::from("O-PENDING"),
-        );
+        tracker
+            .restore_order(
+                venue_order_id,
+                Quantity::from("10.0000"),
+                Quantity::from("6.0000"),
+                OrderSide::Buy,
+                InstrumentId::from("TEST.POLYMARKET"),
+                ClientOrderId::from("O-PENDING"),
+            )
+            .expect("test identity must restore");
 
         cap_order_reports_to_confirmed_fills(&mut reports, &[], &tracker);
 
         assert_eq!(reports[0].filled_qty, Quantity::from("6.0000"));
+    }
+
+    #[rstest]
+    fn drops_order_report_that_contradicts_tracker_identity() {
+        let venue_order_id = VenueOrderId::from("V-TRACKER-CONFLICT");
+        let mut report = order_report_filled(venue_order_id, "8.0000");
+        report.instrument_id = InstrumentId::from("OTHER.POLYMARKET");
+        let mut reports = vec![report];
+        let tracker = OrderFillTrackerMap::new();
+        tracker
+            .restore_order(
+                venue_order_id,
+                Quantity::from("10.0000"),
+                Quantity::from("4.0000"),
+                OrderSide::Buy,
+                InstrumentId::from("TEST.POLYMARKET"),
+                ClientOrderId::from("O-TRACKER-CONFLICT"),
+            )
+            .expect("test identity must restore");
+
+        cap_order_reports_to_confirmed_fills(&mut reports, &[], &tracker);
+
+        assert!(
+            reports.is_empty(),
+            "venue-keyed tracker quantity must not cross instrument identity"
+        );
     }
 
     #[rstest]
@@ -1523,14 +1641,16 @@ mod tests {
             None,
         )];
         let tracker = OrderFillTrackerMap::new();
-        tracker.restore_order(
-            venue_order_id,
-            Quantity::from("10.0000"),
-            Quantity::from("3.0000"),
-            OrderSide::Buy,
-            InstrumentId::from("TEST.POLYMARKET"),
-            ClientOrderId::from("O-BOTH"),
-        );
+        tracker
+            .restore_order(
+                venue_order_id,
+                Quantity::from("10.0000"),
+                Quantity::from("3.0000"),
+                OrderSide::Buy,
+                InstrumentId::from("TEST.POLYMARKET"),
+                ClientOrderId::from("O-BOTH"),
+            )
+            .expect("test identity must restore");
 
         cap_order_reports_to_confirmed_fills(&mut reports, &fills, &tracker);
 
@@ -1542,14 +1662,16 @@ mod tests {
         let venue_order_id = VenueOrderId::from("V-OVER");
         let mut reports = vec![order_report_filled(venue_order_id, "10.0000")];
         let tracker = OrderFillTrackerMap::new();
-        tracker.restore_order(
-            venue_order_id,
-            Quantity::from("10.0000"),
-            Quantity::from("2.0000"),
-            OrderSide::Buy,
-            InstrumentId::from("TEST.POLYMARKET"),
-            ClientOrderId::from("O-OVER"),
-        );
+        tracker
+            .restore_order(
+                venue_order_id,
+                Quantity::from("10.0000"),
+                Quantity::from("2.0000"),
+                OrderSide::Buy,
+                InstrumentId::from("TEST.POLYMARKET"),
+                ClientOrderId::from("O-OVER"),
+            )
+            .expect("test identity must restore");
 
         cap_order_reports_to_confirmed_fills(&mut reports, &[], &tracker);
 
