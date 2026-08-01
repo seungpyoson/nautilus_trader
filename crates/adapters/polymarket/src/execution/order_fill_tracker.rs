@@ -21,7 +21,7 @@ use indexmap::IndexMap;
 use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
 use nautilus_core::MUTEX_POISONED;
 use nautilus_model::{
-    enums::OrderSide,
+    enums::{OrderSide, OrderType, TimeInForce},
     events::OrderFilled,
     identifiers::{ClientOrderId, InstrumentId, VenueOrderId},
     reports::{FillReport, OrderStatusReport},
@@ -30,6 +30,7 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
+use super::identity::{OrderReportIdentity, TrackerRegistrationPermit};
 use crate::common::consts::DUST_SNAP_THRESHOLD_DEC;
 
 /// Cumulative fill state for a single order.
@@ -38,6 +39,8 @@ struct OrderFillState {
     submitted_qty: Quantity,
     cumulative_filled: Quantity,
     order_side: OrderSide,
+    order_type: OrderType,
+    time_in_force: TimeInForce,
     instrument_id: InstrumentId,
     client_order_id: Option<ClientOrderId>,
 }
@@ -94,22 +97,14 @@ impl OrderFillTrackerMap {
 
     pub(crate) fn restore_order(
         &self,
-        venue_order_id: VenueOrderId,
+        permit: &TrackerRegistrationPermit<'_>,
         submitted_qty: Quantity,
         filled_qty: Quantity,
-        order_side: OrderSide,
-        instrument_id: InstrumentId,
-        client_order_id: ClientOrderId,
     ) -> Result<(), TrackerIdentityConflict> {
-        let mut state = new_order_state(
-            submitted_qty,
-            order_side,
-            instrument_id,
-            Some(client_order_id),
-        );
+        let mut state = new_order_state(submitted_qty, permit.identity);
         state.cumulative_filled = filled_qty;
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        register_order_state(&mut guard.orders, venue_order_id, state, true)
+        register_order_state(&mut guard.orders, permit.venue_order_id, state, true)
     }
 
     /// Returns true if the order has been registered (accepted).
@@ -139,6 +134,19 @@ impl OrderFillTrackerMap {
             .map(|state| artifact_matches_state(state, instrument_id, client_order_id, order_side))
     }
 
+    pub(crate) fn order_identity_matches(
+        &self,
+        venue_order_id: &VenueOrderId,
+        identity: OrderReportIdentity,
+    ) -> Option<bool> {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .orders
+            .get(venue_order_id)
+            .map(|state| order_identity_matches_state(state, identity))
+    }
+
     /// Validates tracker-owned identity and applies dust snapping atomically.
     /// Untracked venue orders pass through as external reconciliation reports.
     pub(crate) fn admit_and_snap_fill_report(&self, report: &mut FillReport) -> bool {
@@ -154,18 +162,15 @@ impl OrderFillTrackerMap {
         true
     }
 
-    /// Returns true if the order has received any fills or been removed (settled).
-    pub(crate) fn has_fills_or_settled(&self, venue_order_id: &VenueOrderId) -> bool {
-        match self
-            .inner
+    /// Returns true only when retained tracker state proves a fill occurred.
+    /// Missing state is not settlement evidence; callers must query the venue.
+    pub(crate) fn has_recorded_fills(&self, venue_order_id: &VenueOrderId) -> bool {
+        self.inner
             .lock()
             .expect(MUTEX_POISONED)
             .orders
             .get(venue_order_id)
-        {
-            Some(s) => !s.cumulative_filled.is_zero(),
-            None => true, // Removed = already settled
-        }
+            .is_some_and(|state| !state.cumulative_filled.is_zero())
     }
 
     /// Returns the cumulative filled quantity for an order, if tracked.
@@ -273,20 +278,17 @@ impl OrderFillTrackerMap {
     /// the window after this drain.
     pub(crate) fn register_and_take_pending_fills(
         &self,
-        venue_order_id: VenueOrderId,
-        client_order_id: Option<ClientOrderId>,
+        permit: &TrackerRegistrationPermit<'_>,
         submitted_qty: Quantity,
-        order_side: OrderSide,
-        instrument_id: InstrumentId,
     ) -> Result<Vec<BufferedFill>, TrackerIdentityConflict> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
         register_order_state(
             &mut guard.orders,
-            venue_order_id,
-            new_order_state(submitted_qty, order_side, instrument_id, client_order_id),
+            permit.venue_order_id,
+            new_order_state(submitted_qty, permit.identity),
             false,
         )?;
-        Ok(take_and_prepare_fills(&mut guard, venue_order_id))
+        Ok(take_and_prepare_fills(&mut guard, permit.venue_order_id))
     }
 
     /// Registers the order and drains its buffered fills only when a fill is already buffered.
@@ -295,23 +297,23 @@ impl OrderFillTrackerMap {
     /// the venue took the order. Returns `None` (registering nothing) when no fill is buffered.
     pub(crate) fn register_and_take_pending_fills_if_buffered(
         &self,
-        venue_order_id: VenueOrderId,
-        client_order_id: Option<ClientOrderId>,
+        permit: &TrackerRegistrationPermit<'_>,
         submitted_qty: Quantity,
-        order_side: OrderSide,
-        instrument_id: InstrumentId,
     ) -> Result<Option<Vec<BufferedFill>>, TrackerIdentityConflict> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        if !guard.pending_fills.contains_key(&venue_order_id) {
+        if !guard.pending_fills.contains_key(&permit.venue_order_id) {
             return Ok(None);
         }
         register_order_state(
             &mut guard.orders,
-            venue_order_id,
-            new_order_state(submitted_qty, order_side, instrument_id, client_order_id),
+            permit.venue_order_id,
+            new_order_state(submitted_qty, permit.identity),
             false,
         )?;
-        Ok(Some(take_and_prepare_fills(&mut guard, venue_order_id)))
+        Ok(Some(take_and_prepare_fills(
+            &mut guard,
+            permit.venue_order_id,
+        )))
     }
 
     /// Drains and prepares buffered fills for an already-registered order.
@@ -323,19 +325,20 @@ impl OrderFillTrackerMap {
     /// Drains buffered order reports for a registered order (raw, for conversion by the caller).
     pub(crate) fn take_pending_reports(
         &self,
-        venue_order_id: VenueOrderId,
-        instrument_id: InstrumentId,
-        client_order_id: Option<ClientOrderId>,
-        order_side: OrderSide,
+        permit: &TrackerRegistrationPermit<'_>,
     ) -> Vec<OrderStatusReport> {
+        let venue_order_id = permit.venue_order_id;
+        let identity = permit.identity;
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
         let reports = guard
             .pending_reports
             .remove(&venue_order_id)
             .unwrap_or_default();
-        if guard.orders.get(&venue_order_id).is_some_and(|state| {
-            !artifact_matches_state(state, instrument_id, client_order_id, order_side)
-        }) {
+        if guard
+            .orders
+            .get(&venue_order_id)
+            .is_some_and(|state| !order_identity_matches_state(state, identity))
+        {
             log::error!(
                 "Buffered order reports for venue order {venue_order_id} contradict tracked order identity; dropping them"
             );
@@ -348,16 +351,18 @@ impl OrderFillTrackerMap {
                     report.instrument_id,
                     report.client_order_id,
                     report.order_side,
-                    instrument_id,
-                    client_order_id,
-                    order_side,
-                ) {
+                    identity.instrument_id,
+                    identity.client_order_id,
+                    identity.order_side,
+                ) || report.order_type != identity.order_type
+                    || report.time_in_force != identity.time_in_force
+                {
                     log::error!(
                         "Buffered order report for venue order {venue_order_id} contradicts tracked order identity; dropping it"
                     );
                     return None;
                 }
-                report.client_order_id = client_order_id;
+                report.client_order_id = identity.client_order_id;
                 Some(report)
             })
             .collect()
@@ -385,7 +390,7 @@ impl OrderFillTrackerMap {
 
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
         if guard.voided_trades.contains(&correction.correction_key) {
-            reverse_fill_in(&mut guard.orders, &fill.venue_order_id, fill.last_qty);
+            reverse_order_fill_in(&mut guard.orders, &fill);
             return false;
         }
 
@@ -417,7 +422,7 @@ impl OrderFillTrackerMap {
             .unwrap_or_default();
 
         for fill in &fills {
-            reverse_fill_in(&mut guard.orders, &fill.venue_order_id, fill.last_qty);
+            reverse_order_fill_in(&mut guard.orders, fill);
         }
         fills
     }
@@ -439,12 +444,18 @@ impl OrderFillTrackerMap {
             .contains(&correction_key.to_string())
     }
 
-    pub(crate) fn reverse_fill(&self, venue_order_id: &VenueOrderId, quantity: Quantity) {
-        reverse_fill_in(
-            &mut self.inner.lock().expect(MUTEX_POISONED).orders,
-            venue_order_id,
-            quantity,
-        );
+    pub(crate) fn reverse_fill_report(&self, report: &FillReport) {
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let Some(state) = guard.orders.get(&report.venue_order_id) else {
+            return;
+        };
+        if fill_report_matches_state(state, report) {
+            reverse_fill_in(&mut guard.orders, &report.venue_order_id, report.last_qty);
+        }
+    }
+
+    pub(crate) fn reverse_order_fill(&self, fill: &OrderFilled) {
+        reverse_order_fill_in(&mut self.inner.lock().expect(MUTEX_POISONED).orders, fill);
     }
 
     /// Snap each report's `last_qty` against the registered submitted quantity
@@ -568,18 +579,15 @@ impl OrderFillTrackerMap {
     }
 }
 
-fn new_order_state(
-    submitted_qty: Quantity,
-    order_side: OrderSide,
-    instrument_id: InstrumentId,
-    client_order_id: Option<ClientOrderId>,
-) -> OrderFillState {
+fn new_order_state(submitted_qty: Quantity, identity: OrderReportIdentity) -> OrderFillState {
     OrderFillState {
         submitted_qty,
         cumulative_filled: Quantity::zero(submitted_qty.precision),
-        order_side,
-        instrument_id,
-        client_order_id,
+        order_side: identity.order_side,
+        order_type: identity.order_type,
+        time_in_force: identity.time_in_force,
+        instrument_id: identity.instrument_id,
+        client_order_id: identity.client_order_id,
     }
 }
 
@@ -673,12 +681,17 @@ fn fill_report_matches_state(state: &OrderFillState, report: &FillReport) -> boo
 }
 
 fn order_report_matches_state(state: &OrderFillState, report: &OrderStatusReport) -> bool {
+    order_identity_matches_state(state, OrderReportIdentity::from_report(report))
+}
+
+fn order_identity_matches_state(state: &OrderFillState, identity: OrderReportIdentity) -> bool {
     artifact_matches_state(
         state,
-        report.instrument_id,
-        report.client_order_id,
-        report.order_side,
-    )
+        identity.instrument_id,
+        identity.client_order_id,
+        identity.order_side,
+    ) && state.order_type == identity.order_type
+        && state.time_in_force == identity.time_in_force
 }
 
 fn register_order_state(
@@ -693,7 +706,9 @@ fn register_order_state(
             incoming.instrument_id,
             incoming.client_order_id,
             incoming.order_side,
-        ) {
+        ) || current.order_type != incoming.order_type
+            || current.time_in_force != incoming.time_in_force
+        {
             return Err(TrackerIdentityConflict);
         }
         if current.client_order_id.is_none() {
@@ -727,6 +742,39 @@ fn push_buffered<V>(
 
 #[cfg(test)]
 impl OrderFillTrackerMap {
+    pub(crate) fn remove_order_for_test(&self, venue_order_id: &VenueOrderId) {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .orders
+            .remove(venue_order_id);
+    }
+
+    pub(crate) fn restore_order_for_test(
+        &self,
+        venue_order_id: VenueOrderId,
+        submitted_qty: Quantity,
+        filled_qty: Quantity,
+        order_side: OrderSide,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+    ) -> Result<(), TrackerIdentityConflict> {
+        let registry = super::identity::OrderIdentityRegistry::default();
+        let permit = registry
+            .admit_tracker_registration(
+                venue_order_id,
+                OrderReportIdentity {
+                    client_order_id: Some(client_order_id),
+                    instrument_id,
+                    order_side,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::Gtc,
+                },
+            )
+            .expect("test tracker identity must be permitted");
+        self.restore_order(&permit, submitted_qty, filled_qty)
+    }
+
     /// Registers an order directly, for tests that set up an already-accepted order.
     pub(crate) fn register(
         &self,
@@ -737,10 +785,29 @@ impl OrderFillTrackerMap {
         _size_precision: u8,
         _price_precision: u8,
     ) {
+        self.register_identity_for_test(
+            venue_order_id,
+            submitted_qty,
+            OrderReportIdentity {
+                client_order_id: None,
+                instrument_id,
+                order_side,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::Gtc,
+            },
+        );
+    }
+
+    pub(crate) fn register_identity_for_test(
+        &self,
+        venue_order_id: VenueOrderId,
+        submitted_qty: Quantity,
+        identity: OrderReportIdentity,
+    ) {
         register_order_state(
             &mut self.inner.lock().expect(MUTEX_POISONED).orders,
             venue_order_id,
-            new_order_state(submitted_qty, order_side, instrument_id, None),
+            new_order_state(submitted_qty, identity),
             false,
         )
         .expect("test registration must not contradict tracked identity");
@@ -831,6 +898,23 @@ fn reverse_fill_in(
         } else {
             state.cumulative_filled - qty
         };
+    }
+}
+
+fn reverse_order_fill_in(
+    orders: &mut FifoCacheMap<VenueOrderId, OrderFillState, 10_000>,
+    fill: &OrderFilled,
+) {
+    let Some(state) = orders.get(&fill.venue_order_id) else {
+        return;
+    };
+    if artifact_matches_state(
+        state,
+        fill.instrument_id,
+        Some(fill.client_order_id),
+        fill.order_side,
+    ) {
+        reverse_fill_in(orders, &fill.venue_order_id, fill.last_qty);
     }
 }
 
@@ -938,8 +1022,70 @@ mod tests {
     }
 
     #[rstest]
+    fn test_order_report_rejects_tracked_time_in_force_conflict() {
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("order-tif-conflict");
+        let instrument_id = InstrumentId::from("TEST.POLYMARKET");
+        tracker.register(
+            venue_order_id,
+            Quantity::new(10.0, 6),
+            OrderSide::Buy,
+            instrument_id,
+            6,
+            2,
+        );
+        let mut report = test_order_report(venue_order_id, instrument_id, OrderSide::Buy);
+        report.time_in_force = TimeInForce::Fok;
+
+        assert_eq!(
+            tracker.cumulative_filled_for_report(&report),
+            Err(TrackerIdentityConflict)
+        );
+    }
+
+    #[rstest]
+    fn test_missing_tracker_state_is_not_fill_or_settlement_evidence() {
+        let tracker = OrderFillTrackerMap::new();
+        assert!(!tracker.has_recorded_fills(&VenueOrderId::from("V-EVICTED")));
+    }
+
+    #[rstest]
+    fn test_late_rollback_cannot_cross_reused_order_identity() {
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("V-REUSED");
+        let original_instrument = InstrumentId::from("ORIGINAL.POLYMARKET");
+        let original_fill = test_fill_report(venue_order_id, original_instrument, OrderSide::Buy);
+        tracker.register(
+            venue_order_id,
+            Quantity::new(10.0, 6),
+            OrderSide::Buy,
+            original_instrument,
+            6,
+            2,
+        );
+        tracker.remove_order_for_test(&venue_order_id);
+
+        tracker.register(
+            venue_order_id,
+            Quantity::new(10.0, 6),
+            OrderSide::Buy,
+            InstrumentId::from("REPLACEMENT.POLYMARKET"),
+            6,
+            2,
+        );
+        tracker.record_fill(&venue_order_id, Quantity::new(5.0, 6));
+        tracker.reverse_fill_report(&original_fill);
+
+        assert_eq!(
+            tracker.get_cumulative_filled(&venue_order_id),
+            Some(Quantity::new(5.0, 6))
+        );
+    }
+
+    #[rstest]
     fn test_conflicting_registration_does_not_replace_tracker_identity() {
         let tracker = OrderFillTrackerMap::new();
+        let registry = super::super::identity::OrderIdentityRegistry::default();
         let venue_order_id = VenueOrderId::from("order-registration-conflict");
         let original_instrument = InstrumentId::from("ORIGINAL.POLYMARKET");
         tracker.register(
@@ -952,14 +1098,20 @@ mod tests {
         );
         tracker.record_fill(&venue_order_id, Quantity::new(5.0, 6));
 
-        assert!(matches!(
-            tracker.register_and_take_pending_fills(
+        let permit = registry
+            .admit_tracker_registration(
                 venue_order_id,
-                Some(ClientOrderId::from("O-CONFLICT")),
-                Quantity::new(20.0, 6),
-                OrderSide::Sell,
-                InstrumentId::from("REPLACEMENT.POLYMARKET"),
-            ),
+                OrderReportIdentity {
+                    client_order_id: Some(ClientOrderId::from("O-CONFLICT")),
+                    instrument_id: InstrumentId::from("REPLACEMENT.POLYMARKET"),
+                    order_side: OrderSide::Sell,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::Gtc,
+                },
+            )
+            .expect("unclaimed registry permits the tracker conflict test");
+        assert!(matches!(
+            tracker.register_and_take_pending_fills(&permit, Quantity::new(20.0, 6)),
             Err(TrackerIdentityConflict)
         ));
 
@@ -974,6 +1126,7 @@ mod tests {
     #[rstest]
     fn test_buffered_order_report_is_revalidated_when_identity_arrives() {
         let tracker = OrderFillTrackerMap::new();
+        let registry = super::super::identity::OrderIdentityRegistry::default();
         let venue_order_id = VenueOrderId::from("order-buffered-conflict");
         let report = test_order_report(
             venue_order_id,
@@ -986,26 +1139,23 @@ mod tests {
                 .is_none()
         );
 
-        tracker
-            .register_and_take_pending_fills(
+        let permit = registry
+            .admit_tracker_registration(
                 venue_order_id,
-                Some(ClientOrderId::from("O-CURRENT")),
-                Quantity::new(10.0, 6),
-                OrderSide::Buy,
-                InstrumentId::from("CURRENT.POLYMARKET"),
+                OrderReportIdentity {
+                    client_order_id: Some(ClientOrderId::from("O-CURRENT")),
+                    instrument_id: InstrumentId::from("CURRENT.POLYMARKET"),
+                    order_side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::Gtc,
+                },
             )
+            .expect("current identity must be permitted");
+        tracker
+            .register_and_take_pending_fills(&permit, Quantity::new(10.0, 6))
             .expect("current identity must register");
 
-        assert!(
-            tracker
-                .take_pending_reports(
-                    venue_order_id,
-                    InstrumentId::from("CURRENT.POLYMARKET"),
-                    Some(ClientOrderId::from("O-CURRENT")),
-                    OrderSide::Buy,
-                )
-                .is_empty()
-        );
+        assert!(tracker.take_pending_reports(&permit).is_empty());
     }
 
     #[rstest]
@@ -1066,14 +1216,21 @@ mod tests {
             },
         );
         let prior_fills = tracker.void_buffered_trade(correction_key);
-        let drained = tracker
-            .register_and_take_pending_fills(
+        let registry = super::super::identity::OrderIdentityRegistry::default();
+        let permit = registry
+            .admit_tracker_registration(
                 venue_order_id,
-                Some(ClientOrderId::from("O-FAILED-BEFORE-DRAIN")),
-                Quantity::new(10.0, 6),
-                OrderSide::Buy,
-                instrument_id,
+                OrderReportIdentity {
+                    client_order_id: Some(ClientOrderId::from("O-FAILED-BEFORE-DRAIN")),
+                    instrument_id,
+                    order_side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::Gtc,
+                },
             )
+            .expect("matching identity must be permitted");
+        let drained = tracker
+            .register_and_take_pending_fills(&permit, Quantity::new(10.0, 6))
             .expect("matching identity must register");
         let buffered = &drained[0];
         let fill = OrderFilled::new(

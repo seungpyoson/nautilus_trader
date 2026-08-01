@@ -24,7 +24,7 @@ use nautilus_model::{
     enums::{OrderStatus, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
-    orders::Order,
+    orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Currency, Quantity},
 };
@@ -40,8 +40,8 @@ use super::{
         weighted_average_price,
     },
     reconciliation::{
-        FillContext, build_identity_admitted_fill_reports_from_trades, build_position_reports,
-        cap_order_report_filled_qty, confirmed_filled_quantities,
+        FillContext, FillReportQuery, build_identity_admitted_fill_reports_from_trades,
+        build_position_reports, cap_order_report_filled_qty, confirmed_filled_quantities,
         normalize_terminal_order_report_quantity,
     },
 };
@@ -100,26 +100,24 @@ fn venue_answer_matches_request(answered_order_id: &str, venue_order_id: VenueOr
 /// Registry identity is checked once by `resolve_local_order_request`;
 /// this pure check covers the cached object and NT indexes.
 fn cached_order_matches_request(
-    cached_client_order_id: ClientOrderId,
-    cached_instrument_id: InstrumentId,
-    order_venue_order_id: Option<VenueOrderId>,
+    cached: &OrderAny,
     cache_venue_order_id: Option<VenueOrderId>,
     requested_client_order_id: Option<ClientOrderId>,
     indexed_client_order_id: Option<ClientOrderId>,
     instrument_id: InstrumentId,
     venue_order_id: VenueOrderId,
 ) -> bool {
-    if cached_instrument_id != instrument_id
+    if cached.instrument_id() != instrument_id
         || !client_order_ids_match_request(
             requested_client_order_id,
-            Some(cached_client_order_id),
+            Some(cached.client_order_id()),
             indexed_client_order_id,
         )
     {
         return false;
     }
 
-    let known_venue_order_ids = [order_venue_order_id, cache_venue_order_id];
+    let known_venue_order_ids = [cached.venue_order_id(), cache_venue_order_id];
 
     known_venue_order_ids
         .iter()
@@ -179,6 +177,8 @@ impl PolymarketExecutionClient {
         &self,
         report: &OrderStatusReport,
     ) -> Result<Option<Quantity>, OrderIdentityConflict> {
+        self.order_identities
+            .resolve_order_status_report(report, &self.fill_tracker)?;
         let indexed_client_order_id = self
             .core
             .cache()
@@ -200,22 +200,23 @@ impl PolymarketExecutionClient {
         let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
 
         if !cached_order_matches_request(
-            cached.client_order_id(),
-            cached.instrument_id(),
-            cached.venue_order_id(),
+            &cached,
             cache_venue_order_id,
             report.client_order_id,
             indexed_client_order_id,
             report.instrument_id,
             report.venue_order_id,
-        ) {
+        ) || cached.order_side() != report.order_side
+            || cached.order_type() != report.order_type
+            || cached.time_in_force() != report.time_in_force
+        {
             log::error!(
                 "Cached order {client_order_id} does not match venue report order {} and \
-                 instrument {}; ignoring its filled quantity",
+                 instrument {}; rejecting the report",
                 report.venue_order_id,
                 report.instrument_id,
             );
-            return Ok(None);
+            return Err(OrderIdentityConflict);
         }
 
         Ok(Some(cached.filled_qty()))
@@ -265,9 +266,7 @@ impl PolymarketExecutionClient {
                 .copied();
 
             if !cached_order_matches_request(
-                cached_client_order_id,
-                cached.instrument_id(),
-                cached.venue_order_id(),
+                cached,
                 cache_venue_order_id,
                 client_order_id,
                 indexed_client_order_id,
@@ -358,6 +357,16 @@ impl PolymarketExecutionClient {
             log::debug!(
                 "Order {venue_order_id} has unsettled trades; reporting non-terminal {order_status}"
             );
+            if self
+                .order_identities
+                .resolve_order_status_report(&report, &self.fill_tracker)
+                .is_err()
+            {
+                log::error!(
+                    "Recovered order {venue_order_id} contradicts current identity; reporting nothing"
+                );
+                return Ok(None);
+            }
             return Ok(Some(report));
         }
 
@@ -367,11 +376,13 @@ impl PolymarketExecutionClient {
             &self.shared_token_instruments,
             &self.order_identities,
             &self.fill_tracker,
-            Some(instrument_id),
-            Some(venue_order_id),
-            None,
-            None,
-            ts_init,
+            FillReportQuery {
+                instrument_filter: Some(instrument_id),
+                venue_order_filter: Some(venue_order_id),
+                start: None,
+                end: None,
+                ts_init,
+            },
         );
 
         discards.report(log::Level::Debug, "Polymarket order status report");
@@ -411,6 +422,16 @@ impl PolymarketExecutionClient {
             );
             report.price = cached_price;
             report.cancel_reason = Some("ORDER_NOT_FOUND_AT_VENUE".to_string());
+            if self
+                .order_identities
+                .resolve_order_status_report(&report, &self.fill_tracker)
+                .is_err()
+            {
+                log::error!(
+                    "Recovered order {venue_order_id} contradicts current identity; reporting nothing"
+                );
+                return Ok(None);
+            }
             return Ok(Some(report));
         }
 
@@ -537,9 +558,7 @@ impl PolymarketExecutionClient {
                 let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
 
                 if !cached_order_matches_request(
-                    order.client_order_id(),
-                    order.instrument_id(),
-                    order.venue_order_id(),
+                    &order,
                     cache_venue_order_id,
                     Some(client_order_id),
                     indexed_client_order_id,
@@ -624,9 +643,11 @@ impl PolymarketExecutionClient {
                             &token_instruments,
                             &order_identities,
                             &fill_tracker,
-                            GetTradesParams::default(),
-                            Some(instrument_id),
-                            clock.get_time_ns(),
+                            ConfirmedFillQuery {
+                                params: GetTradesParams::default(),
+                                instrument_id: Some(instrument_id),
+                                ts_init: clock.get_time_ns(),
+                            },
                         )
                         .await
                         {
@@ -650,12 +671,7 @@ impl PolymarketExecutionClient {
                     );
 
                     if order_identities
-                        .resolve_order_request(
-                            requested_venue_order_id,
-                            instrument_id,
-                            Some(client_order_id),
-                            indexed_client_order_id,
-                        )
+                        .resolve_order_status_report(&report, &fill_tracker)
                         .is_err()
                     {
                         log::error!(
@@ -783,9 +799,7 @@ impl PolymarketExecutionClient {
                     let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
 
                     if !cached_order_matches_request(
-                        cached.client_order_id(),
-                        cached.instrument_id(),
-                        cached.venue_order_id(),
+                        cached,
                         cache_venue_order_id,
                         cmd.client_order_id,
                         indexed_client_order_id,
@@ -818,9 +832,11 @@ impl PolymarketExecutionClient {
                     &self.shared_token_instruments,
                     &self.order_identities,
                     &self.fill_tracker,
-                    GetTradesParams::default(),
-                    Some(instrument_id),
-                    self.clock.get_time_ns(),
+                    ConfirmedFillQuery {
+                        params: GetTradesParams::default(),
+                        instrument_id: Some(instrument_id),
+                        ts_init: self.clock.get_time_ns(),
+                    },
                 )
                 .await
                 {
@@ -838,16 +854,9 @@ impl PolymarketExecutionClient {
                 None
             };
             cap_order_report_filled_qty(&mut report, local_filled, confirmed_filled);
-            let indexed_client_order_id =
-                self.core.cache().client_order_id(&venue_order_id).copied();
-
             if self
-                .resolve_local_order_request(
-                    cmd.client_order_id,
-                    indexed_client_order_id,
-                    instrument_id,
-                    venue_order_id,
-                )
+                .order_identities
+                .resolve_order_status_report(&report, &self.fill_tracker)
                 .is_err()
             {
                 log::error!(
@@ -912,9 +921,11 @@ impl PolymarketExecutionClient {
                 &self.shared_token_instruments,
                 &self.order_identities,
                 &self.fill_tracker,
-                GetTradesParams::default(),
-                cmd.instrument_id,
-                self.clock.get_time_ns(),
+                ConfirmedFillQuery {
+                    params: GetTradesParams::default(),
+                    instrument_id: cmd.instrument_id,
+                    ts_init: self.clock.get_time_ns(),
+                },
             )
             .await
             {
@@ -996,11 +1007,13 @@ impl PolymarketExecutionClient {
             &self.shared_token_instruments,
             &self.order_identities,
             &self.fill_tracker,
-            cmd.instrument_id,
-            cmd.venue_order_id,
-            cmd.start,
-            cmd.end,
-            self.clock.get_time_ns(),
+            FillReportQuery {
+                instrument_filter: cmd.instrument_id,
+                venue_order_filter: cmd.venue_order_id,
+                start: cmd.start,
+                end: cmd.end,
+                ts_init: self.clock.get_time_ns(),
+            },
         );
 
         // A bounded query that answered with trades it could not place in time
@@ -1077,10 +1090,13 @@ async fn fetch_confirmed_fill_reports(
     token_instruments: &AtomicMap<Ustr, InstrumentAny>,
     order_identities: &OrderIdentityRegistry,
     fill_tracker: &OrderFillTrackerMap,
-    params: GetTradesParams,
-    instrument_id: Option<InstrumentId>,
-    ts_init: UnixNanos,
+    query: ConfirmedFillQuery,
 ) -> anyhow::Result<Vec<FillReport>> {
+    let ConfirmedFillQuery {
+        params,
+        instrument_id,
+        ts_init,
+    } = query;
     let trades = http_client
         .get_trades(params)
         .await
@@ -1091,11 +1107,13 @@ async fn fetch_confirmed_fill_reports(
         token_instruments,
         order_identities,
         fill_tracker,
-        instrument_id,
-        None,
-        None,
-        None,
-        ts_init,
+        FillReportQuery {
+            instrument_filter: instrument_id,
+            venue_order_filter: None,
+            start: None,
+            end: None,
+            ts_init,
+        },
     );
     // Debug, not error. This runs on the open-order poll, so a permanent
     // condition -- one historical trade the account cannot interpret -- would
@@ -1104,6 +1122,12 @@ async fn fetch_confirmed_fill_reports(
     // the same trade once.
     discards.report(log::Level::Debug, "Polymarket fill fetch");
     Ok(reports)
+}
+
+struct ConfirmedFillQuery {
+    params: GetTradesParams,
+    instrument_id: Option<InstrumentId>,
+    ts_init: UnixNanos,
 }
 
 pub(crate) fn get_pusd_currency() -> Currency {

@@ -40,7 +40,10 @@ use ustr::Ustr;
 
 use super::PolymarketExecutionClient;
 use crate::{
-    execution::{identity::OrderIdentity, reports::fetch_and_emit_account_state},
+    execution::{
+        identity::{OrderIdentity, OrderReportIdentity},
+        reports::fetch_and_emit_account_state,
+    },
     http::{clob::HeartbeatResponse, error::Error as HttpError},
     websocket::{
         dispatch::{WsDispatchContext, WsDispatchState, dispatch_user_message},
@@ -441,16 +444,21 @@ impl PolymarketExecutionClient {
                 continue;
             }
             self.order_identities.mark_accepted(venue_order_id);
+            let permit = match self
+                .order_identities
+                .admit_tracker_registration(venue_order_id, OrderReportIdentity::from_order(order))
+            {
+                Ok(permit) => permit,
+                Err(_) => {
+                    log::error!(
+                        "Conflicting cached identity for venue order {venue_order_id}; refusing to restore fill tracking"
+                    );
+                    continue;
+                }
+            };
             if self
                 .fill_tracker
-                .restore_order(
-                    venue_order_id,
-                    order.quantity(),
-                    order.filled_qty(),
-                    order.order_side(),
-                    order.instrument_id(),
-                    order.client_order_id(),
-                )
+                .restore_order(&permit, order.quantity(), order.filled_qty())
                 .is_err()
             {
                 log::error!(
@@ -458,6 +466,7 @@ impl PolymarketExecutionClient {
                 );
                 continue;
             }
+            drop(permit);
 
             for event in order.events() {
                 match event {

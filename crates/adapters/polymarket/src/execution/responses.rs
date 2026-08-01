@@ -34,7 +34,7 @@ use tokio::task::JoinHandle;
 
 use super::{
     cancellations::execute_deferred_cancel,
-    identity::{OrderIdentity, OrderIdentityRegistry},
+    identity::{OrderIdentity, OrderIdentityRegistry, OrderReportIdentity},
     order_fill_tracker::{BufferedFill, FillCorrectionMetadata, OrderFillTrackerMap},
     pending::{PendingCancelTracker, PendingSubmitTracker},
     reconciliation::cap_order_report_filled_qty,
@@ -362,13 +362,20 @@ pub(super) fn drain_pending_reports_for_known_order(
     size_precision: u8,
     price_precision: u8,
 ) {
-    let buffered = fill_tracker.take_pending_reports(
-        venue_order_id,
-        order.instrument_id(),
-        Some(order.client_order_id()),
-        order.order_side(),
-    );
+    let permit = match order_identities
+        .admit_tracker_registration(venue_order_id, OrderReportIdentity::from_order(order))
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            log::error!(
+                "Conflicting identity for venue order {venue_order_id}; refusing buffered reports"
+            );
+            return;
+        }
+    };
+    let buffered = fill_tracker.take_pending_reports(&permit);
     if buffered.is_empty() {
+        drop(permit);
         accept_order_with_pending_fills(
             order,
             venue_order_id,
@@ -390,13 +397,7 @@ pub(super) fn drain_pending_reports_for_known_order(
 
     let buffered_fills = if should_register {
         let tracker_quantity = fill_tracker_quantity.unwrap_or_else(|| order.quantity());
-        match fill_tracker.register_and_take_pending_fills(
-            venue_order_id,
-            Some(order.client_order_id()),
-            tracker_quantity,
-            order.order_side(),
-            order.instrument_id(),
-        ) {
+        match fill_tracker.register_and_take_pending_fills(&permit, tracker_quantity) {
             Ok(fills) => fills,
             Err(_) => {
                 log::error!(
@@ -408,6 +409,7 @@ pub(super) fn drain_pending_reports_for_known_order(
     } else {
         Vec::new()
     };
+    drop(permit);
 
     // The unknown-submit path did not emit OrderAccepted at submit; synthesize it once now
     // that buffered activity confirms the venue accepted the order, before terminal events.
@@ -449,13 +451,20 @@ pub(super) fn accept_order_with_pending_fills(
 ) {
     // Accept only once a buffered fill proves the venue took the order
     let tracker_quantity = fill_tracker_quantity.unwrap_or_else(|| order.quantity());
-    let fills = match fill_tracker.register_and_take_pending_fills_if_buffered(
-        venue_order_id,
-        Some(order.client_order_id()),
-        tracker_quantity,
-        order.order_side(),
-        order.instrument_id(),
-    ) {
+    let permit = match order_identities
+        .admit_tracker_registration(venue_order_id, OrderReportIdentity::from_order(order))
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            log::error!(
+                "Conflicting identity for venue order {venue_order_id}; refusing buffered fills"
+            );
+            return;
+        }
+    };
+    let fills = match fill_tracker
+        .register_and_take_pending_fills_if_buffered(&permit, tracker_quantity)
+    {
         Ok(Some(fills)) => fills,
         Ok(None) => return,
         Err(_) => {
@@ -465,6 +474,7 @@ pub(super) fn accept_order_with_pending_fills(
             return;
         }
     };
+    drop(permit);
 
     let ts_event = fills
         .iter()
@@ -524,13 +534,21 @@ pub(super) fn handle_order_response(
                         emitter.emit_order_accepted(order, venue_order_id, ts_now);
                     }
 
-                    let fills = match fill_tracker.register_and_take_pending_fills(
+                    let permit = match order_identities.admit_tracker_registration(
                         venue_order_id,
-                        Some(order.client_order_id()),
-                        order.quantity(),
-                        order.order_side(),
-                        order.instrument_id(),
+                        OrderReportIdentity::from_order(order),
                     ) {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            log::error!(
+                                "Conflicting tracker identity for accepted venue order {venue_order_id}"
+                            );
+                            return None;
+                        }
+                    };
+                    let fills = match fill_tracker
+                        .register_and_take_pending_fills(&permit, order.quantity())
+                    {
                         Ok(fills) => fills,
                         Err(_) => {
                             log::error!(
@@ -541,12 +559,8 @@ pub(super) fn handle_order_response(
                     };
 
                     // The register above precedes this drain, so a racing report can't be orphaned
-                    let buffered = fill_tracker.take_pending_reports(
-                        venue_order_id,
-                        order.instrument_id(),
-                        Some(order.client_order_id()),
-                        order.order_side(),
-                    );
+                    let buffered = fill_tracker.take_pending_reports(&permit);
+                    drop(permit);
                     emit_drained_activity(
                         order,
                         venue_order_id,
@@ -814,7 +828,7 @@ pub(super) async fn check_fok_status(
     tokio::time::sleep(FOK_CHECK_DELAY).await;
 
     let venue_order_id = VenueOrderId::from(order_id);
-    if fill_tracker.has_fills_or_settled(&venue_order_id) {
+    if fill_tracker.has_recorded_fills(&venue_order_id) {
         return;
     }
 
@@ -1136,14 +1150,12 @@ mod tests {
                 UnixNanos::from(1_000_000_000u64),
             ),
         );
+        let order_identities = OrderIdentityRegistry::default();
+        let permit = order_identities
+            .admit_tracker_registration(venue_order_id, OrderReportIdentity::from_order(&order))
+            .expect("matching identity must be permitted");
         let fills = fill_tracker
-            .register_and_take_pending_fills(
-                venue_order_id,
-                Some(order.client_order_id()),
-                Quantity::from("10"),
-                order.order_side(),
-                order.instrument_id(),
-            )
+            .register_and_take_pending_fills(&permit, Quantity::from("10"))
             .expect("matching identity must register");
         assert_eq!(
             fill_tracker.get_cumulative_filled(&venue_order_id),
@@ -1195,11 +1207,13 @@ mod tests {
             &[trade],
             &ctx,
             &instruments,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::from(1_000_000_000u64),
+            crate::execution::reconciliation::FillReportQuery {
+                instrument_filter: None,
+                venue_order_filter: None,
+                start: None,
+                end: None,
+                ts_init: UnixNanos::from(1_000_000_000u64),
+            },
         );
 
         assert!(reports.is_empty());

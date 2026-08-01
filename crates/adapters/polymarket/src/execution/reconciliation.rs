@@ -58,6 +58,15 @@ pub(crate) struct FillContext<'a> {
     pub clock: &'static AtomicTime,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct FillReportQuery {
+    pub instrument_filter: Option<InstrumentId>,
+    pub venue_order_filter: Option<VenueOrderId>,
+    pub start: Option<UnixNanos>,
+    pub end: Option<UnixNanos>,
+    pub ts_init: UnixNanos,
+}
+
 /// What a reconciliation pass could not turn into an admitted fill report.
 ///
 /// Identity admission happens inside the builder before a report can contribute
@@ -184,12 +193,15 @@ pub(crate) fn build_identity_admitted_fill_reports_from_trades(
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     order_identities: &OrderIdentityRegistry,
     fill_tracker: &OrderFillTrackerMap,
-    instrument_filter: Option<InstrumentId>,
-    venue_order_filter: Option<VenueOrderId>,
-    start: Option<UnixNanos>,
-    end: Option<UnixNanos>,
-    ts_init: UnixNanos,
+    query: FillReportQuery,
 ) -> (Vec<FillReport>, FillBuildDiscards) {
+    let FillReportQuery {
+        instrument_filter,
+        venue_order_filter,
+        start,
+        end,
+        ts_init,
+    } = query;
     let mut reports = Vec::new();
     let mut discards = FillBuildDiscards::default();
     // Keep an unresolved scoped request as `Some(empty)`: `None` means an
@@ -403,11 +415,7 @@ pub(crate) fn build_fill_reports_from_trades(
     trades: &[PolymarketTradeReport],
     ctx: &FillContext<'_>,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
-    instrument_filter: Option<InstrumentId>,
-    venue_order_filter: Option<VenueOrderId>,
-    start: Option<UnixNanos>,
-    end: Option<UnixNanos>,
-    ts_init: UnixNanos,
+    query: FillReportQuery,
 ) -> (Vec<FillReport>, FillBuildDiscards) {
     build_identity_admitted_fill_reports_from_trades(
         trades,
@@ -415,11 +423,7 @@ pub(crate) fn build_fill_reports_from_trades(
         instruments,
         &OrderIdentityRegistry::default(),
         &OrderFillTrackerMap::new(),
-        instrument_filter,
-        venue_order_filter,
-        start,
-        end,
-        ts_init,
+        query,
     )
 }
 
@@ -574,11 +578,13 @@ pub(crate) async fn generate_mass_status(
         instruments,
         order_identities,
         fill_tracker,
-        None,
-        None,
-        cutoff,
-        None,
-        ts_init,
+        FillReportQuery {
+            instrument_filter: None,
+            venue_order_filter: None,
+            start: cutoff,
+            end: None,
+            ts_init,
+        },
     );
     let trades_after = trades_before - fills_filtered.outside_lookback;
 
@@ -629,12 +635,7 @@ pub(crate) async fn generate_mass_status(
 
     order_reports.retain(|report| {
         if order_identities
-            .resolve_order_request(
-                report.venue_order_id,
-                report.instrument_id,
-                report.client_order_id,
-                None,
-            )
+            .resolve_order_status_report(report, fill_tracker)
             .is_ok()
         {
             true
@@ -763,6 +764,23 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    macro_rules! build_fill_reports_from_trades {
+        ($trades:expr, $ctx:expr, $instruments:expr, $instrument_filter:expr, $venue_order_filter:expr, $start:expr, $end:expr, $ts_init:expr $(,)?) => {
+            super::build_fill_reports_from_trades(
+                $trades,
+                $ctx,
+                $instruments,
+                FillReportQuery {
+                    instrument_filter: $instrument_filter,
+                    venue_order_filter: $venue_order_filter,
+                    start: $start,
+                    end: $end,
+                    ts_init: $ts_init,
+                },
+            )
+        };
+    }
     use crate::execution::identity::OrderIdentity;
 
     /// Maker address of the configured account, as the trade fixture reports it.
@@ -826,7 +844,7 @@ mod tests {
         let mut trade = confirmed_maker_trade_for(&instrument);
         disown_maker_orders(&mut trade);
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -856,7 +874,7 @@ mod tests {
         let mut trade = confirmed_maker_trade_for(&instrument);
         trade.maker_orders.clear();
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -877,7 +895,7 @@ mod tests {
         let mut trade = confirmed_maker_trade_for(&instrument);
         disown_maker_orders(&mut trade);
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -902,7 +920,7 @@ mod tests {
         trade.trader_side = PolymarketLiquiditySide::Taker;
         trade.asset_id = Ustr::from("UNMAPPED-TOKEN");
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -942,7 +960,7 @@ mod tests {
             ..fill_context()
         };
 
-        let (reports, _) = build_fill_reports_from_trades(
+        let (reports, _) = build_fill_reports_from_trades!(
             &[trade],
             &context,
             &instruments,
@@ -982,7 +1000,7 @@ mod tests {
         let mut undated = confirmed_maker_trade_for(&instrument);
         undated.match_time = "not a timestamp".to_string();
 
-        let (windowed, discards) = build_fill_reports_from_trades(
+        let (windowed, discards) = build_fill_reports_from_trades!(
             &[old, recent, undated],
             &fill_context(),
             &instruments,
@@ -999,7 +1017,7 @@ mod tests {
         recent_again.match_time = "3000".to_string();
         let mut undated_again = confirmed_maker_trade_for(&instrument);
         undated_again.match_time = "not a timestamp".to_string();
-        let (expected, _) = build_fill_reports_from_trades(
+        let (expected, _) = build_fill_reports_from_trades!(
             &[recent_again, undated_again],
             &fill_context(),
             &instruments,
@@ -1053,7 +1071,7 @@ mod tests {
         let mut old = confirmed_maker_trade_for(&instrument);
         old.match_time = "1".to_string();
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[old],
             &fill_context(),
             &instruments,
@@ -1094,7 +1112,7 @@ mod tests {
         trade.status = status;
         disown_maker_orders(&mut trade);
 
-        let (reports, _) = build_fill_reports_from_trades(
+        let (reports, _) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -1115,7 +1133,7 @@ mod tests {
         trade.trader_side = PolymarketLiquiditySide::Taker;
         trade.asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -1141,7 +1159,7 @@ mod tests {
         trade.asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
         trade.match_time = "1000".to_string();
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -1165,7 +1183,7 @@ mod tests {
             maker_order.asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
         }
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -1193,7 +1211,7 @@ mod tests {
             maker_order.asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
         }
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[taker_trade, maker_trade],
             &fill_context(),
             &instruments,
@@ -1223,7 +1241,7 @@ mod tests {
         trade.maker_orders[0].owner = api_key.to_string();
         let owned = VenueOrderId::from(trade.maker_orders[0].order_id.as_str());
 
-        let (reports, _) = build_fill_reports_from_trades(
+        let (reports, _) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -1250,7 +1268,7 @@ mod tests {
         trade.maker_orders[0].maker_address = USER_ADDRESS.to_string();
         trade.maker_orders[0].asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -1276,7 +1294,7 @@ mod tests {
         trade.trader_side = PolymarketLiquiditySide::Taker;
         disown_maker_orders(&mut trade);
 
-        let (reports, _) = build_fill_reports_from_trades(
+        let (reports, _) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -1297,7 +1315,7 @@ mod tests {
         trade.trader_side = PolymarketLiquiditySide::Taker;
         trade.match_time = "not a timestamp".to_string();
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -1320,7 +1338,7 @@ mod tests {
         trade.match_time = "not a timestamp".to_string();
         let ts_init = UnixNanos::from(1_000_000_000u64);
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -1365,11 +1383,13 @@ mod tests {
             &instruments,
             &order_identities,
             &fill_tracker,
-            None,
-            None,
-            Some(UnixNanos::from(1)),
-            None,
-            UnixNanos::from(1_000_000_000u64),
+            FillReportQuery {
+                instrument_filter: None,
+                venue_order_filter: None,
+                start: Some(UnixNanos::from(1)),
+                end: None,
+                ts_init: UnixNanos::from(1_000_000_000u64),
+            },
         );
 
         assert!(reports.is_empty());
@@ -1444,11 +1464,13 @@ mod tests {
             &instruments,
             &order_identities,
             &fill_tracker,
-            Some(requested_instrument.id()),
-            Some(venue_order_id),
-            None,
-            None,
-            UnixNanos::from(1_000_000_000u64),
+            FillReportQuery {
+                instrument_filter: Some(requested_instrument.id()),
+                venue_order_filter: Some(venue_order_id),
+                start: None,
+                end: None,
+                ts_init: UnixNanos::from(1_000_000_000u64),
+            },
         );
 
         assert!(reports.is_empty());
@@ -1466,7 +1488,7 @@ mod tests {
         }
         let expected_reports = trade.maker_orders.len();
 
-        let (reports, discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_fill_reports_from_trades!(
             &[trade],
             &fill_context(),
             &instruments,
@@ -1579,7 +1601,7 @@ mod tests {
         // report, so a zero floor would erase them.
         let tracker = OrderFillTrackerMap::new();
         tracker
-            .restore_order(
+            .restore_order_for_test(
                 venue_order_id,
                 Quantity::from("10.0000"),
                 Quantity::from("6.0000"),
@@ -1602,7 +1624,7 @@ mod tests {
         let mut reports = vec![report];
         let tracker = OrderFillTrackerMap::new();
         tracker
-            .restore_order(
+            .restore_order_for_test(
                 venue_order_id,
                 Quantity::from("10.0000"),
                 Quantity::from("4.0000"),
@@ -1642,7 +1664,7 @@ mod tests {
         )];
         let tracker = OrderFillTrackerMap::new();
         tracker
-            .restore_order(
+            .restore_order_for_test(
                 venue_order_id,
                 Quantity::from("10.0000"),
                 Quantity::from("3.0000"),
@@ -1663,7 +1685,7 @@ mod tests {
         let mut reports = vec![order_report_filled(venue_order_id, "10.0000")];
         let tracker = OrderFillTrackerMap::new();
         tracker
-            .restore_order(
+            .restore_order_for_test(
                 venue_order_id,
                 Quantity::from("10.0000"),
                 Quantity::from("2.0000"),

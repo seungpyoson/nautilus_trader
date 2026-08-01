@@ -56,7 +56,7 @@ use crate::{
     },
     execution::{
         get_pusd_currency,
-        identity::{OrderIdentity, OrderIdentityRegistry},
+        identity::{OrderIdentity, OrderIdentityRegistry, OrderReportIdentity},
         order_fill_tracker::{BufferedFill, FillCorrectionMetadata, OrderFillTrackerMap},
         parse::{
             build_maker_fill_report, compute_commission, determine_order_side,
@@ -189,13 +189,22 @@ fn dispatch_order_update(
         && report.order_status != OrderStatus::Rejected
     {
         is_accepted = true;
-        match ctx.fill_tracker.register_and_take_pending_fills(
-            venue_order_id,
-            local_client_order_id,
-            report.quantity,
-            report.order_side,
-            report.instrument_id,
-        ) {
+        let permit = match ctx
+            .order_identities
+            .admit_tracker_registration(venue_order_id, OrderReportIdentity::from_report(&report))
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                log::error!(
+                    "WebSocket order update for {venue_order_id} contradicts registered identity; dropping it"
+                );
+                return;
+            }
+        };
+        match ctx
+            .fill_tracker
+            .register_and_take_pending_fills(&permit, report.quantity)
+        {
             Ok(fills) => fills,
             Err(_) => {
                 log::error!(
@@ -241,20 +250,31 @@ fn dispatch_order_update(
 
     // Tracked own orders route through order events; externally-managed orders
     // (no captured identity) buffer until accepted or fall back to reports.
-    let identity = ctx.order_identities.get(&venue_order_id);
     if is_accepted || local_client_order_id.is_some() {
-        match identity {
-            Some(identity) => emit_tracked_order_status(&report, &identity, ts_event, ctx),
-            None => ctx.emitter.send_order_status_report(report),
+        match ctx
+            .order_identities
+            .resolve_order_status_report(&report, ctx.fill_tracker)
+        {
+            Ok(Some(identity)) => emit_tracked_order_status(&report, &identity, ts_event, ctx),
+            Ok(None) => ctx.emitter.send_order_status_report(report),
+            Err(_) => log::error!(
+                "WebSocket order update for {venue_order_id} changed identity before emission; dropping it"
+            ),
         }
     } else if let Some(report) = ctx
         .fill_tracker
         .accept_or_buffer_report(venue_order_id, report)
     {
         // Registered between the early accepted-check and here: emit rather than buffer
-        match ctx.order_identities.get(&venue_order_id) {
-            Some(identity) => emit_tracked_order_status(&report, &identity, ts_event, ctx),
-            None => ctx.emitter.send_order_status_report(report),
+        match ctx
+            .order_identities
+            .resolve_order_status_report(&report, ctx.fill_tracker)
+        {
+            Ok(Some(identity)) => emit_tracked_order_status(&report, &identity, ts_event, ctx),
+            Ok(None) => ctx.emitter.send_order_status_report(report),
+            Err(_) => log::error!(
+                "WebSocket order update for {venue_order_id} changed identity before emission; dropping it"
+            ),
         }
     }
 
@@ -269,8 +289,7 @@ fn dispatch_order_update(
             Ok(Some(identity)) => emit_buffered_order_filled(&identity, &fill, ctx),
             Ok(None) => ctx.emitter.send_fill_report(fill.report),
             Err(_) => {
-                ctx.fill_tracker
-                    .reverse_fill(&fill.report.venue_order_id, fill.report.last_qty);
+                ctx.fill_tracker.reverse_fill_report(&fill.report);
                 log::error!(
                     "Buffered WebSocket fill for {venue_order_id} contradicts tracked identity; dropping it"
                 );
@@ -444,8 +463,7 @@ fn void_failed_trade(
 
     let direct_fills = state.matched_fills.remove(&dedup_key).unwrap_or_default();
     for fill in &direct_fills {
-        ctx.fill_tracker
-            .reverse_fill(&fill.venue_order_id, fill.last_qty);
+        ctx.fill_tracker.reverse_order_fill(fill);
     }
 
     let mut fills = direct_fills;
@@ -629,8 +647,7 @@ fn dispatch_maker_fills(
                 }
                 Ok(None) => ctx.emitter.send_fill_report(report),
                 Err(_) => {
-                    ctx.fill_tracker
-                        .reverse_fill(&maker_venue_order_id, report.last_qty);
+                    ctx.fill_tracker.reverse_fill_report(&report);
                     log::error!(
                         "WebSocket maker fill for {maker_venue_order_id} changed identity before emission; dropping it"
                     );
@@ -716,8 +733,7 @@ fn dispatch_taker_fill(
             }
             Ok(None) => ctx.emitter.send_fill_report(report),
             Err(_) => {
-                ctx.fill_tracker
-                    .reverse_fill(&venue_order_id, report.last_qty);
+                ctx.fill_tracker.reverse_fill_report(&report);
                 log::error!(
                     "WebSocket taker fill for {venue_order_id} changed identity before emission; dropping it"
                 );
@@ -1684,7 +1700,7 @@ mod tests {
         };
         let mut state = WsDispatchState::default();
 
-        dispatch_user_message(&UserWsMessage::Trade(trade.clone()), &ctx, &mut state);
+        dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
 
         let event = receiver
             .try_recv()
@@ -1713,7 +1729,7 @@ mod tests {
         let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
 
         let token_instruments = AtomicMap::new();
-        token_instruments.insert(trade.asset_id, reported_instrument.clone());
+        token_instruments.insert(trade.asset_id, reported_instrument);
         let fill_tracker = OrderFillTrackerMap::new();
         fill_tracker.register(
             venue_order_id,
@@ -2876,23 +2892,33 @@ mod tests {
         token_instruments.insert(asset_id, instrument.clone());
 
         let fill_tracker = OrderFillTrackerMap::new();
-        fill_tracker.register(
+        fill_tracker.register_identity_for_test(
             venue_order_id,
             Quantity::from("10"),
-            OrderSide::Buy,
-            instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
+            OrderReportIdentity {
+                client_order_id: Some(ClientOrderId::from("O-TERMINAL")),
+                instrument_id: instrument.id(),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::Fok,
+            },
         );
 
         let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            instrument.id(),
-            "O-TERMINAL",
-        );
+        order_identities
+            .register_order_identity_for_test(
+                venue_order_id,
+                OrderIdentity {
+                    client_order_id: ClientOrderId::from("O-TERMINAL"),
+                    strategy_id: StrategyId::from("S-001"),
+                    instrument_id: instrument.id(),
+                    order_side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::Fok,
+                },
+            )
+            .expect("test identity must register");
         order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
