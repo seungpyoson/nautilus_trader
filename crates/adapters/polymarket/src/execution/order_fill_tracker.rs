@@ -439,6 +439,16 @@ impl OrderFillTrackerMap {
             .add(correction_key.to_string());
     }
 
+    pub(crate) fn applied_buffered_fills(&self, correction_key: &str) -> Vec<OrderFilled> {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .applied_buffered_fills
+            .get(&correction_key.to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
     #[must_use]
     pub(crate) fn is_trade_confirmed(&self, correction_key: &str) -> bool {
         self.inner
@@ -528,38 +538,31 @@ impl OrderFillTrackerMap {
     /// The returned quantity is used for an order-only reconciliation update. It is not a fill and
     /// must not change positions, balances, or commissions. The entry is removed on normalization
     /// so repeated terminal messages are idempotent.
+    #[cfg(test)]
     pub(crate) fn check_terminal_quantity_normalization(
         &self,
         venue_order_id: &VenueOrderId,
     ) -> Option<Quantity> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        let s = guard.orders.get(venue_order_id)?;
-        if s.cumulative_filled >= s.submitted_qty {
-            return None;
-        }
-        let leaves = s.submitted_qty.as_decimal() - s.cumulative_filled.as_decimal();
+        check_terminal_quantity_normalization_in(&mut guard.orders, venue_order_id)
+    }
 
-        if leaves > Decimal::ZERO && leaves < DUST_SNAP_THRESHOLD_DEC {
-            let filled_qty = s.cumulative_filled;
-
-            log::debug!(
-                "Normalizing terminal order {venue_order_id} quantity from {} to {filled_qty} \
-                 (non-economic leaves={leaves})",
-                s.submitted_qty,
-            );
-            guard.orders.remove(venue_order_id);
-            Some(filled_qty)
-        } else {
-            if leaves >= DUST_SNAP_THRESHOLD_DEC {
-                log::debug!(
-                    "Order {venue_order_id} MATCHED with significant residual \
-                     {leaves} (filled {}/{})",
-                    s.cumulative_filled,
-                    s.submitted_qty,
-                );
-            }
-            None
+    pub(crate) fn check_terminal_quantity_normalization_for_identity(
+        &self,
+        venue_order_id: &VenueOrderId,
+        identity: OrderReportIdentity,
+    ) -> Result<Option<Quantity>, TrackerIdentityConflict> {
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let Some(state) = guard.orders.get(venue_order_id) else {
+            return Ok(None);
+        };
+        if !order_identity_matches_state(state, identity) {
+            return Err(TrackerIdentityConflict);
         }
+        Ok(check_terminal_quantity_normalization_in(
+            &mut guard.orders,
+            venue_order_id,
+        ))
     }
 
     /// Returns the real unfilled remainder of a terminal IOC order.
@@ -567,20 +570,76 @@ impl OrderFillTrackerMap {
     /// The entry is removed so duplicate `CONFIRMED` trade messages cannot emit repeated
     /// cancellations. The caller must use this only after a taker trade confirms: that proves the
     /// FAK order has finished matching and the venue has killed the returned remainder.
+    #[cfg(test)]
     pub(crate) fn take_terminal_ioc_remainder(
         &self,
         venue_order_id: &VenueOrderId,
     ) -> Option<Quantity> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        let state = guard.orders.get(venue_order_id)?;
-        if state.cumulative_filled.is_zero() || state.cumulative_filled >= state.submitted_qty {
-            return None;
-        }
-
-        let remainder = state.submitted_qty - state.cumulative_filled;
-        guard.orders.remove(venue_order_id);
-        Some(remainder)
+        take_terminal_ioc_remainder_in(&mut guard.orders, venue_order_id)
     }
+
+    pub(crate) fn take_terminal_ioc_remainder_for_identity(
+        &self,
+        venue_order_id: &VenueOrderId,
+        identity: OrderReportIdentity,
+    ) -> Result<Option<Quantity>, TrackerIdentityConflict> {
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let Some(state) = guard.orders.get(venue_order_id) else {
+            return Ok(None);
+        };
+        if !order_identity_matches_state(state, identity) {
+            return Err(TrackerIdentityConflict);
+        }
+        Ok(take_terminal_ioc_remainder_in(
+            &mut guard.orders,
+            venue_order_id,
+        ))
+    }
+}
+
+fn check_terminal_quantity_normalization_in(
+    orders: &mut FifoCacheMap<VenueOrderId, OrderFillState, 10_000>,
+    venue_order_id: &VenueOrderId,
+) -> Option<Quantity> {
+    let state = orders.get(venue_order_id)?;
+    if state.cumulative_filled >= state.submitted_qty {
+        return None;
+    }
+    let leaves = state.submitted_qty.as_decimal() - state.cumulative_filled.as_decimal();
+    if leaves > Decimal::ZERO && leaves < DUST_SNAP_THRESHOLD_DEC {
+        let filled_qty = state.cumulative_filled;
+        let submitted_qty = state.submitted_qty;
+        log::debug!(
+            "Normalizing terminal order {venue_order_id} quantity from {submitted_qty} to \
+             {filled_qty} (non-economic leaves={leaves})"
+        );
+        orders.remove(venue_order_id);
+        Some(filled_qty)
+    } else {
+        if leaves >= DUST_SNAP_THRESHOLD_DEC {
+            log::debug!(
+                "Order {venue_order_id} MATCHED with significant residual {leaves} \
+                 (filled {}/{})",
+                state.cumulative_filled,
+                state.submitted_qty,
+            );
+        }
+        None
+    }
+}
+
+fn take_terminal_ioc_remainder_in(
+    orders: &mut FifoCacheMap<VenueOrderId, OrderFillState, 10_000>,
+    venue_order_id: &VenueOrderId,
+) -> Option<Quantity> {
+    let state = orders.get(venue_order_id)?;
+    if state.cumulative_filled.is_zero() || state.cumulative_filled >= state.submitted_qty {
+        return None;
+    }
+    let remainder = state.submitted_qty - state.cumulative_filled;
+    orders.remove(venue_order_id);
+    Some(remainder)
 }
 
 fn new_order_state(submitted_qty: Quantity, identity: OrderReportIdentity) -> OrderFillState {
@@ -677,7 +736,6 @@ fn take_identity_admitted_reports(
                 identity.client_order_id,
                 identity.order_side,
             ) || report.client_order_id != identity.client_order_id
-                || report.order_type != identity.order_type
                 || report.time_in_force != identity.time_in_force
             {
                 log::error!(
@@ -732,7 +790,12 @@ fn fill_report_matches_state(state: &OrderFillState, report: &FillReport) -> boo
 }
 
 fn order_report_matches_state(state: &OrderFillState, report: &OrderStatusReport) -> bool {
-    order_identity_matches_state(state, OrderReportIdentity::from_report(report))
+    artifact_matches_state(
+        state,
+        report.instrument_id,
+        report.client_order_id,
+        report.order_side,
+    ) && state.time_in_force == report.time_in_force
 }
 
 fn order_identity_matches_state(state: &OrderFillState, identity: OrderReportIdentity) -> bool {

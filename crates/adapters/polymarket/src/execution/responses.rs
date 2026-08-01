@@ -37,7 +37,7 @@ use super::{
     identity::{OrderIdentity, OrderIdentityRegistry, OrderReportIdentity},
     order_fill_tracker::{BufferedFill, FillCorrectionMetadata, OrderFillTrackerMap},
     parse::parse_order_status_report,
-    pending::{PendingCancelTracker, PendingSubmitTracker},
+    pending::PendingCancelTracker,
     reconciliation::cap_order_report_filled_qty,
     reports::get_pusd_currency,
     submitter::OrderSubmitter,
@@ -55,7 +55,6 @@ pub(super) async fn handle_batch_order_responses(
     clock: &'static AtomicTime,
     fill_tracker: &Arc<OrderFillTrackerMap>,
     order_identities: &OrderIdentityRegistry,
-    pending_submits: &PendingSubmitTracker,
     pending_cancels: &PendingCancelTracker,
     pending_tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>,
     account_id: AccountId,
@@ -71,10 +70,15 @@ pub(super) async fn handle_batch_order_responses(
 
     let mut deferred = Vec::new();
 
-    for (batch_order, response) in batch_orders.iter().zip(responses) {
+    for ((batch_order, expected_venue_order_id), response) in batch_orders
+        .iter()
+        .zip(&expected_venue_order_ids)
+        .zip(responses)
+    {
         if let Some((order_id_str, venue_order_id)) = handle_order_response(
             Ok(response),
             &batch_order.order,
+            *expected_venue_order_id,
             emitter,
             clock,
             fill_tracker,
@@ -103,7 +107,6 @@ pub(super) async fn handle_batch_order_responses(
                 clock,
                 fill_tracker,
                 order_identities,
-                pending_submits,
                 pending_cancels,
             ) {
                 deferred.push((batch_order.order.clone(), order_id_str, venue_order_id));
@@ -148,6 +151,26 @@ pub(super) fn reject_submit_order(
     let ts_now = clock.get_time_ns();
     emitter.emit_order_rejected(order, reason, ts_now, is_post_only_crossing(reason));
     pending_cancels.remove(&order.client_order_id());
+}
+
+pub(super) fn reject_registered_submit(
+    order: &OrderAny,
+    expected_venue_order_id: VenueOrderId,
+    reason: &str,
+    order_identities: &OrderIdentityRegistry,
+    emitter: &ExecutionEventEmitter,
+    clock: &'static AtomicTime,
+    pending_cancels: &PendingCancelTracker,
+) {
+    match order_identities
+        .reject_pending_order(expected_venue_order_id, OrderIdentity::from_order(order))
+    {
+        Ok(true) => reject_submit_order(order, reason, emitter, clock, pending_cancels),
+        Ok(false) => {}
+        Err(_) => log::error!(
+            "Submit failure for {expected_venue_order_id} contradicts an accepted or different identity; refusing a false rejection"
+        ),
+    }
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -219,7 +242,6 @@ pub(super) async fn handle_single_order_response(
     clock: &'static AtomicTime,
     fill_tracker: &Arc<OrderFillTrackerMap>,
     order_identities: &OrderIdentityRegistry,
-    pending_submits: &PendingSubmitTracker,
     pending_cancels: &PendingCancelTracker,
     account_id: AccountId,
 ) {
@@ -228,6 +250,7 @@ pub(super) async fn handle_single_order_response(
             if let Some((order_id_str, venue_order_id)) = handle_order_response(
                 Ok(response),
                 &batch_order.order,
+                expected_venue_order_id,
                 emitter,
                 clock,
                 fill_tracker,
@@ -259,7 +282,6 @@ pub(super) async fn handle_single_order_response(
                 clock,
                 fill_tracker,
                 order_identities,
-                pending_submits,
                 pending_cancels,
             ) {
                 execute_deferred_cancel(
@@ -275,9 +297,11 @@ pub(super) async fn handle_single_order_response(
             }
         }
         Err(e) => {
-            reject_submit_order(
+            reject_registered_submit(
                 &batch_order.order,
+                expected_venue_order_id,
                 &format!("{e}"),
+                order_identities,
                 emitter,
                 clock,
                 pending_cancels,
@@ -296,29 +320,22 @@ pub(super) fn handle_unknown_submit_result(
     clock: &'static AtomicTime,
     fill_tracker: &Arc<OrderFillTrackerMap>,
     order_identities: &OrderIdentityRegistry,
-    pending_submits: &PendingSubmitTracker,
     pending_cancels: &PendingCancelTracker,
 ) -> Option<(String, VenueOrderId)> {
+    if order_identities
+        .mark_outcome_unknown(expected_venue_order_id)
+        .is_err()
+    {
+        log::error!(
+            "Unknown submit outcome for {expected_venue_order_id} contradicts submission state"
+        );
+        return None;
+    }
     log::warn!(
         "Submit outcome unknown for {}: {reason}. Tracking expected venue order ID {}",
         order.client_order_id(),
         expected_venue_order_id
     );
-
-    if order_identities
-        .register_order_identity(
-            expected_venue_order_id,
-            OrderIdentity::from_order(order),
-            fill_tracker,
-        )
-        .is_err()
-    {
-        log::error!(
-            "Conflicting identity for expected venue order {expected_venue_order_id}; refusing unknown-submit recovery"
-        );
-        return None;
-    }
-    pending_submits.insert(expected_venue_order_id, OrderIdentity::from_order(order));
 
     drain_pending_reports_for_known_order(
         order,
@@ -386,7 +403,7 @@ pub(super) fn drain_pending_reports_for_known_order(
             .or_else(|| activity.fills.iter().map(|fill| fill.report.ts_event).min())
             .unwrap_or_else(|| clock.get_time_ns());
 
-        if order_identities.mark_accepted(venue_order_id) {
+        if matches!(order_identities.mark_accepted(venue_order_id), Ok(true)) {
             emitter.emit_order_accepted(order, venue_order_id, ts_event);
         }
     }
@@ -406,6 +423,7 @@ pub(super) fn drain_pending_reports_for_known_order(
 pub(super) fn handle_order_response(
     result: crate::http::error::Result<OrderResponse>,
     order: &OrderAny,
+    expected_venue_order_id: VenueOrderId,
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
     fill_tracker: &Arc<OrderFillTrackerMap>,
@@ -421,6 +439,20 @@ pub(super) fn handle_order_response(
                 // VenueOrderId panics on an empty string
                 if let Some(order_id) = response.order_id.filter(|s| !s.is_empty()) {
                     let venue_order_id = VenueOrderId::from(order_id.as_str());
+                    if venue_order_id != expected_venue_order_id {
+                        reject_registered_submit(
+                            order,
+                            expected_venue_order_id,
+                            &format!(
+                                "Venue returned order ID {venue_order_id}, expected {expected_venue_order_id}"
+                            ),
+                            order_identities,
+                            emitter,
+                            clock,
+                            pending_cancels,
+                        );
+                        return None;
+                    }
                     let ts_now = clock.get_time_ns();
                     if order_identities
                         .register_order_identity(
@@ -435,8 +467,15 @@ pub(super) fn handle_order_response(
                         );
                         return None;
                     }
-                    if order_identities.mark_accepted(venue_order_id) {
-                        emitter.emit_order_accepted(order, venue_order_id, ts_now);
+                    match order_identities.mark_accepted(venue_order_id) {
+                        Ok(true) => emitter.emit_order_accepted(order, venue_order_id, ts_now),
+                        Ok(false) => {}
+                        Err(_) => {
+                            log::error!(
+                                "Accepted venue order {venue_order_id} was already rejected; refusing submit response"
+                            );
+                            return None;
+                        }
                     }
 
                     let permit = match order_identities.admit_tracker_registration(
@@ -486,7 +525,15 @@ pub(super) fn handle_order_response(
                     }
                 } else if let Some(reason) = response.error_msg.filter(|s| !s.is_empty()) {
                     // Batch endpoint reports a rejected leg as success=true with an empty orderID; reason in error_msg
-                    reject_submit_order(order, &reason, emitter, clock, pending_cancels);
+                    reject_registered_submit(
+                        order,
+                        expected_venue_order_id,
+                        &reason,
+                        order_identities,
+                        emitter,
+                        clock,
+                        pending_cancels,
+                    );
                 } else {
                     log::warn!(
                         "Order accepted but no order_id returned for {}",
@@ -497,13 +544,23 @@ pub(super) fn handle_order_response(
                 let reason = response
                     .error_msg
                     .unwrap_or_else(|| "unknown error".to_string());
-                reject_submit_order(order, &reason, emitter, clock, pending_cancels);
+                reject_registered_submit(
+                    order,
+                    expected_venue_order_id,
+                    &reason,
+                    order_identities,
+                    emitter,
+                    clock,
+                    pending_cancels,
+                );
             }
         }
         Err(e) => {
-            reject_submit_order(
+            reject_registered_submit(
                 order,
+                expected_venue_order_id,
                 &format!("HTTP request failed: {e}"),
+                order_identities,
                 emitter,
                 clock,
                 pending_cancels,
@@ -609,12 +666,15 @@ fn emit_drained_activity(
     }
 
     if identity.requires_terminal_quantity_normalization() || has_filled {
-        if let Some(quantity) = fill_tracker.check_terminal_quantity_normalization(&venue_order_id)
-        {
+        if let Ok(Some(quantity)) = fill_tracker.check_terminal_quantity_normalization_for_identity(
+            &venue_order_id,
+            identity.report_identity(),
+        ) {
             emit_terminal_quantity_update(order, venue_order_id, quantity, emitter, clock);
         }
     } else if identity.time_in_force == TimeInForce::Ioc
-        && let Some(remainder) = fill_tracker.take_terminal_ioc_remainder(&venue_order_id)
+        && let Ok(Some(remainder)) = fill_tracker
+            .take_terminal_ioc_remainder_for_identity(&venue_order_id, identity.report_identity())
     {
         log::debug!(
             "Closing terminal IOC order {venue_order_id} as Canceled after buffered fills \
@@ -780,10 +840,9 @@ pub(super) async fn check_fok_status(
         size_precision,
         ts_now,
     );
-    if OrderReportIdentity::from_report(&report) != OrderReportIdentity::from_order(order)
-        || order_identities
-            .resolve_order_status_report(&report, fill_tracker)
-            .is_err()
+    if order_identities
+        .resolve_order_status_report(&report, fill_tracker)
+        .is_err()
     {
         log::error!(
             "FOK status answer for {venue_order_id} contradicts the complete local order identity; deferring reconciliation"
@@ -987,6 +1046,7 @@ mod tests {
         let deferred_cancel = handle_order_response(
             Ok(response),
             &order,
+            venue_order_id,
             &emitter,
             nautilus_core::time::get_atomic_clock_realtime(),
             &fill_tracker,
@@ -1139,9 +1199,15 @@ mod tests {
         let expected_venue_order_id = VenueOrderId::from(ws_order.id.as_str());
         let (emitter, mut receiver) = test_emitter();
         let fill_tracker = Arc::new(OrderFillTrackerMap::new());
-        let pending_submits = PendingSubmitTracker::default();
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
+        order_identities
+            .register_pending_order_identity(
+                expected_venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         assert!(
             handle_unknown_submit_result(
@@ -1153,15 +1219,16 @@ mod tests {
                 nautilus_core::time::get_atomic_clock_realtime(),
                 &fill_tracker,
                 &order_identities,
-                &pending_submits,
                 &pending_cancels,
             )
             .is_none()
         );
 
         assert_eq!(
-            pending_submits.client_order_id(&expected_venue_order_id),
-            Some(order.client_order_id())
+            order_identities
+                .get(&expected_venue_order_id)
+                .map(|identity| identity.client_order_id),
+            Some(order.client_order_id()),
         );
 
         let token_instruments = AtomicMap::new();
@@ -1170,7 +1237,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1201,9 +1267,15 @@ mod tests {
         let fill_ts = UnixNanos::from(1_700_000_000_000_000_000u64);
         let (emitter, mut receiver) = test_emitter();
         let fill_tracker = Arc::new(OrderFillTrackerMap::new());
-        let pending_submits = PendingSubmitTracker::default();
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         fill_tracker.buffer_fill_for_test(
             venue_order_id,
@@ -1256,7 +1328,6 @@ mod tests {
                 nautilus_core::time::get_atomic_clock_realtime(),
                 &fill_tracker,
                 &order_identities,
-                &pending_submits,
                 &pending_cancels,
             )
             .is_none()
@@ -1342,9 +1413,15 @@ mod tests {
                 .is_none()
         );
         fill_tracker.mark_trade_confirmed(correction_key);
-        let pending_submits = PendingSubmitTracker::default();
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         assert!(
             handle_unknown_submit_result(
@@ -1356,7 +1433,6 @@ mod tests {
                 nautilus_core::time::get_atomic_clock_realtime(),
                 &fill_tracker,
                 &order_identities,
-                &pending_submits,
                 &pending_cancels,
             )
             .is_none()
@@ -1408,9 +1484,15 @@ mod tests {
         let venue_order_id = VenueOrderId::from("0xdrain-terminal-order");
         let (emitter, mut receiver) = test_emitter();
         let fill_tracker = Arc::new(OrderFillTrackerMap::new());
-        let pending_submits = PendingSubmitTracker::default();
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         let report = OrderStatusReport::new(
             AccountId::from("POLY-001"),
@@ -1439,7 +1521,6 @@ mod tests {
             nautilus_core::time::get_atomic_clock_realtime(),
             &fill_tracker,
             &order_identities,
-            &pending_submits,
             &pending_cancels,
         );
         assert!(result.is_none());
@@ -1494,9 +1575,15 @@ mod tests {
         receiver.try_recv().expect("expected quantity update event");
 
         let fill_tracker = Arc::new(OrderFillTrackerMap::new());
-        let pending_submits = PendingSubmitTracker::default();
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         let cancel_report = OrderStatusReport::new(
             account_id,
@@ -1536,7 +1623,6 @@ mod tests {
                 nautilus_core::time::get_atomic_clock_realtime(),
                 &fill_tracker,
                 &order_identities,
-                &pending_submits,
                 &pending_cancels,
             )
             .is_none()
@@ -1571,7 +1657,6 @@ mod tests {
         let order = test_limit_order("O-DRAIN-FILLED-DUST", instrument_id);
         let (emitter, mut receiver) = test_emitter();
         let fill_tracker = Arc::new(OrderFillTrackerMap::new());
-        let pending_submits = PendingSubmitTracker::default();
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
 
@@ -1592,6 +1677,13 @@ mod tests {
             None,
         );
         fill_tracker.buffer_report_for_test(venue_order_id, order.client_order_id(), filled_report);
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
         fill_tracker.buffer_fill_for_test(
             venue_order_id,
             order.client_order_id(),
@@ -1613,7 +1705,6 @@ mod tests {
                 nautilus_core::time::get_atomic_clock_realtime(),
                 &fill_tracker,
                 &order_identities,
-                &pending_submits,
                 &pending_cancels,
             )
             .is_none()
@@ -1719,10 +1810,15 @@ mod tests {
 
         let (emitter, mut receiver) = test_emitter();
         let fill_tracker = Arc::new(OrderFillTrackerMap::new());
-        let pending_submits = PendingSubmitTracker::default();
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
-        pending_submits.insert(venue_order_id, OrderIdentity::from_order(&order));
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         // Step 1: the WS taker trade arrives BEFORE the submit response. The order is not yet
         // registered, so the fill buffers in the tracker rather than emitting.
@@ -1731,7 +1827,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id,
@@ -1759,6 +1854,7 @@ mod tests {
             handle_order_response(
                 Ok(response),
                 &order,
+                venue_order_id,
                 &emitter,
                 nautilus_core::time::get_atomic_clock_realtime(),
                 &fill_tracker,
@@ -1831,10 +1927,15 @@ mod tests {
 
         let (emitter, mut receiver) = test_emitter();
         let fill_tracker = Arc::new(OrderFillTrackerMap::new());
-        let pending_submits = PendingSubmitTracker::default();
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
-        pending_submits.insert(venue_order_id, OrderIdentity::from_order(&order));
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         // Step 1: the submit's expected identity is already registered as pending, so a WS cancel
         // arriving before the HTTP response can claim and close that exact order immediately.
@@ -1843,7 +1944,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id,
@@ -1866,6 +1966,7 @@ mod tests {
             handle_order_response(
                 Ok(response),
                 &order,
+                venue_order_id,
                 &emitter,
                 nautilus_core::time::get_atomic_clock_realtime(),
                 &fill_tracker,
@@ -1941,10 +2042,15 @@ mod tests {
 
         let (emitter, mut receiver) = test_emitter();
         let fill_tracker = Arc::new(OrderFillTrackerMap::new());
-        let pending_submits = PendingSubmitTracker::default();
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
-        pending_submits.insert(venue_order_id, OrderIdentity::from_order(&order));
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         // WS taker fill of 12 shares (the marketable BUY filled below its limit) before the response.
         let token_instruments = AtomicMap::new();
@@ -1952,7 +2058,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id,
@@ -1975,6 +2080,7 @@ mod tests {
         handle_order_response(
             Ok(response),
             &order,
+            venue_order_id,
             &emitter,
             nautilus_core::time::get_atomic_clock_realtime(),
             &fill_tracker,
@@ -2027,7 +2133,6 @@ mod tests {
         let fill_tracker = Arc::new(OrderFillTrackerMap::new());
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
-
         let response = OrderResponse {
             success: true,
             order_id: Some(String::new()),
@@ -2038,6 +2143,7 @@ mod tests {
             handle_order_response(
                 Ok(response),
                 &order,
+                VenueOrderId::from("V-BATCH-EMPTY"),
                 &emitter,
                 nautilus_core::time::get_atomic_clock_realtime(),
                 &fill_tracker,
@@ -2052,6 +2158,55 @@ mod tests {
 
         // The empty id routes to the warn branch: no order events emitted
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_submit_response_refuses_a_different_venue_order_id() {
+        let instrument = test_instrument();
+        let order = test_limit_order("O-ID-MISMATCH", instrument.id());
+        let expected_venue_order_id = VenueOrderId::from("V-EXPECTED");
+        let returned_venue_order_id = VenueOrderId::from("V-RETURNED");
+        let (emitter, mut receiver) = test_emitter();
+        let fill_tracker = Arc::new(OrderFillTrackerMap::new());
+        let pending_cancels = PendingCancelTracker::default();
+        let order_identities = OrderIdentityRegistry::default();
+        order_identities
+            .register_pending_order_identity(
+                expected_venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
+
+        let response = OrderResponse {
+            success: true,
+            order_id: Some(returned_venue_order_id.to_string()),
+            error_msg: None,
+        };
+        assert!(
+            handle_order_response(
+                Ok(response),
+                &order,
+                expected_venue_order_id,
+                &emitter,
+                nautilus_core::time::get_atomic_clock_realtime(),
+                &fill_tracker,
+                &order_identities,
+                &pending_cancels,
+                AccountId::from("POLY-001"),
+                instrument.size_precision(),
+                instrument.price_precision(),
+            )
+            .is_none()
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ExecutionEvent::Order(OrderEventAny::Rejected(_)))
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert!(order_identities.get(&expected_venue_order_id).is_none());
+        assert!(order_identities.get(&returned_venue_order_id).is_none());
     }
 
     // The batch endpoint reports a rejected leg as success=true with an empty orderID and the reason
@@ -2070,6 +2225,14 @@ mod tests {
         let fill_tracker = Arc::new(OrderFillTrackerMap::new());
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
+        let venue_order_id = VenueOrderId::from("V-BATCH-REJECT");
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         let response = OrderResponse {
             success: true,
@@ -2081,6 +2244,7 @@ mod tests {
             handle_order_response(
                 Ok(response),
                 &order,
+                venue_order_id,
                 &emitter,
                 nautilus_core::time::get_atomic_clock_realtime(),
                 &fill_tracker,
@@ -2118,6 +2282,14 @@ mod tests {
         let fill_tracker = Arc::new(OrderFillTrackerMap::new());
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
+        let venue_order_id = VenueOrderId::from("V-REJECT");
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                OrderIdentity::from_order(&order),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         let response = OrderResponse {
             success: false,
@@ -2129,6 +2301,7 @@ mod tests {
             handle_order_response(
                 Ok(response),
                 &order,
+                venue_order_id,
                 &emitter,
                 nautilus_core::time::get_atomic_clock_realtime(),
                 &fill_tracker,

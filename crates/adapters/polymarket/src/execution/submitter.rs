@@ -83,7 +83,6 @@ pub(crate) struct MarketOrderSubmitRequest {
 pub(crate) struct MarketOrderSubmitResult {
     pub response: OrderResponse,
     pub expected_base_qty: Decimal,
-    pub expected_venue_order_id: VenueOrderId,
 }
 
 #[derive(Debug, Clone)]
@@ -286,7 +285,6 @@ impl OrderSubmitter {
         Ok(MarketOrderSubmitResult {
             response,
             expected_base_qty,
-            expected_venue_order_id,
         })
     }
 

@@ -69,10 +69,8 @@ use ustr::Ustr;
 
 pub(crate) use self::reports::get_pusd_currency;
 use self::{
-    identity::OrderIdentityRegistry,
-    order_builder::PolymarketOrderBuilder,
-    order_fill_tracker::OrderFillTrackerMap,
-    pending::{PendingCancelTracker, PendingSubmitTracker},
+    identity::OrderIdentityRegistry, order_builder::PolymarketOrderBuilder,
+    order_fill_tracker::OrderFillTrackerMap, pending::PendingCancelTracker,
     submitter::OrderSubmitter,
 };
 use crate::{
@@ -104,7 +102,6 @@ pub struct PolymarketExecutionClient {
     position_event_handler: Option<TypedHandler<PositionEvent>>,
     shared_token_instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
     neg_risk_index: Arc<AtomicMap<InstrumentId, bool>>,
-    pending_submits: PendingSubmitTracker,
     pending_cancels: PendingCancelTracker,
     order_identities: Arc<OrderIdentityRegistry>,
     fill_tracker: Arc<OrderFillTrackerMap>,
@@ -212,7 +209,6 @@ impl PolymarketExecutionClient {
             position_event_handler: None,
             shared_token_instruments: Arc::new(AtomicMap::new()),
             neg_risk_index: Arc::new(AtomicMap::new()),
-            pending_submits: PendingSubmitTracker::default(),
             pending_cancels: PendingCancelTracker::default(),
             order_identities: Arc::new(OrderIdentityRegistry::default()),
             fill_tracker: Arc::new(OrderFillTrackerMap::new()),

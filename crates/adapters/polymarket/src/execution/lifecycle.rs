@@ -288,7 +288,6 @@ impl PolymarketExecutionClient {
         let user_api_key = self.secrets.credential.api_key().to_string();
 
         let fill_tracker = self.fill_tracker.clone();
-        let pending_submits = self.pending_submits.clone();
         let order_identities = self.order_identities.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
 
@@ -296,7 +295,6 @@ impl PolymarketExecutionClient {
             let ctx = WsDispatchContext {
                 token_instruments: &token_instruments,
                 fill_tracker: &fill_tracker,
-                pending_submits: &pending_submits,
                 order_identities: &order_identities,
                 emitter: &emitter,
                 account_id,
@@ -443,7 +441,12 @@ impl PolymarketExecutionClient {
                 );
                 continue;
             }
-            self.order_identities.mark_accepted(venue_order_id);
+            if self.order_identities.mark_accepted(venue_order_id).is_err() {
+                log::error!(
+                    "Cached venue order {venue_order_id} was already rejected; refusing restoration"
+                );
+                continue;
+            }
             let permit = match self
                 .order_identities
                 .admit_tracker_registration(venue_order_id, OrderReportIdentity::from_order(order))
@@ -1164,7 +1167,10 @@ mod tests {
         let state = client.ws_dispatch_state.lock().expect(MUTEX_POISONED);
 
         assert_eq!(identity.client_order_id, order.client_order_id());
-        assert!(!client.order_identities.mark_accepted(venue_order_id));
+        assert_eq!(
+            client.order_identities.mark_accepted(venue_order_id),
+            Ok(false)
+        );
         assert_eq!(
             client.fill_tracker.get_cumulative_filled(&venue_order_id),
             Some(order.filled_qty())

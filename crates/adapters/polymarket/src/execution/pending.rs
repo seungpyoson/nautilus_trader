@@ -18,47 +18,8 @@
 use std::sync::{Arc, Mutex};
 
 use ahash::AHashSet;
-use nautilus_common::cache::fifo::FifoCacheMap;
 use nautilus_core::MUTEX_POISONED;
-use nautilus_model::identifiers::{ClientOrderId, VenueOrderId};
-
-use super::identity::OrderIdentity;
-
-/// Maps an in-flight submit's expected venue order ID to its complete immutable identity, so the
-/// cache-free WS dispatch can validate and register a tracked own order before the response lands.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct PendingSubmitTracker {
-    venue_to_identity: Arc<Mutex<FifoCacheMap<VenueOrderId, OrderIdentity, 10_000>>>,
-}
-
-impl PendingSubmitTracker {
-    pub(crate) fn insert(&self, venue_order_id: VenueOrderId, identity: OrderIdentity) {
-        self.venue_to_identity
-            .lock()
-            .expect(MUTEX_POISONED)
-            .insert(venue_order_id, identity);
-    }
-
-    pub(crate) fn identity(&self, venue_order_id: &VenueOrderId) -> Option<OrderIdentity> {
-        self.venue_to_identity
-            .lock()
-            .expect(MUTEX_POISONED)
-            .get(venue_order_id)
-            .copied()
-    }
-
-    pub(crate) fn client_order_id(&self, venue_order_id: &VenueOrderId) -> Option<ClientOrderId> {
-        self.identity(venue_order_id)
-            .map(|identity| identity.client_order_id)
-    }
-
-    pub(crate) fn remove(&self, venue_order_id: &VenueOrderId) -> Option<OrderIdentity> {
-        self.venue_to_identity
-            .lock()
-            .expect(MUTEX_POISONED)
-            .remove(venue_order_id)
-    }
-}
+use nautilus_model::identifiers::ClientOrderId;
 
 /// Tracks client order IDs whose cancel was deferred because the venue order ID was not yet
 /// known, so the cancel can be issued once the submit response lands.

@@ -36,7 +36,7 @@ use super::{
     responses::{
         check_fok_status, emit_market_order_submitted, handle_batch_order_responses,
         handle_order_response, handle_single_order_response, handle_unknown_submit_result,
-        reject_submit_order,
+        reject_registered_submit, reject_submit_order,
     },
     submitter::{MarketBuyFeeContext, MarketOrderSubmitRequest, UnknownSubmitError},
     types::{BatchLimitOrderContext, LimitOrderSubmitRequest},
@@ -90,7 +90,6 @@ impl PolymarketExecutionClient {
         let clock = self.clock;
         let fill_tracker = self.fill_tracker.clone();
         let order_identities = self.order_identities.clone();
-        let pending_submits = self.pending_submits.clone();
         let pending_cancels = self.pending_cancels.clone();
         let account_id = self.core.account_id;
         let size_precision = instrument.size_precision();
@@ -106,12 +105,29 @@ impl PolymarketExecutionClient {
             };
 
             let expected_venue_order_id = submission.expected_venue_order_id;
-            pending_submits.insert(expected_venue_order_id, OrderIdentity::from_order(&order));
+            if order_identities
+                .register_pending_order_identity(
+                    expected_venue_order_id,
+                    OrderIdentity::from_order(&order),
+                    &fill_tracker,
+                )
+                .is_err()
+            {
+                reject_submit_order(
+                    &order,
+                    "Expected venue order identity is already owned",
+                    &emitter,
+                    clock,
+                    &pending_cancels,
+                );
+                return Ok(());
+            }
             match submitter.post_limit_order_submission(submission).await {
                 Ok(response) => {
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
                         Ok(response),
                         &order,
+                        expected_venue_order_id,
                         &emitter,
                         clock,
                         &fill_tracker,
@@ -132,7 +148,6 @@ impl PolymarketExecutionClient {
                         )
                         .await;
                     }
-                    pending_submits.remove(&expected_venue_order_id);
                 }
                 Err(e) if e.is_submit_outcome_unknown() => {
                     if let Some((order_id_str, venue_order_id)) = handle_unknown_submit_result(
@@ -144,7 +159,6 @@ impl PolymarketExecutionClient {
                         clock,
                         &fill_tracker,
                         &order_identities,
-                        &pending_submits,
                         &pending_cancels,
                     ) {
                         execute_deferred_cancel(
@@ -158,13 +172,17 @@ impl PolymarketExecutionClient {
                         )
                         .await;
                     }
-                    if fill_tracker.contains(&expected_venue_order_id) {
-                        pending_submits.remove(&expected_venue_order_id);
-                    }
                 }
                 Err(e) => {
-                    pending_submits.remove(&expected_venue_order_id);
-                    reject_submit_order(&order, &format!("{e}"), &emitter, clock, &pending_cancels);
+                    reject_registered_submit(
+                        &order,
+                        expected_venue_order_id,
+                        &format!("{e}"),
+                        &order_identities,
+                        &emitter,
+                        clock,
+                        &pending_cancels,
+                    );
                 }
             }
             Ok(())
@@ -209,7 +227,6 @@ impl PolymarketExecutionClient {
         let clock = self.clock;
         let fill_tracker = self.fill_tracker.clone();
         let order_identities = self.order_identities.clone();
-        let pending_submits = self.pending_submits.clone();
         let pending_cancels = self.pending_cancels.clone();
         let account_id = self.core.account_id;
         let size_precision = instrument.size_precision();
@@ -256,7 +273,23 @@ impl PolymarketExecutionClient {
                 }
             };
             let expected_venue_order_id = submission.expected_venue_order_id;
-            pending_submits.insert(expected_venue_order_id, OrderIdentity::from_order(&order));
+            if order_identities
+                .register_pending_order_identity(
+                    expected_venue_order_id,
+                    OrderIdentity::from_order(&order),
+                    &fill_tracker,
+                )
+                .is_err()
+            {
+                reject_submit_order(
+                    &order,
+                    "Expected venue order identity is already owned",
+                    &emitter,
+                    clock,
+                    &pending_cancels,
+                );
+                return Ok(());
+            }
 
             match submitter.post_market_order_submission(submission).await {
                 Ok(result) => {
@@ -273,18 +306,6 @@ impl PolymarketExecutionClient {
                         clock,
                     );
 
-                    if result.response.success
-                        && let Some(order_id) = result.response.order_id.as_ref()
-                    {
-                        let venue_order_id = VenueOrderId::from(order_id.as_str());
-                        if venue_order_id != result.expected_venue_order_id {
-                            log::warn!(
-                                "Market submit returned order ID {venue_order_id}, expected {}",
-                                result.expected_venue_order_id
-                            );
-                        }
-                    }
-
                     let fok_order_id = result
                         .response
                         .order_id
@@ -295,6 +316,7 @@ impl PolymarketExecutionClient {
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
                         Ok(result.response),
                         &order,
+                        expected_venue_order_id,
                         &emitter,
                         clock,
                         &fill_tracker,
@@ -315,8 +337,6 @@ impl PolymarketExecutionClient {
                         )
                         .await;
                     }
-
-                    pending_submits.remove(&expected_venue_order_id);
 
                     if let Some(order_id) = fok_order_id {
                         check_fok_status(
@@ -367,7 +387,6 @@ impl PolymarketExecutionClient {
                             clock,
                             &fill_tracker,
                             &order_identities,
-                            &pending_submits,
                             &pending_cancels,
                         ) {
                             execute_deferred_cancel(
@@ -381,13 +400,16 @@ impl PolymarketExecutionClient {
                             )
                             .await;
                         }
-                        if fill_tracker.contains(&unknown.expected_venue_order_id) {
-                            pending_submits.remove(&unknown.expected_venue_order_id);
-                        }
                     } else {
-                        pending_submits.remove(&expected_venue_order_id);
-                        let ts_now = clock.get_time_ns();
-                        emitter.emit_order_rejected(&order, &format!("{e}"), ts_now, false);
+                        reject_registered_submit(
+                            &order,
+                            expected_venue_order_id,
+                            &format!("{e}"),
+                            &order_identities,
+                            &emitter,
+                            clock,
+                            &pending_cancels,
+                        );
                     }
                 }
             }
@@ -532,7 +554,6 @@ impl PolymarketExecutionClient {
         let clock = self.clock;
         let fill_tracker = self.fill_tracker.clone();
         let order_identities = self.order_identities.clone();
-        let pending_submits = self.pending_submits.clone();
         let pending_cancels = self.pending_cancels.clone();
         let pending_tasks = self.pending_tasks.clone();
         let account_id = self.core.account_id;
@@ -552,8 +573,25 @@ impl PolymarketExecutionClient {
             for (batch_order, result) in batch_orders.into_iter().zip(prepare_results) {
                 match result {
                     Ok(submission) => {
-                        prepared_orders.push(batch_order);
-                        submissions.push(submission);
+                        if order_identities
+                            .register_pending_order_identity(
+                                submission.expected_venue_order_id,
+                                OrderIdentity::from_order(&batch_order.order),
+                                &fill_tracker,
+                            )
+                            .is_ok()
+                        {
+                            prepared_orders.push(batch_order);
+                            submissions.push(submission);
+                        } else {
+                            reject_submit_order(
+                                &batch_order.order,
+                                "Expected venue order identity is already owned",
+                                &emitter,
+                                clock,
+                                &pending_cancels,
+                            );
+                        }
                     }
                     Err(e) => {
                         reject_submit_order(
@@ -582,14 +620,7 @@ impl PolymarketExecutionClient {
                     let submission = submissions_chunk.pop().expect("len 1");
                     let expected_venue_order_id = submission.expected_venue_order_id;
                     let batch_order = orders_chunk.pop().expect("len 1");
-                    pending_submits.insert(
-                        expected_venue_order_id,
-                        OrderIdentity::from_order(&batch_order.order),
-                    );
                     let result = submitter.post_limit_order_submission(submission).await;
-                    let outcome_unknown = result
-                        .as_ref()
-                        .is_err_and(|error| error.is_submit_outcome_unknown());
                     handle_single_order_response(
                         result,
                         batch_order,
@@ -599,28 +630,15 @@ impl PolymarketExecutionClient {
                         clock,
                         &fill_tracker,
                         &order_identities,
-                        &pending_submits,
                         &pending_cancels,
                         account_id,
                     )
                     .await;
-                    if !outcome_unknown || fill_tracker.contains(&expected_venue_order_id) {
-                        pending_submits.remove(&expected_venue_order_id);
-                    }
                 } else {
                     let expected_venue_order_ids: Vec<VenueOrderId> = submissions_chunk
                         .iter()
                         .map(|submission| submission.expected_venue_order_id)
                         .collect();
-                    for (batch_order, expected_venue_order_id) in
-                        orders_chunk.iter().zip(&expected_venue_order_ids)
-                    {
-                        pending_submits.insert(
-                            *expected_venue_order_id,
-                            OrderIdentity::from_order(&batch_order.order),
-                        );
-                    }
-
                     match submitter
                         .post_limit_order_submissions(submissions_chunk)
                         .await
@@ -635,15 +653,11 @@ impl PolymarketExecutionClient {
                                 clock,
                                 &fill_tracker,
                                 &order_identities,
-                                &pending_submits,
                                 &pending_cancels,
                                 &pending_tasks,
                                 account_id,
                             )
                             .await;
-                            for venue_order_id in &expected_venue_order_ids {
-                                pending_submits.remove(venue_order_id);
-                            }
                         }
                         Err(e) if e.is_submit_outcome_unknown() => {
                             for (batch_order, expected_venue_order_id) in
@@ -659,7 +673,6 @@ impl PolymarketExecutionClient {
                                         clock,
                                         &fill_tracker,
                                         &order_identities,
-                                        &pending_submits,
                                         &pending_cancels,
                                     )
                                 {
@@ -674,19 +687,17 @@ impl PolymarketExecutionClient {
                                     )
                                     .await;
                                 }
-                                if fill_tracker.contains(&expected_venue_order_id) {
-                                    pending_submits.remove(&expected_venue_order_id);
-                                }
                             }
                         }
                         Err(e) => {
                             for (batch_order, expected_venue_order_id) in
                                 orders_chunk.into_iter().zip(expected_venue_order_ids)
                             {
-                                pending_submits.remove(&expected_venue_order_id);
-                                reject_submit_order(
+                                reject_registered_submit(
                                     &batch_order.order,
+                                    expected_venue_order_id,
                                     &format!("{e}"),
+                                    &order_identities,
                                     &emitter,
                                     clock,
                                     &pending_cancels,

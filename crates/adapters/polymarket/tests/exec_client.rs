@@ -193,6 +193,7 @@ struct TestServerState {
     order_request_gate: Arc<RequestGate>,
     batch_order_request_gate: Arc<RequestGate>,
     open_order_ids: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    order_id_aliases: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     orders_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
     book_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     single_order_request_gate: Arc<RequestGate>,
@@ -239,6 +240,7 @@ impl Default for TestServerState {
             order_request_gate: Arc::new(RequestGate::default()),
             batch_order_request_gate: Arc::new(RequestGate::default()),
             open_order_ids: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            order_id_aliases: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             orders_response_override: Arc::new(tokio::sync::Mutex::new(None)),
             single_order_request_gate: Arc::new(RequestGate::default()),
             single_order_response: Arc::new(tokio::sync::Mutex::new(None)),
@@ -387,7 +389,8 @@ fn add_test_account_to_cache(cache: &Rc<RefCell<Cache>>, account_id: AccountId) 
 async fn handle_get_orders(State(state): State<TestServerState>) -> Response {
     *state.last_path.lock().await = "/data/orders".to_string();
     if let Some(override_value) = state.orders_response_override.lock().await.as_ref() {
-        return Json(override_value.clone()).into_response();
+        return Json(rewrite_order_id_aliases(&state, override_value.clone()).await)
+            .into_response();
     }
     Json(load_json("http_open_orders_page.json")).into_response()
 }
@@ -396,10 +399,11 @@ async fn handle_get_order(State(state): State<TestServerState>) -> Response {
     *state.last_path.lock().await = "/data/order".to_string();
     state.single_order_request_gate.wait().await;
     let resp = state.single_order_response.lock().await;
-    match resp.as_ref() {
-        Some(v) => Json(v.clone()).into_response(),
-        None => Json(load_json("http_open_order.json")).into_response(),
-    }
+    let body = resp
+        .clone()
+        .unwrap_or_else(|| load_json("http_open_order.json"));
+    drop(resp);
+    Json(rewrite_order_id_aliases(&state, body).await).into_response()
 }
 
 async fn handle_get_trades(
@@ -409,7 +413,8 @@ async fn handle_get_trades(
     *state.last_path.lock().await = "/data/trades".to_string();
     *state.last_query.lock().await = query;
     if let Some(override_value) = state.trades_response_override.lock().await.as_ref() {
-        return Json(override_value.clone()).into_response();
+        return Json(rewrite_order_id_aliases(&state, override_value.clone()).await)
+            .into_response();
     }
     Json(load_json("http_trades_page.json")).into_response()
 }
@@ -440,8 +445,9 @@ async fn handle_post_order(
         .collect();
     *state.order_post_count.lock().await += 1;
 
-    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
-        *state.last_body.lock().await = Some(v);
+    let parsed = serde_json::from_slice::<Value>(&body).ok();
+    if let Some(v) = parsed.as_ref() {
+        *state.last_body.lock().await = Some(v.clone());
     }
 
     state.order_request_gate.wait().await;
@@ -459,9 +465,23 @@ async fn handle_post_order(
 
     let status = *state.order_response_status.lock().await;
     let resp = state.order_response.lock().await;
-    let body = resp
+    let mut body = resp
         .clone()
         .unwrap_or_else(|| load_json("http_order_response_ok.json"));
+    if body.get("success").and_then(Value::as_bool) == Some(true)
+        && let Some(expected_order_id) = parsed.as_ref().and_then(expected_order_id_from_submission)
+    {
+        if let Some(configured_order_id) = body.get("orderID").and_then(Value::as_str)
+            && configured_order_id != expected_order_id
+        {
+            state
+                .order_id_aliases
+                .lock()
+                .await
+                .insert(configured_order_id.to_string(), expected_order_id.clone());
+        }
+        body["orderID"] = Value::String(expected_order_id);
+    }
     record_open_order_ids(&state, std::slice::from_ref(&body)).await;
     (status, Json(body)).into_response()
 }
@@ -483,6 +503,13 @@ async fn handle_post_orders(
     };
 
     let parsed = serde_json::from_slice::<Value>(&body).ok();
+    let expected_order_ids: Vec<String> = parsed
+        .as_ref()
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(expected_order_id_from_submission)
+        .collect();
     let request_count = parsed
         .as_ref()
         .and_then(Value::as_array)
@@ -496,7 +523,7 @@ async fn handle_post_orders(
 
     let status = *state.batch_order_response_status.lock().await;
     let resp = state.batch_order_response.lock().await;
-    let body = resp.clone().unwrap_or_else(|| {
+    let mut body = resp.clone().unwrap_or_else(|| {
         // Namespace by POST count so order IDs are globally unique across chunks, matching the
         // venue (each order receives a distinct ID); a per-chunk index alone would collide.
         let entries: Vec<Value> = (0..request_count.max(1))
@@ -510,6 +537,22 @@ async fn handle_post_orders(
             .collect();
         Value::Array(entries)
     });
+    if let Some(responses) = body.as_array_mut() {
+        for (response, expected_order_id) in responses.iter_mut().zip(expected_order_ids) {
+            if response.get("success").and_then(Value::as_bool) == Some(true) {
+                if let Some(configured_order_id) = response.get("orderID").and_then(Value::as_str)
+                    && configured_order_id != expected_order_id
+                {
+                    state
+                        .order_id_aliases
+                        .lock()
+                        .await
+                        .insert(configured_order_id.to_string(), expected_order_id.clone());
+                }
+                response["orderID"] = Value::String(expected_order_id);
+            }
+        }
+    }
 
     if let Some(responses) = body.as_array() {
         record_open_order_ids(&state, responses).await;
@@ -517,21 +560,65 @@ async fn handle_post_orders(
     (status, Json(body)).into_response()
 }
 
+fn expected_order_id_from_submission(submission: &Value) -> Option<String> {
+    let order: PolymarketOrder = serde_json::from_value(submission.get("order")?.clone()).ok()?;
+    order_hash(&order, false)
+        .ok()
+        .map(|hash| format!("{hash:#x}"))
+}
+
+async fn rewrite_order_id_aliases(state: &TestServerState, mut value: Value) -> Value {
+    let aliases = state.order_id_aliases.lock().await;
+    rewrite_value_strings(&mut value, &aliases);
+    value
+}
+
+fn rewrite_value_strings(value: &mut Value, aliases: &HashMap<String, String>) {
+    match value {
+        Value::String(text) => {
+            if let Some(replacement) = aliases.get(text) {
+                *text = replacement.clone();
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                rewrite_value_strings(value, aliases);
+            }
+        }
+        Value::Object(fields) => {
+            let original = std::mem::take(fields);
+            for (key, mut value) in original {
+                rewrite_value_strings(&mut value, aliases);
+                let key = aliases.get(&key).cloned().unwrap_or(key);
+                fields.insert(key, value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 async fn handle_delete_order(State(state): State<TestServerState>, body: Bytes) -> Response {
     *state.last_path.lock().await = "/order".to_string();
     *state.cancel_delete_count.lock().await += 1;
 
-    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
-        *state.last_body.lock().await = Some(v);
+    let parsed = serde_json::from_slice::<Value>(&body).ok();
+    if let Some(v) = parsed.as_ref() {
+        *state.last_body.lock().await = Some(v.clone());
     }
 
     state.cancel_request_gate.wait().await;
 
     let status = *state.cancel_response_status.lock().await;
     let resp = state.cancel_response.lock().await;
-    let body = resp
-        .clone()
-        .unwrap_or_else(|| load_json("http_cancel_response_ok.json"));
+    let body = resp.clone().unwrap_or_else(|| {
+        let order_id = parsed
+            .as_ref()
+            .and_then(|value| value.get("orderID"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        json!({"canceled": [order_id], "not_canceled": {}})
+    });
+    let body = rewrite_order_id_aliases(&state, body).await;
     record_canceled_order_ids(&state, &body).await;
     (status, Json(body)).into_response()
 }
@@ -540,17 +627,24 @@ async fn handle_delete_orders(State(state): State<TestServerState>, body: Bytes)
     *state.last_path.lock().await = "/orders".to_string();
     *state.batch_cancel_delete_count.lock().await += 1;
 
-    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
-        *state.last_body.lock().await = Some(v);
+    let parsed = serde_json::from_slice::<Value>(&body).ok();
+    if let Some(v) = parsed.as_ref() {
+        *state.last_body.lock().await = Some(v.clone());
     }
 
     state.batch_cancel_request_gate.wait().await;
 
     let status = *state.batch_cancel_response_status.lock().await;
     let resp = state.batch_cancel_response.lock().await;
-    let body = resp
-        .clone()
-        .unwrap_or_else(|| load_json("http_batch_cancel_response.json"));
+    let body = resp.clone().unwrap_or_else(|| {
+        let order_ids = parsed
+            .as_ref()
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        json!({"canceled": order_ids, "not_canceled": {}})
+    });
+    let body = rewrite_order_id_aliases(&state, body).await;
     record_canceled_order_ids(&state, &body).await;
     (status, Json(body)).into_response()
 }
@@ -592,7 +686,8 @@ async fn handle_user_socket(mut socket: WebSocket) {
 
 async fn handle_cancel_all(State(state): State<TestServerState>) -> Response {
     *state.last_path.lock().await = "/cancel-all".to_string();
-    Json(load_json("http_batch_cancel_response.json")).into_response()
+    let canceled: Vec<String> = state.open_order_ids.lock().await.drain().collect();
+    Json(json!({"canceled": canceled, "not_canceled": {}})).into_response()
 }
 
 async fn handle_gamma_markets(State(state): State<TestServerState>) -> Response {
@@ -1295,11 +1390,9 @@ async fn test_generate_order_status_reports_ignores_a_mismatched_cached_fill() {
         .await
         .unwrap();
 
-    assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].instrument_id, reported_instrument_id);
     assert!(
-        reports[0].filled_qty.is_zero(),
-        "a cache entry for {cached_instrument_id} must not become fill evidence for \
+        reports.is_empty(),
+        "tracker identity {cached_instrument_id} must reject a venue report relabeled as \
          {reported_instrument_id}"
     );
 }
@@ -1349,7 +1442,7 @@ async fn test_generate_order_status_reports_drop_a_reverse_registry_conflict() {
         .submit_order(make_submit_cmd(&registered_order, instrument_id))
         .unwrap();
     assert_order_event(rx.try_recv().unwrap(), "Submitted");
-    assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+    let venue_order_id = accepted_venue_order_id(recv_execution_event(&mut rx).await);
 
     cache.borrow_mut().reset();
     add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
@@ -1368,7 +1461,7 @@ async fn test_generate_order_status_reports_drop_a_reverse_registry_conflict() {
         .borrow_mut()
         .add_order(conflicting_order.clone(), None, None, false)
         .unwrap();
-    submit_and_accept_order(&cache, &mut conflicting_order, venue_order_id_str);
+    submit_and_accept_order(&cache, &mut conflicting_order, venue_order_id.as_str());
     let cached_fill = TestOrderEventStubs::filled(
         &conflicting_order,
         &instrument,
@@ -1401,7 +1494,7 @@ async fn test_generate_order_status_reports_drop_a_reverse_registry_conflict() {
 
     assert!(
         reports.is_empty(),
-        "venue order {venue_order_id_str} belongs to registry owner \
+        "venue order {venue_order_id} belongs to registry owner \
          {registered_client_order_id}, so a report resolved through conflicting cache owner \
          {conflicting_client_order_id} must be dropped"
     );
@@ -3540,7 +3633,7 @@ async fn test_fok_deferred_check_emits_terminal_event(
         "asset_id": returned_asset_id,
         "expiration": null,
         "order_type": "FOK",
-        "created_at": 1_703_875_200_000_i64
+        "created_at": 1_703_875_200_i64
     }));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -3607,7 +3700,7 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
     let state = TestServerState::default();
     *state.single_order_response.lock().await = Some(json!({
         "associate_trades": [],
-        "id": "test-fok-order-id",
+        "id": DEFAULT_ACCEPTED_ORDER_ID,
         "status": "MATCHED",
         "market": "0xtest",
         "original_size": "10.0000",
@@ -3617,10 +3710,10 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
         "price": "0.5100",
         "side": "BUY",
         "size_matched": "10.0000",
-        "asset_id": "TEST-TOKEN",
+        "asset_id": FIXTURE_TOKEN_ID,
         "expiration": null,
         "order_type": "FOK",
-        "created_at": 1_703_875_200_000_i64
+        "created_at": 1_703_875_200_i64
     }));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -3956,6 +4049,13 @@ fn assert_order_event(event: ExecutionEvent, expected: &str) -> OrderEventAny {
             order_event
         }
         other => panic!("Expected Order event, was {other:?}"),
+    }
+}
+
+fn accepted_venue_order_id(event: ExecutionEvent) -> VenueOrderId {
+    match assert_order_event(event, "Accepted") {
+        OrderEventAny::Accepted(accepted) => accepted.venue_order_id,
+        other => panic!("Expected accepted event, was {other:?}"),
     }
 }
 

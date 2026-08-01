@@ -62,7 +62,6 @@ use crate::{
             build_maker_fill_report, compute_commission, determine_order_side,
             instrument_taker_fee, parse_liquidity_side,
         },
-        pending::PendingSubmitTracker,
     },
 };
 
@@ -110,6 +109,7 @@ impl WsDispatchState {
 
 #[derive(Clone, Debug)]
 struct PendingTerminalOrder {
+    identity: OrderIdentity,
     trade_ids: Vec<String>,
     ts_event: UnixNanos,
 }
@@ -119,7 +119,6 @@ struct PendingTerminalOrder {
 pub(crate) struct WsDispatchContext<'a> {
     pub token_instruments: &'a AtomicMap<Ustr, InstrumentAny>,
     pub fill_tracker: &'a OrderFillTrackerMap,
-    pub pending_submits: &'a PendingSubmitTracker,
     pub order_identities: &'a OrderIdentityRegistry,
     pub emitter: &'a ExecutionEventEmitter,
     pub account_id: AccountId,
@@ -163,8 +162,8 @@ fn dispatch_order_update(
     let ts_init = ctx.clock.get_time_ns();
     let mut report =
         build_ws_order_status_report(order, instrument, ctx.account_id, ts_event, ts_init);
-    let pending_identity = ctx.pending_submits.identity(&venue_order_id);
-    let local_client_order_id = pending_identity.map(|identity| identity.client_order_id);
+    let registered_identity = ctx.order_identities.get(&venue_order_id);
+    let local_client_order_id = registered_identity.map(|identity| identity.client_order_id);
     if ctx
         .order_identities
         .resolve_fill_report(
@@ -184,23 +183,13 @@ fn dispatch_order_update(
     let mut is_accepted = ctx.fill_tracker.contains(&venue_order_id);
     report.client_order_id = local_client_order_id;
 
-    // A pending submit carries the full immutable identity. Claim it before routing any WS status,
-    // including a rejection which deliberately does not create tracker state.
-    if let Some(pending_identity) = pending_identity
-        && !is_accepted
-        && (!OrderReportIdentity::from_report(&report).agrees_with_registered(pending_identity)
-            || ctx
-                .order_identities
-                .register_order_identity(venue_order_id, pending_identity, ctx.fill_tracker)
-                .is_err())
+    if let Some(registered_identity) = registered_identity
+        && !OrderReportIdentity::from_report(&report).agrees_with_registered(registered_identity)
     {
         log::error!(
-            "WebSocket order update for {venue_order_id} contradicts pending submit identity; dropping it"
+            "WebSocket order update for {venue_order_id} contradicts registered identity; dropping it"
         );
         return;
-    }
-    if pending_identity.is_some() && !is_accepted {
-        ctx.pending_submits.remove(&venue_order_id);
     }
 
     // A known own order (submit in flight) self-registers on its first WS update
@@ -320,11 +309,13 @@ fn dispatch_order_update(
     }
 
     if order.status == PolymarketOrderStatus::Matched
+        && let Some(identity) = registered_identity
         && let Some(trade_ids) = order.associate_trades.clone().filter(|ids| !ids.is_empty())
     {
         state.pending_terminal_orders.insert(
             venue_order_id,
             PendingTerminalOrder {
+                identity,
                 trade_ids,
                 ts_event,
             },
@@ -384,16 +375,30 @@ fn emit_quantity_normalization_if_ready(
         return;
     };
 
-    let Some(identity) = ctx.order_identities.get(&venue_order_id) else {
-        log::warn!("Cannot normalize terminal order {venue_order_id} without a local identity");
+    if ctx.order_identities.get(&venue_order_id) != Some(pending.identity) {
+        log::error!(
+            "Terminal order {venue_order_id} changed identity before normalization; dropping retained state"
+        );
         return;
-    };
+    }
 
-    if let Some(quantity) = ctx
+    match ctx
         .fill_tracker
-        .check_terminal_quantity_normalization(&venue_order_id)
-    {
-        emit_terminal_quantity_update(&identity, venue_order_id, quantity, pending.ts_event, ctx);
+        .check_terminal_quantity_normalization_for_identity(
+            &venue_order_id,
+            pending.identity.report_identity(),
+        ) {
+        Ok(Some(quantity)) => emit_terminal_quantity_update(
+            &pending.identity,
+            venue_order_id,
+            quantity,
+            pending.ts_event,
+            ctx,
+        ),
+        Ok(None) => {}
+        Err(_) => log::error!(
+            "Terminal order {venue_order_id} contradicts tracker identity; dropping retained state"
+        ),
     }
 }
 
@@ -403,35 +408,38 @@ fn emit_quantity_normalization_if_ready(
 /// difference can be normalized. IOC maps to FAK, so every positive remainder was killed by the
 /// venue and must close as `Canceled` without changing the venue-reported fill quantity.
 fn emit_taker_terminal_status(
-    trade: &PolymarketUserTrade,
+    identity: &OrderIdentity,
+    venue_order_id: VenueOrderId,
     ctx: &WsDispatchContext<'_>,
     ts_event: UnixNanos,
 ) {
-    let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
-
-    let Some(identity) = ctx.order_identities.get(&venue_order_id) else {
-        return;
-    };
-
     if identity.requires_terminal_quantity_normalization() {
-        if let Some(quantity) = ctx
+        match ctx
             .fill_tracker
-            .check_terminal_quantity_normalization(&venue_order_id)
-        {
-            emit_terminal_quantity_update(&identity, venue_order_id, quantity, ts_event, ctx);
+            .check_terminal_quantity_normalization_for_identity(
+                &venue_order_id,
+                identity.report_identity(),
+            ) {
+            Ok(Some(quantity)) => {
+                emit_terminal_quantity_update(identity, venue_order_id, quantity, ts_event, ctx);
+            }
+            Ok(None) => {}
+            Err(_) => log::error!(
+                "Terminal FOK trade for {venue_order_id} contradicts tracker identity; dropping it"
+            ),
         }
         return;
     }
 
     if identity.time_in_force == TimeInForce::Ioc
-        && let Some(remainder) = ctx
+        && let Ok(Some(remainder)) = ctx
             .fill_tracker
-            .take_terminal_ioc_remainder(&venue_order_id)
+            .take_terminal_ioc_remainder_for_identity(&venue_order_id, identity.report_identity())
     {
         log::debug!(
             "Closing terminal IOC order {venue_order_id} as Canceled (unfilled remainder={remainder})"
         );
-        emit_order_canceled(&identity, venue_order_id, ts_event, ctx);
+        emit_order_canceled(identity, venue_order_id, ts_event, ctx);
     }
 }
 
@@ -463,13 +471,13 @@ fn dispatch_trade_update(
     }
 
     let is_confirmed = trade.status == PolymarketTradeStatus::Confirmed;
-    dispatch_trade_fills(trade, &dedup_key, is_confirmed, ctx, state);
+    let local_fills = dispatch_trade_fills(trade, &dedup_key, is_confirmed, ctx, state);
 
     if !is_confirmed {
         return None;
     }
 
-    confirm_trade(trade, &dedup_key, ctx, state);
+    confirm_trade(trade, &dedup_key, &local_fills, ctx, state);
     Some(AccountRefreshRequest)
 }
 
@@ -519,10 +527,16 @@ fn dispatch_trade_fills(
     is_confirmed: bool,
     ctx: &WsDispatchContext<'_>,
     state: &mut WsDispatchState,
-) {
+) -> Vec<OrderFilled> {
     if state.processed_fills.contains(dedup_key) {
         log::debug!("Duplicate fill skipped: {dedup_key}");
-        return;
+        let mut fills = state
+            .matched_fills
+            .get(dedup_key)
+            .cloned()
+            .unwrap_or_default();
+        fills.extend(ctx.fill_tracker.applied_buffered_fills(dedup_key));
+        return fills;
     }
 
     state.processed_fills.add(dedup_key.clone());
@@ -533,38 +547,39 @@ fn dispatch_trade_fills(
     };
 
     if !fills.is_empty() {
-        state.matched_fills.insert(dedup_key.clone(), fills);
+        state.matched_fills.insert(dedup_key.clone(), fills.clone());
     }
+    fills
 }
 
 fn confirm_trade(
     trade: &PolymarketUserTrade,
     dedup_key: &str,
+    local_fills: &[OrderFilled],
     ctx: &WsDispatchContext<'_>,
     state: &mut WsDispatchState,
 ) {
     let ts_event = parse_timestamp_ms(&trade.timestamp).unwrap_or_else(|_| ctx.clock.get_time_ns());
     ctx.fill_tracker.mark_trade_confirmed(dedup_key);
     state.confirmed_trades.add(trade.id.clone());
-    if trade.trader_side == PolymarketLiquiditySide::Maker {
-        for order in trade
-            .maker_orders
-            .iter()
-            .filter(|order| is_user_maker_order(order, ctx))
-        {
-            emit_quantity_normalization_if_ready(
-                VenueOrderId::from(order.order_id.as_str()),
-                ctx,
-                state,
+    for fill in local_fills {
+        let Ok(Some(identity)) = ctx.order_identities.resolve_fill_report(
+            fill.venue_order_id,
+            fill.instrument_id,
+            Some(fill.client_order_id),
+            fill.order_side,
+            ctx.fill_tracker,
+        ) else {
+            log::error!(
+                "Confirmed trade {} changed identity before terminal processing; dropping terminal mutation",
+                trade.id
             );
+            continue;
+        };
+        emit_quantity_normalization_if_ready(fill.venue_order_id, ctx, state);
+        if trade.trader_side != PolymarketLiquiditySide::Maker {
+            emit_taker_terminal_status(&identity, fill.venue_order_id, ctx, ts_event);
         }
-    } else {
-        emit_quantity_normalization_if_ready(
-            VenueOrderId::from(trade.taker_order_id.as_str()),
-            ctx,
-            state,
-        );
-        emit_taker_terminal_status(trade, ctx, ts_event);
     }
 }
 
@@ -626,7 +641,10 @@ fn dispatch_maker_fills(
             ts_init,
         );
         let maker_venue_order_id = report.venue_order_id;
-        report.client_order_id = ctx.pending_submits.client_order_id(&maker_venue_order_id);
+        report.client_order_id = ctx
+            .order_identities
+            .get(&maker_venue_order_id)
+            .map(|identity| identity.client_order_id);
         if ctx
             .order_identities
             .resolve_fill_report(
@@ -715,7 +733,10 @@ fn dispatch_taker_fill(
         ts_event,
         ts_init,
     );
-    report.client_order_id = ctx.pending_submits.client_order_id(&venue_order_id);
+    report.client_order_id = ctx
+        .order_identities
+        .get(&venue_order_id)
+        .map(|identity| identity.client_order_id);
     if ctx
         .order_identities
         .resolve_fill_report(
@@ -951,8 +972,15 @@ fn ensure_accepted(
     ts_event: UnixNanos,
     ctx: &WsDispatchContext<'_>,
 ) {
-    if !ctx.order_identities.mark_accepted(venue_order_id) {
-        return;
+    match ctx.order_identities.mark_accepted(venue_order_id) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(_) => {
+            log::error!(
+                "Venue order {venue_order_id} was already rejected; refusing acceptance event"
+            );
+            return;
+        }
     }
     let accepted = OrderAccepted::new(
         ctx.emitter.trader_id(),
@@ -1369,7 +1397,6 @@ mod tests {
         token_instruments.insert(order.asset_id, instrument);
 
         let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1378,7 +1405,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1410,7 +1436,6 @@ mod tests {
         token_instruments.insert(order.asset_id, instrument);
 
         let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1418,15 +1443,17 @@ mod tests {
 
         let venue_order_id = VenueOrderId::from(order.id.as_str());
         let client_order_id = ClientOrderId::from("O-UNKNOWN-SUBMIT");
-        pending_submits.insert(
-            venue_order_id,
-            test_order_identity(test_instrument().id(), "O-UNKNOWN-SUBMIT"),
-        );
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                test_order_identity(test_instrument().id(), "O-UNKNOWN-SUBMIT"),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1465,7 +1492,6 @@ mod tests {
         token_instruments.insert(trade.asset_id, instrument);
 
         let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1474,7 +1500,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1507,7 +1532,6 @@ mod tests {
         let instrument = test_instrument();
         let token_instruments = AtomicMap::new();
         let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1515,7 +1539,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1552,13 +1575,11 @@ mod tests {
         let token_instruments = AtomicMap::new();
         token_instruments.insert(trade.asset_id, instrument);
         let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         let emitter = test_emitter();
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1592,7 +1613,6 @@ mod tests {
             instrument.size_precision(),
             instrument.price_precision(),
         );
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         register_identity(
             &order_identities,
@@ -1600,14 +1620,13 @@ mod tests {
             instrument.id(),
             "O-MATCHED-FAILED",
         );
-        order_identities.mark_accepted(venue_order_id);
+        let _ = order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1668,21 +1687,22 @@ mod tests {
         token_instruments.insert(trade.asset_id, instrument);
 
         let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         let emitter = test_emitter();
 
         let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
         let client_order_id = ClientOrderId::from("O-UNKNOWN-FILL");
-        pending_submits.insert(
-            venue_order_id,
-            test_order_identity(test_instrument().id(), "O-UNKNOWN-FILL"),
-        );
+        order_identities
+            .register_pending_order_identity(
+                venue_order_id,
+                test_order_identity(test_instrument().id(), "O-UNKNOWN-FILL"),
+                &fill_tracker,
+            )
+            .expect("pending identity must register");
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1699,7 +1719,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_dispatch_late_fill_uses_tracker_identity_after_registry_eviction() {
+    fn test_dispatch_late_fill_keeps_process_lifetime_identity_after_registry_churn() {
         let trade: PolymarketUserTrade = load("ws_user_trade.json");
         let market: GammaMarket = load("gamma_market_sports_market_money_line.json");
         let defs = parse_gamma_market(&market).unwrap();
@@ -1719,8 +1739,6 @@ mod tests {
             instrument.size_precision(),
             instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         register_identity(
             &order_identities,
@@ -1728,6 +1746,7 @@ mod tests {
             instrument.id(),
             "O-LATE-FILL",
         );
+        let _ = order_identities.mark_accepted(venue_order_id);
         assert!(order_identities.get(&venue_order_id).is_some());
 
         for index in 0..10_000 {
@@ -1740,7 +1759,7 @@ mod tests {
                 &eviction_client_order_id,
             );
         }
-        assert!(order_identities.get(&venue_order_id).is_none());
+        assert!(order_identities.get(&venue_order_id).is_some());
 
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1749,7 +1768,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1761,17 +1779,16 @@ mod tests {
 
         dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
 
-        let event = receiver
-            .try_recv()
-            .expect("expected identity-admitted fill report");
-        let ExecutionEvent::Report(ExecutionReport::Fill(report)) = event else {
-            panic!("expected fill report after registry eviction, was {event:?}");
+        let event = receiver.try_recv().expect("expected tracked order fill");
+        let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = event else {
+            panic!("expected tracked fill after registry churn, was {event:?}");
         };
-        assert_eq!(report.instrument_id, instrument.id());
+        assert_eq!(fill.instrument_id, instrument.id());
+        assert_eq!(fill.client_order_id, ClientOrderId::from("O-LATE-FILL"));
         assert_eq!(
             fill_tracker.get_cumulative_filled(&venue_order_id),
-            Some(report.last_qty),
-            "tracker-owned identity must admit and record only the matching fill"
+            Some(fill.last_qty),
+            "process-lifetime identity must admit and record only the matching fill"
         );
     }
 
@@ -1790,29 +1807,35 @@ mod tests {
         let token_instruments = AtomicMap::new();
         token_instruments.insert(trade.asset_id, reported_instrument);
         let fill_tracker = OrderFillTrackerMap::new();
-        fill_tracker.register(
-            venue_order_id,
-            Quantity::from("100"),
-            OrderSide::Buy,
-            registered_instrument.id(),
-            registered_instrument.size_precision(),
-            registered_instrument.price_precision(),
-        );
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
-        register_identity(
-            &order_identities,
-            venue_order_id,
-            registered_instrument.id(),
-            "O-IDENTITY-CONFLICT",
-        );
+        let identity = OrderIdentity {
+            client_order_id: ClientOrderId::from("O-IDENTITY-CONFLICT"),
+            strategy_id: StrategyId::from("S-001"),
+            instrument_id: registered_instrument.id(),
+            order_side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Ioc,
+        };
+        order_identities
+            .register_order_identity_for_test(venue_order_id, identity)
+            .expect("test identity must register");
+        let permit = order_identities
+            .admit_tracker_registration(venue_order_id, identity.report_identity())
+            .expect("tracker identity must be admitted");
+        fill_tracker
+            .register_and_take_pending_fills(
+                &permit,
+                Quantity::new(100.0, registered_instrument.size_precision()),
+            )
+            .expect("tracker identity must register");
+        drop(permit);
+        let _ = order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1835,6 +1858,33 @@ mod tests {
     }
 
     #[rstest]
+    fn test_external_matched_order_is_not_retained_for_future_identity() {
+        let order: PolymarketUserOrder = load("ws_user_order_matched.json");
+        let instrument = test_instrument();
+        let venue_order_id = VenueOrderId::from(order.id.as_str());
+        let token_instruments = AtomicMap::new();
+        token_instruments.insert(order.asset_id, instrument);
+        let fill_tracker = OrderFillTrackerMap::new();
+        let order_identities = OrderIdentityRegistry::default();
+        let emitter = test_emitter();
+        let ctx = WsDispatchContext {
+            token_instruments: &token_instruments,
+            fill_tracker: &fill_tracker,
+            order_identities: &order_identities,
+            emitter: &emitter,
+            account_id: AccountId::from("POLY-001"),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+            user_address: "0xtest",
+            user_api_key: "test-key",
+        };
+        let mut state = WsDispatchState::default();
+
+        dispatch_user_message(&UserWsMessage::Order(order), &ctx, &mut state);
+
+        assert!(state.pending_terminal_orders.get(&venue_order_id).is_none());
+    }
+
+    #[rstest]
     fn test_dispatch_order_matched_caps_filled_qty_when_no_trades_tracked() {
         let order: PolymarketUserOrder = load("ws_user_order_matched.json");
         let instrument = test_instrument();
@@ -1854,8 +1904,6 @@ mod tests {
             instrument.size_precision(),
             instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
         // No identity registered, so the order surfaces as a report (the external/reconciliation
         // fallback), where filled_qty is capped to tracked fills.
         let order_identities = OrderIdentityRegistry::default();
@@ -1866,7 +1914,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1911,8 +1958,6 @@ mod tests {
             instrument.price_precision(),
         );
         fill_tracker.record_fill(&venue_order_id, Quantity::new(50.0, 6));
-
-        let pending_submits = PendingSubmitTracker::default();
         // No identity registered, so the order surfaces as a report (the external/reconciliation
         // fallback), where filled_qty is capped to tracked fills.
         let order_identities = OrderIdentityRegistry::default();
@@ -1923,7 +1968,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -1966,8 +2010,6 @@ mod tests {
             instrument.price_precision(),
         );
         fill_tracker.record_fill(&venue_order_id, Quantity::new(99.995, 6));
-
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         register_identity(
             &order_identities,
@@ -1975,7 +2017,7 @@ mod tests {
             instrument.id(),
             "O-MATCHED",
         );
-        order_identities.mark_accepted(venue_order_id);
+        let _ = order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
@@ -1988,7 +2030,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -2038,7 +2079,6 @@ mod tests {
             instrument.size_precision(),
             instrument.price_precision(),
         );
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         register_identity(
             &order_identities,
@@ -2046,14 +2086,13 @@ mod tests {
             instrument.id(),
             "O-CONFIRMED-DUST",
         );
-        order_identities.mark_accepted(venue_order_id);
+        let _ = order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -2108,8 +2147,6 @@ mod tests {
             instrument.size_precision(),
             instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         register_identity(
             &order_identities,
@@ -2117,7 +2154,7 @@ mod tests {
             instrument.id(),
             "O-CANCEL",
         );
-        order_identities.mark_accepted(venue_order_id);
+        let _ = order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
@@ -2125,7 +2162,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -2190,8 +2226,6 @@ mod tests {
             instrument.size_precision(),
             instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         register_identity(
             &order_identities,
@@ -2199,7 +2233,7 @@ mod tests {
             instrument.id(),
             "O-CANCEL-FULL",
         );
-        order_identities.mark_accepted(venue_order_id);
+        let _ = order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
@@ -2207,7 +2241,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -2242,8 +2275,6 @@ mod tests {
         // Fill tracker has NO registration (simulates HTTP still in-flight)
         let fill_tracker = OrderFillTrackerMap::new();
         let venue_order_id = VenueOrderId::from(cancel_order.id.as_str());
-
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2252,7 +2283,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -2316,11 +2346,9 @@ mod tests {
             instrument.size_precision(),
             instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         register_identity(&order_identities, venue_order_id, instrument.id(), "O-3797");
-        order_identities.mark_accepted(venue_order_id);
+        let _ = order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
@@ -2328,7 +2356,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -2507,8 +2534,6 @@ mod tests {
             instrument.size_precision(),
             instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         register_identity(
             &order_identities,
@@ -2516,7 +2541,7 @@ mod tests {
             instrument.id(),
             "O-OVERFILL",
         );
-        order_identities.mark_accepted(venue_order_id);
+        let _ = order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
@@ -2524,7 +2549,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -2658,31 +2682,26 @@ mod tests {
             instrument.size_precision(),
         )
         .unwrap();
-        fill_tracker.register(
-            venue_order_id,
-            submitted,
-            order_side,
-            instrument.id(),
-            instrument.size_precision(),
-            instrument.price_precision(),
-        );
-
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
+        let identity = OrderIdentity {
+            client_order_id: ClientOrderId::from("O-ONE-SHOT"),
+            strategy_id: StrategyId::from("S-001"),
+            instrument_id: instrument.id(),
+            order_side,
+            order_type,
+            time_in_force,
+        };
         order_identities
-            .register_order_identity_for_test(
-                venue_order_id,
-                OrderIdentity {
-                    client_order_id: ClientOrderId::from("O-ONE-SHOT"),
-                    strategy_id: StrategyId::from("S-001"),
-                    instrument_id: instrument.id(),
-                    order_side,
-                    order_type,
-                    time_in_force,
-                },
-            )
+            .register_order_identity_for_test(venue_order_id, identity)
             .expect("test identity must register");
-        order_identities.mark_accepted(venue_order_id);
+        let permit = order_identities
+            .admit_tracker_registration(venue_order_id, identity.report_identity())
+            .expect("tracker identity must be admitted");
+        fill_tracker
+            .register_and_take_pending_fills(&permit, submitted)
+            .expect("tracker identity must register");
+        drop(permit);
+        let _ = order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
@@ -2690,7 +2709,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -2817,8 +2835,6 @@ mod tests {
             size_precision,
             instrument.price_precision(),
         );
-
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         register_identity(
             &order_identities,
@@ -2826,7 +2842,7 @@ mod tests {
             instrument.id(),
             "O-GROSS-OVERFILL",
         );
-        order_identities.mark_accepted(venue_order_id);
+        let _ = order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
@@ -2834,7 +2850,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -2902,14 +2917,12 @@ mod tests {
     fn owns_a_live_maker_order_whose_address_differs_only_in_case() {
         let token_instruments = AtomicMap::new();
         let fill_tracker = OrderFillTrackerMap::new();
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         let emitter = test_emitter();
 
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
@@ -2969,8 +2982,6 @@ mod tests {
                 time_in_force: TimeInForce::Fok,
             },
         );
-
-        let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
         order_identities
             .register_order_identity_for_test(
@@ -2985,7 +2996,7 @@ mod tests {
                 },
             )
             .expect("test identity must register");
-        order_identities.mark_accepted(venue_order_id);
+        let _ = order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(sender);
@@ -2993,7 +3004,6 @@ mod tests {
         let ctx = WsDispatchContext {
             token_instruments: &token_instruments,
             fill_tracker: &fill_tracker,
-            pending_submits: &pending_submits,
             order_identities: &order_identities,
             emitter: &emitter,
             account_id: AccountId::from("POLY-001"),
