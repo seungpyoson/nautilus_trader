@@ -426,14 +426,24 @@ impl PolymarketExecutionClient {
                 continue;
             };
 
-            self.order_identities
-                .register_order_identity(venue_order_id, OrderIdentity::from_order(order));
+            if self
+                .order_identities
+                .register_order_identity(venue_order_id, OrderIdentity::from_order(order))
+                .is_err()
+            {
+                log::error!(
+                    "Conflicting cached identity for venue order {venue_order_id}; refusing to restore fill tracking"
+                );
+                continue;
+            }
             self.order_identities.mark_accepted(venue_order_id);
             self.fill_tracker.restore_order(
                 venue_order_id,
                 order.quantity(),
                 order.filled_qty(),
                 order.order_side(),
+                order.instrument_id(),
+                order.client_order_id(),
             );
 
             for event in order.events() {

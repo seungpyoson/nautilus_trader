@@ -313,8 +313,15 @@ pub(super) fn handle_unknown_submit_result(
         expected_venue_order_id
     );
 
-    order_identities
-        .register_order_identity(expected_venue_order_id, OrderIdentity::from_order(order));
+    if order_identities
+        .register_order_identity(expected_venue_order_id, OrderIdentity::from_order(order))
+        .is_err()
+    {
+        log::error!(
+            "Conflicting identity for expected venue order {expected_venue_order_id}; refusing unknown-submit recovery"
+        );
+        return None;
+    }
     pending_submits.insert(expected_venue_order_id, order.client_order_id());
 
     drain_pending_reports_for_known_order(
@@ -379,6 +386,7 @@ pub(super) fn drain_pending_reports_for_known_order(
             Some(order.client_order_id()),
             tracker_quantity,
             order.order_side(),
+            order.instrument_id(),
         )
     } else {
         Vec::new()
@@ -429,6 +437,7 @@ pub(super) fn accept_order_with_pending_fills(
         Some(order.client_order_id()),
         tracker_quantity,
         order.order_side(),
+        order.instrument_id(),
     ) else {
         return;
     };
@@ -474,8 +483,15 @@ pub(super) fn handle_order_response(
                 if let Some(order_id) = response.order_id.filter(|s| !s.is_empty()) {
                     let venue_order_id = VenueOrderId::from(order_id.as_str());
                     let ts_now = clock.get_time_ns();
-                    order_identities
-                        .register_order_identity(venue_order_id, OrderIdentity::from_order(order));
+                    if order_identities
+                        .register_order_identity(venue_order_id, OrderIdentity::from_order(order))
+                        .is_err()
+                    {
+                        log::error!(
+                            "Conflicting identity for accepted venue order {venue_order_id}; refusing submit response"
+                        );
+                        return None;
+                    }
                     if order_identities.mark_accepted(venue_order_id) {
                         emitter.emit_order_accepted(order, venue_order_id, ts_now);
                     }
@@ -485,6 +501,7 @@ pub(super) fn handle_order_response(
                         Some(order.client_order_id()),
                         order.quantity(),
                         order.order_side(),
+                        order.instrument_id(),
                     );
 
                     // The register above precedes this drain, so a racing report can't be orphaned
@@ -742,6 +759,7 @@ fn emit_drained_order_report(
 pub(super) async fn check_fok_status(
     submitter: &OrderSubmitter,
     order_id: &str,
+    expected_asset_id: &str,
     order: &OrderAny,
     fill_tracker: &Arc<OrderFillTrackerMap>,
     emitter: &ExecutionEventEmitter,
@@ -772,6 +790,15 @@ pub(super) async fn check_fok_status(
             return;
         }
     };
+
+    if venue_order.id != order_id || venue_order.asset_id.as_str() != expected_asset_id {
+        log::error!(
+            "FOK status answer for {order_id} returned order {} and asset {}; expected order {order_id} and asset {expected_asset_id}; deferring reconciliation",
+            venue_order.id,
+            venue_order.asset_id,
+        );
+        return;
+    }
 
     let order_status = OrderStatus::from(venue_order.status);
     let ts_now = clock.get_time_ns();
@@ -1045,6 +1072,52 @@ mod tests {
             UnixNanos::from(1_000_000_100u64),
             Some(UUID4::new()),
         )
+    }
+
+    #[rstest]
+    fn test_buffered_fill_cannot_cross_submitted_instrument_identity() {
+        let expected_instrument_id = InstrumentId::from("EXPECTED.POLYMARKET");
+        let venue_order_id = VenueOrderId::from("V-BUFFERED-CONFLICT");
+        let order = test_limit_order("O-BUFFERED-CONFLICT", expected_instrument_id);
+        let fill_tracker = OrderFillTrackerMap::new();
+        fill_tracker.buffer_fill_for_test(
+            venue_order_id,
+            test_fill_report(
+                InstrumentId::from("OTHER.POLYMARKET"),
+                venue_order_id,
+                Quantity::from("1"),
+                UnixNanos::from(1_000_000_000u64),
+            ),
+        );
+        let fills = fill_tracker.register_and_take_pending_fills(
+            venue_order_id,
+            Some(order.client_order_id()),
+            Quantity::from("10"),
+            order.order_side(),
+            order.instrument_id(),
+        );
+        assert_eq!(
+            fill_tracker.get_cumulative_filled(&venue_order_id),
+            Some(Quantity::zero(Quantity::from("10").precision)),
+            "a contradictory buffered fill must be rejected before tracker state changes"
+        );
+        let (emitter, mut receiver) = test_emitter();
+
+        emit_drained_activity(
+            &order,
+            venue_order_id,
+            fills,
+            &[],
+            &fill_tracker,
+            &emitter,
+            nautilus_core::time::get_atomic_clock_realtime(),
+        );
+
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            fill_tracker.get_cumulative_filled(&venue_order_id),
+            Some(Quantity::zero(Quantity::from("10").precision))
+        );
     }
 
     #[rstest]

@@ -164,6 +164,21 @@ fn dispatch_order_update(
     let mut report =
         build_ws_order_status_report(order, instrument, ctx.account_id, ts_event, ts_init);
     let local_client_order_id = ctx.pending_submits.client_order_id(&venue_order_id);
+    if ctx
+        .order_identities
+        .resolve_fill_report(
+            venue_order_id,
+            report.instrument_id,
+            local_client_order_id,
+            ctx.fill_tracker,
+        )
+        .is_err()
+    {
+        log::error!(
+            "WebSocket order update for {venue_order_id} contradicts tracked identity; dropping it"
+        );
+        return;
+    }
     let mut is_accepted = ctx.fill_tracker.contains(&venue_order_id);
     report.client_order_id = local_client_order_id;
 
@@ -178,10 +193,10 @@ fn dispatch_order_update(
             local_client_order_id,
             report.quantity,
             report.order_side,
+            report.instrument_id,
         )
     } else if is_accepted {
-        ctx.fill_tracker
-            .take_pending_fills(venue_order_id, local_client_order_id)
+        ctx.fill_tracker.take_pending_fills(venue_order_id)
     } else {
         Vec::new()
     };
@@ -228,11 +243,21 @@ fn dispatch_order_update(
     }
 
     for fill in buffered_fills {
-        match identity {
-            Some(identity) => {
-                emit_buffered_order_filled(&identity, &fill, ctx);
+        match ctx.order_identities.resolve_fill_report(
+            fill.report.venue_order_id,
+            fill.report.instrument_id,
+            fill.report.client_order_id,
+            ctx.fill_tracker,
+        ) {
+            Ok(Some(identity)) => emit_buffered_order_filled(&identity, &fill, ctx),
+            Ok(None) => ctx.emitter.send_fill_report(fill.report),
+            Err(_) => {
+                ctx.fill_tracker
+                    .reverse_fill(&fill.report.venue_order_id, fill.report.last_qty);
+                log::error!(
+                    "Buffered WebSocket fill for {venue_order_id} contradicts tracked identity; dropping it"
+                );
             }
-            None => ctx.emitter.send_fill_report(fill.report),
         }
     }
 
@@ -545,10 +570,21 @@ fn dispatch_maker_fills(
         );
         let maker_venue_order_id = report.venue_order_id;
         report.client_order_id = ctx.pending_submits.client_order_id(&maker_venue_order_id);
-        report.last_qty = ctx
-            .fill_tracker
-            .snap_fill_qty(&maker_venue_order_id, report.last_qty);
-
+        if ctx
+            .order_identities
+            .resolve_fill_report(
+                maker_venue_order_id,
+                report.instrument_id,
+                report.client_order_id,
+                ctx.fill_tracker,
+            )
+            .is_err()
+        {
+            log::error!(
+                "WebSocket maker fill for {maker_venue_order_id} contradicts tracked identity; dropping it"
+            );
+            continue;
+        }
         if let Some(report) = ctx.fill_tracker.accept_or_buffer_fill(
             maker_venue_order_id,
             report,
@@ -558,8 +594,13 @@ fn dispatch_maker_fills(
                 is_confirmed,
             },
         ) {
-            match ctx.order_identities.get(&maker_venue_order_id) {
-                Some(identity) => {
+            match ctx.order_identities.resolve_fill_report(
+                maker_venue_order_id,
+                report.instrument_id,
+                report.client_order_id,
+                ctx.fill_tracker,
+            ) {
+                Ok(Some(identity)) => {
                     fills.push(emit_order_filled(
                         &identity,
                         &report,
@@ -567,7 +608,15 @@ fn dispatch_maker_fills(
                         ctx,
                     ));
                 }
-                None => ctx.emitter.send_fill_report(report),
+                Ok(None) => ctx.emitter.send_fill_report(report),
+                Err(_) => {
+                    ctx.fill_tracker
+                        .reverse_fill(&maker_venue_order_id, report.last_qty);
+                    log::error!(
+                        "WebSocket maker fill for {maker_venue_order_id} changed identity before emission; dropping it"
+                    );
+                    continue;
+                }
             }
             reemit_terminal_cancel(maker_venue_order_id, state, ctx);
         }
@@ -609,10 +658,21 @@ fn dispatch_taker_fill(
         ts_init,
     );
     report.client_order_id = ctx.pending_submits.client_order_id(&venue_order_id);
-    report.last_qty = ctx
-        .fill_tracker
-        .snap_fill_qty(&venue_order_id, report.last_qty);
-
+    if ctx
+        .order_identities
+        .resolve_fill_report(
+            venue_order_id,
+            report.instrument_id,
+            report.client_order_id,
+            ctx.fill_tracker,
+        )
+        .is_err()
+    {
+        log::error!(
+            "WebSocket taker fill for {venue_order_id} contradicts tracked identity; dropping it"
+        );
+        return Vec::new();
+    }
     if let Some(report) = ctx.fill_tracker.accept_or_buffer_fill(
         venue_order_id,
         report,
@@ -622,13 +682,26 @@ fn dispatch_taker_fill(
             is_confirmed,
         },
     ) {
-        match ctx.order_identities.get(&venue_order_id) {
-            Some(identity) => {
+        match ctx.order_identities.resolve_fill_report(
+            venue_order_id,
+            report.instrument_id,
+            report.client_order_id,
+            ctx.fill_tracker,
+        ) {
+            Ok(Some(identity)) => {
                 let fill = emit_order_filled(&identity, &report, trade_fill_info(trade), ctx);
                 reemit_terminal_cancel(venue_order_id, state, ctx);
                 return vec![fill];
             }
-            None => ctx.emitter.send_fill_report(report),
+            Ok(None) => ctx.emitter.send_fill_report(report),
+            Err(_) => {
+                ctx.fill_tracker
+                    .reverse_fill(&venue_order_id, report.last_qty);
+                log::error!(
+                    "WebSocket taker fill for {venue_order_id} changed identity before emission; dropping it"
+                );
+                return Vec::new();
+            }
         }
         reemit_terminal_cancel(venue_order_id, state, ctx);
     }
@@ -1087,17 +1160,19 @@ mod tests {
         instrument_id: InstrumentId,
         client_order_id: &str,
     ) {
-        order_identities.register_order_identity(
-            venue_order_id,
-            OrderIdentity {
-                client_order_id: ClientOrderId::from(client_order_id),
-                strategy_id: StrategyId::from("S-001"),
-                instrument_id,
-                order_side: OrderSide::Buy,
-                order_type: OrderType::Limit,
-                time_in_force: TimeInForce::Gtc,
-            },
-        );
+        order_identities
+            .register_order_identity(
+                venue_order_id,
+                OrderIdentity {
+                    client_order_id: ClientOrderId::from(client_order_id),
+                    strategy_id: StrategyId::from("S-001"),
+                    instrument_id,
+                    order_side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::Gtc,
+                },
+            )
+            .expect("test identity must register");
     }
 
     fn load<T: serde::de::DeserializeOwned>(filename: &str) -> T {
@@ -1522,7 +1597,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_dispatch_late_fill_falls_back_to_report_after_identity_eviction() {
+    fn test_dispatch_late_fill_uses_tracker_identity_after_registry_eviction() {
         let trade: PolymarketUserTrade = load("ws_user_trade.json");
         let market: GammaMarket = load("gamma_market_sports_market_money_line.json");
         let defs = parse_gamma_market(&market).unwrap();
@@ -1584,30 +1659,77 @@ mod tests {
 
         dispatch_user_message(&UserWsMessage::Trade(trade.clone()), &ctx, &mut state);
 
-        let event = receiver.try_recv().expect("expected late fill report");
+        let event = receiver
+            .try_recv()
+            .expect("expected identity-admitted fill report");
         let ExecutionEvent::Report(ExecutionReport::Fill(report)) = event else {
-            panic!("expected fill report for evicted identity, was {event:?}");
+            panic!("expected fill report after registry eviction, was {event:?}");
         };
-
-        assert_eq!(report.venue_order_id, venue_order_id);
-        assert_eq!(report.trade_id, TradeId::from(trade.id.as_str()));
         assert_eq!(report.instrument_id, instrument.id());
         assert_eq!(
-            report.last_qty.as_decimal(),
-            Decimal::from_str_exact(&trade.size).unwrap()
+            fill_tracker.get_cumulative_filled(&venue_order_id),
+            Some(report.last_qty),
+            "tracker-owned identity must admit and record only the matching fill"
         );
-        assert_eq!(
-            report.last_px.as_decimal(),
-            Decimal::from_str_exact(&trade.price).unwrap()
+    }
+
+    #[rstest]
+    fn test_dispatch_taker_fill_refuses_registered_instrument_conflict() {
+        let mut trade: PolymarketUserTrade = load("ws_user_trade.json");
+        let market: GammaMarket = load("gamma_market_sports_market_money_line.json");
+        let defs = parse_gamma_market(&market).unwrap();
+        let registered_instrument =
+            create_instrument_from_def(&defs[0], UnixNanos::from(1_000_000_000u64)).unwrap();
+        let reported_instrument =
+            create_instrument_from_def(&defs[1], UnixNanos::from(1_000_000_000u64)).unwrap();
+        trade.asset_id = Ustr::from(reported_instrument.raw_symbol().as_str());
+        let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
+
+        let token_instruments = AtomicMap::new();
+        token_instruments.insert(trade.asset_id, reported_instrument.clone());
+        let fill_tracker = OrderFillTrackerMap::new();
+        fill_tracker.register(
+            venue_order_id,
+            Quantity::from("100"),
+            OrderSide::Buy,
+            registered_instrument.id(),
+            registered_instrument.size_precision(),
+            registered_instrument.price_precision(),
         );
-        assert_eq!(report.order_side, OrderSide::Buy);
-        assert_eq!(report.liquidity_side, LiquiditySide::Taker);
-        assert_eq!(
-            report.commission.as_decimal(),
-            Decimal::from_str_exact("0.1875").unwrap()
+        let pending_submits = PendingSubmitTracker::default();
+        let order_identities = OrderIdentityRegistry::default();
+        register_identity(
+            &order_identities,
+            venue_order_id,
+            registered_instrument.id(),
+            "O-IDENTITY-CONFLICT",
         );
-        assert_eq!(report.commission.currency, Currency::pUSD());
+        let mut emitter = test_emitter();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(sender);
+        let ctx = WsDispatchContext {
+            token_instruments: &token_instruments,
+            fill_tracker: &fill_tracker,
+            pending_submits: &pending_submits,
+            order_identities: &order_identities,
+            emitter: &emitter,
+            account_id: AccountId::from("POLY-001"),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+            user_address: "0xtest",
+            user_api_key: "test-key",
+        };
+
+        dispatch_user_message(
+            &UserWsMessage::Trade(trade),
+            &ctx,
+            &mut WsDispatchState::default(),
+        );
+
         assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            fill_tracker.get_cumulative_filled(&venue_order_id),
+            Some(Quantity::zero(registered_instrument.size_precision()))
+        );
     }
 
     #[rstest]
@@ -2436,17 +2558,19 @@ mod tests {
 
         let pending_submits = PendingSubmitTracker::default();
         let order_identities = OrderIdentityRegistry::default();
-        order_identities.register_order_identity(
-            venue_order_id,
-            OrderIdentity {
-                client_order_id: ClientOrderId::from("O-ONE-SHOT"),
-                strategy_id: StrategyId::from("S-001"),
-                instrument_id: instrument.id(),
-                order_side,
-                order_type,
-                time_in_force,
-            },
-        );
+        order_identities
+            .register_order_identity(
+                venue_order_id,
+                OrderIdentity {
+                    client_order_id: ClientOrderId::from("O-ONE-SHOT"),
+                    strategy_id: StrategyId::from("S-001"),
+                    instrument_id: instrument.id(),
+                    order_side,
+                    order_type,
+                    time_in_force,
+                },
+            )
+            .expect("test identity must register");
         order_identities.mark_accepted(venue_order_id);
         let mut emitter = test_emitter();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();

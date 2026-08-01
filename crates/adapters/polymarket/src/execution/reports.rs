@@ -33,15 +33,16 @@ use ustr::Ustr;
 
 use super::{
     PolymarketExecutionClient,
-    identity::OrderIdentityConflict,
+    identity::{OrderIdentityConflict, OrderIdentityRegistry},
+    order_fill_tracker::OrderFillTrackerMap,
     parse::{
         parse_balance_allowance, parse_order_status_report, sum_filled_quantity,
         weighted_average_price,
     },
     reconciliation::{
-        FillContext, build_fill_reports_from_trades, build_position_reports,
+        FillContext, build_identity_admitted_fill_reports_from_trades, build_position_reports,
         cap_order_report_filled_qty, confirmed_filled_quantities,
-        normalize_terminal_order_report_quantity, retain_identity_admitted_fill_reports,
+        normalize_terminal_order_report_quantity,
     },
 };
 use crate::{
@@ -288,7 +289,7 @@ impl PolymarketExecutionClient {
         let cached_price = cached.as_ref().and_then(Order::price);
         let cached_side = cached.as_ref().map(Order::order_side);
 
-        let has_pending_trade = trades.iter().any(|trade| {
+        let pending_trades = trades.iter().filter(|trade| {
             trade.status.is_pending_settlement()
                 && (trade.taker_order_id == venue_order_id.as_str()
                     || trade
@@ -296,6 +297,33 @@ impl PolymarketExecutionClient {
                         .iter()
                         .any(|order| order.order_id == venue_order_id.as_str()))
         });
+        let mut has_pending_trade = false;
+        for trade in pending_trades {
+            has_pending_trade = true;
+            let asset_id = if trade.taker_order_id == venue_order_id.as_str() {
+                trade.asset_id
+            } else {
+                Ustr::from(
+                    trade
+                        .maker_orders
+                        .iter()
+                        .find(|order| order.order_id == venue_order_id.as_str())
+                        .expect("matching maker order was established above")
+                        .asset_id
+                        .as_str(),
+                )
+            };
+            if self
+                .shared_token_instruments
+                .get_cloned(&asset_id)
+                .is_none_or(|instrument| instrument.id() != instrument_id)
+            {
+                log::error!(
+                    "Pending trade for venue order {venue_order_id} contradicts requested instrument {instrument_id}; deferring terminal recovery"
+                );
+                return Ok(None);
+            }
+        }
 
         if has_pending_trade {
             let Some(cached) = cached.as_ref() else {
@@ -333,10 +361,12 @@ impl PolymarketExecutionClient {
             return Ok(Some(report));
         }
 
-        let (mut order_fills, mut discards) = build_fill_reports_from_trades(
+        let (order_fills, discards) = build_identity_admitted_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
+            &self.order_identities,
+            &self.fill_tracker,
             Some(instrument_id),
             Some(venue_order_id),
             None,
@@ -344,10 +374,14 @@ impl PolymarketExecutionClient {
             ts_init,
         );
 
-        discards.identity_conflicts +=
-            retain_identity_admitted_fill_reports(&mut order_fills, &self.order_identities);
         discards.report(log::Level::Debug, "Polymarket order status report");
-        self.fill_tracker.snap_fill_reports(&mut order_fills);
+
+        if discards.identity_conflicts > 0 {
+            log::error!(
+                "Trade identity for venue order {venue_order_id} is contradictory; deferring terminal recovery"
+            );
+            return Ok(None);
+        }
 
         if order_fills.is_empty() {
             let Some(cached) = cached.as_ref() else {
@@ -582,6 +616,8 @@ impl PolymarketExecutionClient {
                             &http_client,
                             &ctx,
                             &token_instruments,
+                            &order_identities,
+                            &fill_tracker,
                             GetTradesParams::default(),
                             Some(instrument_id),
                             clock.get_time_ns(),
@@ -769,6 +805,8 @@ impl PolymarketExecutionClient {
                     &self.http_client,
                     &self.fill_context(),
                     &self.shared_token_instruments,
+                    &self.order_identities,
+                    &self.fill_tracker,
                     GetTradesParams::default(),
                     Some(instrument_id),
                     self.clock.get_time_ns(),
@@ -861,6 +899,8 @@ impl PolymarketExecutionClient {
                 &self.http_client,
                 &self.fill_context(),
                 &self.shared_token_instruments,
+                &self.order_identities,
+                &self.fill_tracker,
                 GetTradesParams::default(),
                 cmd.instrument_id,
                 self.clock.get_time_ns(),
@@ -930,10 +970,12 @@ impl PolymarketExecutionClient {
             .context("failed to fetch trades")?;
 
         let ctx = self.fill_context();
-        let (mut reports, mut discards) = build_fill_reports_from_trades(
+        let (reports, discards) = build_identity_admitted_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
+            &self.order_identities,
+            &self.fill_tracker,
             cmd.instrument_id,
             cmd.venue_order_id,
             cmd.start,
@@ -941,15 +983,10 @@ impl PolymarketExecutionClient {
             self.clock.get_time_ns(),
         );
 
-        discards.identity_conflicts +=
-            retain_identity_admitted_fill_reports(&mut reports, &self.order_identities);
-
         // A bounded query that answered with trades it could not place in time
         // has weakened the caller's window, which is worth more than a line the
         // operator only sees with debug logging enabled.
         discards.report(log::Level::Warn, "Polymarket fill reports");
-
-        self.fill_tracker.snap_fill_reports(&mut reports);
 
         log::debug!("Generated {} fill reports", reports.len());
         Ok(reports)
@@ -1018,6 +1055,8 @@ async fn fetch_confirmed_fill_reports(
     http_client: &PolymarketClobHttpClient,
     ctx: &FillContext<'_>,
     token_instruments: &AtomicMap<Ustr, InstrumentAny>,
+    order_identities: &OrderIdentityRegistry,
+    fill_tracker: &OrderFillTrackerMap,
     params: GetTradesParams,
     instrument_id: Option<InstrumentId>,
     ts_init: UnixNanos,
@@ -1026,10 +1065,12 @@ async fn fetch_confirmed_fill_reports(
         .get_trades(params)
         .await
         .context("failed to fetch confirmed trades")?;
-    let (reports, discards) = build_fill_reports_from_trades(
+    let (reports, discards) = build_identity_admitted_fill_reports_from_trades(
         &trades,
         ctx,
         token_instruments,
+        order_identities,
+        fill_tracker,
         instrument_id,
         None,
         None,

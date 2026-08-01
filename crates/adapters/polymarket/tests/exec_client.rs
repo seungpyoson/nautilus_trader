@@ -2027,6 +2027,88 @@ async fn test_generate_order_status_report_recovers_canceled_when_no_trades() {
 
 #[rstest]
 #[tokio::test]
+async fn test_generate_order_status_report_defers_on_a_contradictory_confirmed_trade() {
+    let venue_order_id_str = DEFAULT_ACCEPTED_ORDER_ID;
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(Value::Null);
+    let conflicting_token = "CONFLICTING-TOKEN";
+    let mut trades = recovery_trades_response(venue_order_id_str, "10.0000", "0.5000");
+    trades["data"][0]["asset_id"] = Value::String(conflicting_token.to_string());
+    *state.trades_response_override.lock().await = Some(trades);
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let registered_instrument_id = InstrumentId::from("REGISTERED-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_precisions_and_raw_symbol(
+        &cache,
+        registered_instrument_id,
+        FIXTURE_TOKEN_ID,
+        4,
+        4,
+    );
+    let registered_instrument = cache
+        .borrow()
+        .instrument(&registered_instrument_id)
+        .unwrap()
+        .clone();
+    client.on_instrument(registered_instrument);
+    let registered_order = make_limit_order(
+        "O-TERMINAL-CONFLICT",
+        registered_instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(registered_order.clone(), None, None, false)
+        .unwrap();
+    client
+        .submit_order(make_submit_cmd(&registered_order, registered_instrument_id))
+        .unwrap();
+    assert_order_event(rx.try_recv().unwrap(), "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+
+    let conflicting_instrument_id = InstrumentId::from("CONFLICTING-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_precisions_and_raw_symbol(
+        &cache,
+        conflicting_instrument_id,
+        conflicting_token,
+        4,
+        4,
+    );
+    let conflicting_instrument = cache
+        .borrow()
+        .instrument(&conflicting_instrument_id)
+        .unwrap()
+        .clone();
+    client.on_instrument(conflicting_instrument);
+
+    let report = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(registered_instrument_id),
+            client_order_id: Some(registered_order.client_order_id()),
+            venue_order_id: Some(VenueOrderId::from(venue_order_id_str)),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        report.is_none(),
+        "a contradictory confirmed trade must defer terminal recovery, not become a false cancellation"
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_generate_order_status_report_does_not_relabel_a_cached_order() {
     let state = TestServerState::default();
     *state.single_order_response.lock().await = Some(Value::Null);
@@ -3414,19 +3496,38 @@ fn assert_order_status_report(event: ExecutionEvent, expected_status: OrderStatu
 }
 
 #[rstest]
-#[case("UNMATCHED", "Rejected")]
-#[case("CANCELED", "Canceled")]
-#[case("CANCELED_MARKET_RESOLVED", "Expired")]
+#[case(
+    "UNMATCHED",
+    DEFAULT_ACCEPTED_ORDER_ID,
+    FIXTURE_TOKEN_ID,
+    Some("Rejected")
+)]
+#[case(
+    "CANCELED",
+    DEFAULT_ACCEPTED_ORDER_ID,
+    FIXTURE_TOKEN_ID,
+    Some("Canceled")
+)]
+#[case(
+    "CANCELED_MARKET_RESOLVED",
+    DEFAULT_ACCEPTED_ORDER_ID,
+    FIXTURE_TOKEN_ID,
+    Some("Expired")
+)]
+#[case("CANCELED", "different-order-id", FIXTURE_TOKEN_ID, None)]
+#[case("CANCELED", DEFAULT_ACCEPTED_ORDER_ID, "OTHER-TOKEN", None)]
 #[tokio::test]
 async fn test_fok_deferred_check_emits_terminal_event(
     #[case] venue_status: &str,
-    #[case] expected_event: &str,
+    #[case] returned_order_id: &str,
+    #[case] returned_asset_id: &str,
+    #[case] expected_event: Option<&str>,
 ) {
     let state = TestServerState::default();
     // REST resolves the unfilled FOK order to a terminal status for the deferred check.
     *state.single_order_response.lock().await = Some(json!({
         "associate_trades": [],
-        "id": "test-fok-order-id",
+        "id": returned_order_id,
         "status": venue_status,
         "market": "0xtest",
         "original_size": "10.0000",
@@ -3436,7 +3537,7 @@ async fn test_fok_deferred_check_emits_terminal_event(
         "price": "0.5100",
         "side": "BUY",
         "size_matched": "0.0000",
-        "asset_id": "TEST-TOKEN",
+        "asset_id": returned_asset_id,
         "expiration": null,
         "order_type": "FOK",
         "created_at": 1_703_875_200_000_i64
@@ -3487,11 +3588,16 @@ async fn test_fok_deferred_check_emits_terminal_event(
     // Deferred FOK check: after ~5s, the own order resolves via REST to a terminal state and
     // emits the matching order event (the order was submitted through this client, so it is
     // tracked).
-    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_order_event(event, expected_event);
+    let event = tokio::time::timeout(Duration::from_secs(7), rx.recv()).await;
+    match expected_event {
+        Some(expected_event) => {
+            assert_order_event(event.unwrap().unwrap(), expected_event);
+        }
+        None => assert!(
+            event.is_err(),
+            "a contradictory FOK venue answer must not emit terminal state"
+        ),
+    }
 }
 
 // A MATCHED FOK report excludes provisional quantity until the trade confirms
@@ -3767,7 +3873,22 @@ fn add_instrument_to_cache_with_precisions(
     price_precision: u8,
     size_precision: u8,
 ) {
-    let symbol = FIXTURE_TOKEN_ID;
+    add_instrument_to_cache_with_precisions_and_raw_symbol(
+        cache,
+        instrument_id,
+        FIXTURE_TOKEN_ID,
+        price_precision,
+        size_precision,
+    );
+}
+
+fn add_instrument_to_cache_with_precisions_and_raw_symbol(
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    symbol: &str,
+    price_precision: u8,
+    size_precision: u8,
+) {
     let size_increment = if size_precision == 0 {
         Quantity::from("1")
     } else {

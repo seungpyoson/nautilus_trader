@@ -29,7 +29,7 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use super::{
-    identity::OrderIdentityRegistry,
+    identity::{OrderIdentityConflict, OrderIdentityRegistry},
     order_fill_tracker::OrderFillTrackerMap,
     parse::{
         build_maker_fill_report, instrument_taker_fee, parse_fill_report,
@@ -58,10 +58,10 @@ pub(crate) struct FillContext<'a> {
     pub clock: &'static AtomicTime,
 }
 
-/// What a reconciliation pass could not turn into or retain as a fill report.
+/// What a reconciliation pass could not turn into an admitted fill report.
 ///
-/// The builder returns its partial-result counts and callers add any later
-/// identity-admission rejections before choosing the appropriate severity.
+/// Identity admission happens inside the builder before a report can contribute
+/// diagnostics or consume venue-order-keyed tracker quantity.
 /// `ExecutionMassStatus` has no field for the counts, so callers currently
 /// surface them through logs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -160,10 +160,29 @@ fn trade_mentions_venue_order(
             .any(|order| order.order_id == venue_order_id.as_str())
 }
 
-pub(crate) fn build_fill_reports_from_trades(
+fn admit_and_snap_fill_report(
+    mut report: FillReport,
+    order_identities: &OrderIdentityRegistry,
+    fill_tracker: &OrderFillTrackerMap,
+) -> Result<FillReport, OrderIdentityConflict> {
+    order_identities.resolve_fill_report(
+        report.venue_order_id,
+        report.instrument_id,
+        report.client_order_id,
+        fill_tracker,
+    )?;
+    if !fill_tracker.admit_and_snap_fill_report(&mut report) {
+        return Err(OrderIdentityConflict);
+    }
+    Ok(report)
+}
+
+pub(crate) fn build_identity_admitted_fill_reports_from_trades(
     trades: &[PolymarketTradeReport],
     ctx: &FillContext<'_>,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
+    order_identities: &OrderIdentityRegistry,
+    fill_tracker: &OrderFillTrackerMap,
     instrument_filter: Option<InstrumentId>,
     venue_order_filter: Option<VenueOrderId>,
     start: Option<UnixNanos>,
@@ -202,7 +221,9 @@ pub(crate) fn build_fill_reports_from_trades(
         }
 
         let is_maker = trade.trader_side == PolymarketLiquiditySide::Maker;
-        if let Some(asset_ids) = &requested_asset_ids {
+        if venue_order_filter.is_none()
+            && let Some(asset_ids) = &requested_asset_ids
+        {
             let mentions_requested_instrument = if is_maker {
                 trade
                     .maker_orders
@@ -279,12 +300,6 @@ pub(crate) fn build_fill_reports_from_trades(
                     }
                 };
 
-                if let Some(filter_id) = instrument_filter
-                    && instrument_id != filter_id
-                {
-                    continue;
-                }
-
                 let ts_event =
                     parse_timestamp(&trade.match_time).unwrap_or(ctx.clock.get_time_ns());
                 let report = build_maker_fill_report(
@@ -305,10 +320,24 @@ pub(crate) fn build_fill_reports_from_trades(
 
                 if venue_order_filter
                     .as_ref()
-                    .is_none_or(|id| report.venue_order_id == *id)
+                    .is_some_and(|id| report.venue_order_id != *id)
                 {
-                    reports.push(report);
+                    continue;
                 }
+                let report =
+                    match admit_and_snap_fill_report(report, order_identities, fill_tracker) {
+                        Ok(report) => report,
+                        Err(_) => {
+                            discards.identity_conflicts += 1;
+                            continue;
+                        }
+                    };
+                if let Some(filter_id) = instrument_filter
+                    && instrument_id != filter_id
+                {
+                    continue;
+                }
+                reports.push(report);
             }
         } else {
             let token_id = Ustr::from(trade.asset_id.as_str());
@@ -326,12 +355,6 @@ pub(crate) fn build_fill_reports_from_trades(
                 }
             };
 
-            if let Some(filter_id) = instrument_filter
-                && instrument_id != filter_id
-            {
-                continue;
-            }
-
             let report = parse_fill_report(
                 trade,
                 instrument_id,
@@ -346,10 +369,23 @@ pub(crate) fn build_fill_reports_from_trades(
 
             if venue_order_filter
                 .as_ref()
-                .is_none_or(|id| report.venue_order_id == *id)
+                .is_some_and(|id| report.venue_order_id != *id)
             {
-                reports.push(report);
+                continue;
             }
+            let report = match admit_and_snap_fill_report(report, order_identities, fill_tracker) {
+                Ok(report) => report,
+                Err(_) => {
+                    discards.identity_conflicts += 1;
+                    continue;
+                }
+            };
+            if let Some(filter_id) = instrument_filter
+                && instrument_id != filter_id
+            {
+                continue;
+            }
+            reports.push(report);
         }
 
         if age_unknown && reports.len() > reports_before {
@@ -360,27 +396,29 @@ pub(crate) fn build_fill_reports_from_trades(
     (reports, discards)
 }
 
-/// Drops fill reports that contradict a registered own-order identity.
-///
-/// An order absent from the registry is legitimately external and remains
-/// admissible. Registered venue orders must retain their instrument and client
-/// identity before venue-order-keyed tracker state can affect the report.
-pub(crate) fn retain_identity_admitted_fill_reports(
-    reports: &mut Vec<FillReport>,
-    order_identities: &OrderIdentityRegistry,
-) -> usize {
-    let reports_before = reports.len();
-    reports.retain(|report| {
-        order_identities
-            .resolve_order_request(
-                report.venue_order_id,
-                report.instrument_id,
-                report.client_order_id,
-                None,
-            )
-            .is_ok()
-    });
-    reports_before - reports.len()
+#[cfg(test)]
+pub(crate) fn build_fill_reports_from_trades(
+    trades: &[PolymarketTradeReport],
+    ctx: &FillContext<'_>,
+    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instrument_filter: Option<InstrumentId>,
+    venue_order_filter: Option<VenueOrderId>,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+    ts_init: UnixNanos,
+) -> (Vec<FillReport>, FillBuildDiscards) {
+    build_identity_admitted_fill_reports_from_trades(
+        trades,
+        ctx,
+        instruments,
+        &OrderIdentityRegistry::default(),
+        &OrderFillTrackerMap::new(),
+        instrument_filter,
+        venue_order_filter,
+        start,
+        end,
+        ts_init,
+    )
 }
 
 /// Converts open orders into order status reports.
@@ -512,6 +550,14 @@ pub(crate) async fn generate_mass_status(
     let (mut order_reports, orders_filtered) =
         build_order_reports_from_orders(&orders, instruments, ctx.account_id, None, ts_init);
 
+    // Complete all remote reads before identity-admitting any reconciliation
+    // artifact. The registry cannot change across an await after final
+    // admission and before the reports are returned.
+    let positions = data_api_client
+        .get_positions(ctx.user_address)
+        .await
+        .context("failed to fetch positions for mass status")?;
+
     // Fetch and parse fill reports
     let all_trades = http_client
         .get_trades(GetTradesParams::default())
@@ -520,10 +566,12 @@ pub(crate) async fn generate_mass_status(
 
     let trades_before = all_trades.len();
 
-    let (mut fill_reports, mut fills_filtered) = build_fill_reports_from_trades(
+    let (fill_reports, fills_filtered) = build_identity_admitted_fill_reports_from_trades(
         &all_trades,
         ctx,
         instruments,
+        order_identities,
+        fill_tracker,
         None,
         None,
         cutoff,
@@ -531,19 +579,6 @@ pub(crate) async fn generate_mass_status(
         ts_init,
     );
     let trades_after = trades_before - fills_filtered.outside_lookback;
-
-    fills_filtered.identity_conflicts +=
-        retain_identity_admitted_fill_reports(&mut fill_reports, order_identities);
-
-    // Snap dust drift on REST fills the same way the WS path does.
-    // Commission stays as venue-reported.
-    fill_tracker.snap_fill_reports(&mut fill_reports);
-
-    // Position reports from Data API
-    let positions = data_api_client
-        .get_positions(ctx.user_address)
-        .await
-        .context("failed to fetch positions for mass status")?;
 
     let position_reports = build_position_reports(&positions, ctx.account_id, ts_init);
 
@@ -710,13 +745,14 @@ mod tests {
     use nautilus_core::datetime::NANOSECONDS_IN_SECOND;
     use nautilus_model::{
         enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
-        identifiers::TradeId,
+        identifiers::{ClientOrderId, TradeId},
         instruments::stubs::binary_option,
         types::{Money, Price},
     };
     use rstest::rstest;
 
     use super::*;
+    use crate::execution::identity::OrderIdentity;
 
     /// Maker address of the configured account, as the trade fixture reports it.
     const USER_ADDRESS: &str = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
@@ -1289,6 +1325,47 @@ mod tests {
     }
 
     #[rstest]
+    fn identity_rejection_does_not_claim_an_unknown_age_trade_was_kept() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut trade = confirmed_maker_trade_for(&instrument);
+        trade.trader_side = PolymarketLiquiditySide::Taker;
+        trade.match_time = "not a timestamp".to_string();
+        let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
+        let order_identities = OrderIdentityRegistry::default();
+        order_identities
+            .register_order_identity(
+                venue_order_id,
+                OrderIdentity {
+                    client_order_id: ClientOrderId::from("O-1"),
+                    strategy_id: nautilus_model::identifiers::StrategyId::from("S-1"),
+                    instrument_id: InstrumentId::from("OTHER.POLYMARKET"),
+                    order_side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::Gtc,
+                },
+            )
+            .expect("identity must register");
+        let fill_tracker = OrderFillTrackerMap::new();
+
+        let (reports, discards) = build_identity_admitted_fill_reports_from_trades(
+            &[trade],
+            &fill_context(),
+            &instruments,
+            &order_identities,
+            &fill_tracker,
+            None,
+            None,
+            Some(UnixNanos::from(1)),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(reports.is_empty());
+        assert_eq!(discards.identity_conflicts, 1);
+        assert_eq!(discards.unknown_age, 0);
+    }
+
+    #[rstest]
     fn counts_unknown_age_once_for_a_maker_trade_with_multiple_reports() {
         let (instruments, instrument) = mapped_instrument();
         let mut trade = confirmed_maker_trade_for(&instrument);
@@ -1416,6 +1493,8 @@ mod tests {
             Quantity::from("10.0000"),
             Quantity::from("6.0000"),
             OrderSide::Buy,
+            InstrumentId::from("TEST.POLYMARKET"),
+            ClientOrderId::from("O-PENDING"),
         );
 
         cap_order_reports_to_confirmed_fills(&mut reports, &[], &tracker);
@@ -1449,6 +1528,8 @@ mod tests {
             Quantity::from("10.0000"),
             Quantity::from("3.0000"),
             OrderSide::Buy,
+            InstrumentId::from("TEST.POLYMARKET"),
+            ClientOrderId::from("O-BOTH"),
         );
 
         cap_order_reports_to_confirmed_fills(&mut reports, &fills, &tracker);
@@ -1466,6 +1547,8 @@ mod tests {
             Quantity::from("10.0000"),
             Quantity::from("2.0000"),
             OrderSide::Buy,
+            InstrumentId::from("TEST.POLYMARKET"),
+            ClientOrderId::from("O-OVER"),
         );
 
         cap_order_reports_to_confirmed_fills(&mut reports, &[], &tracker);

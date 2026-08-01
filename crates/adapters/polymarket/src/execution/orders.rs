@@ -234,7 +234,7 @@ impl PolymarketExecutionClient {
 
             match submitter
                 .submit_market_order(MarketOrderSubmitRequest {
-                    token_id,
+                    token_id: token_id.clone(),
                     side,
                     amount,
                     time_in_force,
@@ -305,6 +305,7 @@ impl PolymarketExecutionClient {
                         check_fok_status(
                             &submitter,
                             &order_id,
+                            &token_id,
                             &order,
                             &fill_tracker,
                             &emitter,

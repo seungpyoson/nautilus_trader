@@ -32,12 +32,14 @@ use nautilus_model::{
     orders::{Order, OrderAny},
 };
 
+use super::order_fill_tracker::OrderFillTrackerMap;
+
 /// Identity fields captured at submit so the cache-free WS dispatch can build order events.
 ///
 /// `trader_id` and `account_id` are client-wide constants threaded from the dispatch context,
 /// so they are not stored here. Fill-specific values (`last_qty`, `last_px`, `trade_id`,
 /// `commission`) come from the venue trade payload.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OrderIdentity {
     pub client_order_id: ClientOrderId,
     pub strategy_id: StrategyId,
@@ -96,12 +98,24 @@ impl OrderIdentityRegistry {
         &self,
         venue_order_id: VenueOrderId,
         identity: OrderIdentity,
-    ) {
+    ) -> Result<(), OrderIdentityConflict> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        if guard
+            .identities
+            .get(&venue_order_id)
+            .is_some_and(|registered| *registered != identity)
+            || guard
+                .client_to_venue
+                .get(&identity.client_order_id)
+                .is_some_and(|registered| *registered != venue_order_id)
+        {
+            return Err(OrderIdentityConflict);
+        }
         guard.identities.insert(venue_order_id, identity);
         guard
             .client_to_venue
             .insert(identity.client_order_id, venue_order_id);
+        Ok(())
     }
 
     /// Returns the identity for a tracked order, if known.
@@ -127,38 +141,39 @@ impl OrderIdentityRegistry {
         indexed_client_order_id: Option<ClientOrderId>,
     ) -> Result<Option<ClientOrderId>, OrderIdentityConflict> {
         let guard = self.inner.lock().expect(MUTEX_POISONED);
-        let registered_identity = guard.identities.get(&venue_order_id).copied();
-        if registered_identity.is_some_and(|identity| identity.instrument_id != instrument_id) {
-            return Err(OrderIdentityConflict);
-        }
-
-        let registered_client_order_id =
-            registered_identity.map(|identity| identity.client_order_id);
-        let known_client_order_ids = [
+        resolve_order_request_in(
+            &guard,
+            venue_order_id,
+            instrument_id,
             requested_client_order_id,
             indexed_client_order_id,
-            registered_client_order_id,
-        ];
-        let resolved_client_order_id = known_client_order_ids.iter().flatten().next().copied();
-        if resolved_client_order_id.is_some_and(|expected| {
-            known_client_order_ids
-                .iter()
-                .flatten()
-                .any(|known| *known != expected)
-        }) {
+        )
+    }
+
+    /// Admits fill economics only when registry and tracker identity agree.
+    ///
+    /// A venue order absent from both stores is genuinely external. If the
+    /// registry has aged out first, tracker-owned instrument/client identity
+    /// must still agree before the fill can use tracker quantity.
+    pub(crate) fn resolve_fill_report(
+        &self,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        fill_tracker: &OrderFillTrackerMap,
+    ) -> Result<Option<OrderIdentity>, OrderIdentityConflict> {
+        let identity = {
+            let guard = self.inner.lock().expect(MUTEX_POISONED);
+            resolve_order_request_in(&guard, venue_order_id, instrument_id, client_order_id, None)?;
+            guard.identities.get(&venue_order_id).copied()
+        };
+        if fill_tracker
+            .fill_identity_matches(&venue_order_id, instrument_id, client_order_id)
+            .is_some_and(|matches| !matches)
+        {
             return Err(OrderIdentityConflict);
         }
-
-        if resolved_client_order_id.is_some_and(|client_order_id| {
-            guard
-                .client_to_venue
-                .get(&client_order_id)
-                .is_some_and(|known| *known != venue_order_id)
-        }) {
-            return Err(OrderIdentityConflict);
-        }
-
-        Ok(resolved_client_order_id)
+        Ok(identity)
     }
 
     /// Returns the latest venue order ID captured for a tracked client order.
@@ -186,11 +201,53 @@ impl OrderIdentityRegistry {
     }
 }
 
+fn resolve_order_request_in(
+    guard: &RegistryInner,
+    venue_order_id: VenueOrderId,
+    instrument_id: InstrumentId,
+    requested_client_order_id: Option<ClientOrderId>,
+    indexed_client_order_id: Option<ClientOrderId>,
+) -> Result<Option<ClientOrderId>, OrderIdentityConflict> {
+    let registered_identity = guard.identities.get(&venue_order_id).copied();
+    if registered_identity.is_some_and(|identity| identity.instrument_id != instrument_id) {
+        return Err(OrderIdentityConflict);
+    }
+
+    let registered_client_order_id = registered_identity.map(|identity| identity.client_order_id);
+    let known_client_order_ids = [
+        requested_client_order_id,
+        indexed_client_order_id,
+        registered_client_order_id,
+    ];
+    let resolved_client_order_id = known_client_order_ids.iter().flatten().next().copied();
+    if resolved_client_order_id.is_some_and(|expected| {
+        known_client_order_ids
+            .iter()
+            .flatten()
+            .any(|known| *known != expected)
+    }) {
+        return Err(OrderIdentityConflict);
+    }
+
+    if resolved_client_order_id.is_some_and(|client_order_id| {
+        guard
+            .client_to_venue
+            .get(&client_order_id)
+            .is_some_and(|known| *known != venue_order_id)
+    }) {
+        return Err(OrderIdentityConflict);
+    }
+
+    Ok(resolved_client_order_id)
+}
+
 #[cfg(test)]
 mod tests {
+    use nautilus_model::types::Quantity;
     use rstest::rstest;
 
     use super::*;
+    use crate::execution::order_fill_tracker::OrderFillTrackerMap;
 
     fn test_identity() -> OrderIdentity {
         OrderIdentity {
@@ -209,13 +266,65 @@ mod tests {
         let vid = VenueOrderId::from("V-1");
         assert!(registry.get(&vid).is_none());
 
-        registry.register_order_identity(vid, test_identity());
+        registry
+            .register_order_identity(vid, test_identity())
+            .expect("first identity must register");
         let identity = registry.get(&vid).expect("identity registered");
         assert_eq!(identity.client_order_id, ClientOrderId::from("O-1"));
         assert_eq!(identity.order_side, OrderSide::Buy);
         assert_eq!(
             registry.venue_order_id(&ClientOrderId::from("O-1")),
             Some(vid)
+        );
+    }
+
+    #[rstest]
+    fn test_registered_identity_is_immutable() {
+        let registry = OrderIdentityRegistry::default();
+        let venue_order_id = VenueOrderId::from("V-1");
+        let identity = test_identity();
+        registry
+            .register_order_identity(venue_order_id, identity)
+            .expect("first identity must register");
+
+        let conflicting = OrderIdentity {
+            instrument_id: InstrumentId::from("OTHER.POLYMARKET"),
+            ..identity
+        };
+        assert_eq!(
+            registry.register_order_identity(venue_order_id, conflicting),
+            Err(OrderIdentityConflict)
+        );
+        assert_eq!(registry.get(&venue_order_id), Some(identity));
+    }
+
+    #[rstest]
+    fn test_fill_identity_uses_tracker_identity_after_registry_eviction() {
+        let registry = OrderIdentityRegistry::default();
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("V-1");
+        let instrument_id = InstrumentId::from("TEST.POLYMARKET");
+        tracker.register(
+            venue_order_id,
+            Quantity::from("10"),
+            OrderSide::Buy,
+            instrument_id,
+            4,
+            4,
+        );
+
+        assert_eq!(
+            registry.resolve_fill_report(venue_order_id, instrument_id, None, &tracker,),
+            Ok(None)
+        );
+        assert_eq!(
+            registry.resolve_fill_report(
+                venue_order_id,
+                InstrumentId::from("OTHER.POLYMARKET"),
+                None,
+                &tracker,
+            ),
+            Err(OrderIdentityConflict)
         );
     }
 
