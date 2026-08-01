@@ -161,14 +161,24 @@ impl PolymarketExecutionClient {
         &self,
         requested_client_order_id: Option<ClientOrderId>,
         indexed_client_order_id: Option<ClientOrderId>,
+        instrument_id: InstrumentId,
         venue_order_id: VenueOrderId,
     ) -> bool {
-        if !client_order_ids_match_request(requested_client_order_id, None, indexed_client_order_id)
+        let registered_identity = self.order_identities.get(&venue_order_id);
+        if registered_identity.is_some_and(|identity| identity.instrument_id != instrument_id)
+            || !client_order_ids_match_request(
+                requested_client_order_id,
+                registered_identity.map(|identity| identity.client_order_id),
+                indexed_client_order_id,
+            )
         {
             return false;
         }
 
-        let Some(client_order_id) = requested_client_order_id.or(indexed_client_order_id) else {
+        let Some(client_order_id) = requested_client_order_id
+            .or(indexed_client_order_id)
+            .or_else(|| registered_identity.map(|identity| identity.client_order_id))
+        else {
             return true;
         };
         let cache = self.core.cache();
@@ -234,6 +244,7 @@ impl PolymarketExecutionClient {
         if !self.local_order_indexes_match_request(
             client_order_id,
             indexed_client_order_id,
+            instrument_id,
             venue_order_id,
         ) {
             log::error!(
@@ -476,6 +487,7 @@ impl PolymarketExecutionClient {
         if !self.local_order_indexes_match_request(
             Some(client_order_id),
             indexed_client_order_id,
+            instrument_id,
             requested_venue_order_id,
         ) {
             log::error!(
@@ -630,6 +642,7 @@ impl PolymarketExecutionClient {
         if !self.local_order_indexes_match_request(
             cmd.client_order_id,
             indexed_client_order_id,
+            instrument_id,
             venue_order_id,
         ) {
             log::error!(

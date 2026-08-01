@@ -161,15 +161,16 @@ pub(crate) fn build_fill_reports_from_trades(
 ) -> (Vec<FillReport>, FillBuildDiscards) {
     let mut reports = Vec::new();
     let mut discards = FillBuildDiscards::default();
-    let requested_asset_ids = instrument_filter.and_then(|filter_id| {
+    // Keep an unresolved scoped request as `Some(empty)`: `None` means an
+    // intentional account-wide pass and must not be inferred from missing state.
+    let requested_asset_ids = instrument_filter.map(|filter_id| {
         let snapshot = instruments.load();
-        let asset_ids = snapshot
+        snapshot
             .iter()
             .filter_map(|(asset_id, instrument)| {
                 (instrument.id() == filter_id).then_some(*asset_id)
             })
-            .collect::<Vec<_>>();
-        (!asset_ids.is_empty()).then_some(asset_ids)
+            .collect::<Vec<_>>()
     });
 
     for trade in trades {
@@ -1058,6 +1059,37 @@ mod tests {
 
         assert!(reports.is_empty());
         assert_eq!(discards.unowned_maker_trades, 0);
+    }
+
+    #[rstest]
+    fn unresolved_instrument_filter_owns_no_trade_diagnostics() {
+        let (instruments, instrument) = mapped_instrument();
+        let mut taker_trade = confirmed_maker_trade_for(&instrument);
+        taker_trade.trader_side = PolymarketLiquiditySide::Taker;
+        taker_trade.asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
+
+        let mut maker_trade = confirmed_maker_trade_for(&instrument);
+        disown_maker_orders(&mut maker_trade);
+        for maker_order in &mut maker_trade.maker_orders {
+            maker_order.asset_id = Ustr::from(COMPLEMENTARY_TOKEN);
+        }
+
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[taker_trade, maker_trade],
+            &fill_context(),
+            &instruments,
+            Some(InstrumentId::from("UNLOADED.POLYMARKET")),
+            None,
+            None,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(reports.is_empty());
+        assert!(
+            discards.findings().is_empty(),
+            "an unresolved scoped instrument must not inherit account-wide diagnostics"
+        );
     }
 
     /// A match carries every maker's order, so only the account's own becomes a report.

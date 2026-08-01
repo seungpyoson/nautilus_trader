@@ -6945,6 +6945,69 @@ async fn test_query_order_refuses_a_forward_index_without_cached_order() {
 
 #[rstest]
 #[tokio::test]
+async fn test_query_order_refuses_a_registry_identity_without_cached_order() {
+    let venue_order_id =
+        VenueOrderId::from("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12");
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let registered_client_order_id = ClientOrderId::from("O-REGISTERED-QUERY-CLIENT");
+    let order = make_limit_order(
+        registered_client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+    assert_order_event(rx.try_recv().unwrap(), "Submitted");
+    let accepted = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_order_event(accepted, "Accepted");
+
+    cache.borrow_mut().reset();
+    add_instrument_to_cache(&cache, instrument_id);
+
+    client
+        .query_order(QueryOrder::new(
+            TraderId::from("TESTER-001"),
+            Some(*POLYMARKET_CLIENT_ID),
+            StrategyId::from("S-001"),
+            instrument_id,
+            ClientOrderId::from("O-CONFLICTING-QUERY-CLIENT"),
+            Some(venue_order_id),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "a retained venue-keyed registry identity must remain authoritative when cache state is absent"
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_query_order_refuses_a_venue_indexed_to_another_client_order_id() {
     let venue_order_id = VenueOrderId::from("0xshared-query-venue-order");
     let state = TestServerState::default();
