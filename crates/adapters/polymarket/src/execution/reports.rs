@@ -95,15 +95,13 @@ fn venue_answer_matches_request(answered_order_id: &str, venue_order_id: VenueOr
 
 /// Whether every available local identity agrees with an order-scoped request.
 ///
-/// The request, order object, NT cache indexes, and adapter registry are
-/// independent lifecycle surfaces. A cached order is safe to consume only when
-/// every available client, instrument, and venue identity agrees.
+/// Registry identity is checked once by `local_order_indexes_match_request`;
+/// this pure check covers the cached object and NT indexes.
 fn cached_order_matches_request(
     cached_client_order_id: ClientOrderId,
     cached_instrument_id: InstrumentId,
     order_venue_order_id: Option<VenueOrderId>,
     cache_venue_order_id: Option<VenueOrderId>,
-    registry_venue_order_id: Option<VenueOrderId>,
     requested_client_order_id: Option<ClientOrderId>,
     indexed_client_order_id: Option<ClientOrderId>,
     instrument_id: InstrumentId,
@@ -119,22 +117,12 @@ fn cached_order_matches_request(
         return false;
     }
 
-    let known_venue_order_ids = [
-        order_venue_order_id,
-        cache_venue_order_id,
-        registry_venue_order_id,
-    ];
+    let known_venue_order_ids = [order_venue_order_id, cache_venue_order_id];
 
     known_venue_order_ids
         .iter()
         .flatten()
-        .next()
-        .is_some_and(|_| {
-            known_venue_order_ids
-                .iter()
-                .flatten()
-                .all(|known| *known == venue_order_id)
-        })
+        .all(|known| *known == venue_order_id)
 }
 
 impl PolymarketExecutionClient {
@@ -153,10 +141,7 @@ impl PolymarketExecutionClient {
         }
     }
 
-    /// Whether the independent cache and adapter indexes agree with the request.
-    ///
-    /// These indexes can outlive or precede the cached order object, so validate
-    /// them before optional order lookup rather than making the object the gate.
+    /// Whether every available local identity agrees with an order request.
     fn local_order_indexes_match_request(
         &self,
         requested_client_order_id: Option<ClientOrderId>,
@@ -164,49 +149,49 @@ impl PolymarketExecutionClient {
         instrument_id: InstrumentId,
         venue_order_id: VenueOrderId,
     ) -> bool {
-        let registered_identity = self.order_identities.get(&venue_order_id);
-        if registered_identity.is_some_and(|identity| identity.instrument_id != instrument_id)
-            || !client_order_ids_match_request(
-                requested_client_order_id,
-                registered_identity.map(|identity| identity.client_order_id),
-                indexed_client_order_id,
-            )
-        {
+        let Ok(client_order_id) = self.order_identities.resolve_order_request(
+            venue_order_id,
+            instrument_id,
+            requested_client_order_id,
+            indexed_client_order_id,
+        ) else {
             return false;
-        }
-
-        let Some(client_order_id) = requested_client_order_id
-            .or(indexed_client_order_id)
-            .or_else(|| registered_identity.map(|identity| identity.client_order_id))
-        else {
-            return true;
         };
-        let cache = self.core.cache();
-        let known_venue_order_ids = [
-            cache.venue_order_id(&client_order_id).copied(),
-            self.order_identities.venue_order_id(&client_order_id),
-        ];
 
-        known_venue_order_ids
-            .iter()
-            .flatten()
-            .all(|known| *known == venue_order_id)
+        client_order_id.is_none_or(|client_order_id| {
+            self.core
+                .cache()
+                .venue_order_id(&client_order_id)
+                .is_none_or(|known| *known == venue_order_id)
+        })
     }
 
     fn cached_filled_for_report(&self, report: &OrderStatusReport) -> Option<Quantity> {
         let cache = self.core.cache();
         let indexed_client_order_id = cache.client_order_id(&report.venue_order_id).copied();
+        if !self.local_order_indexes_match_request(
+            report.client_order_id,
+            indexed_client_order_id,
+            report.instrument_id,
+            report.venue_order_id,
+        ) {
+            log::error!(
+                "Local order identity does not match venue report order {} and instrument {}; \
+                 ignoring its filled quantity",
+                report.venue_order_id,
+                report.instrument_id,
+            );
+            return None;
+        }
         let client_order_id = report.client_order_id.or(indexed_client_order_id)?;
         let cached = cache.order(&client_order_id)?;
         let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
-        let registry_venue_order_id = self.order_identities.venue_order_id(&client_order_id);
 
         if !cached_order_matches_request(
             cached.client_order_id(),
             cached.instrument_id(),
             cached.venue_order_id(),
             cache_venue_order_id,
-            registry_venue_order_id,
             report.client_order_id,
             indexed_client_order_id,
             report.instrument_id,
@@ -262,16 +247,12 @@ impl PolymarketExecutionClient {
                 .cache()
                 .venue_order_id(&cached_client_order_id)
                 .copied();
-            let registry_venue_order_id = self
-                .order_identities
-                .venue_order_id(&cached_client_order_id);
 
             if !cached_order_matches_request(
                 cached_client_order_id,
                 cached.instrument_id(),
                 cached.venue_order_id(),
                 cache_venue_order_id,
-                registry_venue_order_id,
                 client_order_id,
                 indexed_client_order_id,
                 instrument_id,
@@ -499,15 +480,12 @@ impl PolymarketExecutionClient {
         let cached_filled = match cache.order(&client_order_id) {
             Some(order) => {
                 let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
-                let registry_venue_order_id =
-                    self.order_identities.venue_order_id(&client_order_id);
 
                 if !cached_order_matches_request(
                     order.client_order_id(),
                     order.instrument_id(),
                     order.venue_order_id(),
                     cache_venue_order_id,
-                    registry_venue_order_id,
                     Some(client_order_id),
                     indexed_client_order_id,
                     instrument_id,
@@ -524,6 +502,7 @@ impl PolymarketExecutionClient {
             }
             None => Quantity::zero(size_prec),
         };
+        let order_identities = self.order_identities.clone();
 
         self.spawn_task("query_order", async move {
             match http_client.get_order_optional(&venue_order_id).await {
@@ -606,6 +585,22 @@ impl PolymarketExecutionClient {
                         local_filled,
                         confirmed_filled,
                     );
+
+                    if order_identities
+                        .resolve_order_request(
+                            requested_venue_order_id,
+                            instrument_id,
+                            Some(client_order_id),
+                            indexed_client_order_id,
+                        )
+                        .is_err()
+                    {
+                        log::error!(
+                            "Requested order {client_order_id} changed local identity while \
+                             querying venue order {requested_venue_order_id}; reporting nothing"
+                        );
+                        return Ok(());
+                    }
                     emitter.send_order_status_report(report);
                 }
                 Ok(None) => {
@@ -719,15 +714,12 @@ impl PolymarketExecutionClient {
                 if let Some(ref cached) = cached {
                     let client_order_id = cached.client_order_id();
                     let cache_venue_order_id = cache.venue_order_id(&client_order_id).copied();
-                    let registry_venue_order_id =
-                        self.order_identities.venue_order_id(&client_order_id);
 
                     if !cached_order_matches_request(
                         cached.client_order_id(),
                         cached.instrument_id(),
                         cached.venue_order_id(),
                         cache_venue_order_id,
-                        registry_venue_order_id,
                         cmd.client_order_id,
                         indexed_client_order_id,
                         instrument_id,
@@ -772,6 +764,20 @@ impl PolymarketExecutionClient {
                 None
             };
             cap_order_report_filled_qty(&mut report, local_filled, confirmed_filled);
+            let indexed_client_order_id =
+                self.core.cache().client_order_id(&venue_order_id).copied();
+            if !self.local_order_indexes_match_request(
+                cmd.client_order_id,
+                indexed_client_order_id,
+                instrument_id,
+                venue_order_id,
+            ) {
+                log::error!(
+                    "Requested order identity changed while querying venue order \
+                     {venue_order_id}; reporting nothing"
+                );
+                return Ok(None);
+            }
             return Ok(Some(report));
         }
 

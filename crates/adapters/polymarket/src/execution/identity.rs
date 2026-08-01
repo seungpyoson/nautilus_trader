@@ -80,6 +80,9 @@ pub(crate) struct OrderIdentityRegistry {
     inner: Mutex<RegistryInner>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OrderIdentityConflict;
+
 #[derive(Debug, Default)]
 struct RegistryInner {
     identities: FifoCacheMap<VenueOrderId, OrderIdentity, 10_000>,
@@ -109,6 +112,53 @@ impl OrderIdentityRegistry {
             .identities
             .get(venue_order_id)
             .copied()
+    }
+
+    /// Resolves the client identity only when every registered identity agrees.
+    ///
+    /// Returns an error on any client, instrument, or venue contradiction.
+    /// The complete check uses one registry lock so the two indexes cannot drift
+    /// between independent reads.
+    pub(crate) fn resolve_order_request(
+        &self,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+        requested_client_order_id: Option<ClientOrderId>,
+        indexed_client_order_id: Option<ClientOrderId>,
+    ) -> Result<Option<ClientOrderId>, OrderIdentityConflict> {
+        let guard = self.inner.lock().expect(MUTEX_POISONED);
+        let registered_identity = guard.identities.get(&venue_order_id).copied();
+        if registered_identity.is_some_and(|identity| identity.instrument_id != instrument_id) {
+            return Err(OrderIdentityConflict);
+        }
+
+        let registered_client_order_id =
+            registered_identity.map(|identity| identity.client_order_id);
+        let known_client_order_ids = [
+            requested_client_order_id,
+            indexed_client_order_id,
+            registered_client_order_id,
+        ];
+        let resolved_client_order_id = known_client_order_ids.iter().flatten().next().copied();
+        if resolved_client_order_id.is_some_and(|expected| {
+            known_client_order_ids
+                .iter()
+                .flatten()
+                .any(|known| *known != expected)
+        }) {
+            return Err(OrderIdentityConflict);
+        }
+
+        if resolved_client_order_id.is_some_and(|client_order_id| {
+            guard
+                .client_to_venue
+                .get(&client_order_id)
+                .is_some_and(|known| *known != venue_order_id)
+        }) {
+            return Err(OrderIdentityConflict);
+        }
+
+        Ok(resolved_client_order_id)
     }
 
     /// Returns the latest venue order ID captured for a tracked client order.

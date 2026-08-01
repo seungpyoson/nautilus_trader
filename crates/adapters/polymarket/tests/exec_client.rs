@@ -195,6 +195,7 @@ struct TestServerState {
     open_order_ids: Arc<tokio::sync::Mutex<HashSet<String>>>,
     orders_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
     book_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    single_order_request_gate: Arc<RequestGate>,
     single_order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     trades_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
 }
@@ -239,6 +240,7 @@ impl Default for TestServerState {
             batch_order_request_gate: Arc::new(RequestGate::default()),
             open_order_ids: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             orders_response_override: Arc::new(tokio::sync::Mutex::new(None)),
+            single_order_request_gate: Arc::new(RequestGate::default()),
             single_order_response: Arc::new(tokio::sync::Mutex::new(None)),
             trades_response_override: Arc::new(tokio::sync::Mutex::new(None)),
             book_response: Arc::new(tokio::sync::Mutex::new(Some(json!({
@@ -392,6 +394,7 @@ async fn handle_get_orders(State(state): State<TestServerState>) -> Response {
 
 async fn handle_get_order(State(state): State<TestServerState>) -> Response {
     *state.last_path.lock().await = "/data/order".to_string();
+    state.single_order_request_gate.wait().await;
     let resp = state.single_order_response.lock().await;
     match resp.as_ref() {
         Some(v) => Json(v.clone()).into_response(),
@@ -1298,6 +1301,109 @@ async fn test_generate_order_status_reports_ignores_a_mismatched_cached_fill() {
         reports[0].filled_qty.is_zero(),
         "a cache entry for {cached_instrument_id} must not become fill evidence for \
          {reported_instrument_id}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_reports_ignore_a_reverse_registry_conflict() {
+    let venue_order_id_str = DEFAULT_ACCEPTED_ORDER_ID;
+    let state = TestServerState::default();
+    let mut venue_order = load_json("http_open_orders_page.json")["data"][0].clone();
+    venue_order["id"] = Value::String(venue_order_id_str.to_string());
+    venue_order["status"] = Value::String("MATCHED".to_string());
+    venue_order["original_size"] = Value::String("10.0000".to_string());
+    venue_order["size_matched"] = Value::String("10.0000".to_string());
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [venue_order],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument.clone());
+
+    let registered_client_order_id = ClientOrderId::from("O-BULK-REGISTERED");
+    let registered_order = make_limit_order(
+        registered_client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(registered_order.clone(), None, None, false)
+        .unwrap();
+    client
+        .submit_order(make_submit_cmd(&registered_order, instrument_id))
+        .unwrap();
+    assert_order_event(rx.try_recv().unwrap(), "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+
+    cache.borrow_mut().reset();
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+
+    let conflicting_client_order_id = ClientOrderId::from("O-BULK-CONFLICTING");
+    let mut conflicting_order = make_limit_order(
+        conflicting_client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(conflicting_order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut conflicting_order, venue_order_id_str);
+    let cached_fill = TestOrderEventStubs::filled(
+        &conflicting_order,
+        &instrument,
+        Some(TradeId::from("T-BULK-REGISTRY-CONFLICT")),
+        None,
+        Some(Price::from("0.5000")),
+        Some(Quantity::from("5.0000")),
+        Some(LiquiditySide::Taker),
+        None,
+        None,
+        Some(AccountId::from("POLYMARKET-001")),
+    );
+    cache.borrow_mut().update_order(&cached_fill).unwrap();
+
+    let reports = client
+        .generate_order_status_reports(&GenerateOrderStatusReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            open_only: false,
+            instrument_id: Some(instrument_id),
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert!(
+        reports[0].filled_qty.is_zero(),
+        "cached fill for {conflicting_client_order_id} must not override the registry owner \
+         {registered_client_order_id} of venue order {venue_order_id_str}"
     );
 }
 
@@ -7003,6 +7109,73 @@ async fn test_query_order_refuses_a_registry_identity_without_cached_order() {
             .await
             .is_err(),
         "a retained venue-keyed registry identity must remain authoritative when cache state is absent"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_order_rechecks_registry_identity_after_the_venue_answers() {
+    let venue_order_id = VenueOrderId::from(DEFAULT_ACCEPTED_ORDER_ID);
+    let state = TestServerState::default();
+    state.single_order_request_gate.enable();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let requested_client_order_id = ClientOrderId::from("O-RACING-QUERY");
+    client
+        .query_order(QueryOrder::new(
+            TraderId::from("TESTER-001"),
+            Some(*POLYMARKET_CLIENT_ID),
+            StrategyId::from("S-001"),
+            instrument_id,
+            requested_client_order_id,
+            Some(venue_order_id),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let gate = state.single_order_request_gate.clone();
+            async move { gate.started() == 1 }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let registered_client_order_id = ClientOrderId::from("O-RACING-SUBMIT");
+    let registered_order = make_limit_order(
+        registered_client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(registered_order.clone(), None, None, false)
+        .unwrap();
+    client
+        .submit_order(make_submit_cmd(&registered_order, instrument_id))
+        .unwrap();
+    assert_order_event(rx.try_recv().unwrap(), "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+
+    state.single_order_request_gate.release();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "a query for {requested_client_order_id} must not emit after {venue_order_id} becomes \
+         registered to {registered_client_order_id} during the HTTP request"
     );
 }
 
