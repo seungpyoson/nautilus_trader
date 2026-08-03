@@ -91,9 +91,11 @@ use rust_decimal::Decimal;
 use crate::{
     client::ExecutionClientAdapter,
     reconciliation::{
-        check_position_reconciliation, generate_external_order_status_events,
-        generate_reconciliation_order_events, generate_reconciliation_order_pre_fill_events,
+        ReconciliationReportIdentity, ReportOrderResolution, check_position_reconciliation,
+        generate_external_order_status_events, generate_reconciliation_order_events,
+        generate_reconciliation_order_pre_fill_events,
         generate_reconciliation_order_snapshot_events, reconcile_fill_report as reconcile_fill,
+        report_identity_matches_order, resolve_report_order,
     },
 };
 
@@ -101,65 +103,6 @@ const TIMER_SNAPSHOT_POSITIONS: &str = "ExecEngine_SNAPSHOT_POSITIONS";
 const TIMER_PURGE_CLOSED_ORDERS: &str = "ExecEngine_PURGE_CLOSED_ORDERS";
 const TIMER_PURGE_CLOSED_POSITIONS: &str = "ExecEngine_PURGE_CLOSED_POSITIONS";
 const TIMER_PURGE_ACCOUNT_EVENTS: &str = "ExecEngine_PURGE_ACCOUNT_EVENTS";
-
-#[derive(Clone, Copy)]
-struct ReconciliationReportIdentity {
-    instrument_id: InstrumentId,
-    client_order_id: Option<ClientOrderId>,
-    venue_order_id: VenueOrderId,
-    order_side: OrderSide,
-}
-
-enum ReportOrderResolution {
-    Matched(ClientOrderId),
-    External,
-    Conflict,
-}
-
-fn resolve_report_order(
-    cache: &Cache,
-    report: ReconciliationReportIdentity,
-) -> ReportOrderResolution {
-    let by_client = report
-        .client_order_id
-        .and_then(|id| cache.order(&id).map(|order| order.clone()));
-    let by_venue = cache
-        .client_order_id(&report.venue_order_id)
-        .and_then(|id| cache.order(id).map(|order| order.clone()));
-
-    let order = match (by_client, by_venue) {
-        (Some(client_order), Some(venue_order))
-            if client_order.client_order_id() != venue_order.client_order_id() =>
-        {
-            return ReportOrderResolution::Conflict;
-        }
-        (Some(order), _) | (None, Some(order)) => order,
-        (None, None) => return ReportOrderResolution::External,
-    };
-
-    if report_identity_matches_order(&order, report) {
-        ReportOrderResolution::Matched(order.client_order_id())
-    } else {
-        ReportOrderResolution::Conflict
-    }
-}
-
-fn report_identity_matches_order(order: &OrderAny, report: ReconciliationReportIdentity) -> bool {
-    let venue_id_matches = order.venue_order_id().is_none()
-        || order.venue_order_id() == Some(report.venue_order_id)
-        || order
-            .venue_order_ids()
-            .iter()
-            .any(|venue_order_id| **venue_order_id == report.venue_order_id);
-    let client_id_matches = report
-        .client_order_id
-        .is_none_or(|client_order_id| client_order_id == order.client_order_id());
-
-    order.instrument_id() == report.instrument_id
-        && order.order_side() == report.order_side
-        && client_id_matches
-        && venue_id_matches
-}
 
 /// Central execution engine responsible for orchestrating order routing and execution.
 ///
