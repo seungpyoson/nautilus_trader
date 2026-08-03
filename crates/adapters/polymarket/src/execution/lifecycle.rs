@@ -609,14 +609,14 @@ impl PolymarketExecutionClient {
     ) -> anyhow::Result<()> {
         let mut finalized = report.clone();
         finalized.status = PolymarketTradeStatus::Confirmed;
-        let (candidates, filtered) = build_fill_reports_from_trades(
+        let (candidates, findings) = build_fill_reports_from_trades(
             std::slice::from_ref(&finalized),
             &self.fill_context(),
             &self.shared_token_instruments,
             None,
             self.clock.get_time_ns(),
         );
-        if filtered != 0 || candidates.len() != fills.len() {
+        if !findings.is_empty() || candidates.len() != fills.len() {
             return Err(anyhow!(
                 "venue changed the fill set of restored trade {}",
                 report.id

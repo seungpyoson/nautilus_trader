@@ -68,3 +68,6 @@ class PolymarketMakerOrder(msgspec.Struct, frozen=True, omit_defaults=True):
     owner: str
     price: str
     side: PolymarketOrderSide | None = None
+
+    def is_owned_by(self, maker_address: str, api_key: str) -> bool:
+        return self.maker_address.casefold() == maker_address.casefold() or self.owner == api_key

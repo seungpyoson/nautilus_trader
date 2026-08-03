@@ -57,6 +57,33 @@ pub(crate) struct FillContext<'a> {
     pub clock: &'static AtomicTime,
 }
 
+/// Losses encountered while converting authenticated venue trades into fills.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FillBuildFindings {
+    /// Entries whose instrument was not loaded, so no report could be built.
+    pub unmapped_instruments: usize,
+    /// Confirmed maker trades holding none of this account's maker orders.
+    pub unowned_maker_trades: usize,
+}
+
+impl FillBuildFindings {
+    pub(crate) fn is_empty(self) -> bool {
+        self.unmapped_instruments == 0 && self.unowned_maker_trades == 0
+    }
+
+    pub(crate) fn report(self, level: log::Level, context: &str) {
+        if self.is_empty() {
+            return;
+        }
+        log::log!(
+            level,
+            "{context}: {} entr(ies) had no loaded instrument; {} confirmed maker trade(s) held no maker order owned by this account",
+            self.unmapped_instruments,
+            self.unowned_maker_trades,
+        );
+    }
+}
+
 /// Converts trade reports into fill reports: single implementation of maker/taker
 /// parsing used by both `generate_fill_reports()` and `generate_mass_status()`.
 pub(crate) fn build_fill_reports_from_trades(
@@ -65,7 +92,7 @@ pub(crate) fn build_fill_reports_from_trades(
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     instrument_filter: Option<InstrumentId>,
     ts_init: UnixNanos,
-) -> (Vec<FillReport>, usize) {
+) -> (Vec<FillReport>, FillBuildFindings) {
     build_fill_reports_for_status(
         trades,
         ctx,
@@ -81,7 +108,7 @@ pub(crate) fn build_pending_fill_reports_from_trades(
     ctx: &FillContext<'_>,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     ts_init: UnixNanos,
-) -> (Vec<FillReport>, usize) {
+) -> (Vec<FillReport>, FillBuildFindings) {
     build_fill_reports_for_status(
         trades,
         ctx,
@@ -114,9 +141,9 @@ fn build_fill_reports_for_status(
     instrument_filter: Option<InstrumentId>,
     ts_init: UnixNanos,
     status_selection: TradeStatusSelection,
-) -> (Vec<FillReport>, usize) {
+) -> (Vec<FillReport>, FillBuildFindings) {
     let mut reports = Vec::new();
-    let mut filtered = 0usize;
+    let mut findings = FillBuildFindings::default();
 
     for trade in trades {
         if !status_selection.includes(trade.status) {
@@ -126,8 +153,16 @@ fn build_fill_reports_for_status(
         let is_maker = trade.trader_side == PolymarketLiquiditySide::Maker;
 
         if is_maker {
+            if !trade
+                .maker_orders
+                .iter()
+                .any(|order| order.is_owned_by(ctx.user_address, ctx.api_key))
+            {
+                findings.unowned_maker_trades += 1;
+                continue;
+            }
             for mo in &trade.maker_orders {
-                if mo.maker_address != ctx.user_address && mo.owner != ctx.api_key {
+                if !mo.is_owned_by(ctx.user_address, ctx.api_key) {
                     continue;
                 }
                 let token_id = Ustr::from(mo.asset_id.as_str());
@@ -135,7 +170,7 @@ fn build_fill_reports_for_status(
                 let (instrument_id, price_prec, size_prec) = match instrument {
                     Some(i) => (i.id(), i.price_precision(), i.size_precision()),
                     None => {
-                        filtered += 1;
+                        findings.unmapped_instruments += 1;
                         continue;
                     }
                 };
@@ -178,7 +213,7 @@ fn build_fill_reports_for_status(
                         instrument_fee_exponent(&i),
                     ),
                     None => {
-                        filtered += 1;
+                        findings.unmapped_instruments += 1;
                         continue;
                     }
                 };
@@ -205,7 +240,7 @@ fn build_fill_reports_for_status(
         }
     }
 
-    (reports, filtered)
+    (reports, findings)
 }
 
 /// Converts open orders into order status reports.
@@ -352,8 +387,12 @@ pub(crate) async fn generate_mass_status(
         .await
         .context("failed to fetch trades for mass status")?;
 
-    let (fill_reports, fills_filtered) =
+    let (fill_reports, fill_findings) =
         build_fill_reports_from_trades(&trades, ctx, instruments, None, ts_init);
+    fill_findings.report(
+        log::Level::Warn,
+        "Mass-status generation lost fill evidence",
+    );
     let admitted_fills = local_orders.admit_reconciliation_fill_reports(fill_reports);
     let mut fill_reports = admitted_fills.artifacts;
 
@@ -426,11 +465,10 @@ pub(crate) async fn generate_mass_status(
         );
     } else {
         log::debug!(
-            "Generated mass status: {} orders ({} filtered), {} fills ({} filtered), {} positions",
+            "Generated mass status: {} orders ({} filtered), {} fills, {} positions",
             order_reports.len(),
             orders_filtered,
             fill_reports.len(),
-            fills_filtered,
             position_reports.len(),
         );
     }

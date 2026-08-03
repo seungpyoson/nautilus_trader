@@ -87,7 +87,7 @@ fn build_recovery_fill_reports(
             }
     }) {
         let trade = std::slice::from_ref(trade);
-        let (built, _) = match status {
+        let (built, findings) = match status {
             RecoveryTradeStatus::Pending => {
                 build_pending_fill_reports_from_trades(trade, ctx, instruments, ts_init)
             }
@@ -99,7 +99,11 @@ fn build_recovery_fill_reports(
             .into_iter()
             .filter(|fill| fill.venue_order_id == venue_order_id)
             .collect();
-        unresolved_identity |= matching.is_empty();
+        findings.report(
+            log::Level::Warn,
+            "Terminal trade recovery lost fill evidence",
+        );
+        unresolved_identity |= !findings.is_empty() || matching.is_empty();
         reports.extend(matching);
     }
 
@@ -662,12 +666,16 @@ impl PolymarketExecutionClient {
             .context("failed to fetch trades")?;
 
         let ctx = self.fill_context();
-        let (reports, _) = build_fill_reports_from_trades(
+        let (reports, findings) = build_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
             cmd.instrument_id,
             self.clock.get_time_ns(),
+        );
+        findings.report(
+            log::Level::Warn,
+            "Fill-report generation lost fill evidence",
         );
 
         let admitted = self.local_orders.admit_reconciliation_fill_reports(reports);
@@ -756,8 +764,12 @@ async fn fetch_confirmed_fill_reports(
         .get_trades(params)
         .await
         .context("failed to fetch confirmed trades")?;
-    let (reports, _) =
+    let (reports, findings) =
         build_fill_reports_from_trades(&trades, ctx, token_instruments, instrument_id, ts_init);
+    findings.report(
+        log::Level::Warn,
+        "Confirmed-fill retrieval lost fill evidence",
+    );
     let admitted = local_orders.admit_reconciliation_fill_reports(reports);
     if admitted.conflicts > 0 {
         log::warn!(

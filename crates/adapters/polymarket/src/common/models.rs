@@ -63,6 +63,16 @@ pub struct PolymarketMakerOrder {
     pub side: Option<PolymarketOrderSide>,
 }
 
+impl PolymarketMakerOrder {
+    /// Returns whether this maker-order leg belongs to the configured account.
+    ///
+    /// Ethereum addresses are hexadecimal identifiers and therefore compare
+    /// without regard to display casing. API keys remain exact identifiers.
+    pub fn is_owned_by(&self, user_address: &str, api_key: &str) -> bool {
+        self.maker_address.eq_ignore_ascii_case(user_address) || self.owner == api_key
+    }
+}
+
 /// Human-readable label for a Polymarket instrument.
 #[derive(Debug, Clone)]
 pub struct PolymarketLabel {

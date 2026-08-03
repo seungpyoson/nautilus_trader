@@ -731,7 +731,7 @@ mod tests {
             clock: nautilus_core::time::get_atomic_clock_realtime(),
         };
 
-        let (reports, _) = crate::execution::reconciliation::build_fill_reports_from_trades(
+        let (reports, findings) = crate::execution::reconciliation::build_fill_reports_from_trades(
             &[trade],
             &ctx,
             &instruments,
@@ -740,6 +740,71 @@ mod tests {
         );
 
         assert!(reports.is_empty());
+        assert!(findings.is_empty());
+    }
+
+    #[rstest]
+    fn test_confirmed_maker_trade_matches_address_without_case_sensitivity() {
+        let instrument = test_instrument();
+        let mut trade: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
+        trade.trader_side = crate::common::enums::PolymarketLiquiditySide::Maker;
+        for maker_order in &mut trade.maker_orders {
+            maker_order.owner = "different-api-key".to_string();
+        }
+
+        let instruments = AtomicMap::new();
+        instruments.insert(trade.asset_id, instrument);
+        let ctx = crate::execution::reconciliation::FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: "0X70997970C51812DC3A010C7D01B50E0D17DC79C8",
+            api_key: "configured-api-key",
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let (reports, findings) = crate::execution::reconciliation::build_fill_reports_from_trades(
+            &[trade],
+            &ctx,
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(findings.unowned_maker_trades, 0);
+    }
+
+    #[rstest]
+    fn test_confirmed_maker_trade_without_owned_order_is_reported_as_a_finding() {
+        let instrument = test_instrument();
+        let mut trade: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
+        trade.trader_side = crate::common::enums::PolymarketLiquiditySide::Maker;
+        for maker_order in &mut trade.maker_orders {
+            maker_order.maker_address = "0x0000000000000000000000000000000000000000".to_string();
+            maker_order.owner = "different-api-key".to_string();
+        }
+
+        let instruments = AtomicMap::new();
+        instruments.insert(trade.asset_id, instrument);
+        let ctx = crate::execution::reconciliation::FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            api_key: "configured-api-key",
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let (reports, findings) = crate::execution::reconciliation::build_fill_reports_from_trades(
+            &[trade],
+            &ctx,
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(reports.is_empty());
+        assert_eq!(findings.unowned_maker_trades, 1);
+        assert_eq!(findings.unmapped_instruments, 0);
     }
 
     #[rstest]

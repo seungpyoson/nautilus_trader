@@ -223,7 +223,7 @@ class PolymarketUserTrade(msgspec.Struct, tag="trade", tag_field="event_type", f
             user_order_ids = [
                 order.order_id
                 for order in self.maker_orders
-                if order.maker_address == maker_address or order.owner == api_key
+                if order.is_owned_by(maker_address, api_key)
             ]
         return user_order_ids
 

@@ -782,6 +782,21 @@ def test_maker_order_without_side_omits_field_in_encoded_json() -> None:
     assert encoded["asset_id"] == "x"
 
 
+def test_maker_order_ownership_ignores_address_case() -> None:
+    order = PolymarketMakerOrder(
+        asset_id="asset",
+        fee_rate_bps="0",
+        maker_address="0xAbCd",
+        matched_amount="1",
+        order_id="order",
+        outcome="Yes",
+        owner="different-api-key",
+        price="0.5",
+    )
+
+    assert order.is_owned_by("0xaBcD", "configured-api-key")
+
+
 def test_parse_user_trade_to_dict() -> None:
     # Arrange
     data = pkgutil.get_data(
