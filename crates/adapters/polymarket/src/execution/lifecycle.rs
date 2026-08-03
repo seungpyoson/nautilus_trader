@@ -22,7 +22,7 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use indexmap::IndexMap;
 use nautilus_common::{
     live::{runner::get_exec_event_sender, runtime::get_runtime},
@@ -40,10 +40,19 @@ use ustr::Ustr;
 
 use super::PolymarketExecutionClient;
 use crate::{
-    execution::{local_orders::OrderIdentity, reports::fetch_and_emit_account_state},
-    http::{clob::HeartbeatResponse, error::Error as HttpError},
+    common::enums::PolymarketTradeStatus,
+    execution::{
+        local_orders::OrderIdentity,
+        parse::{parse_timestamp, serialize_info},
+        reconciliation::build_fill_reports_from_trades,
+        reports::fetch_and_emit_account_state,
+    },
+    http::{clob::HeartbeatResponse, error::Error as HttpError, query::GetTradesParams},
     websocket::{
-        dispatch::{WsDispatchContext, dispatch_user_message},
+        dispatch::{
+            RestoredTradeSettlementAction, WsDispatchContext, build_order_fill_confirmed,
+            build_order_fill_voided, dispatch_user_message,
+        },
         messages::PolymarketWsMessage,
     },
 };
@@ -51,6 +60,13 @@ use crate::{
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const HEARTBEAT_TRANSPORT_FAILURE_LIMIT: u32 = 2;
+
+#[derive(Debug)]
+struct RestoredTradeSettlement {
+    trade_id: String,
+    key: String,
+    fills: Vec<OrderFilled>,
+}
 
 impl PolymarketExecutionClient {
     fn start_heartbeat_task(&mut self) {
@@ -389,7 +405,7 @@ impl PolymarketExecutionClient {
         log::debug!("Loaded {} instruments from cache", instruments.len());
     }
 
-    pub(super) fn load_orders_from_cache(&self) {
+    fn load_orders_from_cache(&self) -> Vec<RestoredTradeSettlement> {
         let cache = self.core.cache();
         let orders: Vec<_> = cache
             .orders(
@@ -404,7 +420,8 @@ impl PolymarketExecutionClient {
             .collect();
         drop(cache);
 
-        let mut matched_fills: AHashMap<String, Vec<OrderFilled>> = AHashMap::new();
+        let mut matched_fills: AHashMap<String, (String, Vec<OrderFilled>)> = AHashMap::new();
+        let mut confirmed_trades = AHashSet::new();
         let mut voided_trades = AHashSet::new();
 
         for order in &orders {
@@ -433,8 +450,23 @@ impl PolymarketExecutionClient {
             for event in order.events() {
                 match event {
                     OrderEventAny::Filled(fill) => {
-                        if let Some(key) = polymarket_trade_key(fill.info.as_ref()) {
-                            matched_fills.entry(key).or_default().push(fill.clone());
+                        if let Some((trade_id, key)) = polymarket_trade_identity(fill.info.as_ref())
+                        {
+                            if polymarket_trade_status(fill.info.as_ref())
+                                == Some(PolymarketTradeStatus::Confirmed)
+                            {
+                                confirmed_trades.insert(key.clone());
+                            }
+                            matched_fills
+                                .entry(key)
+                                .or_insert_with(|| (trade_id, Vec::new()))
+                                .1
+                                .push(fill.clone());
+                        }
+                    }
+                    OrderEventAny::FillConfirmed(confirmed) => {
+                        if let Some(key) = polymarket_trade_key(confirmed.info.as_ref()) {
+                            confirmed_trades.insert(key);
                         }
                     }
                     OrderEventAny::FillVoided(voided) => {
@@ -448,18 +480,168 @@ impl PolymarketExecutionClient {
         }
 
         let mut state = self.ws_dispatch_state.lock().expect(MUTEX_POISONED);
+        for key in &voided_trades {
+            state.restore_voided_trade(key.clone());
+        }
 
-        for (key, fills) in matched_fills {
-            if !voided_trades.contains(&key) {
-                state.restore_matched_trade(key, fills);
+        let mut settlements = Vec::new();
+        for (key, (trade_id, fills)) in matched_fills {
+            if voided_trades.contains(&key) {
+                continue;
+            }
+            if confirmed_trades.contains(&key) {
+                let _ = state.restore_trade_settlement(
+                    &trade_id,
+                    key,
+                    fills,
+                    PolymarketTradeStatus::Confirmed,
+                );
+                continue;
+            }
+            settlements.push(RestoredTradeSettlement {
+                trade_id,
+                key,
+                fills,
+            });
+        }
+
+        drop(state);
+
+        log::debug!("Loaded {} order lifecycles from cache", orders.len());
+
+        settlements
+    }
+
+    async fn revalidate_restored_trade_settlements(
+        &self,
+        settlements: Vec<RestoredTradeSettlement>,
+    ) -> anyhow::Result<()> {
+        for settlement in settlements {
+            let reports = self
+                .http_client
+                .get_trades(GetTradesParams {
+                    id: Some(settlement.trade_id.clone()),
+                    ..GetTradesParams::default()
+                })
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to revalidate restored trade {}",
+                        settlement.trade_id
+                    )
+                })?;
+            let mut exact_reports = reports
+                .iter()
+                .filter(|report| report.id == settlement.trade_id);
+            let report = exact_reports.next().ok_or_else(|| {
+                anyhow!(
+                    "restored trade {} was absent from the venue response",
+                    settlement.trade_id
+                )
+            })?;
+            if exact_reports.next().is_some() {
+                return Err(anyhow!(
+                    "venue returned duplicate rows for restored trade {}",
+                    settlement.trade_id
+                ));
+            }
+            let venue_key = format!("{}-{}", report.id, report.taker_order_id);
+            if venue_key != settlement.key {
+                return Err(anyhow!(
+                    "venue changed the identity of restored trade {}",
+                    settlement.trade_id
+                ));
+            }
+            self.validate_restored_trade_fills(report, &settlement.fills)?;
+
+            let action = self
+                .ws_dispatch_state
+                .lock()
+                .expect(MUTEX_POISONED)
+                .restore_trade_settlement(
+                    &settlement.trade_id,
+                    settlement.key,
+                    settlement.fills,
+                    report.status,
+                );
+
+            let ts_event =
+                parse_timestamp(&report.last_update).unwrap_or_else(|| self.clock.get_time_ns());
+            let ts_init = self.clock.get_time_ns();
+            let info = serialize_info(report);
+            match action {
+                RestoredTradeSettlementAction::Pending => {}
+                RestoredTradeSettlementAction::Confirmed(fills) => {
+                    for fill in fills {
+                        let mut confirmed =
+                            build_order_fill_confirmed(&fill, ts_event, ts_init, info.clone());
+                        confirmed.causation_id = Some(fill.event_id);
+                        self.emitter
+                            .send_order_event(OrderEventAny::FillConfirmed(confirmed));
+                    }
+                }
+                RestoredTradeSettlementAction::Failed(fills) => {
+                    for fill in fills {
+                        self.local_orders
+                            .reverse_fill(&fill.venue_order_id, fill.last_qty);
+                        let mut voided = build_order_fill_voided(
+                            &fill,
+                            &settlement.trade_id,
+                            ts_event,
+                            ts_init,
+                            info.clone(),
+                        );
+                        voided.causation_id = Some(fill.event_id);
+                        self.emitter
+                            .send_order_event(OrderEventAny::FillVoided(voided));
+                    }
+                }
             }
         }
 
-        for key in voided_trades {
-            state.restore_voided_trade(key);
+        Ok(())
+    }
+
+    fn validate_restored_trade_fills(
+        &self,
+        report: &crate::http::models::PolymarketTradeReport,
+        fills: &[OrderFilled],
+    ) -> anyhow::Result<()> {
+        let mut finalized = report.clone();
+        finalized.status = PolymarketTradeStatus::Confirmed;
+        let (candidates, filtered) = build_fill_reports_from_trades(
+            std::slice::from_ref(&finalized),
+            &self.fill_context(),
+            &self.shared_token_instruments,
+            None,
+            self.clock.get_time_ns(),
+        );
+        if filtered != 0 || candidates.len() != fills.len() {
+            return Err(anyhow!(
+                "venue changed the fill set of restored trade {}",
+                report.id
+            ));
         }
 
-        log::debug!("Loaded {} order lifecycles from cache", orders.len());
+        for fill in fills {
+            let mut matches = candidates.iter().filter(|candidate| {
+                candidate.trade_id == fill.trade_id
+                    && candidate.venue_order_id == fill.venue_order_id
+                    && candidate.instrument_id == fill.instrument_id
+                    && candidate.order_side == fill.order_side
+                    && candidate.last_qty == fill.last_qty
+                    && candidate.last_px == fill.last_px
+                    && candidate.liquidity_side == fill.liquidity_side
+            });
+            if matches.next().is_none() || matches.next().is_some() {
+                return Err(anyhow!(
+                    "venue changed a fill identity of restored trade {}",
+                    report.id
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     pub(super) fn start_client(&mut self) {
@@ -513,7 +695,9 @@ impl PolymarketExecutionClient {
         self.stopping.store(false, Ordering::Release);
 
         self.load_instruments_from_cache();
-        self.load_orders_from_cache();
+        let settlements = self.load_orders_from_cache();
+        self.revalidate_restored_trade_settlements(settlements)
+            .await?;
         self.core.set_instruments_initialized();
 
         self.start_ws_stream().await?;
@@ -648,10 +832,18 @@ async fn run_heartbeats(
 }
 
 fn polymarket_trade_key(info: Option<&IndexMap<Ustr, Ustr>>) -> Option<String> {
+    polymarket_trade_identity(info).map(|(_, key)| key)
+}
+
+fn polymarket_trade_identity(info: Option<&IndexMap<Ustr, Ustr>>) -> Option<(String, String)> {
     let info = info?;
     let trade_id = info.get(&Ustr::from("id"))?;
     let taker_order_id = info.get(&Ustr::from("taker_order_id"))?;
-    Some(format!("{trade_id}-{taker_order_id}"))
+    Some((trade_id.to_string(), format!("{trade_id}-{taker_order_id}")))
+}
+
+fn polymarket_trade_status(info: Option<&IndexMap<Ustr, Ustr>>) -> Option<PolymarketTradeStatus> {
+    info?.get(&Ustr::from("status"))?.as_str().parse().ok()
 }
 
 fn upsert_execution_lookup(
@@ -752,7 +944,10 @@ mod tests {
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
         enums::{AccountType, OmsType, OrderSide, OrderStatus, PositionSide, TimeInForce},
-        events::{OrderEventAny, PositionClosed, PositionEvent, order::spec::OrderFillVoidedSpec},
+        events::{
+            OrderEventAny, OrderFillConfirmed, PositionClosed, PositionEvent,
+            order::spec::OrderFillVoidedSpec,
+        },
         identifiers::{
             AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId,
             TraderId, VenueOrderId,
@@ -1106,7 +1301,7 @@ mod tests {
                 .unwrap()
         };
 
-        client.load_orders_from_cache();
+        let _ = client.load_orders_from_cache();
 
         let key = "trade-restart-V-001";
         let identity = client
@@ -1132,6 +1327,76 @@ mod tests {
         assert!(state.processed_fills.contains(&key.to_string()));
         assert_eq!(state.matched_fill_count(key), 0);
         assert!(state.is_voided_trade(key));
+    }
+
+    #[rstest]
+    fn load_orders_from_cache_does_not_requery_durably_confirmed_fill() {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xCONFIRMED", false, false);
+        let venue_order_id = VenueOrderId::from("V-001");
+        let trade_id = TradeId::from("trade-confirmed");
+
+        let order = {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            let order = cache_accepted_open_order(&mut cache, instrument.id());
+            let mut event = TestOrderEventStubs::filled(
+                &order,
+                &instrument,
+                None,
+                None,
+                Some(ModelPrice::from("0.5000")),
+                None,
+                None,
+                None,
+                None,
+                Some(AccountId::from("POLYMARKET-001")),
+            );
+            let OrderEventAny::Filled(ref mut fill) = event else {
+                panic!("expected filled event");
+            };
+            fill.trade_id = trade_id;
+            fill.info = Some(IndexMap::from([
+                (Ustr::from("id"), Ustr::from(trade_id.as_str())),
+                (Ustr::from("taker_order_id"), Ustr::from("V-001")),
+                (Ustr::from("status"), Ustr::from("MATCHED")),
+            ]));
+            let OrderEventAny::Filled(fill) = event else {
+                unreachable!();
+            };
+            cache
+                .update_order(&OrderEventAny::Filled(fill.clone()))
+                .unwrap();
+            let confirmed = OrderFillConfirmed::new(
+                fill.trader_id,
+                fill.strategy_id,
+                fill.instrument_id,
+                fill.client_order_id,
+                fill.venue_order_id,
+                fill.account_id,
+                fill.trade_id,
+                Some(IndexMap::from([
+                    (Ustr::from("id"), Ustr::from(trade_id.as_str())),
+                    (Ustr::from("taker_order_id"), Ustr::from("V-001")),
+                    (Ustr::from("status"), Ustr::from("CONFIRMED")),
+                ])),
+                UUID4::new(),
+                UnixNanos::from(1),
+                UnixNanos::from(2),
+                false,
+            );
+            cache
+                .update_order(&OrderEventAny::FillConfirmed(confirmed))
+                .unwrap()
+        };
+
+        let settlements = client.load_orders_from_cache();
+        let state = client.ws_dispatch_state.lock().expect(MUTEX_POISONED);
+
+        assert!(settlements.is_empty());
+        assert_eq!(state.matched_fill_count("trade-confirmed-V-001"), 0);
+        assert!(state.is_confirmed_trade(trade_id.as_str(), venue_order_id));
+        assert!(order.filled_qty() > Quantity::zero(order.quantity().precision));
     }
 
     #[rstest]

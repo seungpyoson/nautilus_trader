@@ -15,6 +15,7 @@
 
 //! Parsing functions for Polymarket execution reports.
 
+use indexmap::IndexMap;
 use nautilus_core::{
     UUID4, UnixNanos,
     datetime::{NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND},
@@ -27,6 +28,8 @@ use nautilus_model::{
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
+use serde::Serialize;
+use ustr::Ustr;
 
 use crate::{
     common::{
@@ -46,6 +49,20 @@ pub const fn parse_liquidity_side(side: PolymarketLiquiditySide) -> LiquiditySid
         PolymarketLiquiditySide::Maker => LiquiditySide::Maker,
         PolymarketLiquiditySide::Taker => LiquiditySide::Taker,
     }
+}
+
+pub(crate) fn serialize_info<T: Serialize>(value: &T) -> Option<IndexMap<Ustr, Ustr>> {
+    let value = serde_json::to_value(value).ok()?;
+    let object = value.as_object()?;
+    let mut info = IndexMap::with_capacity(object.len());
+    for (key, value) in object {
+        let value = match value {
+            serde_json::Value::String(value) => value.clone(),
+            other => other.to_string(),
+        };
+        info.insert(Ustr::from(key.as_str()), Ustr::from(value.as_str()));
+    }
+    Some(info)
 }
 
 /// Resolves the Nautilus order status from Polymarket status and event type.

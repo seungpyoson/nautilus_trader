@@ -40,6 +40,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use futures_util::StreamExt;
+use indexmap::IndexMap;
 use nautilus_common::{
     cache::{Cache, INSTRUMENT_NOT_FOUND, InstrumentLookupError},
     clients::ExecutionClient,
@@ -60,12 +61,12 @@ use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::{AccountAny, cash::CashAccount},
     enums::{
-        AccountType, AssetClass, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
-        TriggerType,
+        AccountType, AssetClass, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
+        TimeInForce, TriggerType,
     },
     events::{AccountState, OrderEventAny, OrderPendingCancel},
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TraderId,
+        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TradeId, TraderId,
         VenueOrderId,
     },
     instruments::{BinaryOption, InstrumentAny},
@@ -89,6 +90,7 @@ use nautilus_polymarket::{
 use rstest::rstest;
 use rust_decimal_macros::dec;
 use serde_json::{Value, json};
+use ustr::Ustr;
 
 const TEST_PRIVATE_KEY: &str = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 const TEST_CHUNK_PRIVATE_KEY: &str =
@@ -3229,6 +3231,151 @@ async fn connect_and_restore_local_orders(
     add_test_account_to_cache(cache, AccountId::from("POLYMARKET-001"));
     client.start().unwrap();
     client.connect().await.unwrap();
+}
+
+fn cache_provisional_fill(
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    venue_order_id: VenueOrderId,
+    trade_id: TradeId,
+) {
+    let mut order = make_limit_order(
+        "O-RESTART-PROVISIONAL",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(cache, &mut order, venue_order_id.as_str());
+
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    let mut filled = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        None,
+        None,
+        Some(Price::from("0.5000")),
+        Some(Quantity::new(10.0, 4)),
+        Some(LiquiditySide::Taker),
+        None,
+        None,
+        Some(AccountId::from("POLYMARKET-001")),
+    );
+    let OrderEventAny::Filled(ref mut fill) = filled else {
+        panic!("expected filled event");
+    };
+    fill.trade_id = trade_id;
+    fill.info = Some(IndexMap::from([
+        (Ustr::from("id"), Ustr::from(trade_id.as_str())),
+        (
+            Ustr::from("taker_order_id"),
+            Ustr::from(venue_order_id.as_str()),
+        ),
+        (Ustr::from("status"), Ustr::from("MATCHED")),
+    ]));
+    cache.borrow_mut().update_order(&filled).unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_revalidates_provisional_fill_and_voids_failed_trade() {
+    let state = TestServerState::default();
+    let venue_order_id = VenueOrderId::from(DEFAULT_ACCEPTED_ORDER_ID);
+    let trade_id = TradeId::from("trade-restart-failed");
+    let mut trades = load_json("http_trades_page.json");
+    trades["data"][0]["id"] = Value::String(trade_id.to_string());
+    trades["data"][0]["taker_order_id"] = Value::String(venue_order_id.to_string());
+    trades["data"][0]["status"] = Value::String("FAILED".to_string());
+    *state.trades_response_override.lock().await = Some(trades);
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    cache_provisional_fill(&cache, instrument_id, venue_order_id, trade_id);
+
+    connect_and_restore_local_orders(&mut client, &cache).await;
+
+    let event = assert_order_event(recv_execution_event(&mut rx).await, "FillVoided");
+    let OrderEventAny::FillVoided(voided) = event else {
+        panic!("expected fill-voided event");
+    };
+    assert_eq!(voided.trade_id, trade_id);
+    assert_eq!(voided.venue_order_id, venue_order_id);
+    assert_eq!(
+        state.last_query.lock().await.get("id").map(String::as_str),
+        Some(trade_id.as_str())
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_persists_confirmation_for_provisional_fill() {
+    let state = TestServerState::default();
+    let venue_order_id = VenueOrderId::from(DEFAULT_ACCEPTED_ORDER_ID);
+    let trade_id = TradeId::from("trade-restart-confirmed");
+    let mut trades = load_json("http_trades_page.json");
+    trades["data"][0]["id"] = Value::String(trade_id.to_string());
+    trades["data"][0]["taker_order_id"] = Value::String(venue_order_id.to_string());
+    trades["data"][0]["status"] = Value::String("CONFIRMED".to_string());
+    *state.trades_response_override.lock().await = Some(trades);
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    cache_provisional_fill(&cache, instrument_id, venue_order_id, trade_id);
+
+    connect_and_restore_local_orders(&mut client, &cache).await;
+
+    let event = assert_order_event(recv_execution_event(&mut rx).await, "FillConfirmed");
+    let OrderEventAny::FillConfirmed(confirmed) = event else {
+        panic!("expected fill-confirmed event");
+    };
+    assert_eq!(confirmed.trade_id, trade_id);
+    assert_eq!(confirmed.venue_order_id, venue_order_id);
+    assert_eq!(
+        state.last_query.lock().await.get("id").map(String::as_str),
+        Some(trade_id.as_str())
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_refuses_changed_provisional_fill_identity() {
+    let state = TestServerState::default();
+    let venue_order_id = VenueOrderId::from(DEFAULT_ACCEPTED_ORDER_ID);
+    let trade_id = TradeId::from("trade-restart-changed");
+    let mut trades = load_json("http_trades_page.json");
+    trades["data"][0]["id"] = Value::String(trade_id.to_string());
+    trades["data"][0]["taker_order_id"] = Value::String(venue_order_id.to_string());
+    trades["data"][0]["status"] = Value::String("CONFIRMED".to_string());
+    trades["data"][0]["side"] = Value::String("SELL".to_string());
+    *state.trades_response_override.lock().await = Some(trades);
+
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    cache_provisional_fill(&cache, instrument_id, venue_order_id, trade_id);
+
+    let error = client
+        .connect()
+        .await
+        .expect_err("identity drift must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("venue changed a fill identity of restored trade"),
+        "unexpected error: {error}"
+    );
 }
 
 fn assert_order_event(event: ExecutionEvent, expected: &str) -> OrderEventAny {

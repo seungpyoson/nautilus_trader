@@ -34,8 +34,8 @@ use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
     enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
     events::{
-        OrderAccepted, OrderCanceled, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled,
-        OrderRejected, OrderUpdated,
+        OrderAccepted, OrderCanceled, OrderEventAny, OrderExpired, OrderFillConfirmed,
+        OrderFillVoided, OrderFilled, OrderRejected, OrderUpdated,
     },
     identifiers::{AccountId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
@@ -59,7 +59,7 @@ use crate::{
         local_orders::{ArtifactAdmission, LocalOrderCoordinator, OrderIdentity},
         parse::{
             build_maker_fill_report, compute_commission, determine_order_side,
-            instrument_fee_exponent, instrument_taker_fee, parse_liquidity_side,
+            instrument_fee_exponent, instrument_taker_fee, parse_liquidity_side, serialize_info,
         },
     },
 };
@@ -83,6 +83,12 @@ pub(crate) struct WsDispatchState {
     terminal_cancel_reports: FifoCacheMap<VenueOrderId, OrderStatusReport, 10_000>,
 }
 
+pub(crate) enum RestoredTradeSettlementAction {
+    Pending,
+    Confirmed(Vec<OrderFilled>),
+    Failed(Vec<OrderFilled>),
+}
+
 impl WsDispatchState {
     pub(crate) fn restore_matched_trade(&mut self, key: String, fills: Vec<OrderFilled>) {
         self.processed_fills.add(key.clone());
@@ -94,6 +100,31 @@ impl WsDispatchState {
         self.matched_fills.remove(&key);
         self.voided_trades.add(key);
     }
+
+    pub(crate) fn restore_trade_settlement(
+        &mut self,
+        trade_id: &str,
+        key: String,
+        fills: Vec<OrderFilled>,
+        status: PolymarketTradeStatus,
+    ) -> RestoredTradeSettlementAction {
+        if status == PolymarketTradeStatus::Failed {
+            self.restore_voided_trade(key);
+            return RestoredTradeSettlementAction::Failed(fills);
+        }
+
+        if status.is_finalized() {
+            self.processed_fills.add(key);
+            for fill in &fills {
+                self.confirmed_trades
+                    .add(confirmed_trade_key(trade_id, fill.venue_order_id));
+            }
+            return RestoredTradeSettlementAction::Confirmed(fills);
+        }
+
+        self.restore_matched_trade(key, fills);
+        RestoredTradeSettlementAction::Pending
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +135,11 @@ impl WsDispatchState {
 
     pub(crate) fn is_voided_trade(&self, key: &str) -> bool {
         self.voided_trades.contains(&key.to_string())
+    }
+
+    pub(crate) fn is_confirmed_trade(&self, trade_id: &str, venue_order_id: VenueOrderId) -> bool {
+        self.confirmed_trades
+            .contains(&confirmed_trade_key(trade_id, venue_order_id))
     }
 }
 
@@ -412,10 +448,18 @@ fn confirm_trade(
         }
     }
 
+    let mut newly_confirmed_fills = Vec::new();
+    if let Some(fills) = state.matched_fills.get(&dedup_key.to_string()) {
+        for fill in fills.clone() {
+            let confirmed_key = confirmed_trade_key(&trade.id, fill.venue_order_id);
+            if !state.confirmed_trades.contains(&confirmed_key) {
+                state.confirmed_trades.add(confirmed_key);
+                newly_confirmed_fills.push(fill);
+            }
+        }
+    }
+
     for venue_order_id in &confirmed_local_venues {
-        state
-            .confirmed_trades
-            .add(confirmed_trade_key(&trade.id, *venue_order_id));
         emit_quantity_normalization_if_ready(*venue_order_id, ctx, state);
     }
 
@@ -425,6 +469,11 @@ fn confirm_trade(
     {
         emit_taker_terminal_status(trade, ctx, ts_event);
     }
+
+    for fill in newly_confirmed_fills {
+        emit_order_fill_confirmed(&fill, trade, ts_event, ctx);
+    }
+    state.matched_fills.remove(&dedup_key.to_string());
 }
 
 fn confirmed_trade_key(trade_id: &str, venue_order_id: VenueOrderId) -> String {
@@ -838,14 +887,72 @@ fn emit_order_fill_voided(
     ctx: &WsDispatchContext<'_>,
 ) {
     let ts_event = parse_timestamp_ms(&trade.timestamp).unwrap_or_else(|_| ctx.clock.get_time_ns());
-    let mut voided = OrderFillVoided::new(
+    let mut voided = build_order_fill_voided(
+        fill,
+        &trade.id,
+        ts_event,
+        ctx.clock.get_time_ns(),
+        trade_fill_info(trade),
+    );
+    voided.causation_id = causation_id;
+    ctx.emitter
+        .send_order_event(OrderEventAny::FillVoided(voided));
+}
+
+fn emit_order_fill_confirmed(
+    fill: &OrderFilled,
+    trade: &PolymarketUserTrade,
+    ts_event: UnixNanos,
+    ctx: &WsDispatchContext<'_>,
+) {
+    let mut confirmed = build_order_fill_confirmed(
+        fill,
+        ts_event,
+        ctx.clock.get_time_ns(),
+        trade_fill_info(trade),
+    );
+    confirmed.causation_id = Some(fill.event_id);
+    ctx.emitter
+        .send_order_event(OrderEventAny::FillConfirmed(confirmed));
+}
+
+pub(crate) fn build_order_fill_confirmed(
+    fill: &OrderFilled,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+    info: Option<IndexMap<Ustr, Ustr>>,
+) -> OrderFillConfirmed {
+    OrderFillConfirmed::new(
         fill.trader_id,
         fill.strategy_id,
         fill.instrument_id,
         fill.client_order_id,
         fill.venue_order_id,
         fill.account_id,
-        Ustr::from(&format!("{}-FAILED-{}", trade.id, fill.client_order_id)),
+        fill.trade_id,
+        info,
+        UUID4::new(),
+        ts_event,
+        ts_init,
+        false,
+    )
+}
+
+pub(crate) fn build_order_fill_voided(
+    fill: &OrderFilled,
+    venue_trade_id: &str,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+    info: Option<IndexMap<Ustr, Ustr>>,
+) -> OrderFillVoided {
+    OrderFillVoided::new(
+        fill.trader_id,
+        fill.strategy_id,
+        fill.instrument_id,
+        fill.client_order_id,
+        fill.venue_order_id,
+        fill.account_id,
+        Ustr::from(&format!("{venue_trade_id}-FAILED-{}", fill.client_order_id)),
         fill.trade_id,
         fill.last_qty,
         fill.commission,
@@ -856,16 +963,13 @@ fn emit_order_fill_voided(
         fill.liquidity_side,
         fill.position_id,
         Some(Ustr::from("FAILED")),
-        trade_fill_info(trade),
+        info,
         UUID4::new(),
         ts_event,
-        ctx.clock.get_time_ns(),
+        ts_init,
         false,
         false,
-    );
-    voided.causation_id = causation_id;
-    ctx.emitter
-        .send_order_event(OrderEventAny::FillVoided(voided));
+    )
 }
 
 /// Flattens a user trade into a string map of venue fill metadata for `OrderFilled.info`.
@@ -873,17 +977,7 @@ fn emit_order_fill_voided(
 /// Mirrors the v1 adapter, which attaches the full raw trade to each fill it generates. Scalar
 /// fields map to their string form; nested fields (such as `maker_orders`) become their JSON text.
 fn trade_fill_info(trade: &PolymarketUserTrade) -> Option<IndexMap<Ustr, Ustr>> {
-    let value = serde_json::to_value(trade).ok()?;
-    let object = value.as_object()?;
-    let mut info = IndexMap::with_capacity(object.len());
-    for (key, val) in object {
-        let val_str = match val {
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        info.insert(Ustr::from(key.as_str()), Ustr::from(val_str.as_str()));
-    }
-    Some(info)
+    serialize_info(trade)
 }
 
 /// Emits an `OrderUpdated` raising the order quantity to the actual BUY fill, before the fill.
@@ -1053,6 +1147,12 @@ mod tests {
             AccountType::Cash,
             Some(Currency::pUSD()),
         )
+    }
+
+    fn assert_fill_confirmed(event: &ExecutionEvent) {
+        let ExecutionEvent::Order(OrderEventAny::FillConfirmed(_)) = event else {
+            panic!("expected fill-confirmed event, was {event:?}");
+        };
     }
 
     #[rstest]
@@ -1339,6 +1439,11 @@ mod tests {
             }
             other => panic!("expected fill then quantity update, was {other:?}"),
         }
+        assert_fill_confirmed(
+            &receiver
+                .try_recv()
+                .expect("expected durable fill confirmation"),
+        );
         assert!(receiver.try_recv().is_err());
     }
 
@@ -1452,6 +1557,11 @@ mod tests {
 
         dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
         let _fill = receiver.try_recv().expect("Expected filled event");
+        assert_fill_confirmed(
+            &receiver
+                .try_recv()
+                .expect("expected durable fill confirmation"),
+        );
 
         // Channel should be empty: no re-emitted cancel for a fully-filled order
         assert!(
@@ -1656,6 +1766,11 @@ mod tests {
             }
             other => panic!("(B) expected re-emitted cancel, was {other:?}"),
         }
+        assert_fill_confirmed(
+            &receiver
+                .try_recv()
+                .expect("(B) expected durable fill confirmation"),
+        );
 
         // (C) Cancel with size_matched=1.219511
         let msg_c = make_order("1.219511", "1775074738034", PolymarketEventType::Update);
@@ -1701,6 +1816,11 @@ mod tests {
             }
             other => panic!("(E) expected re-emitted cancel, was {other:?}"),
         }
+        assert_fill_confirmed(
+            &receiver
+                .try_recv()
+                .expect("(E) expected durable fill confirmation"),
+        );
 
         // No more events
         assert!(
@@ -1977,16 +2097,18 @@ mod tests {
             assert_eq!(local_orders.identity(&venue_order_id), Some(identity));
         } else {
             assert!(
-                receiver.try_recv().is_err(),
-                "resting order must not receive a terminal event",
-            );
-            assert!(
                 local_orders
                     .cumulative_filled_for_test(&venue_order_id)
                     .is_some(),
                 "ineligible order must stay tracked with open leaves",
             );
         }
+        assert_fill_confirmed(
+            &receiver
+                .try_recv()
+                .expect("expected durable fill confirmation"),
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[rstest]
