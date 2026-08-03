@@ -37,10 +37,10 @@ use nautilus_model::{
     },
     events::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized, OrderModifyRejected,
-        OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted,
-        OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged, PositionClosed,
-        PositionOpened,
+        OrderExpired, OrderFillConfirmed, OrderFillVoided, OrderFilled, OrderInitialized,
+        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
+        OrderSubmitted, OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged,
+        PositionClosed, PositionOpened,
     },
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
@@ -3938,6 +3938,86 @@ impl<'a> FromCapnp<'a> for OrderFillVoided {
     }
 }
 
+impl<'a> ToCapnp<'a> for OrderFillConfirmed {
+    type Builder = order_capnp::order_fill_confirmed::Builder<'a>;
+
+    fn to_capnp(&self, mut builder: Self::Builder) {
+        self.trader_id.to_capnp(builder.reborrow().init_trader_id());
+        self.strategy_id
+            .to_capnp(builder.reborrow().init_strategy_id());
+        self.instrument_id
+            .to_capnp(builder.reborrow().init_instrument_id());
+        self.client_order_id
+            .to_capnp(builder.reborrow().init_client_order_id());
+        self.venue_order_id
+            .to_capnp(builder.reborrow().init_venue_order_id());
+        self.account_id
+            .to_capnp(builder.reborrow().init_account_id());
+        self.trade_id.to_capnp(builder.reborrow().init_trade_id());
+        if let Some(info) = &self.info {
+            let mut entries = builder
+                .reborrow()
+                .init_info()
+                .init_entries(info.len() as u32);
+            for (index, (key, value)) in info.iter().enumerate() {
+                let mut entry = entries.reborrow().get(index as u32);
+                entry.set_key(key.as_str());
+                entry.set_value(value.as_str());
+            }
+        }
+        self.event_id.to_capnp(builder.reborrow().init_event_id());
+        builder.reborrow().init_ts_event().set_value(*self.ts_event);
+        builder.reborrow().init_ts_init().set_value(*self.ts_init);
+        builder.set_reconciliation(self.reconciliation);
+        if let Some(causation_id) = self.causation_id {
+            causation_id.to_capnp(builder.reborrow().init_causation_id());
+        }
+    }
+}
+
+impl<'a> FromCapnp<'a> for OrderFillConfirmed {
+    type Reader = order_capnp::order_fill_confirmed::Reader<'a>;
+
+    fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
+        let info = if reader.has_info() {
+            let entries = reader.get_info()?.get_entries()?;
+            let mut map = IndexMap::with_capacity(entries.len() as usize);
+            for entry in entries {
+                map.insert(
+                    Ustr::from(entry.get_key()?.to_str()?),
+                    Ustr::from(entry.get_value()?.to_str()?),
+                );
+            }
+            Some(map)
+        } else {
+            None
+        };
+        let causation_id = if reader.has_causation_id() {
+            Some(nautilus_core::UUID4::from_capnp(
+                reader.get_causation_id()?,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            trader_id: TraderId::from_capnp(reader.get_trader_id()?)?,
+            strategy_id: StrategyId::from_capnp(reader.get_strategy_id()?)?,
+            instrument_id: InstrumentId::from_capnp(reader.get_instrument_id()?)?,
+            client_order_id: ClientOrderId::from_capnp(reader.get_client_order_id()?)?,
+            venue_order_id: VenueOrderId::from_capnp(reader.get_venue_order_id()?)?,
+            account_id: AccountId::from_capnp(reader.get_account_id()?)?,
+            trade_id: TradeId::from_capnp(reader.get_trade_id()?)?,
+            info,
+            event_id: nautilus_core::UUID4::from_capnp(reader.get_event_id()?)?,
+            ts_event: reader.get_ts_event()?.get_value().into(),
+            ts_init: reader.get_ts_init()?.get_value().into(),
+            reconciliation: reader.get_reconciliation(),
+            causation_id,
+        })
+    }
+}
+
 // OrderInitialized - seed event
 impl<'a> ToCapnp<'a> for OrderInitialized {
     type Builder = order_capnp::order_initialized::Builder<'a>;
@@ -4911,7 +4991,7 @@ mod tests {
     use nautilus_model::{
         data::stubs::*,
         events::order::{
-            spec::{OrderCanceledSpec, OrderFillVoidedSpec},
+            spec::{OrderCanceledSpec, OrderFillConfirmedSpec, OrderFillVoidedSpec},
             stubs::*,
         },
     };
@@ -5332,6 +5412,19 @@ mod tests {
         order_capnp::order_fill_voided::Builder,
         order_capnp::order_fill_voided::Reader,
         OrderFillVoided
+    );
+    capnp_simple_roundtrip_test!(
+        order_fill_confirmed_capnp_roundtrip,
+        {
+            let mut event = OrderFillConfirmedSpec::builder()
+                .info(IndexMap::from([(Ustr::from("source"), Ustr::from("test"))]))
+                .build();
+            event.causation_id = Some(UUID4::new());
+            event
+        },
+        order_capnp::order_fill_confirmed::Builder,
+        order_capnp::order_fill_confirmed::Reader,
+        OrderFillConfirmed
     );
     capnp_simple_roundtrip_test!(
         order_fill_voided_populated_optionals_capnp_roundtrip,

@@ -39,6 +39,7 @@ pub mod denied;
 pub mod denied_reason;
 pub mod emulated;
 pub mod expired;
+pub mod fill_confirmed;
 pub mod fill_voided;
 pub mod filled;
 pub mod initialized;
@@ -78,6 +79,7 @@ pub enum OrderEventType {
     Updated,
     PartiallyFilled,
     Filled,
+    FillConfirmed,
     FillVoided,
 }
 

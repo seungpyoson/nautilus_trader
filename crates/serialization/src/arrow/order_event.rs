@@ -18,8 +18,9 @@ use std::collections::HashMap;
 use arrow::{datatypes::Schema, error::ArrowError, record_batch::RecordBatch};
 use nautilus_model::events::{
     OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated, OrderExpired,
-    OrderFillVoided, OrderFilled, OrderInitialized, OrderModifyRejected, OrderPendingCancel,
-    OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
+    OrderFillConfirmed, OrderFillVoided, OrderFilled, OrderInitialized, OrderModifyRejected,
+    OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted,
+    OrderTriggered, OrderUpdated,
 };
 
 use super::{
@@ -298,6 +299,22 @@ const ORDER_FILL_VOIDED_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("causation_id", true),
 ];
 
+const ORDER_FILL_CONFIRMED_FIELDS: &[JsonFieldSpec] = &[
+    JsonFieldSpec::utf8("trader_id", false),
+    JsonFieldSpec::utf8("strategy_id", false),
+    JsonFieldSpec::utf8("instrument_id", false),
+    JsonFieldSpec::utf8("client_order_id", false),
+    JsonFieldSpec::utf8("venue_order_id", false),
+    JsonFieldSpec::utf8("account_id", false),
+    JsonFieldSpec::utf8("trade_id", false),
+    JsonFieldSpec::utf8_json("info", true),
+    JsonFieldSpec::utf8("event_id", false),
+    JsonFieldSpec::u64("ts_event", false),
+    JsonFieldSpec::u64("ts_init", false),
+    JsonFieldSpec::boolean("reconciliation", false),
+    JsonFieldSpec::utf8("causation_id", true),
+];
+
 fn instrument_metadata(type_name: &'static str, instrument_id: &str) -> HashMap<String, String> {
     let mut metadata = metadata_for_type(type_name);
     metadata.insert(KEY_INSTRUMENT_ID.to_string(), instrument_id.to_string());
@@ -373,6 +390,11 @@ impl_order_event_arrow!(
 impl_order_event_arrow!(OrderUpdated, "OrderUpdated", ORDER_UPDATED_FIELDS);
 impl_order_event_arrow!(OrderFilled, "OrderFilled", ORDER_FILLED_FIELDS);
 impl_order_event_arrow!(OrderFillVoided, "OrderFillVoided", ORDER_FILL_VOIDED_FIELDS);
+impl_order_event_arrow!(
+    OrderFillConfirmed,
+    "OrderFillConfirmed",
+    ORDER_FILL_CONFIRMED_FIELDS
+);
 
 #[cfg(test)]
 mod tests {
@@ -382,7 +404,7 @@ mod tests {
     use nautilus_core::UUID4;
     use nautilus_model::{
         events::order::{
-            spec::OrderFillVoidedSpec,
+            spec::{OrderFillConfirmedSpec, OrderFillVoidedSpec},
             stubs::{
                 order_accepted, order_cancel_rejected, order_denied_max_submitted_rate,
                 order_emulated, order_expired, order_filled, order_initialized_buy_limit,
@@ -429,6 +451,15 @@ mod tests {
     #[rstest]
     fn test_order_fill_voided_round_trip() {
         roundtrip(OrderFillVoidedSpec::builder().is_reopened(true).build());
+    }
+
+    #[rstest]
+    fn test_order_fill_confirmed_round_trip() {
+        let mut event = OrderFillConfirmedSpec::builder()
+            .info(IndexMap::from([(Ustr::from("source"), Ustr::from("test"))]))
+            .build();
+        event.causation_id = Some(UUID4::new());
+        roundtrip(event);
     }
 
     #[rstest]

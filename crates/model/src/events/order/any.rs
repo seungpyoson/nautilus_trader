@@ -23,9 +23,9 @@ use super::{OrderEvent, OrderEventType};
 use crate::{
     events::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized, OrderModifyRejected,
-        OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted,
-        OrderTriggered, OrderUpdated,
+        OrderExpired, OrderFillConfirmed, OrderFillVoided, OrderFilled, OrderInitialized,
+        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
+        OrderSubmitted, OrderTriggered, OrderUpdated,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
 };
@@ -53,6 +53,7 @@ pub enum OrderEventAny {
     CancelRejected(OrderCancelRejected),
     Updated(OrderUpdated),
     Filled(OrderFilled),
+    FillConfirmed(OrderFillConfirmed),
     FillVoided(OrderFillVoided),
 }
 
@@ -76,6 +77,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => Box::new(event),
             Self::Updated(event) => Box::new(event),
             Self::Filled(event) => Box::new(event),
+            Self::FillConfirmed(event) => Box::new(event),
             Self::FillVoided(event) => Box::new(event),
         }
     }
@@ -99,6 +101,7 @@ impl OrderEventAny {
             Self::CancelRejected(_) => OrderEventType::CancelRejected,
             Self::Updated(_) => OrderEventType::Updated,
             Self::Filled(_) => OrderEventType::Filled,
+            Self::FillConfirmed(_) => OrderEventType::FillConfirmed,
             Self::FillVoided(_) => OrderEventType::FillVoided,
         }
     }
@@ -122,6 +125,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.trader_id,
             Self::Updated(event) => event.trader_id,
             Self::Filled(event) => event.trader_id,
+            Self::FillConfirmed(event) => event.trader_id,
             Self::FillVoided(event) => event.trader_id,
         }
     }
@@ -145,6 +149,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.client_order_id,
             Self::Updated(event) => event.client_order_id,
             Self::Filled(event) => event.client_order_id,
+            Self::FillConfirmed(event) => event.client_order_id,
             Self::FillVoided(event) => event.client_order_id,
         }
     }
@@ -168,6 +173,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.client_order_id = client_order_id,
             Self::Updated(event) => event.client_order_id = client_order_id,
             Self::Filled(event) => event.client_order_id = client_order_id,
+            Self::FillConfirmed(event) => event.client_order_id = client_order_id,
             Self::FillVoided(event) => event.client_order_id = client_order_id,
         }
 
@@ -193,6 +199,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.venue_order_id(),
             Self::Updated(event) => event.venue_order_id(),
             Self::Filled(event) => event.venue_order_id(),
+            Self::FillConfirmed(event) => event.venue_order_id(),
             Self::FillVoided(event) => event.venue_order_id(),
         }
     }
@@ -216,6 +223,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.account_id(),
             Self::Updated(event) => event.account_id(),
             Self::Filled(event) => event.account_id(),
+            Self::FillConfirmed(event) => event.account_id(),
             Self::FillVoided(event) => event.account_id(),
         }
     }
@@ -239,6 +247,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.instrument_id(),
             Self::Updated(event) => event.instrument_id(),
             Self::Filled(event) => event.instrument_id(),
+            Self::FillConfirmed(event) => event.instrument_id(),
             Self::FillVoided(event) => event.instrument_id(),
         }
     }
@@ -262,6 +271,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.strategy_id,
             Self::Updated(event) => event.strategy_id,
             Self::Filled(event) => event.strategy_id,
+            Self::FillConfirmed(event) => event.strategy_id,
             Self::FillVoided(event) => event.strategy_id,
         }
     }
@@ -285,6 +295,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.ts_event,
             Self::Updated(event) => event.ts_event,
             Self::Filled(event) => event.ts_event,
+            Self::FillConfirmed(event) => event.ts_event,
             Self::FillVoided(event) => event.ts_event,
         }
     }
@@ -308,6 +319,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => Some(event.reason),
             Self::Updated(_) => None,
             Self::Filled(_) => None,
+            Self::FillConfirmed(_) => None,
             Self::FillVoided(event) => event.reason,
         }
     }
@@ -347,6 +359,7 @@ impl Display for OrderEventAny {
             Self::CancelRejected(e) => write!(f, "{e}"),
             Self::Updated(e) => write!(f, "{e}"),
             Self::Filled(e) => write!(f, "{e}"),
+            Self::FillConfirmed(e) => write!(f, "{e}"),
             Self::FillVoided(e) => write!(f, "{e}"),
         }
     }

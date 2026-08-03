@@ -73,8 +73,8 @@ use crate::{
         PAYLOAD_TYPE_FUNDING_RATES_RESPONSE, PAYLOAD_TYPE_INSTRUMENT_RESPONSE,
         PAYLOAD_TYPE_INSTRUMENTS_RESPONSE, PAYLOAD_TYPE_ORDER_ACCEPTED,
         PAYLOAD_TYPE_ORDER_CANCEL_REJECTED, PAYLOAD_TYPE_ORDER_CANCELED, PAYLOAD_TYPE_ORDER_DENIED,
-        PAYLOAD_TYPE_ORDER_EMULATED, PAYLOAD_TYPE_ORDER_EXPIRED, PAYLOAD_TYPE_ORDER_FILL_VOIDED,
-        PAYLOAD_TYPE_ORDER_FILLED, PAYLOAD_TYPE_ORDER_INITIALIZED,
+        PAYLOAD_TYPE_ORDER_EMULATED, PAYLOAD_TYPE_ORDER_EXPIRED, PAYLOAD_TYPE_ORDER_FILL_CONFIRMED,
+        PAYLOAD_TYPE_ORDER_FILL_VOIDED, PAYLOAD_TYPE_ORDER_FILLED, PAYLOAD_TYPE_ORDER_INITIALIZED,
         PAYLOAD_TYPE_ORDER_MODIFY_REJECTED, PAYLOAD_TYPE_ORDER_PENDING_CANCEL,
         PAYLOAD_TYPE_ORDER_PENDING_UPDATE, PAYLOAD_TYPE_ORDER_REJECTED,
         PAYLOAD_TYPE_ORDER_RELEASED, PAYLOAD_TYPE_ORDER_SUBMITTED, PAYLOAD_TYPE_ORDER_TRIGGERED,
@@ -141,6 +141,7 @@ pub(crate) const CACHE_REPLAY_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_ORDER_CANCEL_REJECTED,
     PAYLOAD_TYPE_ORDER_UPDATED,
     PAYLOAD_TYPE_ORDER_FILLED,
+    PAYLOAD_TYPE_ORDER_FILL_CONFIRMED,
     PAYLOAD_TYPE_ORDER_FILL_VOIDED,
     PAYLOAD_TYPE_POSITION_OPENED,
     PAYLOAD_TYPE_POSITION_CHANGED,
@@ -1197,6 +1198,9 @@ pub fn apply_cache_replay_entry(
                 return Ok(false);
             }
         }
+        PAYLOAD_TYPE_ORDER_FILL_CONFIRMED => {
+            apply_order_event(cache, entry, OrderEventAny::FillConfirmed)?;
+        }
         PAYLOAD_TYPE_ORDER_FILL_VOIDED => {
             let fill_voided = decode_payload::<OrderFillVoided>(entry)?;
             apply_fill_void_to_order_and_positions(cache, entry, &fill_voided)?;
@@ -1750,7 +1754,7 @@ mod tests {
             PositionAdjustmentType, PriceType,
         },
         events::{
-            PositionEvent,
+            OrderFillConfirmed, PositionEvent,
             account::stubs::{cash_account_state, cash_account_state_million_usd},
             order::spec::{
                 OrderAcceptedSpec, OrderFillVoidedSpec, OrderFilledSpec, OrderInitializedSpec,
@@ -3561,6 +3565,67 @@ mod tests {
         assert_eq!(position.commissions(), vec![Money::from("0.60 USD")]);
         assert_eq!(position.fill_voids.len(), 1);
         assert_eq!(position.fill_voids[0].event, fill_voided);
+    }
+
+    #[rstest]
+    fn order_fill_confirmation_replay_preserves_economic_state() {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let initialized = OrderInitializedSpec::builder()
+            .instrument_id(instrument.id())
+            .build();
+        let client_order_id = initialized.client_order_id;
+        let submitted = OrderSubmittedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .account_id(submitted.account_id)
+            .build();
+        let filled = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .venue_order_id(accepted.venue_order_id)
+            .account_id(submitted.account_id)
+            .build();
+        let confirmed = OrderFillConfirmed::new(
+            filled.trader_id,
+            filled.strategy_id,
+            filled.instrument_id,
+            filled.client_order_id,
+            filled.venue_order_id,
+            filled.account_id,
+            filled.trade_id,
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            false,
+        );
+        let reader = reader_with_entries(
+            "run-fill-confirmation-replay",
+            &[
+                append_order_event(1, &OrderEventAny::Initialized(initialized)),
+                append_order_event(2, &OrderEventAny::Submitted(submitted)),
+                append_order_event(3, &OrderEventAny::Accepted(accepted)),
+                append_order_event(4, &OrderEventAny::Filled(filled)),
+                append_order_event(5, &OrderEventAny::FillConfirmed(confirmed)),
+            ],
+        );
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).expect("add instrument");
+
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).expect("replay");
+        let order = cache.order_owned(&client_order_id).expect("order replayed");
+
+        assert_eq!(report.applied_entries, 5);
+        assert_eq!(report.ignored_entries, 0);
+        assert!(matches!(
+            order.events().last(),
+            Some(OrderEventAny::FillConfirmed(_))
+        ));
+        assert!(!order.filled_qty().is_zero());
     }
 
     #[rstest]

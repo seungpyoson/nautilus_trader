@@ -54,10 +54,10 @@ use nautilus_model::{
     data::DataType,
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
-        OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSubmitted, OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged,
-        PositionClosed, PositionEvent, PositionOpened,
+        OrderEmulated, OrderEventAny, OrderExpired, OrderFillConfirmed, OrderFillVoided,
+        OrderFilled, OrderInitialized, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
+        OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
+        PositionAdjusted, PositionChanged, PositionClosed, PositionEvent, PositionOpened,
     },
     identifiers::{ClientId, InstrumentId, Venue},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -126,6 +126,8 @@ pub const PAYLOAD_TYPE_ORDER_CANCEL_REJECTED: &str = "OrderCancelRejected";
 pub const PAYLOAD_TYPE_ORDER_UPDATED: &str = "OrderUpdated";
 /// The canonical `payload_type` tag for [`OrderFilled`].
 pub const PAYLOAD_TYPE_ORDER_FILLED: &str = "OrderFilled";
+/// The canonical `payload_type` tag for [`OrderFillConfirmed`].
+pub const PAYLOAD_TYPE_ORDER_FILL_CONFIRMED: &str = "OrderFillConfirmed";
 /// The canonical `payload_type` tag for [`OrderFillVoided`].
 pub const PAYLOAD_TYPE_ORDER_FILL_VOIDED: &str = "OrderFillVoided";
 /// The canonical `payload_type` tag for [`OrderStatusReport`].
@@ -430,6 +432,7 @@ fn extract_order_event_any_identity(event: &OrderEventAny) -> UUID4 {
         OrderEventAny::CancelRejected(e) => e.event_id,
         OrderEventAny::Updated(e) => e.event_id,
         OrderEventAny::Filled(e) => e.event_id,
+        OrderEventAny::FillConfirmed(e) => e.event_id,
         OrderEventAny::FillVoided(e) => e.event_id,
     }
 }
@@ -619,6 +622,7 @@ pub fn encode_order_event_any(event: &OrderEventAny) -> Result<EncodedPayload, E
         OrderEventAny::CancelRejected(e) => encode_order_cancel_rejected(e),
         OrderEventAny::Updated(e) => encode_order_updated(e),
         OrderEventAny::Filled(e) => Ok(retag(encode_order_filled(e)?, PAYLOAD_TYPE_ORDER_FILLED)),
+        OrderEventAny::FillConfirmed(e) => encode_order_fill_confirmed(e),
         OrderEventAny::FillVoided(e) => encode_order_fill_voided(e),
     }
 }
@@ -1153,6 +1157,15 @@ fn encode_order_fill_voided(e: &OrderFillVoided) -> Result<EncodedPayload, Encod
     encode_with_order_ids(
         e,
         PAYLOAD_TYPE_ORDER_FILL_VOIDED,
+        e.client_order_id.to_string(),
+        Some(e.venue_order_id.to_string()),
+    )
+}
+
+fn encode_order_fill_confirmed(e: &OrderFillConfirmed) -> Result<EncodedPayload, EncodeError> {
+    encode_with_order_ids(
+        e,
+        PAYLOAD_TYPE_ORDER_FILL_CONFIRMED,
         e.client_order_id.to_string(),
         Some(e.venue_order_id.to_string()),
     )
@@ -2088,6 +2101,24 @@ mod tests {
         OrderEventAny::Filled(make_order_filled())
     }
 
+    fn ev_fill_confirmed() -> OrderEventAny {
+        let fill = make_order_filled();
+        OrderEventAny::FillConfirmed(OrderFillConfirmed::new(
+            fill.trader_id,
+            fill.strategy_id,
+            fill.instrument_id,
+            fill.client_order_id,
+            fill.venue_order_id,
+            fill.account_id,
+            fill.trade_id,
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            false,
+        ))
+    }
+
     fn ev_fill_voided() -> OrderEventAny {
         OrderEventAny::FillVoided(
             OrderFillVoidedSpec::builder()
@@ -2309,6 +2340,7 @@ mod tests {
     )]
     #[case::updated(ev_updated(Some(venue_order_id())), PAYLOAD_TYPE_ORDER_UPDATED, true)]
     #[case::filled(ev_filled(), PAYLOAD_TYPE_ORDER_FILLED, true)]
+    #[case::fill_confirmed(ev_fill_confirmed(), PAYLOAD_TYPE_ORDER_FILL_CONFIRMED, true)]
     #[case::fill_voided(ev_fill_voided(), PAYLOAD_TYPE_ORDER_FILL_VOIDED, true)]
     fn order_event_any_envelope_stamps_inner_tag_for_every_variant(
         #[case] event: OrderEventAny,

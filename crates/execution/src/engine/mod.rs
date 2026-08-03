@@ -2717,6 +2717,15 @@ impl ExecutionEngine {
                     self.publish_position_events(position_events);
                 }
             }
+            OrderEventAny::FillConfirmed(confirmed) => {
+                let event = OrderEventAny::FillConfirmed(confirmed.clone());
+                if self
+                    .update_cached_order(client_order_id, &event, false)
+                    .is_some()
+                {
+                    self.publish_order_event(&event);
+                }
+            }
             OrderEventAny::FillVoided(voided) => {
                 let mut voided = voided.clone();
                 let Some(order_before_void) = self

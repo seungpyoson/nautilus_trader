@@ -1386,6 +1386,7 @@ pub trait Strategy: DataActor {
             OrderEventAny::CancelRejected(e) => self.on_order_cancel_rejected(*e),
             OrderEventAny::Updated(e) => self.on_order_updated(*e),
             OrderEventAny::Filled(e) => self.on_order_filled(e),
+            OrderEventAny::FillConfirmed(_) => {}
             OrderEventAny::FillVoided(e) => self.on_order_fill_voided(e),
         }
         self.on_order_event(event);

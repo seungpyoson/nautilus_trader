@@ -39,6 +39,7 @@ struct OrderEvent {
         updated @14 :OrderUpdated;
         filled @15 :OrderFilled;
         fillVoided @16 :OrderFillVoided;
+        fillConfirmed @17 :OrderFillConfirmed;
     }
 }
 
@@ -322,4 +323,21 @@ struct OrderFillVoided {
     reconciliation @21 :Bool;
     causationId @22 :Base.UUID4;
     isReopened @23 :Bool;
+}
+
+# OrderFillConfirmed - durable finality marker for a previously applied fill
+struct OrderFillConfirmed {
+    traderId @0 :Identifiers.TraderId;
+    strategyId @1 :Identifiers.StrategyId;
+    instrumentId @2 :Identifiers.InstrumentId;
+    clientOrderId @3 :Identifiers.ClientOrderId;
+    venueOrderId @4 :Identifiers.VenueOrderId;
+    accountId @5 :Identifiers.AccountId;
+    tradeId @6 :Identifiers.TradeId;
+    info @7 :Base.StringMap;
+    eventId @8 :Base.UUID4;
+    tsEvent @9 :Base.UnixNanos;
+    tsInit @10 :Base.UnixNanos;
+    reconciliation @11 :Bool;
+    causationId @12 :Base.UUID4;
 }

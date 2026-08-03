@@ -78,9 +78,9 @@ use crate::{
     },
     events::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSubmitted, OrderTriggered, OrderUpdated,
+        OrderEventAny, OrderExpired, OrderFillConfirmed, OrderFillVoided, OrderFilled,
+        OrderInitialized, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
+        OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
     },
     identifiers::{
         AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, PositionId,
@@ -199,6 +199,10 @@ impl OrderStatus {
     /// Returns an error if the state transition is invalid from the current status.
     #[rustfmt::skip]
     pub fn transition(&mut self, event: &OrderEventAny) -> Result<Self, OrderError> {
+        if matches!(event, OrderEventAny::FillConfirmed(_)) {
+            return Ok(*self);
+        }
+
         let new_state = match (self, event) {
             (Self::Initialized, OrderEventAny::Denied(_)) => Self::Denied,
             (Self::Initialized, OrderEventAny::Emulated(_)) => Self::Emulated,  // Emulated orders
@@ -830,6 +834,10 @@ impl OrderCore {
             self.validate_fill_void(event)?;
         }
 
+        if let OrderEventAny::FillConfirmed(event) = &event {
+            self.validate_fill_confirmation(event)?;
+        }
+
         // Check for duplicate fill before state transition to maintain consistency
         if let OrderEventAny::Filled(fill) = &event
             && self.events.iter().any(
@@ -890,6 +898,7 @@ impl OrderCore {
             OrderEventAny::Initialized(_)
                 | OrderEventAny::ModifyRejected(_)
                 | OrderEventAny::CancelRejected(_)
+                | OrderEventAny::FillConfirmed(_)
         ) && !matches!(
             self.status,
             OrderStatus::PendingUpdate | OrderStatus::PendingCancel
@@ -917,6 +926,7 @@ impl OrderCore {
             OrderEventAny::Canceled(event) => self.canceled(event),
             OrderEventAny::Expired(event) => self.expired(event),
             OrderEventAny::Filled(event) => self.filled(event),
+            OrderEventAny::FillConfirmed(_) => {}
             OrderEventAny::FillVoided(event) => self.fill_voided(event, source_status),
         }
 
@@ -1039,6 +1049,35 @@ impl OrderCore {
         }
 
         self.validate_fill_void_commission(fill, event, previous)
+    }
+
+    fn validate_fill_confirmation(&self, event: &OrderFillConfirmed) -> Result<(), OrderError> {
+        let fill = self.events.iter().find_map(|candidate| match candidate {
+            OrderEventAny::Filled(fill) if fill.trade_id == event.trade_id => Some(fill),
+            _ => None,
+        });
+        let Some(fill) = fill else {
+            return Err(OrderError::InvalidOrderEvent);
+        };
+
+        if fill.trader_id != event.trader_id
+            || fill.strategy_id != event.strategy_id
+            || fill.instrument_id != event.instrument_id
+            || fill.client_order_id != event.client_order_id
+            || fill.venue_order_id != event.venue_order_id
+            || fill.account_id != event.account_id
+        {
+            return Err(OrderError::InvalidOrderEvent);
+        }
+
+        if self.events.iter().any(|candidate| {
+            matches!(candidate, OrderEventAny::FillConfirmed(confirmed) if confirmed.trade_id == event.trade_id)
+                || matches!(candidate, OrderEventAny::FillVoided(voided) if voided.trade_id == event.trade_id)
+        }) {
+            return Err(OrderError::InvalidOrderEvent);
+        }
+
+        Ok(())
     }
 
     fn matches_fill_void_identity(&self, event: &OrderFillVoided) -> bool {
@@ -1938,6 +1977,58 @@ mod tests {
             Some(Money::from("2.60 USD"))
         );
         assert_eq!(order.commissions_vec(), vec![Money::from("2.60 USD")]);
+    }
+
+    #[rstest]
+    fn test_fill_confirmation_is_durable_without_changing_economic_state() {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(100_000))
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let fill = OrderFilledSpec::builder()
+            .trade_id(TradeId::from("TRADE-CONFIRMED"))
+            .last_qty(Quantity::from(50_000))
+            .commission(Money::from("1.00 USD"))
+            .build();
+        let confirmation = OrderFillConfirmed::new(
+            fill.trader_id,
+            fill.strategy_id,
+            fill.instrument_id,
+            fill.client_order_id,
+            fill.venue_order_id,
+            fill.account_id,
+            fill.trade_id,
+            None,
+            UUID4::new(),
+            UnixNanos::from(3),
+            UnixNanos::from(4),
+            false,
+        );
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Filled(fill)).unwrap();
+        let status = order.status();
+        let filled_qty = order.filled_qty();
+        let event_count = order.events().len();
+
+        order
+            .apply(OrderEventAny::FillConfirmed(confirmation.clone()))
+            .unwrap();
+
+        assert_eq!(order.status(), status);
+        assert_eq!(order.filled_qty(), filled_qty);
+        assert_eq!(order.events().len(), event_count + 1);
+        assert!(matches!(
+            order.events().last(),
+            Some(OrderEventAny::FillConfirmed(event)) if event.trade_id == confirmation.trade_id
+        ));
+        assert!(matches!(
+            order.apply(OrderEventAny::FillConfirmed(confirmation)),
+            Err(OrderError::InvalidOrderEvent)
+        ));
     }
 
     #[rstest]
