@@ -64,7 +64,10 @@ use nautilus_model::{
         AccountType, AssetClass, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
         TimeInForce, TriggerType,
     },
-    events::{AccountState, OrderEventAny, OrderPendingCancel},
+    events::{
+        AccountState, OrderEventAny, OrderFilled, OrderPendingCancel,
+        order::spec::OrderFillVoidedSpec,
+    },
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TradeId, TraderId,
         VenueOrderId,
@@ -3417,6 +3420,140 @@ fn cache_provisional_fill(
     cache.borrow_mut().update_order(&filled).unwrap();
 }
 
+fn restart_maker_orders(venue_order_ids: [VenueOrderId; 2]) -> Value {
+    Value::Array(
+        venue_order_ids
+            .into_iter()
+            .map(|venue_order_id| {
+                json!({
+                    "asset_id": TEST_TOKEN_ASSET_ID,
+                    "fee_rate_bps": "0",
+                    "maker_address": "0x0000000000000000000000000000000000000000",
+                    "matched_amount": "10.0000",
+                    "order_id": venue_order_id.as_str(),
+                    "outcome": "Yes",
+                    "owner": "test_api_key",
+                    "price": "0.5000",
+                    "side": "BUY"
+                })
+            })
+            .collect(),
+    )
+}
+
+fn restart_maker_trade_page(trade_id: TradeId, maker_orders: &Value, status: &str) -> Value {
+    json!({
+        "data": [{
+            "id": trade_id.as_str(),
+            "taker_order_id": "V-UNRELATED-TAKER",
+            "market": "0xtest-market",
+            "asset_id": TEST_TOKEN_ASSET_ID,
+            "side": "SELL",
+            "size": "20.0000",
+            "fee_rate_bps": "0",
+            "price": "0.5000",
+            "status": status,
+            "match_time": "2024-01-01T00:00:00Z",
+            "last_update": "2024-01-01T00:00:10Z",
+            "outcome": "Yes",
+            "bucket_index": 0,
+            "owner": "unrelated-taker-owner",
+            "maker_address": "0x0000000000000000000000000000000000000000",
+            "transaction_hash": "0xabc123",
+            "maker_orders": maker_orders,
+            "trader_side": "MAKER"
+        }],
+        "next_cursor": "LTE="
+    })
+}
+
+fn cache_restart_maker_trade_members(
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    trade_id: TradeId,
+    venue_order_ids: [VenueOrderId; 2],
+    maker_orders: &Value,
+    persisted_members: &[usize],
+    persisted_status: &str,
+) -> Vec<OrderFilled> {
+    add_instrument_to_cache_with_size_precision(cache, instrument_id, 4);
+    let mut orders = [
+        make_limit_order(
+            "O-RESTART-MAKER-A",
+            instrument_id,
+            OrderSide::Buy,
+            false,
+            false,
+            false,
+            TimeInForce::Gtc,
+        ),
+        make_limit_order(
+            "O-RESTART-MAKER-B",
+            instrument_id,
+            OrderSide::Buy,
+            false,
+            false,
+            false,
+            TimeInForce::Gtc,
+        ),
+    ];
+    for (order, venue_order_id) in orders.iter_mut().zip(venue_order_ids) {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        submit_and_accept_order(cache, order, venue_order_id.as_str());
+    }
+
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    persisted_members
+        .iter()
+        .map(|index| {
+            let venue_order_id = venue_order_ids[*index];
+            let mut event = TestOrderEventStubs::filled(
+                &orders[*index],
+                &instrument,
+                None,
+                None,
+                Some(Price::from("0.5000")),
+                Some(Quantity::new(10.0, 4)),
+                Some(LiquiditySide::Maker),
+                None,
+                None,
+                Some(AccountId::from("POLYMARKET-001")),
+            );
+            let OrderEventAny::Filled(ref mut fill) = event else {
+                panic!("expected filled event");
+            };
+            fill.trade_id = nautilus_polymarket::execution::parse::make_composite_trade_id(
+                trade_id.as_str(),
+                venue_order_id.as_str(),
+            );
+            fill.info = Some(IndexMap::from([
+                (Ustr::from("id"), Ustr::from(trade_id.as_str())),
+                (
+                    Ustr::from("taker_order_id"),
+                    Ustr::from("V-UNRELATED-TAKER"),
+                ),
+                (Ustr::from("status"), Ustr::from(persisted_status)),
+                (Ustr::from("trader_side"), Ustr::from("MAKER")),
+                (
+                    Ustr::from("maker_orders"),
+                    Ustr::from(&maker_orders.to_string()),
+                ),
+            ]));
+            let OrderEventAny::Filled(fill) = event else {
+                unreachable!();
+            };
+            cache
+                .borrow_mut()
+                .update_order(&OrderEventAny::Filled(fill.clone()))
+                .unwrap();
+            fill
+        })
+        .collect()
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_connect_revalidates_provisional_fill_and_voids_failed_trade() {
@@ -3478,6 +3615,116 @@ async fn test_connect_persists_confirmation_for_provisional_fill() {
     assert_eq!(
         state.last_query.lock().await.get("id").map(String::as_str),
         Some(trade_id.as_str())
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_revalidates_confirmed_maker_trade_and_emits_missing_member() {
+    let state = TestServerState::default();
+    let trade_id = TradeId::from("trade-restart-incomplete-maker");
+    let maker_venue_ids = [
+        VenueOrderId::from("V-RESTART-MAKER-A"),
+        VenueOrderId::from("V-RESTART-MAKER-B"),
+    ];
+    let maker_orders = restart_maker_orders(maker_venue_ids);
+    *state.trades_response_override.lock().await = Some(restart_maker_trade_page(
+        trade_id,
+        &maker_orders,
+        "CONFIRMED",
+    ));
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let persisted = cache_restart_maker_trade_members(
+        &cache,
+        instrument_id,
+        trade_id,
+        maker_venue_ids,
+        &maker_orders,
+        &[0],
+        "CONFIRMED",
+    );
+    assert_eq!(persisted.len(), 1);
+
+    connect_and_restore_local_orders(&mut client, &cache).await;
+
+    let missing_fill = assert_order_event(recv_execution_event(&mut rx).await, "Filled");
+    let OrderEventAny::Filled(missing_fill) = missing_fill else {
+        panic!("expected missing economic fill");
+    };
+    assert_eq!(missing_fill.venue_order_id, maker_venue_ids[1]);
+    let confirmation = assert_order_event(recv_execution_event(&mut rx).await, "FillConfirmed");
+    let OrderEventAny::FillConfirmed(confirmation) = confirmation else {
+        panic!("expected missing member confirmation");
+    };
+    assert_eq!(confirmation.venue_order_id, maker_venue_ids[1]);
+    assert_eq!(
+        state.last_query.lock().await.get("id").map(String::as_str),
+        Some(trade_id.as_str()),
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_revalidates_failed_maker_trade_and_voids_only_missing_member() {
+    let state = TestServerState::default();
+    let trade_id = TradeId::from("trade-restart-partial-void");
+    let maker_venue_ids = [
+        VenueOrderId::from("V-RESTART-VOID-A"),
+        VenueOrderId::from("V-RESTART-VOID-B"),
+    ];
+    let maker_orders = restart_maker_orders(maker_venue_ids);
+    *state.trades_response_override.lock().await =
+        Some(restart_maker_trade_page(trade_id, &maker_orders, "FAILED"));
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let fills = cache_restart_maker_trade_members(
+        &cache,
+        instrument_id,
+        trade_id,
+        maker_venue_ids,
+        &maker_orders,
+        &[0, 1],
+        "MATCHED",
+    );
+    let fill = &fills[0];
+    let voided = OrderFillVoidedSpec::builder()
+        .trader_id(fill.trader_id)
+        .strategy_id(fill.strategy_id)
+        .instrument_id(fill.instrument_id)
+        .client_order_id(fill.client_order_id)
+        .venue_order_id(fill.venue_order_id)
+        .account_id(fill.account_id)
+        .trade_id(fill.trade_id)
+        .voided_qty(fill.last_qty)
+        .maybe_commission_voided(fill.commission)
+        .order_side(fill.order_side)
+        .order_type(fill.order_type)
+        .last_px(fill.last_px)
+        .currency(fill.currency)
+        .liquidity_side(fill.liquidity_side)
+        .maybe_position_id(fill.position_id)
+        .maybe_info(fill.info.clone())
+        .build();
+    cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::FillVoided(voided))
+        .unwrap();
+
+    connect_and_restore_local_orders(&mut client, &cache).await;
+
+    let correction = assert_order_event(recv_execution_event(&mut rx).await, "FillVoided");
+    let OrderEventAny::FillVoided(correction) = correction else {
+        panic!("expected missing member void");
+    };
+    assert_eq!(correction.venue_order_id, maker_venue_ids[1]);
+    assert_eq!(
+        state.last_query.lock().await.get("id").map(String::as_str),
+        Some(trade_id.as_str()),
     );
 }
 

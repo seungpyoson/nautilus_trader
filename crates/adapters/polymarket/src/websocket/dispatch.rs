@@ -834,7 +834,7 @@ fn ensure_accepted(
 ///
 /// `info` carries the venue fill metadata (the raw trade fields) for trade-sourced fills, and is
 /// `None` for order-path fills that have no originating trade payload.
-fn emit_order_filled(
+pub(crate) fn emit_order_filled(
     identity: &OrderIdentity,
     fill: &FillReport,
     info: Option<IndexMap<Ustr, Ustr>>,

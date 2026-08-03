@@ -36,9 +36,11 @@ settlement store is introduced.
 
 On restoration, each fill in a Polymarket trade group is classified independently as provisional,
 confirmed, or voided using its full persisted identity. A group is accepted as complete only when
-every member has the same terminal finality. A partially finalized group is revalidated against the
-exact venue trade. The adapter validates the complete venue fill set, emits only the missing member
-transitions, and fails closed on mixed or contradictory persisted finality.
+the persisted venue payload proves the full expected local member set and every member has the same
+terminal finality. An incomplete or partially finalized group is revalidated against the exact venue
+trade. The adapter validates the persisted fills as a subset of the complete venue fill set, emits
+only missing economic and finality transitions, and fails closed on mixed or contradictory persisted
+finality.
 
 This makes a crash between member writes recoverable without treating one member as proof for its
 siblings.
