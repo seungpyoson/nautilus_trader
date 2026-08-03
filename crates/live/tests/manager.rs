@@ -64,7 +64,9 @@ use nautilus_model::{
     events::{
         OrderEventAny, OrderFilled,
         account::state::AccountState,
-        order::spec::{OrderAcceptedSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec},
+        order::spec::{
+            OrderAcceptedSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec, OrderUpdatedSpec,
+        },
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId, StrategyId,
@@ -9926,6 +9928,136 @@ async fn test_check_open_orders_targeted_query_rejects_split_identity() {
         OrderStatus::Accepted
     );
     assert_eq!(ctx.manager.recon_check_retry_count(&client_a), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_open_orders_targeted_query_continues_after_identity_conflict() {
+    let config = ExecutionManagerConfig {
+        open_check_threshold_ns: 0,
+        open_check_missing_retries: 1,
+        open_check_open_only: false,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    ctx.add_instrument(test_instrument());
+
+    let client_order_id = ClientOrderId::from("O-TARGETED-MULTI");
+    let venue_order_id = VenueOrderId::from("V-TARGETED-MULTI");
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .client_order_id(client_order_id)
+        .instrument_id(test_instrument_id())
+        .quantity(Quantity::from("10.0"))
+        .price(Price::from("100.0"))
+        .build();
+    let submitted = TestOrderEventStubs::submitted(&order, test_account_id());
+    ctx.add_order(order);
+    let order = ctx.cache.borrow_mut().update_order(&submitted).unwrap();
+    let accepted = TestOrderEventStubs::accepted(&order, test_account_id(), venue_order_id);
+    ctx.cache.borrow_mut().update_order(&accepted).unwrap();
+
+    let conflicting_report = create_order_status_report_for_side(
+        Some(client_order_id),
+        venue_order_id,
+        test_instrument_id(),
+        OrderSide::Sell,
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let valid_report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let first_client = MockExecutionClient::for_venue(
+        ClientId::from("CLIENT-TARGETED-FIRST"),
+        test_venue(),
+        Vec::new(),
+    )
+    .with_order_report(conflicting_report);
+    let second_client = MockExecutionClient::for_venue(
+        ClientId::from("CLIENT-TARGETED-SECOND"),
+        test_venue(),
+        Vec::new(),
+    )
+    .with_order_report(valid_report);
+    let clients: Vec<&dyn ExecutionClient> = vec![&first_client, &second_client];
+
+    let events = ctx.manager.check_open_orders(&clients).await;
+
+    assert_eq!(first_client.order_report_query_count.get(), 1);
+    assert_eq!(second_client.order_report_query_count.get(), 1);
+    assert_eq!(events.len(), 1);
+    let OrderEventAny::Canceled(canceled) = &events[0] else {
+        panic!("Expected OrderCanceled event, was {:?}", events[0]);
+    };
+    assert_eq!(canceled.client_order_id, client_order_id);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_open_orders_targeted_query_uses_identity_updated_during_await() {
+    let config = ExecutionManagerConfig {
+        open_check_threshold_ns: 0,
+        open_check_missing_retries: 1,
+        open_check_open_only: false,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    ctx.add_instrument(test_instrument());
+
+    let client_order_id = ClientOrderId::from("O-TARGETED-UPDATED");
+    let original_venue_order_id = VenueOrderId::from("V-TARGETED-ORIGINAL");
+    let current_venue_order_id = VenueOrderId::from("V-TARGETED-CURRENT");
+    insert_accepted_limit_order(
+        &ctx,
+        client_order_id,
+        original_venue_order_id,
+        test_client_id(),
+    );
+    let order = ctx.get_order(&client_order_id).unwrap();
+    let updated = OrderEventAny::Updated(
+        OrderUpdatedSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(client_order_id)
+            .quantity(order.quantity())
+            .venue_order_id(current_venue_order_id)
+            .account_id(test_account_id())
+            .price(order.price().unwrap())
+            .build(),
+    );
+    let cache = ctx.cache.clone();
+    let report = create_order_status_report(
+        Some(client_order_id),
+        current_venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let mock_client = MockExecutionClient::new(Vec::new())
+        .with_order_report(report)
+        .with_on_order_report_query(Box::new(move || {
+            cache.borrow_mut().update_order(&updated).unwrap();
+        }));
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_open_orders(&clients).await;
+
+    assert_eq!(mock_client.order_report_query_count.get(), 1);
+    assert_eq!(events.len(), 1);
+    let OrderEventAny::Canceled(canceled) = &events[0] else {
+        panic!("Expected OrderCanceled event, was {:?}", events[0]);
+    };
+    assert_eq!(canceled.client_order_id, client_order_id);
 }
 
 #[rstest]

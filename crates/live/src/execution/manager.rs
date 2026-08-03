@@ -192,7 +192,7 @@ impl TargetedOrderQuery {
 #[derive(Debug)]
 pub(crate) struct TargetedOrderReportResult {
     client_order_id: ClientOrderId,
-    report: Option<OrderStatusReport>,
+    reports: Vec<OrderStatusReport>,
     coverage_complete: bool,
 }
 
@@ -1606,7 +1606,9 @@ impl ExecutionManager {
             let client_order_id = result.client_order_id;
             self.targeted_order_queries.shift_remove(&client_order_id);
 
-            if let Some(report) = result.report {
+            let had_reports = !result.reports.is_empty();
+            let mut matched_report = None;
+            for report in result.reports {
                 let resolution = {
                     let cache = self.cache.borrow();
                     resolve_report_order(
@@ -1619,13 +1621,17 @@ impl ExecutionManager {
                         },
                     )
                 };
-                if resolution != ReportOrderResolution::Matched(client_order_id) {
-                    log::error!(
-                        "Rejecting targeted order report for {client_order_id}: report identity does not resolve to the queried order",
-                    );
-                    continue;
+                if resolution == ReportOrderResolution::Matched(client_order_id) {
+                    matched_report = Some(report);
+                    break;
                 }
 
+                log::error!(
+                    "Rejecting targeted order report for {client_order_id}: report identity does not resolve to the queried order",
+                );
+            }
+
+            if let Some(report) = matched_report {
                 self.recon_check_retries.shift_remove(&client_order_id);
                 self.missing_order_coverage_warnings
                     .shift_remove(&client_order_id);
@@ -1649,7 +1655,7 @@ impl ExecutionManager {
                 continue;
             }
 
-            if result.coverage_complete {
+            if result.coverage_complete && !had_reports {
                 events.extend(self.resolve_missing_order(client_order_id));
             } else {
                 log::warn!(
@@ -3842,7 +3848,7 @@ pub(crate) async fn request_targeted_order_reports(
     let mut request_count = 0usize;
 
     for query in queries {
-        let mut report = None;
+        let mut reports = Vec::new();
         let mut coverage_complete = true;
 
         for client_id in &query.responsible_clients {
@@ -3865,20 +3871,7 @@ pub(crate) async fn request_targeted_order_reports(
             request_count += 1;
 
             match client.generate_order_status_report(&query.command).await {
-                Ok(Some(candidate)) if targeted_report_matches(&query, &candidate) => {
-                    report = Some(candidate);
-                    break;
-                }
-                Ok(Some(candidate)) => {
-                    coverage_complete = false;
-                    log::warn!(
-                        "Ignoring mismatched targeted order status report from {client_id} for {}: client_order_id={:?}, venue_order_id={}, instrument_id={}",
-                        query.client_order_id,
-                        candidate.client_order_id,
-                        candidate.venue_order_id,
-                        candidate.instrument_id,
-                    );
-                }
+                Ok(Some(candidate)) => reports.push(candidate),
                 Ok(None) => {}
                 Err(e) => {
                     coverage_complete = false;
@@ -3892,28 +3885,12 @@ pub(crate) async fn request_targeted_order_reports(
 
         results.push(TargetedOrderReportResult {
             client_order_id: query.client_order_id,
-            report,
+            reports,
             coverage_complete,
         });
     }
 
     results
-}
-
-fn targeted_report_matches(query: &TargetedOrderQuery, report: &OrderStatusReport) -> bool {
-    let instrument_matches = query
-        .command
-        .instrument_id
-        .is_none_or(|instrument_id| report.instrument_id == instrument_id);
-    let client_matches = report
-        .client_order_id
-        .is_none_or(|client_order_id| client_order_id == query.client_order_id);
-    let venue_matches = query
-        .command
-        .venue_order_id
-        .is_none_or(|venue_order_id| report.venue_order_id == venue_order_id);
-
-    instrument_matches && client_matches && venue_matches
 }
 
 #[cfg(test)]
