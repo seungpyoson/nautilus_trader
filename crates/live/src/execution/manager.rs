@@ -47,12 +47,12 @@ use nautilus_core::{
 use nautilus_execution::{
     engine::ExecutionEngine,
     reconciliation::{
-        calculate_reconciliation_price, create_inferred_fill_for_qty,
-        create_position_reconciliation_venue_order_id, create_reconciliation_rejected,
-        create_reconciliation_triggered, generate_external_order_status_events,
-        generate_reconciliation_order_pre_fill_events,
+        ReconciliationReportIdentity, ReportOrderResolution, calculate_reconciliation_price,
+        create_inferred_fill_for_qty, create_position_reconciliation_venue_order_id,
+        create_reconciliation_rejected, create_reconciliation_triggered,
+        generate_external_order_status_events, generate_reconciliation_order_pre_fill_events,
         generate_reconciliation_order_snapshot_events, process_mass_status_for_reconciliation,
-        reconcile_order_report, should_reconciliation_update,
+        reconcile_order_report, resolve_report_order, should_reconciliation_update,
     },
 };
 use nautilus_model::{
@@ -578,237 +578,124 @@ impl ExecutionManager {
                 continue;
             }
 
-            if let Some(client_order_id) = &report.client_order_id {
-                if let Some(cached_order) = self.get_order(*client_order_id)
-                    && Self::is_exact_order_match(&cached_order, report)
-                {
-                    log::debug!("Skipping order {client_order_id}: already in sync with venue");
-                    orders_skipped_duplicate += 1;
+            let resolution = {
+                let cache = self.cache.borrow();
+                resolve_report_order(
+                    &cache,
+                    ReconciliationReportIdentity {
+                        instrument_id: report.instrument_id,
+                        client_order_id: report.client_order_id,
+                        venue_order_id: report.venue_order_id,
+                        order_side: report.order_side,
+                    },
+                )
+            };
 
-                    // Still ensure venue_order_id is indexed even when skipping
-                    if let Err(e) = self.cache.borrow_mut().add_venue_order_id(
-                        client_order_id,
-                        &report.venue_order_id,
-                        false,
-                    ) {
-                        log::warn!("Failed to add venue order ID index: {e}");
-                    }
+            match resolution {
+                ReportOrderResolution::Matched(client_order_id) => {
+                    let Some(order) = self.get_order(client_order_id) else {
+                        log::error!(
+                            "Resolved reconciliation order {client_order_id} disappeared from cache"
+                        );
+                        continue;
+                    };
 
-                    continue;
-                }
-
-                // Skip closed reconciliation orders to prevent duplicate inferred fills on restart
-                if let Some(cached_order) = self.get_order(*client_order_id)
-                    && cached_order.is_closed()
-                    && cached_order
-                        .tags()
-                        .is_some_and(|tags| tags.contains(&*TAG_RECONCILIATION))
-                {
-                    log::debug!(
-                        "Skipping closed reconciliation order {client_order_id}: \
-                         synthetic position adjustment from previous session",
-                    );
-                    orders_skipped_duplicate += 1;
-                    continue;
-                }
-
-                if let Some(order) = self.get_order(*client_order_id) {
-                    let instrument = self.get_instrument(&report.instrument_id);
-                    log::info!(
-                        color = LogColor::Blue as u8;
-                        "Reconciling {} {} {} [{}] -> [{}]",
-                        client_order_id,
-                        report.venue_order_id,
-                        report.instrument_id,
-                        order.status(),
-                        report.order_status,
-                    );
-
-                    let order_fills: Vec<&FillReport> = fill_reports
-                        .get(&report.venue_order_id)
-                        .map(|f| f.iter().collect())
-                        .unwrap_or_default();
-                    let order_events = self.reconcile_order_with_fills(
-                        &order,
-                        report,
-                        &order_fills,
-                        instrument.as_ref(),
-                        &mut fill_queue,
-                    );
-
-                    if !order_events.is_empty() {
-                        orders_reconciled += 1;
-                        fills_applied += order_events
-                            .iter()
-                            .filter(|e| matches!(e, OrderEventAny::Filled(_)))
-                            .count();
-                        events.extend(order_events);
-                    }
-
-                    // Always ensure venue_order_id is indexed after reconciliation
-                    if let Err(e) = self.cache.borrow_mut().add_venue_order_id(
-                        client_order_id,
-                        &report.venue_order_id,
-                        false,
-                    ) {
-                        log::warn!("Failed to add venue order ID index: {e}");
-                    }
-                } else if let Some(order) = self.get_order_by_venue_order_id(report.venue_order_id)
-                {
-                    // Fallback: match by venue_order_id
-                    let instrument = self.get_instrument(&report.instrument_id);
-
-                    log::info!(
-                        color = LogColor::Blue as u8;
-                        "Reconciling {} (matched by venue_order_id {}) {} [{}] -> [{}]",
-                        order.client_order_id(),
-                        report.venue_order_id,
-                        report.instrument_id,
-                        order.status(),
-                        report.order_status,
-                    );
-
-                    let order_fills: Vec<&FillReport> = fill_reports
-                        .get(&report.venue_order_id)
-                        .map(|f| f.iter().collect())
-                        .unwrap_or_default();
-                    let order_events = self.reconcile_order_with_fills(
-                        &order,
-                        report,
-                        &order_fills,
-                        instrument.as_ref(),
-                        &mut fill_queue,
-                    );
-
-                    if !order_events.is_empty() {
-                        orders_reconciled += 1;
-                        fills_applied += order_events
-                            .iter()
-                            .filter(|e| matches!(e, OrderEventAny::Filled(_)))
-                            .count();
-                        events.extend(order_events);
-                    }
-
-                    if let Err(e) = self.cache.borrow_mut().add_venue_order_id(
-                        &order.client_order_id(),
-                        &report.venue_order_id,
-                        false,
-                    ) {
-                        log::warn!("Failed to add venue order ID index: {e}");
-                    }
-                } else if !self.config.filter_unclaimed_external {
-                    if let Some(instrument) = self.get_instrument(&report.instrument_id) {
+                    if Self::is_exact_order_match(&order, report) {
+                        log::debug!("Skipping order {client_order_id}: already in sync with venue");
+                        orders_skipped_duplicate += 1;
+                    } else if order.is_closed()
+                        && order
+                            .tags()
+                            .is_some_and(|tags| tags.contains(&*TAG_RECONCILIATION))
+                    {
+                        log::debug!(
+                            "Skipping closed reconciliation order {client_order_id}: \
+                             synthetic position adjustment from previous session",
+                        );
+                        orders_skipped_duplicate += 1;
+                        continue;
+                    } else {
+                        let instrument = self.get_instrument(&report.instrument_id);
+                        log::info!(
+                            color = LogColor::Blue as u8;
+                            "Reconciling {} {} {} [{}] -> [{}]",
+                            client_order_id,
+                            report.venue_order_id,
+                            report.instrument_id,
+                            order.status(),
+                            report.order_status,
+                        );
                         let order_fills: Vec<&FillReport> = fill_reports
                             .get(&report.venue_order_id)
-                            .map(|f| f.iter().collect())
+                            .map(|fills| fills.iter().collect())
                             .unwrap_or_default();
-                        let (external_events, metadata) = self.handle_external_order(
+                        let order_events = self.reconcile_order_with_fills(
+                            &order,
                             report,
-                            mass_status.account_id,
-                            &instrument,
                             &order_fills,
-                            false, // Not synthetic (venue order)
-                            Some(&mut fill_queue),
+                            instrument.as_ref(),
+                            &mut fill_queue,
                         );
-
-                        if !external_events.is_empty() {
-                            external_orders_created += 1;
-                            fills_applied += external_events
+                        if !order_events.is_empty() {
+                            orders_reconciled += 1;
+                            fills_applied += order_events
                                 .iter()
-                                .filter(|e| matches!(e, OrderEventAny::Filled(_)))
+                                .filter(|event| matches!(event, OrderEventAny::Filled(_)))
                                 .count();
-
-                            if report.order_status.is_open() {
-                                open_orders_initialized += 1;
-                            }
-
-                            events.extend(external_events);
-
-                            if let Some(m) = metadata {
-                                external_orders.push(m);
-                            }
+                            events.extend(order_events);
                         }
-                    } else {
+                    }
+
+                    if let Err(e) = self.cache.borrow_mut().add_venue_order_id(
+                        &client_order_id,
+                        &report.venue_order_id,
+                        false,
+                    ) {
+                        log::warn!("Failed to add venue order ID index: {e}");
+                    }
+                }
+                ReportOrderResolution::External => {
+                    if report.client_order_id.is_some() && self.config.filter_unclaimed_external {
+                        continue;
+                    }
+                    let Some(instrument) = self.get_instrument(&report.instrument_id) else {
                         orders_skipped_no_instrument += 1;
+                        continue;
+                    };
+                    let order_fills: Vec<&FillReport> = fill_reports
+                        .get(&report.venue_order_id)
+                        .map(|fills| fills.iter().collect())
+                        .unwrap_or_default();
+                    let (external_events, metadata) = self.handle_external_order(
+                        report,
+                        mass_status.account_id,
+                        &instrument,
+                        &order_fills,
+                        report.client_order_id.is_none()
+                            && report.venue_order_id.as_str().starts_with("S-"),
+                        Some(&mut fill_queue),
+                    );
+                    if !external_events.is_empty() {
+                        external_orders_created += 1;
+                        fills_applied += external_events
+                            .iter()
+                            .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+                            .count();
+                        if report.order_status.is_open() {
+                            open_orders_initialized += 1;
+                        }
+                        events.extend(external_events);
+                        if let Some(metadata) = metadata {
+                            external_orders.push(metadata);
+                        }
                     }
                 }
-            } else if let Some(order) = self.get_order_by_venue_order_id(report.venue_order_id) {
-                // Fallback: match by venue_order_id
-                let instrument = self.get_instrument(&report.instrument_id);
-                log::info!(
-                    color = LogColor::Blue as u8;
-                    "Reconciling {} (matched by venue_order_id {}) {} [{}] -> [{}]",
-                    order.client_order_id(),
-                    report.venue_order_id,
-                    report.instrument_id,
-                    order.status(),
-                    report.order_status,
-                );
-
-                let order_fills: Vec<&FillReport> = fill_reports
-                    .get(&report.venue_order_id)
-                    .map(|f| f.iter().collect())
-                    .unwrap_or_default();
-                let order_events = self.reconcile_order_with_fills(
-                    &order,
-                    report,
-                    &order_fills,
-                    instrument.as_ref(),
-                    &mut fill_queue,
-                );
-
-                if !order_events.is_empty() {
-                    orders_reconciled += 1;
-                    fills_applied += order_events
-                        .iter()
-                        .filter(|e| matches!(e, OrderEventAny::Filled(_)))
-                        .count();
-                    events.extend(order_events);
+                ReportOrderResolution::Conflict => {
+                    log::error!(
+                        "Rejecting mass-status order report for venue_order_id={}: report identity conflicts with cached order",
+                        report.venue_order_id,
+                    );
                 }
-
-                if let Err(e) = self.cache.borrow_mut().add_venue_order_id(
-                    &order.client_order_id(),
-                    &report.venue_order_id,
-                    false,
-                ) {
-                    log::warn!("Failed to add venue order ID index: {e}");
-                }
-            } else if let Some(instrument) = self.get_instrument(&report.instrument_id) {
-                // Synthetic orders (S- prefix) are generated by reconciliation logic
-                let is_synthetic = report.venue_order_id.as_str().starts_with("S-");
-
-                let order_fills: Vec<&FillReport> = fill_reports
-                    .get(&report.venue_order_id)
-                    .map(|f| f.iter().collect())
-                    .unwrap_or_default();
-                let (external_events, metadata) = self.handle_external_order(
-                    report,
-                    mass_status.account_id,
-                    &instrument,
-                    &order_fills,
-                    is_synthetic,
-                    Some(&mut fill_queue),
-                );
-
-                if !external_events.is_empty() {
-                    external_orders_created += 1;
-                    fills_applied += external_events
-                        .iter()
-                        .filter(|e| matches!(e, OrderEventAny::Filled(_)))
-                        .count();
-
-                    if report.order_status.is_open() {
-                        open_orders_initialized += 1;
-                    }
-
-                    events.extend(external_events);
-
-                    if let Some(m) = metadata {
-                        external_orders.push(m);
-                    }
-                }
-            } else {
-                orders_skipped_no_instrument += 1;
             }
         }
 
@@ -846,43 +733,57 @@ impl ExecutionManager {
                 continue;
             }
 
-            let order = first_fill
-                .client_order_id
-                .as_ref()
-                .and_then(|id| self.get_order(*id))
-                .or_else(|| self.get_order_by_venue_order_id(*venue_order_id));
+            let mut sorted_fills: Vec<&FillReport> = fills.iter().collect();
+            sorted_fills.sort_by_key(|fill| fill.ts_event);
 
-            // Skip if resolved order's client_order_id is filtered (venue_order_id lookup path)
-            if let Some(ref order) = order
-                && self
+            for fill in sorted_fills {
+                let resolution = {
+                    let cache = self.cache.borrow();
+                    resolve_report_order(
+                        &cache,
+                        ReconciliationReportIdentity {
+                            instrument_id: fill.instrument_id,
+                            client_order_id: fill.client_order_id,
+                            venue_order_id: fill.venue_order_id,
+                            order_side: fill.order_side,
+                        },
+                    )
+                };
+                let ReportOrderResolution::Matched(client_order_id) = resolution else {
+                    if matches!(resolution, ReportOrderResolution::Conflict) {
+                        log::error!(
+                            "Rejecting orphan fill {} for venue_order_id={}: report identity conflicts with cached order",
+                            fill.trade_id,
+                            fill.venue_order_id,
+                        );
+                    }
+                    continue;
+                };
+                if self
                     .config
                     .filtered_client_order_ids
-                    .contains(&order.client_order_id())
-            {
-                log::debug!(
-                    "Skipping orphan fills for {}: in filtered_client_order_ids",
-                    order.client_order_id()
-                );
-                continue;
-            }
-
-            if let Some(order) = order {
-                let instrument_id = order.instrument_id();
-                if let Some(instrument) = self.get_instrument(&instrument_id) {
-                    let mut sorted_fills: Vec<&FillReport> = fills.iter().collect();
-                    sorted_fills.sort_by_key(|f| f.ts_event);
-
-                    for fill in sorted_fills {
-                        if let Some((event, fill_key)) = self.create_order_fill(
-                            &order,
-                            fill,
-                            &instrument,
-                            &fill_queue.pending_fill_keys,
-                        ) {
-                            fills_applied += 1;
-                            fill_queue.push(&mut events, event, fill_key);
-                        }
-                    }
+                    .contains(&client_order_id)
+                {
+                    log::debug!(
+                        "Skipping orphan fill for {client_order_id}: in filtered_client_order_ids"
+                    );
+                    continue;
+                }
+                let Some(order) = self.get_order(client_order_id) else {
+                    log::error!(
+                        "Resolved orphan-fill order {client_order_id} disappeared from cache"
+                    );
+                    continue;
+                };
+                let Some(instrument) = self.get_instrument(&order.instrument_id()) else {
+                    orders_skipped_no_instrument += 1;
+                    continue;
+                };
+                if let Some((event, fill_key)) =
+                    self.create_order_fill(&order, fill, &instrument, &fill_queue.pending_fill_keys)
+                {
+                    fills_applied += 1;
+                    fill_queue.push(&mut events, event, fill_key);
                 }
             }
         }

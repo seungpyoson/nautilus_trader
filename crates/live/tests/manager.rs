@@ -4902,7 +4902,7 @@ async fn test_mass_status_matches_order_by_venue_order_id() {
 
 #[rstest]
 #[tokio::test]
-async fn test_mass_status_matches_order_by_venue_order_id_with_mismatched_client_id() {
+async fn test_mass_status_rejects_split_client_and_venue_order_identity() {
     let mut ctx = TestContext::new();
     ctx.add_instrument(test_instrument());
 
@@ -4951,11 +4951,15 @@ async fn test_mass_status_matches_order_by_venue_order_id_with_mismatched_client
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
 
-    assert_eq!(result.events.len(), 1);
-    assert!(matches!(result.events[0], OrderEventAny::Canceled(_)));
-    if let OrderEventAny::Canceled(canceled) = &result.events[0] {
-        assert_eq!(canceled.client_order_id, client_order_id);
-    }
+    assert!(result.events.is_empty());
+    assert_eq!(
+        ctx.cache
+            .borrow()
+            .order(&client_order_id)
+            .expect("cached order should remain")
+            .status(),
+        OrderStatus::Accepted,
+    );
 }
 
 #[tokio::test]
@@ -8768,6 +8772,76 @@ async fn test_filtered_client_order_ids_skips_orphan_fills_via_venue_order_id_lo
             .iter()
             .any(|e| matches!(e, OrderEventAny::Filled(_))),
         "Filtered order should not receive orphan fill events via venue_order_id lookup"
+    );
+}
+
+#[tokio::test]
+async fn test_orphan_fill_rejects_split_client_and_venue_order_identity() {
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    let cached_client_order_id = ClientOrderId::from("O-CACHED-ORPHAN");
+    let reported_client_order_id = ClientOrderId::from("O-REPORTED-ORPHAN");
+    let venue_order_id = VenueOrderId::from("V-SPLIT-ORPHAN");
+    ctx.add_instrument(test_instrument());
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .client_order_id(cached_client_order_id)
+        .instrument_id(instrument_id)
+        .quantity(Quantity::from("10.0"))
+        .price(Price::from("100.0"))
+        .build();
+    let submitted = TestOrderEventStubs::submitted(&order, test_account_id());
+    order.apply(submitted).unwrap();
+    let accepted = TestOrderEventStubs::accepted(&order, test_account_id(), venue_order_id);
+    order.apply(accepted).unwrap();
+    ctx.add_order(order);
+    ctx.cache
+        .borrow_mut()
+        .add_venue_order_id(&cached_client_order_id, &venue_order_id, false)
+        .unwrap();
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    mass_status.add_fill_reports(vec![FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        TradeId::from("T-SPLIT-ORPHAN"),
+        OrderSide::Buy,
+        Quantity::from("5.0"),
+        Price::from("100.00"),
+        Money::from("0.50 USD"),
+        LiquiditySide::Taker,
+        Some(reported_client_order_id),
+        None,
+        UnixNanos::from(1_000),
+        UnixNanos::from(1_000),
+        None,
+    )]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert!(
+        !result
+            .events
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Filled(_)))
+    );
+    assert_eq!(
+        ctx.cache
+            .borrow()
+            .order(&cached_client_order_id)
+            .expect("cached order should remain")
+            .filled_qty(),
+        Quantity::zero(1),
     );
 }
 
