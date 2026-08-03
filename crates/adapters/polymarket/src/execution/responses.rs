@@ -529,6 +529,7 @@ mod tests {
         types::{Currency, Price},
     };
     use rstest::rstest;
+    use ustr::Ustr;
 
     use super::*;
     use crate::execution::local_orders::LocalOrderSnapshot;
@@ -735,8 +736,13 @@ mod tests {
             &[trade],
             &ctx,
             &instruments,
-            None,
-            UnixNanos::from(1_000_000_000u64),
+            crate::execution::reconciliation::FillReportQuery {
+                instrument_filter: None,
+                venue_order_filter: None,
+                start: None,
+                end: None,
+                ts_init: UnixNanos::from(1_000_000_000u64),
+            },
         );
 
         assert!(reports.is_empty());
@@ -766,8 +772,13 @@ mod tests {
             &[trade],
             &ctx,
             &instruments,
-            None,
-            UnixNanos::from(1_000_000_000u64),
+            crate::execution::reconciliation::FillReportQuery {
+                instrument_filter: None,
+                venue_order_filter: None,
+                start: None,
+                end: None,
+                ts_init: UnixNanos::from(1_000_000_000u64),
+            },
         );
 
         assert_eq!(reports.len(), 1);
@@ -798,13 +809,143 @@ mod tests {
             &[trade],
             &ctx,
             &instruments,
-            None,
-            UnixNanos::from(1_000_000_000u64),
+            crate::execution::reconciliation::FillReportQuery {
+                instrument_filter: None,
+                venue_order_filter: None,
+                start: None,
+                end: None,
+                ts_init: UnixNanos::from(1_000_000_000u64),
+            },
         );
 
         assert!(reports.is_empty());
         assert_eq!(findings.unowned_maker_trades, 1);
         assert_eq!(findings.unmapped_instruments, 0);
+    }
+
+    #[rstest]
+    fn test_bounded_fill_query_reports_a_kept_trade_of_unknown_age() {
+        let instrument = test_instrument();
+        let mut trade: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
+        trade.match_time = "not-a-timestamp".to_string();
+        let instruments = AtomicMap::new();
+        instruments.insert(trade.asset_id, instrument);
+        let ctx = crate::execution::reconciliation::FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            api_key: "00000000-0000-0000-0000-000000000001",
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let (reports, findings) = crate::execution::reconciliation::build_fill_reports_from_trades(
+            &[trade],
+            &ctx,
+            &instruments,
+            crate::execution::reconciliation::FillReportQuery {
+                instrument_filter: None,
+                venue_order_filter: None,
+                start: None,
+                end: Some(UnixNanos::from(u64::MAX)),
+                ts_init: UnixNanos::from(1_000_000_000u64),
+            },
+        );
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(findings.unknown_age, 1);
+    }
+
+    #[rstest]
+    fn test_bounded_fill_query_counts_a_relevant_trade_outside_the_window() {
+        let instrument = test_instrument();
+        let trade: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
+        let instruments = AtomicMap::new();
+        instruments.insert(trade.asset_id, instrument);
+        let ctx = crate::execution::reconciliation::FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            api_key: "00000000-0000-0000-0000-000000000001",
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let (reports, findings) = crate::execution::reconciliation::build_fill_reports_from_trades(
+            &[trade],
+            &ctx,
+            &instruments,
+            crate::execution::reconciliation::FillReportQuery {
+                instrument_filter: None,
+                venue_order_filter: None,
+                start: None,
+                end: Some(UnixNanos::from(0u64)),
+                ts_init: UnixNanos::from(1_000_000_000u64),
+            },
+        );
+
+        assert!(reports.is_empty());
+        assert_eq!(findings.outside_lookback, 1);
+    }
+
+    #[rstest]
+    fn test_unresolved_instrument_scope_is_strictly_empty_without_findings() {
+        let instrument = test_instrument();
+        let trade: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
+        let instruments = AtomicMap::new();
+        instruments.insert(trade.asset_id, instrument);
+        let ctx = crate::execution::reconciliation::FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            api_key: "00000000-0000-0000-0000-000000000001",
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let (reports, findings) = crate::execution::reconciliation::build_fill_reports_from_trades(
+            &[trade],
+            &ctx,
+            &instruments,
+            crate::execution::reconciliation::FillReportQuery {
+                instrument_filter: Some(InstrumentId::from("UNLOADED.POLYMARKET")),
+                venue_order_filter: None,
+                start: None,
+                end: None,
+                ts_init: UnixNanos::from(1_000_000_000u64),
+            },
+        );
+
+        assert!(reports.is_empty());
+        assert!(findings.is_empty());
+    }
+
+    #[rstest]
+    fn test_instrument_scope_ignores_unrelated_unmapped_trade_without_findings() {
+        let instrument = test_instrument();
+        let trade: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
+        let instruments = AtomicMap::new();
+        instruments.insert(Ustr::from("requested-token"), instrument.clone());
+        let ctx = crate::execution::reconciliation::FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            api_key: "00000000-0000-0000-0000-000000000001",
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let (reports, findings) = crate::execution::reconciliation::build_fill_reports_from_trades(
+            &[trade],
+            &ctx,
+            &instruments,
+            crate::execution::reconciliation::FillReportQuery {
+                instrument_filter: Some(instrument.id()),
+                venue_order_filter: None,
+                start: None,
+                end: None,
+                ts_init: UnixNanos::from(1_000_000_000u64),
+            },
+        );
+
+        assert!(reports.is_empty());
+        assert!(findings.is_empty());
     }
 
     #[rstest]

@@ -44,7 +44,7 @@ use crate::{
     execution::{
         local_orders::OrderIdentity,
         parse::{parse_timestamp, serialize_info},
-        reconciliation::build_fill_reports_from_trades,
+        reconciliation::{FillReportQuery, build_fill_reports_from_trades},
         reports::fetch_and_emit_account_state,
     },
     http::{clob::HeartbeatResponse, error::Error as HttpError, query::GetTradesParams},
@@ -676,8 +676,13 @@ impl PolymarketExecutionClient {
             std::slice::from_ref(&finalized),
             &self.fill_context(),
             &self.shared_token_instruments,
-            None,
-            self.clock.get_time_ns(),
+            FillReportQuery {
+                instrument_filter: None,
+                venue_order_filter: None,
+                start: None,
+                end: None,
+                ts_init: self.clock.get_time_ns(),
+            },
         );
         if !findings.is_empty() || candidates.len() != fills.len() {
             return Err(anyhow!(

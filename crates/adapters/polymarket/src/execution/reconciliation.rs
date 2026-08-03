@@ -57,6 +57,15 @@ pub(crate) struct FillContext<'a> {
     pub clock: &'static AtomicTime,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FillReportQuery {
+    pub instrument_filter: Option<InstrumentId>,
+    pub venue_order_filter: Option<VenueOrderId>,
+    pub start: Option<UnixNanos>,
+    pub end: Option<UnixNanos>,
+    pub ts_init: UnixNanos,
+}
+
 /// Losses encountered while converting authenticated venue trades into fills.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FillBuildFindings {
@@ -64,24 +73,41 @@ pub(crate) struct FillBuildFindings {
     pub unmapped_instruments: usize,
     /// Confirmed maker trades holding none of this account's maker orders.
     pub unowned_maker_trades: usize,
+    /// Relevant trades rejected by the caller's time window.
+    pub outside_lookback: usize,
+    /// Relevant trades kept despite an unparsable venue timestamp.
+    pub unknown_age: usize,
 }
 
 impl FillBuildFindings {
     pub(crate) fn is_empty(self) -> bool {
-        self.unmapped_instruments == 0 && self.unowned_maker_trades == 0
+        self.unmapped_instruments == 0
+            && self.unowned_maker_trades == 0
+            && self.outside_lookback == 0
+            && self.unknown_age == 0
     }
 
     pub(crate) fn report(self, level: log::Level, context: &str) {
-        if self.is_empty() {
+        if self.unmapped_instruments == 0 && self.unowned_maker_trades == 0 && self.unknown_age == 0
+        {
             return;
         }
         log::log!(
             level,
-            "{context}: {} entr(ies) had no loaded instrument; {} confirmed maker trade(s) held no maker order owned by this account",
+            "{context}: {} entr(ies) had no loaded instrument; {} confirmed maker trade(s) held no maker order owned by this account; {} trade(s) of unknown age were kept inside a bounded query",
             self.unmapped_instruments,
             self.unowned_maker_trades,
+            self.unknown_age,
         );
     }
+}
+
+fn trade_mentions_venue_order(trade: &PolymarketTradeReport, venue_order_id: VenueOrderId) -> bool {
+    trade.taker_order_id == venue_order_id.as_str()
+        || trade
+            .maker_orders
+            .iter()
+            .any(|order| order.order_id == venue_order_id.as_str())
 }
 
 /// Converts trade reports into fill reports: single implementation of maker/taker
@@ -90,15 +116,13 @@ pub(crate) fn build_fill_reports_from_trades(
     trades: &[PolymarketTradeReport],
     ctx: &FillContext<'_>,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
-    instrument_filter: Option<InstrumentId>,
-    ts_init: UnixNanos,
+    query: FillReportQuery,
 ) -> (Vec<FillReport>, FillBuildFindings) {
     build_fill_reports_for_status(
         trades,
         ctx,
         instruments,
-        instrument_filter,
-        ts_init,
+        query,
         TradeStatusSelection::Confirmed,
     )
 }
@@ -113,8 +137,13 @@ pub(crate) fn build_pending_fill_reports_from_trades(
         trades,
         ctx,
         instruments,
-        None,
-        ts_init,
+        FillReportQuery {
+            instrument_filter: None,
+            venue_order_filter: None,
+            start: None,
+            end: None,
+            ts_init,
+        },
         TradeStatusSelection::PendingSettlement,
     )
 }
@@ -138,19 +167,66 @@ fn build_fill_reports_for_status(
     trades: &[PolymarketTradeReport],
     ctx: &FillContext<'_>,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
-    instrument_filter: Option<InstrumentId>,
-    ts_init: UnixNanos,
+    query: FillReportQuery,
     status_selection: TradeStatusSelection,
 ) -> (Vec<FillReport>, FillBuildFindings) {
+    let FillReportQuery {
+        instrument_filter,
+        venue_order_filter,
+        start,
+        end,
+        ts_init,
+    } = query;
     let mut reports = Vec::new();
     let mut findings = FillBuildFindings::default();
+    let requested_asset_ids = instrument_filter.map(|filter_id| {
+        instruments
+            .load()
+            .iter()
+            .filter_map(|(asset_id, instrument)| {
+                (instrument.id() == filter_id).then_some(*asset_id)
+            })
+            .collect::<Vec<_>>()
+    });
 
     for trade in trades {
         if !status_selection.includes(trade.status) {
             continue;
         }
 
+        if venue_order_filter
+            .is_some_and(|venue_order_id| !trade_mentions_venue_order(trade, venue_order_id))
+        {
+            continue;
+        }
+
         let is_maker = trade.trader_side == PolymarketLiquiditySide::Maker;
+        if venue_order_filter.is_none()
+            && let Some(asset_ids) = &requested_asset_ids
+        {
+            let mentions_requested_instrument = if is_maker {
+                trade
+                    .maker_orders
+                    .iter()
+                    .any(|order| asset_ids.contains(&order.asset_id))
+            } else {
+                asset_ids.contains(&trade.asset_id)
+            };
+            if !mentions_requested_instrument {
+                continue;
+            }
+        }
+
+        let parsed_timestamp = parse_timestamp(&trade.match_time);
+        if parsed_timestamp.is_some_and(|timestamp| {
+            start.is_some_and(|cutoff| timestamp < cutoff)
+                || end.is_some_and(|cutoff| timestamp > cutoff)
+        }) {
+            findings.outside_lookback += 1;
+            continue;
+        }
+        let age_unknown = parsed_timestamp.is_none() && (start.is_some() || end.is_some());
+        let reports_before = reports.len();
 
         if is_maker {
             if !trade
@@ -165,6 +241,15 @@ fn build_fill_reports_for_status(
                 if !mo.is_owned_by(ctx.user_address, ctx.api_key) {
                     continue;
                 }
+                if venue_order_filter
+                    .is_some_and(|venue_order_id| mo.order_id != venue_order_id.as_str())
+                    || (venue_order_filter.is_none()
+                        && requested_asset_ids
+                            .as_ref()
+                            .is_some_and(|asset_ids| !asset_ids.contains(&mo.asset_id)))
+                {
+                    continue;
+                }
                 let token_id = Ustr::from(mo.asset_id.as_str());
                 let instrument = instruments.get_cloned(&token_id);
                 let (instrument_id, price_prec, size_prec) = match instrument {
@@ -174,15 +259,11 @@ fn build_fill_reports_for_status(
                         continue;
                     }
                 };
-
-                if let Some(filter_id) = instrument_filter
-                    && instrument_id != filter_id
-                {
+                if instrument_filter.is_some_and(|filter_id| instrument_id != filter_id) {
                     continue;
                 }
 
-                let ts_event =
-                    parse_timestamp(&trade.match_time).unwrap_or(ctx.clock.get_time_ns());
+                let ts_event = parsed_timestamp.unwrap_or_else(|| ctx.clock.get_time_ns());
                 let report = build_maker_fill_report(
                     mo,
                     &trade.id,
@@ -201,6 +282,11 @@ fn build_fill_reports_for_status(
                 reports.push(report);
             }
         } else {
+            if venue_order_filter
+                .is_some_and(|venue_order_id| trade.taker_order_id != venue_order_id.as_str())
+            {
+                continue;
+            }
             let token_id = Ustr::from(trade.asset_id.as_str());
             let instrument = instruments.get_cloned(&token_id);
             let (instrument_id, price_prec, size_prec, taker_fee_rate, fee_exponent) =
@@ -217,10 +303,7 @@ fn build_fill_reports_for_status(
                         continue;
                     }
                 };
-
-            if let Some(filter_id) = instrument_filter
-                && instrument_id != filter_id
-            {
+            if instrument_filter.is_some_and(|filter_id| instrument_id != filter_id) {
                 continue;
             }
 
@@ -237,6 +320,10 @@ fn build_fill_reports_for_status(
                 ts_init,
             );
             reports.push(report);
+        }
+
+        if age_unknown && reports.len() > reports_before {
+            findings.unknown_age += 1;
         }
     }
 
@@ -284,27 +371,6 @@ pub(crate) fn build_order_reports_from_orders(
     }
 
     (reports, filtered)
-}
-
-/// Applies venue_order_id and time-range filters to fill reports.
-pub(crate) fn apply_fill_filters(
-    mut reports: Vec<FillReport>,
-    venue_order_id: Option<VenueOrderId>,
-    start: Option<UnixNanos>,
-    end: Option<UnixNanos>,
-) -> Vec<FillReport> {
-    if let Some(vid) = venue_order_id {
-        reports.retain(|r| r.venue_order_id == vid);
-    }
-
-    match (start, end) {
-        (Some(s), Some(e)) => reports.retain(|r| r.ts_event >= s && r.ts_event <= e),
-        (Some(s), None) => reports.retain(|r| r.ts_event >= s),
-        (None, Some(e)) => reports.retain(|r| r.ts_event <= e),
-        (None, None) => {}
-    }
-
-    reports
 }
 
 /// Builds position status reports from Data API positions, filtering dust.
@@ -369,6 +435,7 @@ pub(crate) async fn generate_mass_status(
     lookback_mins: Option<u64>,
 ) -> anyhow::Result<Option<ExecutionMassStatus>> {
     let ts_init = ctx.clock.get_time_ns();
+    let lookback = lookback_mins.map(|mins| (mins, lookback_cutoff(ts_init, mins)));
 
     // Fetch orders
     let orders = http_client
@@ -387,8 +454,18 @@ pub(crate) async fn generate_mass_status(
         .await
         .context("failed to fetch trades for mass status")?;
 
-    let (fill_reports, fill_findings) =
-        build_fill_reports_from_trades(&trades, ctx, instruments, None, ts_init);
+    let (fill_reports, fill_findings) = build_fill_reports_from_trades(
+        &trades,
+        ctx,
+        instruments,
+        FillReportQuery {
+            instrument_filter: None,
+            venue_order_filter: None,
+            start: lookback.map(|(_, cutoff)| cutoff),
+            end: None,
+            ts_init,
+        },
+    );
     fill_findings.report(
         log::Level::Warn,
         "Mass-status generation lost fill evidence",
@@ -440,28 +517,19 @@ pub(crate) async fn generate_mass_status(
     }
 
     // Apply lookback filter
-    if let Some(mins) = lookback_mins {
-        let now_ns = ctx.clock.get_time_ns();
-        let cutoff_ns = now_ns.as_u64().saturating_sub(mins * 60 * 1_000_000_000);
-        let cutoff = UnixNanos::from(cutoff_ns);
-
+    if let Some((mins, cutoff)) = lookback {
         let orders_before = order_reports.len();
         order_reports.retain(|r| r.ts_last >= cutoff);
         let orders_removed = orders_before - order_reports.len();
 
-        let fills_before = fill_reports.len();
-        fill_reports.retain(|r| r.ts_event >= cutoff);
-        let fills_removed = fills_before - fill_reports.len();
-
         log::debug!(
-            "Lookback filter ({}min): orders {}->{} (removed {}), fills {}->{} (removed {})",
+            "Lookback filter ({}min): orders {}->{} (removed {}), fills {} (removed {})",
             mins,
             orders_before,
             order_reports.len(),
             orders_removed,
-            fills_before,
             fill_reports.len(),
-            fills_removed,
+            fill_findings.outside_lookback,
         );
     } else {
         log::debug!(
@@ -482,6 +550,13 @@ pub(crate) async fn generate_mass_status(
     Ok(Some(mass_status))
 }
 
+fn lookback_cutoff(ts_init: UnixNanos, lookback_mins: u64) -> UnixNanos {
+    let lookback_ns = lookback_mins
+        .saturating_mul(60)
+        .saturating_mul(1_000_000_000);
+    UnixNanos::from(ts_init.as_u64().saturating_sub(lookback_ns))
+}
+
 pub(crate) fn confirmed_filled_quantities(
     fill_reports: &[FillReport],
 ) -> AHashMap<(VenueOrderId, InstrumentId), Decimal> {
@@ -493,4 +568,19 @@ pub(crate) fn confirmed_filled_quantities(
     }
 
     confirmed_by_order
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_core::UnixNanos;
+
+    use super::lookback_cutoff;
+
+    #[test]
+    fn lookback_cutoff_saturates_for_unbounded_minutes() {
+        assert_eq!(
+            lookback_cutoff(UnixNanos::from(1_000_000_000u64), u64::MAX),
+            UnixNanos::from(0u64),
+        );
+    }
 }

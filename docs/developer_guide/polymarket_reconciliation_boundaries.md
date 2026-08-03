@@ -20,10 +20,9 @@ that contract while proving the live manager cannot bypass the shared resolver.
 
 ## Maker ownership and incomplete-pass reporting
 
-Ethereum addresses are canonicalized at input boundaries. Configured signer/funder addresses and
-maker addresses decoded from REST or WebSocket payloads use the same lowercase representation;
-runtime ownership checks then use one shared predicate with exact address and API-key equality.
-Python schemas expose the same shared ownership predicate so their behavior cannot drift from Rust.
+Maker ownership uses one shared predicate: Ethereum addresses compare without case while API keys
+remain exact. REST, WebSocket, and Python schema paths all call that predicate, so ownership behavior
+cannot drift between routes or languages.
 
 Trade conversion returns a typed discard summary rather than a single anonymous count. It records
 at least unmapped instruments and confirmed maker trades for which no owned maker order can be

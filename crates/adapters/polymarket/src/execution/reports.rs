@@ -38,7 +38,7 @@ use super::{
         weighted_average_price,
     },
     reconciliation::{
-        FillContext, apply_fill_filters, build_fill_reports_from_trades,
+        FillContext, FillReportQuery, build_fill_reports_from_trades,
         build_pending_fill_reports_from_trades, build_position_reports,
         confirmed_filled_quantities,
     },
@@ -91,9 +91,18 @@ fn build_recovery_fill_reports(
             RecoveryTradeStatus::Pending => {
                 build_pending_fill_reports_from_trades(trade, ctx, instruments, ts_init)
             }
-            RecoveryTradeStatus::Confirmed => {
-                build_fill_reports_from_trades(trade, ctx, instruments, None, ts_init)
-            }
+            RecoveryTradeStatus::Confirmed => build_fill_reports_from_trades(
+                trade,
+                ctx,
+                instruments,
+                FillReportQuery {
+                    instrument_filter: None,
+                    venue_order_filter: Some(venue_order_id),
+                    start: None,
+                    end: None,
+                    ts_init,
+                },
+            ),
         };
         let matching: Vec<_> = built
             .into_iter()
@@ -670,8 +679,13 @@ impl PolymarketExecutionClient {
             &trades,
             &ctx,
             &self.shared_token_instruments,
-            cmd.instrument_id,
-            self.clock.get_time_ns(),
+            FillReportQuery {
+                instrument_filter: cmd.instrument_id,
+                venue_order_filter: cmd.venue_order_id,
+                start: cmd.start,
+                end: cmd.end,
+                ts_init: self.clock.get_time_ns(),
+            },
         );
         findings.report(
             log::Level::Warn,
@@ -686,8 +700,7 @@ impl PolymarketExecutionClient {
             );
         }
 
-        let reports =
-            apply_fill_filters(admitted.artifacts, cmd.venue_order_id, cmd.start, cmd.end);
+        let reports = admitted.artifacts;
 
         log::debug!("Generated {} fill reports", reports.len());
         Ok(reports)
@@ -764,8 +777,18 @@ async fn fetch_confirmed_fill_reports(
         .get_trades(params)
         .await
         .context("failed to fetch confirmed trades")?;
-    let (reports, findings) =
-        build_fill_reports_from_trades(&trades, ctx, token_instruments, instrument_id, ts_init);
+    let (reports, findings) = build_fill_reports_from_trades(
+        &trades,
+        ctx,
+        token_instruments,
+        FillReportQuery {
+            instrument_filter: instrument_id,
+            venue_order_filter: None,
+            start: None,
+            end: None,
+            ts_init,
+        },
+    );
     findings.report(
         log::Level::Warn,
         "Confirmed-fill retrieval lost fill evidence",
