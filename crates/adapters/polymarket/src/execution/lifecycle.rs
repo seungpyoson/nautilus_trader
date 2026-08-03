@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use anyhow::{Context, anyhow};
 use indexmap::IndexMap;
 use nautilus_common::{
@@ -31,7 +31,7 @@ use nautilus_common::{
 use nautilus_core::{MUTEX_POISONED, collections::AtomicMap, time::AtomicTime};
 use nautilus_model::{
     events::{OrderEventAny, OrderFilled, PositionEvent},
-    identifiers::InstrumentId,
+    identifiers::{InstrumentId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::Order,
 };
@@ -66,6 +66,13 @@ struct RestoredTradeSettlement {
     trade_id: String,
     key: String,
     fills: Vec<OrderFilled>,
+    persisted_finality: AHashMap<VenueOrderId, PersistedFillFinality>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistedFillFinality {
+    Confirmed,
+    Voided,
 }
 
 impl PolymarketExecutionClient {
@@ -421,8 +428,7 @@ impl PolymarketExecutionClient {
         drop(cache);
 
         let mut matched_fills: AHashMap<String, (String, Vec<OrderFilled>)> = AHashMap::new();
-        let mut confirmed_trades = AHashSet::new();
-        let mut voided_trades = AHashSet::new();
+        let mut persisted_finality = AHashMap::new();
 
         for order in &orders {
             let Some(venue_order_id) = order.venue_order_id() else {
@@ -455,7 +461,10 @@ impl PolymarketExecutionClient {
                             if polymarket_trade_status(fill.info.as_ref())
                                 == Some(PolymarketTradeStatus::Confirmed)
                             {
-                                confirmed_trades.insert(key.clone());
+                                persisted_finality
+                                    .entry(key.clone())
+                                    .or_insert_with(AHashMap::new)
+                                    .insert(fill.venue_order_id, PersistedFillFinality::Confirmed);
                             }
                             matched_fills
                                 .entry(key)
@@ -466,12 +475,18 @@ impl PolymarketExecutionClient {
                     }
                     OrderEventAny::FillConfirmed(confirmed) => {
                         if let Some(key) = polymarket_trade_key(confirmed.info.as_ref()) {
-                            confirmed_trades.insert(key);
+                            persisted_finality
+                                .entry(key)
+                                .or_insert_with(AHashMap::new)
+                                .insert(confirmed.venue_order_id, PersistedFillFinality::Confirmed);
                         }
                     }
                     OrderEventAny::FillVoided(voided) => {
                         if let Some(key) = polymarket_trade_key(voided.info.as_ref()) {
-                            voided_trades.insert(key);
+                            persisted_finality
+                                .entry(key)
+                                .or_insert_with(AHashMap::new)
+                                .insert(voided.venue_order_id, PersistedFillFinality::Voided);
                         }
                     }
                     _ => {}
@@ -480,16 +495,21 @@ impl PolymarketExecutionClient {
         }
 
         let mut state = self.ws_dispatch_state.lock().expect(MUTEX_POISONED);
-        for key in &voided_trades {
-            state.restore_voided_trade(key.clone());
-        }
-
         let mut settlements = Vec::new();
         for (key, (trade_id, fills)) in matched_fills {
-            if voided_trades.contains(&key) {
-                continue;
-            }
-            if confirmed_trades.contains(&key) {
+            let member_finality = persisted_finality.remove(&key).unwrap_or_default();
+            let all_confirmed = !fills.is_empty()
+                && fills.iter().all(|fill| {
+                    member_finality.get(&fill.venue_order_id)
+                        == Some(&PersistedFillFinality::Confirmed)
+                });
+            let all_voided = !fills.is_empty()
+                && fills.iter().all(|fill| {
+                    member_finality.get(&fill.venue_order_id)
+                        == Some(&PersistedFillFinality::Voided)
+                });
+
+            if all_confirmed {
                 let _ = state.restore_trade_settlement(
                     &trade_id,
                     key,
@@ -498,10 +518,15 @@ impl PolymarketExecutionClient {
                 );
                 continue;
             }
+            if all_voided {
+                state.restore_voided_trade(key);
+                continue;
+            }
             settlements.push(RestoredTradeSettlement {
                 trade_id,
                 key,
                 fills,
+                persisted_finality: member_finality,
             });
         }
 
@@ -553,6 +578,7 @@ impl PolymarketExecutionClient {
                 ));
             }
             self.validate_restored_trade_fills(report, &settlement.fills)?;
+            self.validate_persisted_fill_finality(report, &settlement)?;
 
             let action = self
                 .ws_dispatch_state
@@ -572,7 +598,10 @@ impl PolymarketExecutionClient {
             match action {
                 RestoredTradeSettlementAction::Pending => {}
                 RestoredTradeSettlementAction::Confirmed(fills) => {
-                    for fill in fills {
+                    for fill in fills.into_iter().filter(|fill| {
+                        settlement.persisted_finality.get(&fill.venue_order_id)
+                            != Some(&PersistedFillFinality::Confirmed)
+                    }) {
                         let mut confirmed =
                             build_order_fill_confirmed(&fill, ts_event, ts_init, info.clone());
                         confirmed.causation_id = Some(fill.event_id);
@@ -581,7 +610,10 @@ impl PolymarketExecutionClient {
                     }
                 }
                 RestoredTradeSettlementAction::Failed(fills) => {
-                    for fill in fills {
+                    for fill in fills.into_iter().filter(|fill| {
+                        settlement.persisted_finality.get(&fill.venue_order_id)
+                            != Some(&PersistedFillFinality::Voided)
+                    }) {
                         self.local_orders
                             .reverse_fill(&fill.venue_order_id, fill.last_qty);
                         let mut voided = build_order_fill_voided(
@@ -599,6 +631,37 @@ impl PolymarketExecutionClient {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_persisted_fill_finality(
+        &self,
+        report: &crate::http::models::PolymarketTradeReport,
+        settlement: &RestoredTradeSettlement,
+    ) -> anyhow::Result<()> {
+        let expected = if report.status == PolymarketTradeStatus::Failed {
+            PersistedFillFinality::Voided
+        } else if report.status.is_finalized() {
+            PersistedFillFinality::Confirmed
+        } else if settlement.persisted_finality.is_empty() {
+            return Ok(());
+        } else {
+            return Err(anyhow!(
+                "venue regressed restored trade {} after persisted member finality",
+                report.id
+            ));
+        };
+
+        if settlement
+            .persisted_finality
+            .values()
+            .any(|finality| *finality != expected)
+        {
+            return Err(anyhow!(
+                "venue contradicted persisted member finality for restored trade {}",
+                report.id
+            ));
+        }
         Ok(())
     }
 
@@ -1106,12 +1169,15 @@ mod tests {
         InstrumentAny::BinaryOption(binary)
     }
 
-    fn open_limit_order(instrument_id: InstrumentId) -> OrderAny {
+    fn open_limit_order_with_client(
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+    ) -> OrderAny {
         OrderAny::Limit(LimitOrder::new(
             TraderId::from("TESTER-001"),
             StrategyId::from("S-001"),
             instrument_id,
-            ClientOrderId::from("O-RETAIN"),
+            client_order_id,
             OrderSide::Buy,
             ModelQuantity::new(10.0, 0),
             ModelPrice::from("0.5000"),
@@ -1136,19 +1202,91 @@ mod tests {
         ))
     }
 
-    fn cache_accepted_open_order(cache: &mut Cache, instrument_id: InstrumentId) -> OrderAny {
-        let mut order = open_limit_order(instrument_id);
-        cache.add_order(order.clone(), None, None, false).unwrap();
+    fn open_limit_order(instrument_id: InstrumentId) -> OrderAny {
+        open_limit_order_with_client(instrument_id, ClientOrderId::from("O-RETAIN"))
+    }
 
+    fn cache_accepted_order_with_ids(
+        cache: &mut Cache,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+    ) -> OrderAny {
+        let mut order = open_limit_order_with_client(instrument_id, client_order_id);
+        cache.add_order(order.clone(), None, None, false).unwrap();
         let submitted = TestOrderEventStubs::submitted(&order, AccountId::from("POLYMARKET-001"));
         order = cache.update_order(&submitted).unwrap();
-
         let accepted = TestOrderEventStubs::accepted(
             &order,
             AccountId::from("POLYMARKET-001"),
-            VenueOrderId::from("V-001"),
+            venue_order_id,
         );
         cache.update_order(&accepted).unwrap()
+    }
+
+    fn cache_accepted_open_order(cache: &mut Cache, instrument_id: InstrumentId) -> OrderAny {
+        cache_accepted_order_with_ids(
+            cache,
+            instrument_id,
+            ClientOrderId::from("O-RETAIN"),
+            VenueOrderId::from("V-001"),
+        )
+    }
+
+    fn cache_two_member_trade(
+        cache: &mut Cache,
+        instrument: &InstrumentAny,
+        trade_id: TradeId,
+        taker_order_id: &str,
+    ) -> Vec<OrderFilled> {
+        [
+            (
+                ClientOrderId::from("O-MAKER-A"),
+                VenueOrderId::from("V-MAKER-A"),
+            ),
+            (
+                ClientOrderId::from("O-MAKER-B"),
+                VenueOrderId::from("V-MAKER-B"),
+            ),
+        ]
+        .into_iter()
+        .map(|(client_order_id, venue_order_id)| {
+            let order = cache_accepted_order_with_ids(
+                cache,
+                instrument.id(),
+                client_order_id,
+                venue_order_id,
+            );
+            let mut event = TestOrderEventStubs::filled(
+                &order,
+                instrument,
+                None,
+                None,
+                Some(ModelPrice::from("0.5000")),
+                None,
+                None,
+                None,
+                None,
+                Some(AccountId::from("POLYMARKET-001")),
+            );
+            let OrderEventAny::Filled(ref mut fill) = event else {
+                panic!("expected filled event");
+            };
+            fill.trade_id = trade_id;
+            fill.info = Some(IndexMap::from([
+                (Ustr::from("id"), Ustr::from(trade_id.as_str())),
+                (Ustr::from("taker_order_id"), Ustr::from(taker_order_id)),
+                (Ustr::from("status"), Ustr::from("MATCHED")),
+            ]));
+            let OrderEventAny::Filled(fill) = event else {
+                unreachable!();
+            };
+            cache
+                .update_order(&OrderEventAny::Filled(fill.clone()))
+                .unwrap();
+            fill
+        })
+        .collect()
     }
 
     fn open_position(instrument: &InstrumentAny) -> Position {
@@ -1398,6 +1536,83 @@ mod tests {
         assert_eq!(state.matched_fill_count("trade-confirmed-V-001"), 0);
         assert!(state.is_confirmed_trade(trade_id.as_str(), venue_order_id));
         assert!(order.filled_qty() > Quantity::zero(order.quantity().precision));
+    }
+
+    #[rstest]
+    fn load_orders_from_cache_revalidates_partially_confirmed_maker_trade() {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xPARTIAL-CONFIRM", false, false);
+        let trade_id = TradeId::from("trade-partial-confirm");
+        let taker_order_id = "V-TAKER";
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            let fills = cache_two_member_trade(&mut cache, &instrument, trade_id, taker_order_id);
+            let fill = &fills[0];
+            let confirmed = OrderFillConfirmed::new(
+                fill.trader_id,
+                fill.strategy_id,
+                fill.instrument_id,
+                fill.client_order_id,
+                fill.venue_order_id,
+                fill.account_id,
+                fill.trade_id,
+                fill.info.clone(),
+                UUID4::new(),
+                UnixNanos::from(1),
+                UnixNanos::from(2),
+                false,
+            );
+            cache
+                .update_order(&OrderEventAny::FillConfirmed(confirmed))
+                .unwrap();
+        }
+
+        let settlements = client.load_orders_from_cache();
+
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].fills.len(), 2);
+    }
+
+    #[rstest]
+    fn load_orders_from_cache_revalidates_partially_voided_maker_trade() {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xPARTIAL-VOID", false, false);
+        let trade_id = TradeId::from("trade-partial-void");
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            let fills = cache_two_member_trade(&mut cache, &instrument, trade_id, "V-TAKER");
+            let fill = &fills[0];
+            let voided = OrderFillVoidedSpec::builder()
+                .trader_id(fill.trader_id)
+                .strategy_id(fill.strategy_id)
+                .instrument_id(fill.instrument_id)
+                .client_order_id(fill.client_order_id)
+                .venue_order_id(fill.venue_order_id)
+                .account_id(fill.account_id)
+                .trade_id(fill.trade_id)
+                .voided_qty(fill.last_qty)
+                .maybe_commission_voided(fill.commission)
+                .order_side(fill.order_side)
+                .order_type(fill.order_type)
+                .last_px(fill.last_px)
+                .currency(fill.currency)
+                .liquidity_side(fill.liquidity_side)
+                .maybe_position_id(fill.position_id)
+                .maybe_info(fill.info.clone())
+                .build();
+            cache
+                .update_order(&OrderEventAny::FillVoided(voided))
+                .unwrap();
+        }
+
+        let settlements = client.load_orders_from_cache();
+
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].fills.len(), 2);
     }
 
     #[rstest]
