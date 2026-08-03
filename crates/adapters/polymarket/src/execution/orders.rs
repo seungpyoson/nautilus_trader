@@ -34,9 +34,9 @@ use super::{
     parse::{compute_commission, instrument_fee_exponent, instrument_taker_fee},
     reports::fetch_collateral_balance_pusd,
     responses::{
-        check_fok_status, deny_preparing_order, emit_market_order_submitted,
-        handle_batch_order_responses, handle_order_response, handle_single_order_response,
-        handle_unknown_submit_result, reject_claimed_submit_order_and_cancel, reject_submit_order,
+        check_fok_status, emit_market_order_quantity_update, handle_batch_order_responses,
+        handle_order_response, handle_single_order_response, handle_unknown_submit_result,
+        reject_claimed_submit_order_and_cancel, reject_submit_order,
     },
     submitter::{MarketBuyFeeContext, MarketOrderSubmitRequest, UnknownSubmitError},
     types::{BatchLimitOrderContext, LimitOrderSubmitRequest},
@@ -231,6 +231,7 @@ impl PolymarketExecutionClient {
             );
             return;
         }
+        emitter.emit_order_submitted(&order);
 
         self.spawn_task("submit_market_order", async move {
             let fee_context = if needs_fee_adjustment {
@@ -242,10 +243,11 @@ impl PolymarketExecutionClient {
                         builder_taker_fee_rate: Decimal::ZERO,
                     }),
                     Err(e) => {
-                        deny_preparing_order(
+                        reject_submit_order(
                             &order,
                             &format!("Failed to fetch pUSD balance for fee adjustment: {e}"),
                             &emitter,
+                            clock,
                             &local_orders,
                         );
                         return Ok(());
@@ -295,9 +297,12 @@ impl PolymarketExecutionClient {
                 )
                 .is_err()
             {
-                emitter.emit_order_denied(
+                reject_submit_order(
                     &order,
                     "Local order identity conflicts with an active submission",
+                    &emitter,
+                    clock,
+                    &local_orders,
                 );
                 return Ok(());
             }
@@ -305,7 +310,7 @@ impl PolymarketExecutionClient {
             match submitter.post_market_order_submission(submission).await {
                 Ok(result) => {
                     let mut order = order;
-                    emit_market_order_submitted(
+                    emit_market_order_quantity_update(
                         &mut order,
                         is_quote_qty,
                         side,
@@ -374,7 +379,7 @@ impl PolymarketExecutionClient {
                 Err(e) => {
                     if let Some(unknown) = e.downcast_ref::<UnknownSubmitError>() {
                         let mut order = order;
-                        emit_market_order_submitted(
+                        emit_market_order_quantity_update(
                             &mut order,
                             is_quote_qty,
                             side,

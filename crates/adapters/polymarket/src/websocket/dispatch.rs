@@ -804,7 +804,7 @@ fn ensure_accepted(
 ) {
     let Ok(is_new) = ctx
         .local_orders
-        .accept_submission(venue_order_id, *identity)
+        .observe_acceptance(venue_order_id, *identity)
     else {
         log::error!("Cannot accept {venue_order_id}: local order identity conflict");
         return;

@@ -2420,7 +2420,7 @@ async fn test_submit_market_order_buy_accepted() {
 
 #[rstest]
 #[tokio::test]
-async fn test_submit_market_order_balance_failure_is_denied_before_submission() {
+async fn test_submit_market_order_balance_failure_is_rejected_after_submission() {
     let state = TestServerState::default();
     *state.balance_response_status.lock().await = StatusCode::INTERNAL_SERVER_ERROR;
     let addr = start_mock_server(state.clone()).await;
@@ -2439,7 +2439,8 @@ async fn test_submit_market_order_balance_failure_is_denied_before_submission() 
         .submit_order(make_submit_cmd(&order, instrument_id))
         .unwrap();
 
-    assert_order_event(recv_execution_event(&mut rx).await, "Denied");
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
     assert_eq!(*state.order_post_count.lock().await, 0);
 }
 
@@ -2757,12 +2758,8 @@ async fn test_submit_market_order_rejected_empty_book() {
 
     client.submit_order(cmd).unwrap();
 
-    // Empty book should cause rejection
-    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_order_event(event, "Rejected");
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
 }
 
 fn assert_order_status_report(event: ExecutionEvent, expected_status: OrderStatus) {
@@ -5290,6 +5287,46 @@ async fn test_cancel_order_success_no_rejection_event() {
         Duration::from_secs(5),
     )
     .await;
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cancel_order_refuses_every_conflicting_command_identity() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let mut order = make_limit_order(
+        "O-CANCEL-CONFLICT",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_order_through_client(&client, &mut rx, &cache, &mut order).await;
+
+    let mut wrong_instrument = make_cancel_cmd(order.client_order_id().as_str(), instrument_id);
+    wrong_instrument.instrument_id = InstrumentId::from("OTHER.POLYMARKET");
+    client.cancel_order(wrong_instrument).unwrap();
+
+    let mut wrong_strategy = make_cancel_cmd(order.client_order_id().as_str(), instrument_id);
+    wrong_strategy.strategy_id = StrategyId::from("S-OTHER");
+    client.cancel_order(wrong_strategy).unwrap();
+
+    let mut wrong_venue = make_cancel_cmd(order.client_order_id().as_str(), instrument_id);
+    wrong_venue.venue_order_id = Some(VenueOrderId::from("V-OTHER"));
+    client.cancel_order(wrong_venue).unwrap();
+
+    assert_eq!(*state.cancel_delete_count.lock().await, 0);
     assert_no_execution_event(&mut rx).await;
 }
 

@@ -81,9 +81,14 @@ pub(crate) enum ArtifactAdmission<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CancelAdmission {
     Ready(VenueOrderId),
-    Pending,
-    Unclaimed,
+    Deferred,
     Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SubmissionAcceptance {
+    pub newly_accepted: bool,
+    pub cancel_requested: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -116,7 +121,11 @@ enum OrderApplication {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SubmitRejection {
     Removed,
-    AlreadyAccepted(VenueOrderId),
+    Rejected,
+    AlreadyAccepted {
+        venue_order_id: VenueOrderId,
+        cancel_requested: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,6 +133,7 @@ enum SubmissionState {
     Pending,
     OutcomeUnknown,
     Accepted,
+    Rejected,
 }
 
 /// All mutable state for one local order, owned by one coordinator lock.
@@ -134,18 +144,25 @@ struct LocalOrderState {
     cumulative_filled: Quantity,
     price: Option<Price>,
     submission: SubmissionState,
+    cancel_requested: bool,
     terminal_quantity_normalized: bool,
     terminal_ioc_remainder_taken: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreparingOrderState {
+    identity: OrderIdentity,
+    submission_started: bool,
+    cancel_requested: bool,
+}
+
 #[derive(Debug, Default)]
 struct TrackerInner {
-    preparing: HashMap<ClientOrderId, OrderIdentity>,
+    preparing: HashMap<ClientOrderId, PreparingOrderState>,
     client_to_venue: HashMap<ClientOrderId, VenueOrderId>,
     // Intentionally non-evicting: late REST/WS artifacts and venue-ID reuse must still be checked
     // against the immutable identity originally claimed for this process lifetime.
     orders: HashMap<VenueOrderId, LocalOrderState>,
-    deferred_cancels: HashMap<ClientOrderId, OrderIdentity>,
 }
 
 /// Owns local-order identity, lifecycle, deferred cancellation, and fill normalization.
@@ -172,18 +189,27 @@ impl LocalOrderCoordinator {
         identity: OrderIdentity,
     ) -> Result<(), LocalOrderConflict> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        if guard.preparing.contains_key(&identity.client_order_id)
-            || guard
-                .client_to_venue
-                .contains_key(&identity.client_order_id)
-            || guard
-                .deferred_cancels
-                .get(&identity.client_order_id)
-                .is_some_and(|cancel_identity| *cancel_identity != identity)
+        if guard
+            .client_to_venue
+            .contains_key(&identity.client_order_id)
         {
             return Err(LocalOrderConflict);
         }
-        guard.preparing.insert(identity.client_order_id, identity);
+        if let Some(preparing) = guard.preparing.get_mut(&identity.client_order_id) {
+            if preparing.identity != identity || preparing.submission_started {
+                return Err(LocalOrderConflict);
+            }
+            preparing.submission_started = true;
+            return Ok(());
+        }
+        guard.preparing.insert(
+            identity.client_order_id,
+            PreparingOrderState {
+                identity,
+                submission_started: true,
+                cancel_requested: false,
+            },
+        );
         Ok(())
     }
 
@@ -195,19 +221,22 @@ impl LocalOrderCoordinator {
         price: Option<Price>,
     ) -> Result<(), LocalOrderConflict> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let Some(preparing) = guard.preparing.get(&identity.client_order_id).copied() else {
+            return Err(LocalOrderConflict);
+        };
         if guard.orders.contains_key(&venue_order_id)
             || guard
                 .client_to_venue
                 .contains_key(&identity.client_order_id)
-            || guard.preparing.get(&identity.client_order_id) != Some(&identity)
+            || preparing.identity != identity
+            || !preparing.submission_started
         {
             return Err(LocalOrderConflict);
         }
         guard.preparing.remove(&identity.client_order_id);
-        guard.orders.insert(
-            venue_order_id,
-            new_order_state(identity, submitted_qty, price, SubmissionState::Pending),
-        );
+        let mut state = new_order_state(identity, submitted_qty, price, SubmissionState::Pending);
+        state.cancel_requested = preparing.cancel_requested;
+        guard.orders.insert(venue_order_id, state);
         guard
             .client_to_venue
             .insert(identity.client_order_id, venue_order_id);
@@ -344,57 +373,109 @@ impl LocalOrderCoordinator {
         }
     }
 
-    pub(crate) fn admit_cancel(&self, identity: OrderIdentity) -> CancelAdmission {
-        let guard = self.inner.lock().expect(MUTEX_POISONED);
-        if let Some(preparing) = guard.preparing.get(&identity.client_order_id) {
-            return if *preparing == identity {
-                CancelAdmission::Pending
+    pub(crate) fn request_cancel(
+        &self,
+        identity: OrderIdentity,
+        requested_venue_order_id: Option<VenueOrderId>,
+    ) -> CancelAdmission {
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        if let Some(preparing) = guard.preparing.get_mut(&identity.client_order_id) {
+            return if preparing.identity == identity && requested_venue_order_id.is_none() {
+                preparing.cancel_requested = true;
+                CancelAdmission::Deferred
             } else {
                 CancelAdmission::Conflict
             };
         }
-        let Some(venue_order_id) = guard.client_to_venue.get(&identity.client_order_id) else {
-            return CancelAdmission::Unclaimed;
+        let Some(venue_order_id) = guard
+            .client_to_venue
+            .get(&identity.client_order_id)
+            .copied()
+        else {
+            if requested_venue_order_id.is_some() {
+                return CancelAdmission::Conflict;
+            }
+            guard.preparing.insert(
+                identity.client_order_id,
+                PreparingOrderState {
+                    identity,
+                    submission_started: false,
+                    cancel_requested: true,
+                },
+            );
+            return CancelAdmission::Deferred;
         };
-        let Some(state) = guard.orders.get(venue_order_id) else {
+        let Some(state) = guard.orders.get(&venue_order_id) else {
             return CancelAdmission::Conflict;
         };
-        if state.identity != identity {
+        if state.identity != identity
+            || requested_venue_order_id.is_some_and(|requested| requested != venue_order_id)
+        {
             return CancelAdmission::Conflict;
         }
         match state.submission {
-            SubmissionState::Pending => CancelAdmission::Pending,
-            SubmissionState::OutcomeUnknown | SubmissionState::Accepted => {
-                CancelAdmission::Ready(*venue_order_id)
+            SubmissionState::Pending => {
+                guard
+                    .orders
+                    .get_mut(&venue_order_id)
+                    .expect("order exists under coordinator lock")
+                    .cancel_requested = true;
+                CancelAdmission::Deferred
             }
+            SubmissionState::OutcomeUnknown | SubmissionState::Accepted => {
+                CancelAdmission::Ready(venue_order_id)
+            }
+            SubmissionState::Rejected => CancelAdmission::Conflict,
         }
-    }
-
-    pub(crate) fn defer_cancel(&self, identity: OrderIdentity) -> Result<(), LocalOrderConflict> {
-        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        if guard
-            .deferred_cancels
-            .get(&identity.client_order_id)
-            .is_some_and(|known| *known != identity)
-        {
-            return Err(LocalOrderConflict);
-        }
-        guard
-            .deferred_cancels
-            .insert(identity.client_order_id, identity);
-        Ok(())
-    }
-
-    pub(crate) fn take_deferred_cancel(&self, identity: OrderIdentity) -> bool {
-        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        if guard.deferred_cancels.get(&identity.client_order_id) != Some(&identity) {
-            return false;
-        }
-        guard.deferred_cancels.remove(&identity.client_order_id);
-        true
     }
 
     pub(crate) fn accept_submission(
+        &self,
+        venue_order_id: VenueOrderId,
+        identity: OrderIdentity,
+    ) -> Result<SubmissionAcceptance, LocalOrderConflict> {
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let Some(state) = guard.orders.get_mut(&venue_order_id) else {
+            return Err(LocalOrderConflict);
+        };
+        if state.identity != identity {
+            return Err(LocalOrderConflict);
+        }
+        match state.submission {
+            SubmissionState::Pending | SubmissionState::OutcomeUnknown => {
+                state.submission = SubmissionState::Accepted;
+                let cancel_requested = std::mem::take(&mut state.cancel_requested);
+                Ok(SubmissionAcceptance {
+                    newly_accepted: true,
+                    cancel_requested,
+                })
+            }
+            SubmissionState::Accepted => Ok(SubmissionAcceptance {
+                newly_accepted: false,
+                cancel_requested: std::mem::take(&mut state.cancel_requested),
+            }),
+            SubmissionState::Rejected => Err(LocalOrderConflict),
+        }
+    }
+
+    pub(crate) fn observe_acceptance(
+        &self,
+        venue_order_id: VenueOrderId,
+        identity: OrderIdentity,
+    ) -> Result<bool, LocalOrderConflict> {
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let Some(state) = guard.orders.get_mut(&venue_order_id) else {
+            return Err(LocalOrderConflict);
+        };
+        if state.identity != identity || state.submission == SubmissionState::Rejected {
+            return Err(LocalOrderConflict);
+        }
+        let newly_accepted = state.submission != SubmissionState::Accepted;
+        state.submission = SubmissionState::Accepted;
+        Ok(newly_accepted)
+    }
+
+    pub(crate) fn mark_outcome_unknown(
         &self,
         venue_order_id: VenueOrderId,
         identity: OrderIdentity,
@@ -406,30 +487,10 @@ impl LocalOrderCoordinator {
         if state.identity != identity {
             return Err(LocalOrderConflict);
         }
-        if state.submission == SubmissionState::Accepted {
-            Ok(false)
-        } else {
-            state.submission = SubmissionState::Accepted;
-            Ok(true)
-        }
-    }
-
-    pub(crate) fn mark_outcome_unknown(
-        &self,
-        venue_order_id: VenueOrderId,
-        identity: OrderIdentity,
-    ) -> Result<(), LocalOrderConflict> {
-        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        let Some(state) = guard.orders.get_mut(&venue_order_id) else {
-            return Err(LocalOrderConflict);
-        };
-        if state.identity != identity {
-            return Err(LocalOrderConflict);
-        }
         if state.submission == SubmissionState::Pending {
             state.submission = SubmissionState::OutcomeUnknown;
         }
-        Ok(())
+        Ok(std::mem::take(&mut state.cancel_requested))
     }
 
     pub(crate) fn reject_submission(
@@ -438,7 +499,7 @@ impl LocalOrderCoordinator {
     ) -> Result<SubmitRejection, LocalOrderConflict> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
         if let Some(preparing) = guard.preparing.get(&identity.client_order_id) {
-            if *preparing != identity {
+            if preparing.identity != identity {
                 return Err(LocalOrderConflict);
             }
             guard.preparing.remove(&identity.client_order_id);
@@ -458,11 +519,22 @@ impl LocalOrderCoordinator {
             return Err(LocalOrderConflict);
         }
         if state.submission == SubmissionState::Accepted {
-            return Ok(SubmitRejection::AlreadyAccepted(venue_order_id));
+            let state = guard
+                .orders
+                .get_mut(&venue_order_id)
+                .expect("order exists under coordinator lock");
+            return Ok(SubmitRejection::AlreadyAccepted {
+                venue_order_id,
+                cancel_requested: std::mem::take(&mut state.cancel_requested),
+            });
         }
-        guard.orders.remove(&venue_order_id);
-        guard.client_to_venue.remove(&identity.client_order_id);
-        Ok(SubmitRejection::Removed)
+        let state = guard
+            .orders
+            .get_mut(&venue_order_id)
+            .expect("order exists under coordinator lock");
+        state.submission = SubmissionState::Rejected;
+        state.cancel_requested = false;
+        Ok(SubmitRejection::Rejected)
     }
 
     pub(crate) fn restore_order(
@@ -474,13 +546,22 @@ impl LocalOrderCoordinator {
         price: Option<Price>,
     ) -> Result<(), LocalOrderConflict> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        if guard.orders.contains_key(&venue_order_id)
-            || guard
-                .client_to_venue
-                .get(&identity.client_order_id)
-                .is_some_and(|known| *known != venue_order_id)
+        if guard
+            .client_to_venue
+            .get(&identity.client_order_id)
+            .is_some_and(|known| *known != venue_order_id)
         {
             return Err(LocalOrderConflict);
+        }
+        if let Some(state) = guard.orders.get_mut(&venue_order_id) {
+            if state.identity != identity {
+                return Err(LocalOrderConflict);
+            }
+            state.submitted_qty = submitted_qty;
+            state.cumulative_filled = filled_qty;
+            state.price = price;
+            state.submission = SubmissionState::Accepted;
+            return Ok(());
         }
         let mut state = new_order_state(identity, submitted_qty, price, SubmissionState::Accepted);
         state.cumulative_filled = filled_qty;
@@ -634,6 +715,7 @@ fn new_order_state(
         cumulative_filled: Quantity::zero(submitted_qty.precision),
         price,
         submission,
+        cancel_requested: false,
         terminal_quantity_normalized: false,
         terminal_ioc_remainder_taken: false,
     }
@@ -841,7 +923,10 @@ mod tests {
                 .is_err()
         );
         assert_eq!(coordinator.identity(&v1), Some(first));
-        assert_eq!(coordinator.admit_cancel(first), CancelAdmission::Pending);
+        assert_eq!(
+            coordinator.request_cancel(first, None),
+            CancelAdmission::Deferred
+        );
     }
 
     #[rstest]
@@ -1001,17 +1086,23 @@ mod tests {
     }
 
     #[rstest]
-    fn deferred_cancel_lives_with_order_identity() {
+    fn cancel_request_is_atomic_with_submission_acceptance() {
         let coordinator = LocalOrderCoordinator::new();
+        let venue = VenueOrderId::from("V-1");
         let expected = identity("C-1", "I-1.POLYMARKET", OrderSide::Buy);
-        coordinator.defer_cancel(expected).unwrap();
-        assert!(!coordinator.take_deferred_cancel(identity(
-            "C-1",
-            "I-2.POLYMARKET",
-            OrderSide::Buy
-        )));
-        assert!(coordinator.take_deferred_cancel(expected));
-        assert!(!coordinator.take_deferred_cancel(expected));
+        coordinator.begin_submission(expected).unwrap();
+        assert_eq!(
+            coordinator.request_cancel(expected, None),
+            CancelAdmission::Deferred
+        );
+        coordinator
+            .claim_submission(venue, expected, Quantity::from("10.0000"), None)
+            .unwrap();
+
+        let acceptance = coordinator.accept_submission(venue, expected).unwrap();
+
+        assert!(acceptance.newly_accepted);
+        assert!(acceptance.cancel_requested);
     }
 
     #[rstest]
@@ -1021,42 +1112,73 @@ mod tests {
         let expected = identity("C-1", "I-1.POLYMARKET", OrderSide::Buy);
 
         assert_eq!(
-            coordinator.admit_cancel(expected),
-            CancelAdmission::Unclaimed
+            coordinator.request_cancel(expected, None),
+            CancelAdmission::Deferred
         );
         claim(&coordinator, venue, expected, Quantity::from("10.0000"));
-        assert_eq!(coordinator.admit_cancel(expected), CancelAdmission::Pending);
-        coordinator.accept_submission(venue, expected).unwrap();
         assert_eq!(
-            coordinator.admit_cancel(expected),
+            coordinator.request_cancel(expected, None),
+            CancelAdmission::Deferred
+        );
+        let acceptance = coordinator.accept_submission(venue, expected).unwrap();
+        assert!(acceptance.cancel_requested);
+        assert_eq!(
+            coordinator.request_cancel(expected, None),
             CancelAdmission::Ready(venue)
         );
         assert_eq!(
-            coordinator.admit_cancel(identity("C-1", "I-2.POLYMARKET", OrderSide::Buy)),
+            coordinator.request_cancel(identity("C-1", "I-2.POLYMARKET", OrderSide::Buy), None,),
             CancelAdmission::Conflict
         );
     }
 
     #[rstest]
-    fn unclaimed_cancel_intent_only_follows_the_same_immutable_identity() {
+    fn rejected_claim_retains_immutable_identity() {
         let coordinator = LocalOrderCoordinator::new();
+        let venue = VenueOrderId::from("V-1");
         let expected = identity("C-1", "I-1.POLYMARKET", OrderSide::Buy);
-        coordinator.defer_cancel(expected).unwrap();
+        coordinator.begin_submission(expected).unwrap();
+        coordinator
+            .claim_submission(venue, expected, Quantity::from("10.0000"), None)
+            .unwrap();
+        assert_eq!(
+            coordinator.reject_submission(expected),
+            Ok(SubmitRejection::Rejected)
+        );
 
+        assert_eq!(coordinator.identity(&venue), Some(expected));
+        assert_eq!(
+            coordinator.request_cancel(expected, Some(venue)),
+            CancelAdmission::Conflict
+        );
         assert!(
             coordinator
                 .begin_submission(identity("C-1", "I-2.POLYMARKET", OrderSide::Buy))
                 .is_err()
         );
-        coordinator.begin_submission(expected).unwrap();
+    }
+
+    #[rstest]
+    fn restore_refreshes_mutable_state_without_replacing_identity() {
+        let coordinator = LocalOrderCoordinator::new();
+        let venue = VenueOrderId::from("V-1");
+        let expected = identity("C-1", "I-1.POLYMARKET", OrderSide::Buy);
+        claim(&coordinator, venue, expected, Quantity::from("10.0000"));
+
         coordinator
-            .claim_submission(
-                VenueOrderId::from("V-1"),
+            .restore_order(
+                venue,
                 expected,
-                Quantity::from("10.0000"),
-                None,
+                Quantity::from("12.0000"),
+                Quantity::from("5.0000"),
+                Some(Price::from("0.5000")),
             )
             .unwrap();
-        assert!(coordinator.take_deferred_cancel(expected));
+
+        let snapshot = coordinator.snapshot(&venue).unwrap();
+        assert_eq!(snapshot.identity, expected);
+        assert_eq!(snapshot.quantity, Quantity::from("12.0000"));
+        assert_eq!(snapshot.filled_qty, Quantity::from("5.0000"));
+        assert_eq!(snapshot.price, Some(Price::from("0.5000")));
     }
 }

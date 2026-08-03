@@ -127,7 +127,7 @@ pub(super) fn reject_submit_order(
             order.client_order_id(),
         );
     }
-    emit_submit_rejected(order, reason, emitter, clock, local_orders);
+    emit_submit_rejected(order, reason, emitter, clock);
 }
 
 fn emit_submit_rejected(
@@ -135,30 +135,9 @@ fn emit_submit_rejected(
     reason: &str,
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
-    local_orders: &LocalOrderCoordinator,
 ) {
     let ts_now = clock.get_time_ns();
     emitter.emit_order_rejected(order, reason, ts_now, is_post_only_crossing(reason));
-    local_orders.take_deferred_cancel(OrderIdentity::from_order(order));
-}
-
-pub(super) fn deny_preparing_order(
-    order: &OrderAny,
-    reason: &str,
-    emitter: &ExecutionEventEmitter,
-    local_orders: &LocalOrderCoordinator,
-) {
-    if local_orders
-        .reject_submission(OrderIdentity::from_order(order))
-        .is_err()
-    {
-        log::error!(
-            "Cannot remove denied preparation {}: local order identity conflict",
-            order.client_order_id(),
-        );
-    }
-    emitter.emit_order_denied(order, reason);
-    local_orders.take_deferred_cancel(OrderIdentity::from_order(order));
 }
 
 pub(super) fn reject_claimed_submit_order(
@@ -169,18 +148,19 @@ pub(super) fn reject_claimed_submit_order(
     local_orders: &LocalOrderCoordinator,
 ) -> Option<(String, VenueOrderId)> {
     match local_orders.reject_submission(OrderIdentity::from_order(order)) {
-        Ok(SubmitRejection::Removed) => {
-            emit_submit_rejected(order, reason, emitter, clock, local_orders);
+        Ok(SubmitRejection::Removed | SubmitRejection::Rejected) => {
+            emit_submit_rejected(order, reason, emitter, clock);
             None
         }
-        Ok(SubmitRejection::AlreadyAccepted(venue_order_id)) => {
+        Ok(SubmitRejection::AlreadyAccepted {
+            venue_order_id,
+            cancel_requested,
+        }) => {
             log::debug!(
                 "Ignoring negative submit response for already accepted order {}",
                 order.client_order_id(),
             );
-            local_orders
-                .take_deferred_cancel(OrderIdentity::from_order(order))
-                .then(|| (venue_order_id.to_string(), venue_order_id))
+            cancel_requested.then(|| (venue_order_id.to_string(), venue_order_id))
         }
         Err(_) => {
             log::error!(
@@ -208,7 +188,7 @@ pub(super) async fn reject_claimed_submit_order_and_cancel(
 }
 
 #[expect(clippy::too_many_arguments)]
-pub(super) fn emit_market_order_submitted(
+pub(super) fn emit_market_order_quantity_update(
     order: &mut OrderAny,
     is_quote_qty: bool,
     side: OrderSide,
@@ -219,8 +199,6 @@ pub(super) fn emit_market_order_submitted(
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
 ) {
-    emitter.emit_order_submitted(order);
-
     if !update_quantity || expected_base_qty.is_zero() {
         return;
     }
@@ -315,13 +293,15 @@ pub(super) async fn handle_single_order_response(
             }
         }
         Err(e) => {
-            reject_submit_order(
+            reject_claimed_submit_order_and_cancel(
+                submitter,
                 &batch_order.order,
                 &format!("{e}"),
                 emitter,
                 clock,
                 local_orders,
-            );
+            )
+            .await;
         }
     }
 }
@@ -338,17 +318,19 @@ pub(super) fn handle_unknown_submit_result(
         expected_venue_order_id
     );
 
-    if local_orders
+    let cancel_requested = match local_orders
         .mark_outcome_unknown(expected_venue_order_id, OrderIdentity::from_order(order))
-        .is_err()
     {
-        log::error!(
-            "Cannot retain unknown submit outcome for {}: local order identity conflict",
-            order.client_order_id(),
-        );
-        return None;
-    }
-    if local_orders.take_deferred_cancel(OrderIdentity::from_order(order)) {
+        Ok(cancel_requested) => cancel_requested,
+        Err(_) => {
+            log::error!(
+                "Cannot retain unknown submit outcome for {}: local order identity conflict",
+                order.client_order_id(),
+            );
+            return None;
+        }
+    };
+    if cancel_requested {
         let order_id_str = expected_venue_order_id.to_string();
         return Some((order_id_str, expected_venue_order_id));
     }
@@ -385,23 +367,25 @@ pub(super) fn handle_order_response(
                     match local_orders
                         .accept_submission(venue_order_id, OrderIdentity::from_order(order))
                     {
-                        Ok(true) => emitter.emit_order_accepted(order, venue_order_id, ts_now),
-                        Ok(false) => {}
+                        Ok(acceptance) => {
+                            if acceptance.newly_accepted {
+                                emitter.emit_order_accepted(order, venue_order_id, ts_now);
+                            }
+                            if acceptance.cancel_requested {
+                                log::debug!(
+                                    "Order {} has pending cancel, issuing deferred cancel for {}",
+                                    order.client_order_id(),
+                                    venue_order_id
+                                );
+                                return Some((order_id, venue_order_id));
+                            }
+                        }
                         Err(_) => {
                             log::error!(
                                 "Rejecting submit response for {venue_order_id}: local order identity conflict"
                             );
                             return None;
                         }
-                    }
-
-                    if local_orders.take_deferred_cancel(OrderIdentity::from_order(order)) {
-                        log::debug!(
-                            "Order {} has pending cancel, issuing deferred cancel for {}",
-                            order.client_order_id(),
-                            venue_order_id
-                        );
-                        return Some((order_id, venue_order_id));
                     }
                 } else if let Some(reason) = response.error_msg.filter(|s| !s.is_empty()) {
                     // Batch endpoint reports a rejected leg as success=true with an empty orderID; reason in error_msg
@@ -411,9 +395,11 @@ pub(super) fn handle_order_response(
                         return Some(cancel);
                     }
                 } else {
-                    log::warn!(
-                        "Order accepted but no order_id returned for {}",
-                        order.client_order_id()
+                    return handle_unknown_submit_result(
+                        order,
+                        expected_venue_order_id,
+                        "venue reported success without an order ID or rejection reason",
+                        local_orders,
                     );
                 }
             } else {
@@ -670,7 +656,8 @@ mod tests {
             )
             .unwrap();
 
-        emit_market_order_submitted(
+        emitter.emit_order_submitted(&order);
+        emit_market_order_quantity_update(
             &mut order,
             false,
             OrderSide::Sell,
@@ -774,7 +761,7 @@ mod tests {
         );
 
         assert_eq!(
-            local_orders.admit_cancel(OrderIdentity::from_order(&order)),
+            local_orders.request_cancel(OrderIdentity::from_order(&order), None),
             crate::execution::local_orders::CancelAdmission::Ready(expected_venue_order_id)
         );
 
@@ -813,11 +800,12 @@ mod tests {
         let (emitter, _receiver) = test_emitter();
         let local_orders = LocalOrderCoordinator::new();
         claim_order(&local_orders, &order, venue_order_id);
+        assert_eq!(
+            local_orders.request_cancel(OrderIdentity::from_order(&order), None),
+            crate::execution::local_orders::CancelAdmission::Deferred
+        );
         local_orders
-            .accept_submission(venue_order_id, OrderIdentity::from_order(&order))
-            .unwrap();
-        local_orders
-            .defer_cancel(OrderIdentity::from_order(&order))
+            .observe_acceptance(venue_order_id, OrderIdentity::from_order(&order))
             .unwrap();
 
         assert_eq!(
@@ -847,8 +835,12 @@ mod tests {
             order_id: Some(String::new()),
             error_msg: None,
         };
+        assert_eq!(
+            local_orders.request_cancel(OrderIdentity::from_order(&order), None),
+            crate::execution::local_orders::CancelAdmission::Deferred
+        );
 
-        assert!(
+        assert_eq!(
             handle_order_response(
                 Ok(response),
                 expected_venue_order_id,
@@ -856,11 +848,11 @@ mod tests {
                 &emitter,
                 nautilus_core::time::get_atomic_clock_realtime(),
                 &local_orders,
-            )
-            .is_none()
+            ),
+            Some((expected_venue_order_id.to_string(), expected_venue_order_id,))
         );
 
-        // The empty id routes to the warn branch: no order events emitted
+        // The response is classified as outcome-unknown and releases the deferred cancel.
         assert!(receiver.try_recv().is_err());
     }
 
@@ -970,9 +962,10 @@ mod tests {
         local_orders
             .begin_submission(OrderIdentity::from_order(&order))
             .unwrap();
-        local_orders
-            .defer_cancel(OrderIdentity::from_order(&order))
-            .unwrap();
+        assert_eq!(
+            local_orders.request_cancel(OrderIdentity::from_order(&order), None),
+            crate::execution::local_orders::CancelAdmission::Deferred
+        );
 
         reject_submit_order(
             &order,
@@ -990,7 +983,8 @@ mod tests {
             other => panic!("expected rejected event, was {other:?}"),
         }
 
-        // The reject funnel clears any tracked pending cancel for the order
-        assert!(!local_orders.take_deferred_cancel(OrderIdentity::from_order(&order)));
+        local_orders
+            .begin_submission(OrderIdentity::from_order(&order))
+            .expect("preparation rejection must release its unclaimed identity");
     }
 }

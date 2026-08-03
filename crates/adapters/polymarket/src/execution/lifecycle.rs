@@ -1314,8 +1314,9 @@ mod tests {
         assert_eq!(
             client
                 .local_orders
-                .accept_submission(venue_order_id, identity),
-            Ok(false)
+                .accept_submission(venue_order_id, identity)
+                .map(|acceptance| acceptance.newly_accepted),
+            Ok(false),
         );
         assert_eq!(
             client
