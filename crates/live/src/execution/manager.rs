@@ -1368,31 +1368,38 @@ impl ExecutionManager {
         failed_clients: &IndexSet<ClientId>,
     ) -> OpenOrderReconciliationResult {
         let mut venue_reported_ids = IndexSet::new();
+        let mut admitted_reports = Vec::new();
 
-        for report in &all_reports {
-            if let Some(client_order_id) = &report.client_order_id {
-                venue_reported_ids.insert(*client_order_id);
-                self.missing_order_coverage_warnings
-                    .shift_remove(client_order_id);
-                // A positive report is proof the venue still knows the order:
-                // reset the missing-order ladder so only consecutive misses
-                // accumulate (mirrors the Python engine's per-report clear).
-                self.recon_check_retries.shift_remove(client_order_id);
-            } else {
-                let mapped_client_order_id = self
-                    .cache
-                    .borrow()
-                    .client_order_id(&report.venue_order_id)
-                    .copied();
-
-                // The mapped order was positively reported: it must receive
-                // the full positive-report bookkeeping or the missing-order
-                // loop below immediately re-increments the cleared counter.
-                if let Some(client_order_id) = mapped_client_order_id {
+        for report in all_reports {
+            let resolution = {
+                let cache = self.cache.borrow();
+                resolve_report_order(
+                    &cache,
+                    ReconciliationReportIdentity {
+                        instrument_id: report.instrument_id,
+                        client_order_id: report.client_order_id,
+                        venue_order_id: report.venue_order_id,
+                        order_side: report.order_side,
+                    },
+                )
+            };
+            match resolution {
+                ReportOrderResolution::Matched(client_order_id) => {
                     venue_reported_ids.insert(client_order_id);
                     self.missing_order_coverage_warnings
                         .shift_remove(&client_order_id);
+                    // A positive report is proof the venue still knows the order:
+                    // reset the missing-order ladder so only consecutive misses
+                    // accumulate (mirrors the Python engine's per-report clear).
                     self.recon_check_retries.shift_remove(&client_order_id);
+                    admitted_reports.push((client_order_id, report));
+                }
+                ReportOrderResolution::External => {}
+                ReportOrderResolution::Conflict => {
+                    log::error!(
+                        "Rejecting periodic order report for venue_order_id={}: report identity conflicts with cached order",
+                        report.venue_order_id,
+                    );
                 }
             }
         }
@@ -1400,13 +1407,11 @@ impl ExecutionManager {
         let mut events = Vec::new();
         let mut targeted_candidates = Vec::new();
 
-        for report in all_reports {
-            if let Some(client_order_id) = &report.client_order_id
-                && let Some(order) = self.get_order(*client_order_id)
-            {
+        for (client_order_id, report) in admitted_reports {
+            if let Some(order) = self.get_order(client_order_id) {
                 // Check for recent local activity to avoid race conditions with in-flight fills
                 let threshold = Duration::from_nanos(self.config.open_check_threshold_ns);
-                if let Some(elapsed) = self.order_local_activity.elapsed(client_order_id)
+                if let Some(elapsed) = self.order_local_activity.elapsed(&client_order_id)
                     && elapsed < threshold
                 {
                     let elapsed_ms = elapsed.as_millis();
@@ -1602,6 +1607,25 @@ impl ExecutionManager {
             self.targeted_order_queries.shift_remove(&client_order_id);
 
             if let Some(report) = result.report {
+                let resolution = {
+                    let cache = self.cache.borrow();
+                    resolve_report_order(
+                        &cache,
+                        ReconciliationReportIdentity {
+                            instrument_id: report.instrument_id,
+                            client_order_id: report.client_order_id,
+                            venue_order_id: report.venue_order_id,
+                            order_side: report.order_side,
+                        },
+                    )
+                };
+                if resolution != ReportOrderResolution::Matched(client_order_id) {
+                    log::error!(
+                        "Rejecting targeted order report for {client_order_id}: report identity does not resolve to the queried order",
+                    );
+                    continue;
+                }
+
                 self.recon_check_retries.shift_remove(&client_order_id);
                 self.missing_order_coverage_warnings
                     .shift_remove(&client_order_id);
@@ -3881,13 +3905,15 @@ fn targeted_report_matches(query: &TargetedOrderQuery, report: &OrderStatusRepor
         .command
         .instrument_id
         .is_none_or(|instrument_id| report.instrument_id == instrument_id);
-    let order_matches = report.client_order_id == Some(query.client_order_id)
-        || query
-            .command
-            .venue_order_id
-            .is_some_and(|venue_order_id| report.venue_order_id == venue_order_id);
+    let client_matches = report
+        .client_order_id
+        .is_none_or(|client_order_id| client_order_id == query.client_order_id);
+    let venue_matches = query
+        .command
+        .venue_order_id
+        .is_none_or(|venue_order_id| report.venue_order_id == venue_order_id);
 
-    instrument_matches && order_matches
+    instrument_matches && client_matches && venue_matches
 }
 
 #[cfg(test)]

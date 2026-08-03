@@ -3546,10 +3546,11 @@ async fn test_reconcile_mass_status_accepted_order_expired_at_venue() {
         Some(UUID4::new()),
     );
 
-    let report = create_order_status_report(
+    let report = create_order_status_report_for_side(
         Some(client_order_id),
         venue_order_id,
         instrument_id,
+        OrderSide::Sell,
         OrderStatus::Expired,
         Quantity::from("2.0"),
         Quantity::from("0"),
@@ -9703,6 +9704,48 @@ async fn test_check_open_orders_proceeds_without_local_activity() {
 
 #[rstest]
 #[tokio::test]
+async fn test_check_open_orders_rejects_split_client_and_venue_order_identity() {
+    let config = ExecutionManagerConfig {
+        open_check_threshold_ns: 0,
+        open_check_open_only: true,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    ctx.add_instrument(test_instrument());
+
+    let client_a = ClientOrderId::from("O-PERIODIC-A");
+    let client_b = ClientOrderId::from("O-PERIODIC-B");
+    let venue_a = VenueOrderId::from("V-PERIODIC-A");
+    let venue_b = VenueOrderId::from("V-PERIODIC-B");
+    insert_accepted_limit_order(&ctx, client_a, venue_a, test_client_id());
+    insert_accepted_limit_order(&ctx, client_b, venue_b, test_client_id());
+
+    let report = create_order_status_report(
+        Some(client_a),
+        venue_b,
+        test_instrument_id(),
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let mock_client = MockExecutionClient::new(vec![report]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_open_orders(&clients).await;
+
+    assert!(events.is_empty());
+    assert_eq!(
+        ctx.get_order(&client_a).unwrap().status(),
+        OrderStatus::Accepted
+    );
+    assert_eq!(
+        ctx.get_order(&client_b).unwrap().status(),
+        OrderStatus::Accepted
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_check_open_orders_submitted_missing_at_venue_generates_rejected() {
     // A SUBMITTED order with no venue_order_id that the venue doesn't know
     // about should eventually be rejected after retries are exhausted.
@@ -9838,6 +9881,51 @@ async fn test_check_open_orders_mismatched_targeted_report_defers_resolution() {
     assert!(events.is_empty());
     assert_eq!(mock_client.order_report_query_count.get(), 1);
     assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_open_orders_targeted_query_rejects_split_identity() {
+    let config = ExecutionManagerConfig {
+        open_check_threshold_ns: 0,
+        open_check_missing_retries: 1,
+        open_check_open_only: false,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    ctx.add_instrument(test_instrument());
+
+    let client_a = ClientOrderId::from("O-TARGETED-SPLIT-A");
+    let client_b = ClientOrderId::from("O-TARGETED-SPLIT-B");
+    let venue_a = VenueOrderId::from("V-TARGETED-SPLIT-A");
+    let venue_b = VenueOrderId::from("V-TARGETED-SPLIT-B");
+    insert_accepted_limit_order(&ctx, client_a, venue_a, test_client_id());
+    insert_accepted_limit_order(&ctx, client_b, venue_b, test_client_id());
+
+    let report = create_order_status_report(
+        Some(client_a),
+        venue_b,
+        test_instrument_id(),
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let mock_client = MockExecutionClient::new(Vec::new()).with_order_report(report);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_open_orders(&clients).await;
+
+    assert!(events.is_empty());
+    assert_eq!(
+        ctx.get_order(&client_a).unwrap().status(),
+        OrderStatus::Accepted
+    );
+    assert_eq!(
+        ctx.get_order(&client_b).unwrap().status(),
+        OrderStatus::Accepted
+    );
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_a), 1);
 }
 
 #[rstest]

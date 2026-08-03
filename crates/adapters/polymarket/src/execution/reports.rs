@@ -675,7 +675,7 @@ impl PolymarketExecutionClient {
             .context("failed to fetch trades")?;
 
         let ctx = self.fill_context();
-        let (reports, findings) = build_fill_reports_from_trades(
+        let (reports, mut findings) = build_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
@@ -687,12 +687,12 @@ impl PolymarketExecutionClient {
                 ts_init: self.clock.get_time_ns(),
             },
         );
+        let admitted = self.local_orders.admit_reconciliation_fill_reports(reports);
+        findings.retain_for_admitted(&admitted.artifacts);
         findings.report(
             log::Level::Warn,
             "Fill-report generation lost fill evidence",
         );
-
-        let admitted = self.local_orders.admit_reconciliation_fill_reports(reports);
         if admitted.conflicts > 0 {
             log::warn!(
                 "Rejected {} fill reports with conflicting local order identity",
@@ -777,7 +777,7 @@ async fn fetch_confirmed_fill_reports(
         .get_trades(params)
         .await
         .context("failed to fetch confirmed trades")?;
-    let (reports, findings) = build_fill_reports_from_trades(
+    let (reports, mut findings) = build_fill_reports_from_trades(
         &trades,
         ctx,
         token_instruments,
@@ -789,11 +789,12 @@ async fn fetch_confirmed_fill_reports(
             ts_init,
         },
     );
+    let admitted = local_orders.admit_reconciliation_fill_reports(reports);
+    findings.retain_for_admitted(&admitted.artifacts);
     findings.report(
         log::Level::Warn,
         "Confirmed-fill retrieval lost fill evidence",
     );
-    let admitted = local_orders.admit_reconciliation_fill_reports(reports);
     if admitted.conflicts > 0 {
         log::warn!(
             "Rejected {} confirmed fills with conflicting local order identity",

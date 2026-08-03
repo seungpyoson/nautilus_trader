@@ -532,9 +532,9 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
-    use crate::execution::local_orders::LocalOrderSnapshot;
     use crate::{
         common::enums::PolymarketTradeStatus,
+        execution::local_orders::LocalOrderSnapshot,
         http::{
             models::GammaMarket,
             parse::{create_instrument_from_def, parse_gamma_market},
@@ -852,7 +852,50 @@ mod tests {
         );
 
         assert_eq!(reports.len(), 1);
-        assert_eq!(findings.unknown_age, 1);
+        assert_eq!(findings.unknown_age(), 1);
+    }
+
+    #[rstest]
+    fn test_identity_rejection_does_not_claim_an_unknown_age_trade_was_kept() {
+        let instrument = test_instrument();
+        let mut trade: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
+        trade.match_time = "not-a-timestamp".to_string();
+        let instruments = AtomicMap::new();
+        instruments.insert(trade.asset_id, instrument);
+        let ctx = crate::execution::reconciliation::FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            api_key: "00000000-0000-0000-0000-000000000001",
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let (reports, mut findings) =
+            crate::execution::reconciliation::build_fill_reports_from_trades(
+                &[trade],
+                &ctx,
+                &instruments,
+                crate::execution::reconciliation::FillReportQuery {
+                    instrument_filter: None,
+                    venue_order_filter: None,
+                    start: None,
+                    end: Some(UnixNanos::from(u64::MAX)),
+                    ts_init: UnixNanos::from(1_000_000_000u64),
+                },
+            );
+        let venue_order_id = reports[0].venue_order_id;
+        let conflicting_order = test_limit_order(
+            "O-UNKNOWN-AGE-CONFLICT",
+            InstrumentId::from("OTHER.POLYMARKET"),
+        );
+        let local_orders = LocalOrderCoordinator::new();
+        claim_order(&local_orders, &conflicting_order, venue_order_id);
+
+        let admitted = local_orders.admit_reconciliation_fill_reports(reports);
+        findings.retain_for_admitted(&admitted.artifacts);
+
+        assert!(admitted.artifacts.is_empty());
+        assert_eq!(findings.unknown_age(), 0);
     }
 
     #[rstest]

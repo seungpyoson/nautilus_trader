@@ -15,9 +15,9 @@
 
 //! Reconciliation report generation for the Polymarket execution client.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
-use nautilus_core::{UnixNanos, collections::AtomicMap, time::AtomicTime};
+use nautilus_core::{UUID4, UnixNanos, collections::AtomicMap, time::AtomicTime};
 use nautilus_model::{
     enums::{LiquiditySide, PositionSideSpecified},
     identifiers::{AccountId, ClientId, InstrumentId, Venue, VenueOrderId},
@@ -67,7 +67,7 @@ pub(crate) struct FillReportQuery {
 }
 
 /// Losses encountered while converting authenticated venue trades into fills.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FillBuildFindings {
     /// Entries whose instrument was not loaded, so no report could be built.
     pub unmapped_instruments: usize,
@@ -75,20 +75,40 @@ pub(crate) struct FillBuildFindings {
     pub unowned_maker_trades: usize,
     /// Relevant trades rejected by the caller's time window.
     pub outside_lookback: usize,
-    /// Relevant trades kept despite an unparsable venue timestamp.
-    pub unknown_age: usize,
+    /// Generated reports grouped by unknown-age venue trade. A trade remains a finding only while
+    /// at least one of its reports survives authoritative identity admission.
+    unknown_age_report_groups: Vec<Vec<UUID4>>,
 }
 
 impl FillBuildFindings {
-    pub(crate) fn is_empty(self) -> bool {
+    pub(crate) fn unknown_age(&self) -> usize {
+        self.unknown_age_report_groups.len()
+    }
+
+    pub(crate) fn retain_for_admitted(&mut self, reports: &[FillReport]) {
+        if self.unknown_age_report_groups.is_empty() {
+            return;
+        }
+        let admitted_report_ids: AHashSet<UUID4> =
+            reports.iter().map(|report| report.report_id).collect();
+        self.unknown_age_report_groups.retain(|group| {
+            group
+                .iter()
+                .any(|report_id| admitted_report_ids.contains(report_id))
+        });
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
         self.unmapped_instruments == 0
             && self.unowned_maker_trades == 0
             && self.outside_lookback == 0
-            && self.unknown_age == 0
+            && self.unknown_age_report_groups.is_empty()
     }
 
-    pub(crate) fn report(self, level: log::Level, context: &str) {
-        if self.unmapped_instruments == 0 && self.unowned_maker_trades == 0 && self.unknown_age == 0
+    pub(crate) fn report(&self, level: log::Level, context: &str) {
+        if self.unmapped_instruments == 0
+            && self.unowned_maker_trades == 0
+            && self.unknown_age_report_groups.is_empty()
         {
             return;
         }
@@ -97,7 +117,7 @@ impl FillBuildFindings {
             "{context}: {} entr(ies) had no loaded instrument; {} confirmed maker trade(s) held no maker order owned by this account; {} trade(s) of unknown age were kept inside a bounded query",
             self.unmapped_instruments,
             self.unowned_maker_trades,
-            self.unknown_age,
+            self.unknown_age(),
         );
     }
 }
@@ -323,7 +343,12 @@ fn build_fill_reports_for_status(
         }
 
         if age_unknown && reports.len() > reports_before {
-            findings.unknown_age += 1;
+            findings.unknown_age_report_groups.push(
+                reports[reports_before..]
+                    .iter()
+                    .map(|report| report.report_id)
+                    .collect(),
+            );
         }
     }
 
@@ -454,7 +479,7 @@ pub(crate) async fn generate_mass_status(
         .await
         .context("failed to fetch trades for mass status")?;
 
-    let (fill_reports, fill_findings) = build_fill_reports_from_trades(
+    let (fill_reports, mut fill_findings) = build_fill_reports_from_trades(
         &trades,
         ctx,
         instruments,
@@ -465,10 +490,6 @@ pub(crate) async fn generate_mass_status(
             end: None,
             ts_init,
         },
-    );
-    fill_findings.report(
-        log::Level::Warn,
-        "Mass-status generation lost fill evidence",
     );
     let admitted_fills = local_orders.admit_reconciliation_fill_reports(fill_reports);
     let mut fill_reports = admitted_fills.artifacts;
@@ -485,6 +506,11 @@ pub(crate) async fn generate_mass_status(
     // point-of-use admission boundary before any venue-keyed joins or emission.
     let final_fills = local_orders.admit_reconciliation_fill_reports(fill_reports);
     fill_reports = final_fills.artifacts;
+    fill_findings.retain_for_admitted(&fill_reports);
+    fill_findings.report(
+        log::Level::Warn,
+        "Mass-status generation lost fill evidence",
+    );
     let confirmed_filled = confirmed_filled_quantities(&fill_reports);
     let mut final_order_conflicts = 0usize;
     order_reports = order_reports
