@@ -24,7 +24,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionClientResetPolicy},
     live::{get_runtime, runner::get_exec_event_sender, task::TaskHandles},
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
@@ -434,6 +434,10 @@ impl ExecutionClient for AxExecutionClient {
         self.core.cache().account_owned(&self.core.account_id)
     }
 
+    fn reset_policy(&self) -> ExecutionClientResetPolicy {
+        ExecutionClientResetPolicy::Resettable
+    }
+
     async fn connect(&mut self) -> anyhow::Result<()> {
         if self.core.is_connected() {
             return Ok(());
@@ -660,7 +664,7 @@ impl ExecutionClient for AxExecutionClient {
         Ok(())
     }
 
-    fn reset(&mut self) -> anyhow::Result<()> {
+    fn reset(&mut self) {
         if let Some(handle) = self.auth_refresh_handle.take() {
             handle.abort();
         }
@@ -670,7 +674,6 @@ impl ExecutionClient for AxExecutionClient {
         }
         self.abort_pending_tasks();
         self.core.set_disconnected();
-        Ok(())
     }
 
     fn dispose(&mut self) -> anyhow::Result<()> {

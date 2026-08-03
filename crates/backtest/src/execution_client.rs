@@ -20,7 +20,7 @@ use std::{cell::RefCell, fmt::Debug, rc::Rc};
 use async_trait::async_trait;
 use nautilus_common::{
     cache::Cache,
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionClientResetPolicy},
     clock::Clock,
     factories::OrderEventFactory,
     messages::execution::{
@@ -157,6 +157,10 @@ impl ExecutionClient for BacktestExecutionClient {
 
     fn get_account(&self) -> Option<AccountAny> {
         self.cache.borrow().account_owned(&self.core.account_id)
+    }
+
+    fn reset_policy(&self) -> ExecutionClientResetPolicy {
+        ExecutionClientResetPolicy::Resettable
     }
 
     fn generate_account_state(

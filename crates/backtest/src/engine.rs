@@ -986,7 +986,9 @@ impl BacktestEngine {
     ///
     /// All stateful fields are reset to their initial value. Data and instruments
     /// persist across resets to enable repeated runs with different strategies.
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self) -> anyhow::Result<()> {
+        self.kernel.exec_engine.borrow().ensure_reset_supported()?;
+
         log::debug!("Resetting");
 
         if self.kernel.trader.borrow().is_running() {
@@ -1004,7 +1006,7 @@ impl BacktestEngine {
         for exchange in self.venues.values() {
             exchange.borrow_mut().reset();
         }
-        self.kernel.exec_engine.borrow_mut().reset();
+        self.kernel.exec_engine.borrow_mut().reset()?;
 
         self.kernel.risk_engine.borrow_mut().stop();
         self.kernel.risk_engine.borrow_mut().reset();
@@ -1028,6 +1030,7 @@ impl BacktestEngine {
         self.funding_error = None;
         self.iteration = 0;
         self.force_stop = false;
+
         self.last_ns = UnixNanos::default();
         self.last_module_ns = None;
         self.last_liquidation_ns = None;
@@ -1041,6 +1044,7 @@ impl BacktestEngine {
         self.data_iterator.reset_all_cursors();
 
         log::info!("Reset");
+        Ok(())
     }
 
     /// Sort the engine's internal data stream by timestamp.
@@ -2044,6 +2048,7 @@ mod tests {
     use indexmap::IndexMap;
     use nautilus_common::{
         actor::DataActor,
+        clients::ExecutionClientResetPolicy,
         enums::Environment,
         messages::{
             data::{DataCommand, UnsubscribeCommand},
@@ -2652,7 +2657,7 @@ mod tests {
         let instrument_id = instrument.id();
         engine.add_instrument(&instrument).unwrap();
 
-        engine.reset();
+        engine.reset().unwrap();
 
         assert!(
             engine
@@ -2689,7 +2694,7 @@ mod tests {
         drop(order_emulator);
         data_commands.clear();
 
-        engine.reset();
+        engine.reset().unwrap();
 
         let commands = data_commands.get_messages();
         let emulator = engine.kernel.order_emulator.get_emulator();
@@ -2701,6 +2706,29 @@ mod tests {
             DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(command))
                 if command.instrument_id == instrument_id
         )));
+    }
+
+    #[rstest]
+    fn test_reset_refuses_before_mutating_backtest_state() {
+        let mut engine = create_engine();
+        engine.iteration = 7;
+        let client = StubExecutionClient::new(
+            ClientId::from("NO-RESET"),
+            AccountId::from("NO-RESET-001"),
+            Venue::from("NO-RESET"),
+            OmsType::Netting,
+            None,
+        )
+        .with_reset_policy(ExecutionClientResetPolicy::ProcessRestartRequired);
+        engine
+            .kernel
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client))
+            .unwrap();
+
+        assert!(engine.reset().is_err());
+        assert_eq!(engine.iteration, 7);
     }
 
     #[rstest]

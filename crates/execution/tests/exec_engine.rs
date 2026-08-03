@@ -28,7 +28,7 @@ use std::{
 use ahash::AHashSet;
 use nautilus_common::{
     cache::{Cache, CacheSnapshotRef},
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionClientResetPolicy},
     clock::{self, Clock, TestClock},
     messages::{
         ExecutionReport,
@@ -834,7 +834,7 @@ fn test_counters_increment_and_reset(mut execution_engine: ExecutionEngine) {
     assert_eq!(execution_engine.event_count(), 1);
     assert_eq!(execution_engine.report_count(), 1);
 
-    execution_engine.reset();
+    execution_engine.reset().unwrap();
 
     assert_eq!(execution_engine.command_count(), 0);
     assert_eq!(execution_engine.event_count(), 0);
@@ -13129,7 +13129,7 @@ fn test_reconcile_execution_mass_status_empty(mut execution_engine: ExecutionEng
 
     assert_eq!(execution_engine.report_count(), 1);
 
-    execution_engine.reset();
+    execution_engine.reset().unwrap();
     execution_engine
         .reconcile_execution_report(&ExecutionReport::MassStatus(Box::new(mass_status)));
 
@@ -14680,7 +14680,7 @@ fn test_snapshot_timer_canceled_on_lifecycle_transition(#[case] action: &str) {
 
     match action {
         "stop" => engine.stop(),
-        "reset" => engine.reset(),
+        "reset" => engine.reset().unwrap(),
         "dispose" => engine.dispose(),
         _ => unreachable!(),
     }
@@ -15162,7 +15162,7 @@ fn test_reset_clears_filtered_unclaimed_external_order_count() {
         1,
     );
 
-    execution_engine.reset();
+    execution_engine.reset().unwrap();
 
     assert_eq!(
         execution_engine.filtered_unclaimed_external_order_count(),
@@ -16227,7 +16227,7 @@ fn test_reset_propagates_to_registered_clients(
         .register_client(Box::new(stub_client))
         .unwrap();
 
-    execution_engine.reset();
+    execution_engine.reset().unwrap();
 
     assert_eq!(
         counts.reset_count(),
@@ -16246,7 +16246,7 @@ fn test_reset_clears_cache_state(mut execution_engine: ExecutionEngine) {
         .add_account(account)
         .unwrap();
 
-    execution_engine.reset();
+    execution_engine.reset().unwrap();
 
     assert!(
         execution_engine
@@ -16254,6 +16254,37 @@ fn test_reset_clears_cache_state(mut execution_engine: ExecutionEngine) {
             .borrow()
             .account(&account_id)
             .is_none()
+    );
+}
+
+#[rstest]
+fn test_reset_refuses_before_mutating_when_client_requires_process_restart(
+    mut execution_engine: ExecutionEngine,
+    stub_client: StubExecutionClient,
+) {
+    let account: AccountAny = CashAccount::default().into();
+    let account_id = account.id();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_account(account)
+        .unwrap();
+
+    let counts = stub_client.clone();
+    execution_engine
+        .register_client(Box::new(
+            stub_client.with_reset_policy(ExecutionClientResetPolicy::ProcessRestartRequired),
+        ))
+        .unwrap();
+
+    assert!(execution_engine.reset().is_err());
+    assert_eq!(counts.reset_count(), 0);
+    assert!(
+        execution_engine
+            .cache()
+            .borrow()
+            .account(&account_id)
+            .is_some()
     );
 }
 
@@ -16290,7 +16321,7 @@ fn test_lifecycle_propagates_to_default_client(mut execution_engine: ExecutionEn
 
     execution_engine.start();
     execution_engine.stop();
-    execution_engine.reset();
+    execution_engine.reset().unwrap();
     execution_engine.dispose();
 
     assert_eq!(
@@ -16371,7 +16402,7 @@ fn test_reset_leaves_unrelated_clock_timers_intact() {
         )
         .unwrap();
 
-    engine.reset();
+    engine.reset().unwrap();
 
     let clock_borrow = clock.borrow();
     let names = clock_borrow.timer_names();

@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionClientResetPolicy},
     live::task::TaskHandles,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
@@ -272,6 +272,10 @@ impl ExecutionClient for PolymarketExecutionClient {
         self.core.cache().account_owned(&self.core.account_id)
     }
 
+    fn reset_policy(&self) -> ExecutionClientResetPolicy {
+        ExecutionClientResetPolicy::ProcessRestartRequired
+    }
+
     fn position_reconciliation_tolerance(&self) -> Decimal {
         crate::common::consts::POSITION_RECONCILIATION_TOLERANCE
     }
@@ -295,11 +299,6 @@ impl ExecutionClient for PolymarketExecutionClient {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         self.stop_client();
-        Ok(())
-    }
-
-    fn reset(&mut self) -> anyhow::Result<()> {
-        self.reset_client();
         Ok(())
     }
 

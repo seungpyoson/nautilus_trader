@@ -21,7 +21,7 @@ use std::{
 use async_trait::async_trait;
 use nautilus_common::{
     cache::Cache,
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionClientResetPolicy},
     clock::{Clock, TestClock},
     messages::execution::{
         BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
@@ -55,6 +55,7 @@ pub struct StubExecutionClient {
     start_count: Rc<Cell<usize>>,
     stop_count: Rc<Cell<usize>>,
     reset_count: Rc<Cell<usize>>,
+    reset_policy: ExecutionClientResetPolicy,
     dispose_count: Rc<Cell<usize>>,
     submitted_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
     modified_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
@@ -86,6 +87,7 @@ impl StubExecutionClient {
             start_count: Rc::new(Cell::new(0)),
             stop_count: Rc::new(Cell::new(0)),
             reset_count: Rc::new(Cell::new(0)),
+            reset_policy: ExecutionClientResetPolicy::Resettable,
             dispose_count: Rc::new(Cell::new(0)),
             submitted_order_ids: Rc::new(RefCell::new(Vec::new())),
             modified_order_ids: Rc::new(RefCell::new(Vec::new())),
@@ -114,6 +116,13 @@ impl StubExecutionClient {
     #[must_use]
     pub fn with_submit_order_list_error(mut self, error: impl Into<String>) -> Self {
         self.submit_order_list_error = Some(error.into());
+        self
+    }
+
+    /// Configures the client's in-process reset policy.
+    #[must_use]
+    pub fn with_reset_policy(mut self, policy: ExecutionClientResetPolicy) -> Self {
+        self.reset_policy = policy;
         self
     }
 
@@ -196,6 +205,10 @@ impl ExecutionClient for StubExecutionClient {
         None // Stub implementation returns None
     }
 
+    fn reset_policy(&self) -> ExecutionClientResetPolicy {
+        self.reset_policy
+    }
+
     fn generate_account_state(
         &self,
         _balances: Vec<AccountBalance>,
@@ -218,9 +231,8 @@ impl ExecutionClient for StubExecutionClient {
         Ok(())
     }
 
-    fn reset(&mut self) -> anyhow::Result<()> {
+    fn reset(&mut self) {
         self.reset_count.set(self.reset_count.get() + 1);
-        Ok(())
     }
 
     fn dispose(&mut self) -> anyhow::Result<()> {

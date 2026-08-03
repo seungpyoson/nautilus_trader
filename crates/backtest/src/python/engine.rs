@@ -584,8 +584,8 @@ impl PyBacktestEngine {
 
     /// Resets the engine state for a new run.
     #[pyo3(name = "reset")]
-    fn py_reset(&mut self) {
-        self.0.reset();
+    fn py_reset(&mut self) -> PyResult<()> {
+        self.0.reset().map_err(to_pyruntime_err)
     }
 
     /// Disposes of the engine, releasing all resources.

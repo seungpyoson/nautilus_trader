@@ -26,7 +26,7 @@ use std::{cell::RefCell, collections::VecDeque, fmt::Debug, rc::Rc};
 
 use async_trait::async_trait;
 use nautilus_common::{
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionClientResetPolicy},
     messages::execution::{
         BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
@@ -186,6 +186,10 @@ impl ExecutionClient for LiveExecutionClient {
         self.client.borrow().get_account()
     }
 
+    fn reset_policy(&self) -> ExecutionClientResetPolicy {
+        self.client.borrow().reset_policy()
+    }
+
     fn position_reconciliation_tolerance(&self) -> Decimal {
         self.client.borrow().position_reconciliation_tolerance()
     }
@@ -214,8 +218,8 @@ impl ExecutionClient for LiveExecutionClient {
         self.client.borrow_mut().stop()
     }
 
-    fn reset(&mut self) -> anyhow::Result<()> {
-        self.client.borrow_mut().reset()
+    fn reset(&mut self) {
+        self.client.borrow_mut().reset();
     }
 
     fn dispose(&mut self) -> anyhow::Result<()> {
@@ -364,5 +368,30 @@ impl ExecutionClient for LiveExecutionClient {
         self.client
             .borrow()
             .calculate_commission(instrument, last_qty, last_px, liquidity_side)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_execution::engine::stubs::StubExecutionClient;
+
+    use super::*;
+
+    #[test]
+    fn reset_policy_is_delegated_to_wrapped_client() {
+        let client = StubExecutionClient::new(
+            ClientId::from("NO-RESET"),
+            AccountId::from("NO-RESET-001"),
+            Venue::from("NO-RESET"),
+            OmsType::Netting,
+            None,
+        )
+        .with_reset_policy(ExecutionClientResetPolicy::ProcessRestartRequired);
+        let wrapped = LiveExecutionClient::new(Box::new(client));
+
+        assert_eq!(
+            wrapped.reset_policy(),
+            ExecutionClientResetPolicy::ProcessRestartRequired
+        );
     }
 }

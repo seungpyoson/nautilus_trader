@@ -38,7 +38,7 @@ use futures::future::join_all;
 use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
     cache::{Cache, PositionRef},
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionClientResetPolicy},
     clock::Clock,
     enums::LogColor,
     generators::position_id::PositionIdGenerator,
@@ -1938,15 +1938,38 @@ impl ExecutionEngine {
         }
     }
 
+    /// Verifies that every registered execution client supports an in-process reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before mutation when any client requires a process restart.
+    pub fn ensure_reset_supported(&self) -> anyhow::Result<()> {
+        let blocked: Vec<_> = self
+            .get_all_clients()
+            .into_iter()
+            .filter(|client| {
+                client.reset_policy() == ExecutionClientResetPolicy::ProcessRestartRequired
+            })
+            .map(ExecutionClient::client_id)
+            .collect();
+        anyhow::ensure!(
+            blocked.is_empty(),
+            "Execution engine reset requires process restart for client(s): {blocked:?}"
+        );
+        Ok(())
+    }
+
     /// Resets the execution engine and all registered execution clients to initial state.
     ///
     /// Cancels engine-owned timers (snapshot, purge) but leaves timers owned by
     /// other components on the shared clock untouched.
-    pub fn reset(&mut self) {
+    /// # Errors
+    ///
+    /// Returns before mutation when a client does not support in-process reset.
+    pub fn reset(&mut self) -> anyhow::Result<()> {
+        self.ensure_reset_supported()?;
         for client in self.get_clients_mut() {
-            if let Err(e) = client.reset() {
-                log::error!("{e}");
-            }
+            client.reset();
         }
 
         self.cache.borrow_mut().reset();
@@ -1961,6 +1984,7 @@ impl ExecutionEngine {
         self.filtered_unclaimed_external_order_count = 0;
 
         log::info!("Reset");
+        Ok(())
     }
 
     /// Disposes of the execution engine, releasing resources from all clients and timers.

@@ -1933,7 +1933,7 @@ fn test_reset_cancels_funding_timer() {
     let timer_name = Ustr::from("FUNDING-SETTLEMENT:BINANCE");
     assert!(engine.kernel().clock.borrow().timer_exists(&timer_name));
 
-    engine.reset();
+    engine.reset().unwrap();
 
     assert!(!engine.kernel().clock.borrow().timer_exists(&timer_name));
 }
@@ -2007,7 +2007,7 @@ fn test_simulated_venue_config_settlement_prices_used_on_instrument_close(
         settlement_price
     );
 
-    engine.reset();
+    engine.reset().unwrap();
     engine.run(None, None, None, false).unwrap();
 
     assert_eq!(
@@ -2375,7 +2375,7 @@ fn test_reset_preserves_data(crypto_perpetual_ethusdt: CryptoPerpetual) {
     assert_eq!(result1.iterations, 2);
 
     // Reset and run again - data should persist
-    engine.reset();
+    engine.reset().unwrap();
 
     engine.add_strategy(EmptyStrategy::new()).unwrap();
     engine.run(None, None, None, false).unwrap();
@@ -3253,7 +3253,7 @@ fn test_reset_run_produces_same_results(crypto_perpetual_ethusdt: CryptoPerpetua
     let result1_orders = engine.get_result().total_orders;
 
     // Reset and run again with same data
-    engine.reset();
+    engine.reset().unwrap();
     engine.run(None, None, None, false).unwrap();
     let result2_iterations = engine.get_result().iterations;
     let result2_orders = engine.get_result().total_orders;
@@ -3912,7 +3912,7 @@ fn test_reset_between_emulated_runs_clears_order_emulator_state(
         assert_eq!(emulator.get_submit_order_commands().len(), 1);
     }
 
-    engine.reset();
+    engine.reset().unwrap();
     {
         let emulator = engine.kernel().order_emulator.get_emulator();
         assert!(emulator.get_matching_core(&instrument_id).is_none());

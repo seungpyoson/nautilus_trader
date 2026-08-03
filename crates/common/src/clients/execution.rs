@@ -40,6 +40,16 @@ use crate::messages::execution::{
 pub const DEFAULT_POSITION_RECONCILIATION_TOLERANCE: Decimal =
     Decimal::from_parts(1, 0, 0, false, 8);
 
+/// Declares whether an execution client can participate in an in-process engine reset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExecutionClientResetPolicy {
+    /// The client retains state unless it explicitly proves in-process reset support.
+    #[default]
+    ProcessRestartRequired,
+    /// The client can discard its current epoch when the engine clears the shared cache.
+    Resettable,
+}
+
 /// Defines the interface for an execution client managing order operations.
 ///
 /// # Thread Safety
@@ -54,6 +64,11 @@ pub trait ExecutionClient {
     fn venue(&self) -> Venue;
     fn oms_type(&self) -> OmsType;
     fn get_account(&self) -> Option<AccountAny>;
+
+    /// Returns this client's in-process reset policy.
+    fn reset_policy(&self) -> ExecutionClientResetPolicy {
+        ExecutionClientResetPolicy::ProcessRestartRequired
+    }
 
     /// Returns the maximum absolute position difference tolerated during reconciliation.
     fn position_reconciliation_tolerance(&self) -> Decimal {
@@ -110,12 +125,7 @@ pub trait ExecutionClient {
     /// The default implementation is a no-op. Adapters with reconnectable state
     /// (caches, sequence counters, in-flight orders) should override this.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the client fails to reset.
-    fn reset(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
+    fn reset(&mut self) {}
 
     /// Disposes of client resources and cleans up.
     ///

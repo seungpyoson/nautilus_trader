@@ -803,7 +803,13 @@ impl NautilusKernel {
     }
 
     /// Resets the Nautilus system kernel to its initial state.
-    pub fn reset(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns before mutation when an execution client requires a process restart.
+    pub fn reset(&mut self) -> anyhow::Result<()> {
+        self.exec_engine.borrow().ensure_reset_supported()?;
+
         disarm_shutdown_on_error();
         log::info!("Resetting");
 
@@ -812,7 +818,7 @@ impl NautilusKernel {
         }
 
         self.data_engine.borrow_mut().reset();
-        self.exec_engine.borrow_mut().reset();
+        self.exec_engine.borrow_mut().reset()?;
         self.risk_engine.borrow_mut().reset();
         self.order_emulator.reset();
         self.portfolio.borrow_mut().reset();
@@ -822,6 +828,7 @@ impl NautilusKernel {
         self.state_save_armed = false;
 
         log::info!("Reset");
+        Ok(())
     }
 
     /// Disposes of the Nautilus system kernel, releasing resources.
@@ -1059,13 +1066,16 @@ mod lifecycle_tests {
     use nautilus_common::{
         actor::registry::get_actor_unchecked,
         cache::Cache,
+        clients::ExecutionClientResetPolicy,
         messages::data::{DataCommand, SubscribeCommand, UnsubscribeCommand},
         msgbus::stubs::{TypedIntoMessageSavingHandler, get_typed_into_message_saving_handler},
     };
-    use nautilus_execution::engine::SnapshotAnchorer;
+    use nautilus_execution::engine::{SnapshotAnchorer, stubs::StubExecutionClient};
     use nautilus_model::{
-        enums::{OrderSide, OrderStatus, OrderType, TriggerType},
-        identifiers::{ActorId, ClientOrderId, ComponentId, StrategyId},
+        enums::{OmsType, OrderSide, OrderStatus, OrderType, TriggerType},
+        identifiers::{
+            AccountId, ActorId, ClientId, ClientOrderId, ComponentId, StrategyId, Venue,
+        },
         instruments::{
             CryptoPerpetual, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt,
         },
@@ -1647,7 +1657,7 @@ mod lifecycle_tests {
         kernel.stop_trader();
         data_commands.clear();
 
-        kernel.reset();
+        kernel.reset().unwrap();
 
         let commands = data_commands.get_messages();
         let emulator = kernel.order_emulator.get_emulator();
@@ -1661,5 +1671,29 @@ mod lifecycle_tests {
 
         drop(emulator);
         kernel.dispose();
+    }
+
+    #[rstest]
+    fn test_reset_refuses_before_mutating_kernel_state() {
+        let mut kernel = NautilusKernelBuilder::default().build().unwrap();
+        let started_at = UnixNanos::from(42);
+        kernel.ts_started = Some(started_at);
+
+        let client = StubExecutionClient::new(
+            ClientId::from("NO-RESET"),
+            AccountId::from("NO-RESET-001"),
+            Venue::from("NO-RESET"),
+            OmsType::Netting,
+            None,
+        )
+        .with_reset_policy(ExecutionClientResetPolicy::ProcessRestartRequired);
+        kernel
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client))
+            .unwrap();
+
+        assert!(kernel.reset().is_err());
+        assert_eq!(kernel.ts_started, Some(started_at));
     }
 }

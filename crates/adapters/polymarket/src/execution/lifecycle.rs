@@ -43,7 +43,7 @@ use crate::{
     execution::{local_orders::OrderIdentity, reports::fetch_and_emit_account_state},
     http::{clob::HeartbeatResponse, error::Error as HttpError},
     websocket::{
-        dispatch::{WsDispatchContext, WsDispatchState, dispatch_user_message},
+        dispatch::{WsDispatchContext, dispatch_user_message},
         messages::PolymarketWsMessage,
     },
 };
@@ -501,16 +501,6 @@ impl PolymarketExecutionClient {
         self.core.set_stopped();
 
         log::info!("Polymarket execution client stopped");
-    }
-
-    pub(super) fn reset_client(&mut self) {
-        log::debug!("Resetting Polymarket execution client");
-
-        self.clear_order_event_subscription();
-        self.clear_position_event_subscription();
-        self.shared_token_instruments.store(AHashMap::new());
-        self.neg_risk_index.store(AHashMap::new());
-        *self.ws_dispatch_state.lock().expect(MUTEX_POISONED) = WsDispatchState::default();
     }
 
     pub(super) async fn connect_client(&mut self) -> anyhow::Result<()> {
@@ -1405,40 +1395,6 @@ mod tests {
         client.ensure_position_event_subscription();
         assert!(client.order_event_handler.is_some());
         assert!(client.position_event_handler.is_some());
-    }
-
-    #[rstest]
-    fn reset_clears_subscriptions_and_lookup_state() {
-        let (mut client, _cache) = test_client();
-        let expired = test_binary_option("0xRESET", true, true);
-        client.upsert_execution_lookup(&expired);
-        client.ensure_order_event_subscription();
-        client.ensure_position_event_subscription();
-        client
-            .ws_dispatch_state
-            .lock()
-            .expect(MUTEX_POISONED)
-            .processed_fills
-            .add("trade-1".to_string());
-
-        client.reset_client();
-
-        assert!(client.order_event_handler.is_none());
-        assert!(client.position_event_handler.is_none());
-        assert!(
-            !client
-                .shared_token_instruments
-                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
-        );
-        assert!(!client.neg_risk_index.contains_key(&expired.id()));
-        assert!(
-            !client
-                .ws_dispatch_state
-                .lock()
-                .expect(MUTEX_POISONED)
-                .processed_fills
-                .contains(&"trade-1".to_string())
-        );
     }
 
     #[rstest]
