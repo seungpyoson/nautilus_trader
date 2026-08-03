@@ -105,6 +105,8 @@ const TEST_SIGNER_ADDRESS: &str = "0x1be31a94361a391bbafb2a4ccd704f57dc04d4bb";
 const TEST_API_SECRET_B64: &str = "dGVzdF9zZWNyZXRfa2V5XzMyYnl0ZXNfcGFkMTIzNDU=";
 const TEST_TOKEN_ASSET_ID: &str =
     "71321045679252212594626385532706912750332728571942532289631379312455583992563";
+const OTHER_TEST_TOKEN_ASSET_ID: &str =
+    "81321045679252212594626385532706912750332728571942532289631379312455583992563";
 const DEFAULT_ACCEPTED_ORDER_ID: &str =
     "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12";
 const CANCEL_ALREADY_DONE_ORDER_ID: &str =
@@ -1465,7 +1467,7 @@ async fn test_generate_order_status_report_single_returns_report() {
         ts_init: UnixNanos::default(),
         instrument_id: Some(instrument_id),
         client_order_id: None,
-        venue_order_id: Some(VenueOrderId::from("0x123")),
+        venue_order_id: Some(VenueOrderId::from(DEFAULT_ACCEPTED_ORDER_ID)),
         params: None,
         correlation_id: None,
         causation_id: None,
@@ -1480,6 +1482,35 @@ async fn test_generate_order_status_report_single_returns_report() {
     assert_eq!(report.order_type, OrderType::Limit,);
     assert_eq!(report.filled_qty, Quantity::zero(4));
     assert!(report.price.is_some());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_rejects_a_different_returned_venue_order() {
+    let state = TestServerState::default();
+    let mut response = load_json("http_open_order.json");
+    response["id"] = Value::String("V-RETURNED".to_string());
+    *state.single_order_response.lock().await = Some(response);
+    let addr = start_mock_server(state).await;
+    let (client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+
+    let report = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            client_order_id: None,
+            venue_order_id: Some(VenueOrderId::from("V-REQUESTED")),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(report.is_none());
 }
 
 #[rstest]
@@ -1535,6 +1566,98 @@ async fn test_generate_order_status_report_defers_while_trade_is_unconfirmed() {
 
     assert_eq!(report.order_status, OrderStatus::Accepted);
     assert_eq!(report.filled_qty, Quantity::zero(4));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_terminal_recovery_defers_on_confirmed_maker_identity_conflict() {
+    let venue_order_id_str = "0xmakeridentity00000000000000000000000000000000000000000000000001";
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(Value::Null);
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [{
+            "id": "trade-maker-identity-conflict",
+            "taker_order_id": "0xunrelated-taker",
+            "market": "0xtest-market",
+            "asset_id": TEST_TOKEN_ASSET_ID,
+            "side": "BUY",
+            "size": "10.0000",
+            "fee_rate_bps": "0",
+            "price": "0.5000",
+            "status": "CONFIRMED",
+            "match_time": "2024-01-01T00:00:00Z",
+            "last_update": "2024-01-01T00:00:10Z",
+            "outcome": "Yes",
+            "bucket_index": 0,
+            "owner": "unrelated-taker-owner",
+            "maker_address": "0x0000000000000000000000000000000000000000",
+            "transaction_hash": "0xabc123",
+            "maker_orders": [{
+                "asset_id": OTHER_TEST_TOKEN_ASSET_ID,
+                "fee_rate_bps": "0",
+                "maker_address": "0x0000000000000000000000000000000000000000",
+                "matched_amount": "10.0000",
+                "order_id": venue_order_id_str,
+                "outcome": "No",
+                "owner": "test_api_key",
+                "price": "0.5000",
+                "side": "BUY"
+            }],
+            "trader_side": "MAKER"
+        }],
+        "next_cursor": "LTE="
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    let local_instrument = InstrumentId::from("LOCAL.POLYMARKET");
+    let conflicting_instrument = InstrumentId::from("CONFLICT.POLYMARKET");
+    add_instrument_to_cache_for_asset(&cache, local_instrument, TEST_TOKEN_ASSET_ID, "0.0001", 4);
+    add_instrument_to_cache_for_asset(
+        &cache,
+        conflicting_instrument,
+        OTHER_TEST_TOKEN_ASSET_ID,
+        "0.0001",
+        4,
+    );
+    for instrument_id in [local_instrument, conflicting_instrument] {
+        let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+        client.on_instrument(instrument);
+    }
+
+    let venue_order_id = VenueOrderId::from(venue_order_id_str);
+    let client_order_id = ClientOrderId::from("O-MAKER-IDENTITY-CONFLICT");
+    let mut order = make_limit_order(
+        client_order_id.as_str(),
+        local_instrument,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, venue_order_id_str);
+    connect_and_restore_local_orders(&mut client, &cache).await;
+
+    let report = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(local_instrument),
+            client_order_id: Some(client_order_id),
+            venue_order_id: Some(venue_order_id),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(report.is_none());
 }
 
 #[rstest]
@@ -3143,7 +3266,22 @@ fn add_instrument_to_cache_with_tick(
     tick_size: &str,
     size_precision: u8,
 ) {
-    let symbol = TEST_TOKEN_ASSET_ID;
+    add_instrument_to_cache_for_asset(
+        cache,
+        instrument_id,
+        TEST_TOKEN_ASSET_ID,
+        tick_size,
+        size_precision,
+    );
+}
+
+fn add_instrument_to_cache_for_asset(
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    asset_id: &str,
+    tick_size: &str,
+    size_precision: u8,
+) {
     let price_increment = Price::from(tick_size);
     let size_increment = if size_precision == 0 {
         Quantity::from("1")
@@ -3153,7 +3291,7 @@ fn add_instrument_to_cache_with_tick(
             "0".repeat((size_precision as usize).saturating_sub(1))
         ))
     };
-    let raw_symbol = Symbol::from(symbol);
+    let raw_symbol = Symbol::from(asset_id);
 
     let instrument = BinaryOption::new(
         instrument_id,
@@ -5278,6 +5416,59 @@ async fn test_cancel_order_success_no_rejection_event() {
 
     let cmd = make_cancel_cmd("O-CANCEL-OK", instrument_id);
     client.cancel_order(cmd).unwrap();
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.cancel_delete_count.lock().await == 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_materialized_external_order_is_immediately_cancelable() {
+    let state = TestServerState::default();
+    let venue_order_id = VenueOrderId::from("V-EXTERNAL-CANCEL");
+    *state.cancel_response.lock().await = Some(json!({
+        "canceled": [venue_order_id.to_string()],
+        "not_canceled": {}
+    }));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let client_order_id = ClientOrderId::from("O-EXTERNAL-CANCEL");
+    let mut order = make_limit_order(
+        client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, venue_order_id.as_str());
+
+    client.register_external_order(
+        client_order_id,
+        venue_order_id,
+        instrument_id,
+        StrategyId::from("S-001"),
+        UnixNanos::default(),
+    );
+    client
+        .cancel_order(make_cancel_cmd(client_order_id.as_str(), instrument_id))
+        .unwrap();
 
     wait_until_async(
         || {

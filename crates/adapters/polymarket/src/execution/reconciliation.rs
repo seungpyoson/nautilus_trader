@@ -19,7 +19,7 @@ use ahash::AHashMap;
 use anyhow::Context;
 use nautilus_core::{UnixNanos, collections::AtomicMap, time::AtomicTime};
 use nautilus_model::{
-    enums::{LiquiditySide, OrderStatus, PositionSideSpecified},
+    enums::{LiquiditySide, PositionSideSpecified},
     identifiers::{AccountId, ClientId, InstrumentId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -29,7 +29,7 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use super::{
-    local_orders::LocalOrderCoordinator,
+    local_orders::{ArtifactAdmission, LocalOrderCoordinator},
     parse::{
         build_maker_fill_report, instrument_fee_exponent, instrument_taker_fee, parse_fill_report,
         parse_order_status_report, parse_timestamp,
@@ -37,7 +37,7 @@ use super::{
 };
 use crate::{
     common::{
-        consts::{DUST_POSITION_THRESHOLD, DUST_SNAP_THRESHOLD_DEC, USDC_DECIMALS},
+        consts::{DUST_POSITION_THRESHOLD, USDC_DECIMALS},
         enums::{PolymarketLiquiditySide, PolymarketTradeStatus},
     },
     http::{
@@ -66,11 +66,60 @@ pub(crate) fn build_fill_reports_from_trades(
     instrument_filter: Option<InstrumentId>,
     ts_init: UnixNanos,
 ) -> (Vec<FillReport>, usize) {
+    build_fill_reports_for_status(
+        trades,
+        ctx,
+        instruments,
+        instrument_filter,
+        ts_init,
+        TradeStatusSelection::Confirmed,
+    )
+}
+
+pub(crate) fn build_pending_fill_reports_from_trades(
+    trades: &[PolymarketTradeReport],
+    ctx: &FillContext<'_>,
+    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    ts_init: UnixNanos,
+) -> (Vec<FillReport>, usize) {
+    build_fill_reports_for_status(
+        trades,
+        ctx,
+        instruments,
+        None,
+        ts_init,
+        TradeStatusSelection::PendingSettlement,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum TradeStatusSelection {
+    Confirmed,
+    PendingSettlement,
+}
+
+impl TradeStatusSelection {
+    fn includes(self, status: PolymarketTradeStatus) -> bool {
+        match self {
+            Self::Confirmed => status == PolymarketTradeStatus::Confirmed,
+            Self::PendingSettlement => status.is_pending_settlement(),
+        }
+    }
+}
+
+fn build_fill_reports_for_status(
+    trades: &[PolymarketTradeReport],
+    ctx: &FillContext<'_>,
+    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instrument_filter: Option<InstrumentId>,
+    ts_init: UnixNanos,
+    status_selection: TradeStatusSelection,
+) -> (Vec<FillReport>, usize) {
     let mut reports = Vec::new();
     let mut filtered = 0usize;
 
     for trade in trades {
-        if trade.status != PolymarketTradeStatus::Confirmed {
+        if !status_selection.includes(trade.status) {
             continue;
         }
 
@@ -318,13 +367,32 @@ pub(crate) async fn generate_mass_status(
 
     // Identity may be claimed while the position request is in flight. Re-enter the same
     // point-of-use admission boundary before any venue-keyed joins or emission.
-    let final_orders = local_orders.admit_reconciliation_order_reports(order_reports);
-    order_reports = final_orders.artifacts;
     let final_fills = local_orders.admit_reconciliation_fill_reports(fill_reports);
     fill_reports = final_fills.artifacts;
+    let confirmed_filled = confirmed_filled_quantities(&fill_reports);
+    let mut final_order_conflicts = 0usize;
+    order_reports = order_reports
+        .into_iter()
+        .filter_map(|report| {
+            let venue_filled = report.filled_qty;
+            let report_key = (report.venue_order_id, report.instrument_id);
+            match local_orders.admit_point_of_use_order_report(
+                report,
+                venue_filled,
+                confirmed_filled.get(&report_key).copied(),
+            ) {
+                ArtifactAdmission::Owned { artifact, .. }
+                | ArtifactAdmission::Untracked(artifact) => Some(artifact),
+                ArtifactAdmission::Conflict(_) => {
+                    final_order_conflicts += 1;
+                    None
+                }
+            }
+        })
+        .collect();
     let identity_conflicts = admitted_orders.conflicts
         + admitted_fills.conflicts
-        + final_orders.conflicts
+        + final_order_conflicts
         + final_fills.conflicts;
     if identity_conflicts > 0 {
         log::warn!(
@@ -367,8 +435,6 @@ pub(crate) async fn generate_mass_status(
         );
     }
 
-    cap_order_reports_to_confirmed_fills(&mut order_reports, &fill_reports, local_orders);
-
     let mut mass_status = ExecutionMassStatus::new(client_id, ctx.account_id, venue, ts_init, None);
 
     mass_status.add_order_reports(order_reports);
@@ -376,33 +442,6 @@ pub(crate) async fn generate_mass_status(
     mass_status.add_fill_reports(fill_reports);
 
     Ok(Some(mass_status))
-}
-
-fn cap_order_reports_to_confirmed_fills(
-    order_reports: &mut [OrderStatusReport],
-    fill_reports: &[FillReport],
-    local_orders: &LocalOrderCoordinator,
-) {
-    let confirmed_by_order = confirmed_filled_quantities(fill_reports);
-
-    for report in order_reports {
-        let venue_filled = report.filled_qty;
-        let local_filled = local_orders
-            .snapshot(&report.venue_order_id)
-            .filter(|local| local.identity.instrument_id == report.instrument_id)
-            .map_or_else(
-                || Quantity::zero(report.quantity.precision),
-                |local| local.filled_qty,
-            );
-        cap_order_report_filled_qty(
-            report,
-            venue_filled,
-            local_filled,
-            confirmed_by_order
-                .get(&(report.venue_order_id, report.instrument_id))
-                .copied(),
-        );
-    }
 }
 
 pub(crate) fn confirmed_filled_quantities(
@@ -416,142 +455,4 @@ pub(crate) fn confirmed_filled_quantities(
     }
 
     confirmed_by_order
-}
-
-pub(crate) fn cap_order_report_filled_qty(
-    report: &mut OrderStatusReport,
-    venue_filled: Quantity,
-    local_filled: Quantity,
-    confirmed_filled: Option<Decimal>,
-) {
-    let confirmed_filled = confirmed_filled
-        .and_then(|qty| Quantity::from_decimal_dp(qty, report.quantity.precision).ok())
-        .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
-    let capped = venue_filled.min(local_filled.max(confirmed_filled));
-    report.filled_qty = capped;
-    normalize_terminal_order_report_quantity(report);
-}
-
-pub(crate) fn normalize_terminal_order_report_quantity(report: &mut OrderStatusReport) {
-    if report.order_status != OrderStatus::Filled
-        || report.filled_qty.is_zero()
-        || report.filled_qty >= report.quantity
-    {
-        return;
-    }
-
-    let leaves = report.quantity.as_decimal() - report.filled_qty.as_decimal();
-    if leaves < DUST_SNAP_THRESHOLD_DEC {
-        log::debug!(
-            "Normalizing terminal order report {} quantity from {} to confirmed fills {}",
-            report.venue_order_id,
-            report.quantity,
-            report.filled_qty,
-        );
-        report.quantity = report.filled_qty;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use nautilus_model::{
-        enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
-        identifiers::TradeId,
-        types::{Money, Price},
-    };
-    use rstest::rstest;
-
-    use super::*;
-
-    #[rstest]
-    fn caps_order_report_to_confirmed_companion_fills() {
-        let account_id = AccountId::from("POLY-001");
-        let instrument_id = InstrumentId::from("TEST.POLYMARKET");
-        let venue_order_id = VenueOrderId::from("V-1");
-        let mut reports = vec![OrderStatusReport::new(
-            account_id,
-            instrument_id,
-            None,
-            venue_order_id,
-            OrderSide::Buy,
-            OrderType::Limit,
-            TimeInForce::Gtc,
-            OrderStatus::PartiallyFilled,
-            Quantity::from("10.0000"),
-            Quantity::from("10.0000"),
-            UnixNanos::from(1),
-            UnixNanos::from(1),
-            UnixNanos::from(1),
-            None,
-        )];
-        let fills = vec![FillReport::new(
-            account_id,
-            instrument_id,
-            venue_order_id,
-            TradeId::from("T-1"),
-            OrderSide::Buy,
-            Quantity::from("4.0000"),
-            Price::from("0.5000"),
-            Money::new(0.0, Currency::pUSD()),
-            LiquiditySide::Taker,
-            None,
-            None,
-            UnixNanos::from(1),
-            UnixNanos::from(1),
-            None,
-        )];
-
-        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &LocalOrderCoordinator::new());
-
-        assert_eq!(reports[0].filled_qty, Quantity::from("4.0000"));
-    }
-
-    #[rstest]
-    #[case::below_threshold("99.995", "99.995")]
-    #[case::at_threshold("99.990", "100.000")]
-    fn normalizes_confirmed_dust_residual_to_order_quantity(
-        #[case] confirmed: &str,
-        #[case] expected_quantity: &str,
-    ) {
-        let account_id = AccountId::from("POLY-001");
-        let instrument_id = InstrumentId::from("TEST.POLYMARKET");
-        let venue_order_id = VenueOrderId::from("V-DUST");
-        let mut reports = vec![OrderStatusReport::new(
-            account_id,
-            instrument_id,
-            None,
-            venue_order_id,
-            OrderSide::Buy,
-            OrderType::Limit,
-            TimeInForce::Gtc,
-            OrderStatus::Filled,
-            Quantity::from("100.000"),
-            Quantity::from("100.000"),
-            UnixNanos::from(1),
-            UnixNanos::from(1),
-            UnixNanos::from(1),
-            None,
-        )];
-        let fills = vec![FillReport::new(
-            account_id,
-            instrument_id,
-            venue_order_id,
-            TradeId::from("T-DUST"),
-            OrderSide::Buy,
-            Quantity::from(confirmed),
-            Price::from("0.5000"),
-            Money::zero(Currency::pUSD()),
-            LiquiditySide::Taker,
-            None,
-            None,
-            UnixNanos::from(1),
-            UnixNanos::from(1),
-            None,
-        )];
-
-        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &LocalOrderCoordinator::new());
-
-        assert_eq!(reports[0].quantity, Quantity::from(expected_quantity));
-        assert_eq!(reports[0].filled_qty, Quantity::from(confirmed));
-    }
 }

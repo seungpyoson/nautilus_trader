@@ -57,6 +57,7 @@ use nautilus_model::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
     instruments::InstrumentAny,
+    orders::Order,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
@@ -343,12 +344,47 @@ impl ExecutionClient for PolymarketExecutionClient {
 
     fn register_external_order(
         &self,
-        _client_order_id: ClientOrderId,
-        _venue_order_id: VenueOrderId,
-        _instrument_id: InstrumentId,
-        _strategy_id: StrategyId,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
         _ts_init: UnixNanos,
     ) {
+        let order = self
+            .core
+            .cache()
+            .order(&client_order_id)
+            .map(|order| order.clone());
+        let Some(order) = order else {
+            log::error!(
+                "Cannot register external order {client_order_id}: materialized order is absent from cache"
+            );
+            return;
+        };
+        if order.venue_order_id() != Some(venue_order_id)
+            || order.instrument_id() != instrument_id
+            || order.strategy_id() != strategy_id
+        {
+            log::error!(
+                "Cannot register external order {client_order_id}: core callback conflicts with the materialized order"
+            );
+            return;
+        }
+        if self
+            .local_orders
+            .restore_order(
+                venue_order_id,
+                local_orders::OrderIdentity::from_order(&order),
+                order.quantity(),
+                order.filled_qty(),
+                order.price(),
+            )
+            .is_err()
+        {
+            log::error!(
+                "Cannot register external order {client_order_id}: retained local identity conflicts"
+            );
+        }
     }
 
     fn on_instrument(&mut self, instrument: InstrumentAny) {

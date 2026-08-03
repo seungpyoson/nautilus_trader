@@ -19,7 +19,7 @@ use std::{collections::HashMap, sync::Mutex};
 
 use nautilus_core::MUTEX_POISONED;
 use nautilus_model::{
-    enums::{OrderSide, OrderType, TimeInForce},
+    enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId, StrategyId, VenueOrderId},
     orders::{Order, OrderAny},
     reports::{FillReport, OrderStatusReport},
@@ -66,6 +66,17 @@ pub(crate) struct LocalOrderSnapshot {
     pub quantity: Quantity,
     pub filled_qty: Quantity,
     pub price: Option<Price>,
+}
+
+impl LocalOrderSnapshot {
+    pub(crate) fn from_order(order: &OrderAny) -> Self {
+        Self {
+            identity: OrderIdentity::from_order(order),
+            quantity: order.quantity(),
+            filled_qty: order.filled_qty(),
+            price: order.price(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +127,12 @@ enum FillApplication {
 enum OrderApplication {
     Observe,
     Reconcile,
+    ResolveUnfilledTerminal,
+    ResolvePendingRecovery,
+    PointOfUse {
+        venue_filled: Quantity,
+        confirmed_filled: Option<Decimal>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,6 +308,14 @@ impl LocalOrderCoordinator {
         application: FillApplication,
     ) -> ArtifactAdmission<FillReport> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        if report.client_order_id.is_some_and(|client| {
+            guard
+                .client_to_venue
+                .get(&client)
+                .is_some_and(|known| *known != report.venue_order_id)
+        }) {
+            return ArtifactAdmission::Conflict(LocalOrderConflict);
+        }
         let Some(state) = guard.orders.get(&report.venue_order_id).copied() else {
             return ArtifactAdmission::Untracked(report);
         };
@@ -335,13 +360,63 @@ impl LocalOrderCoordinator {
         self.resolve_order_report(report, OrderApplication::Observe)
     }
 
+    pub(crate) fn admit_unfilled_terminal_order_report(
+        &self,
+        report: OrderStatusReport,
+    ) -> ArtifactAdmission<OrderStatusReport> {
+        self.resolve_order_report(report, OrderApplication::ResolveUnfilledTerminal)
+    }
+
+    pub(crate) fn admit_pending_recovery_order_report(
+        &self,
+        report: OrderStatusReport,
+    ) -> ArtifactAdmission<OrderStatusReport> {
+        self.resolve_order_report(report, OrderApplication::ResolvePendingRecovery)
+    }
+
+    pub(crate) fn admit_point_of_use_order_report(
+        &self,
+        report: OrderStatusReport,
+        venue_filled: Quantity,
+        confirmed_filled: Option<Decimal>,
+    ) -> ArtifactAdmission<OrderStatusReport> {
+        self.resolve_order_report(
+            report,
+            OrderApplication::PointOfUse {
+                venue_filled,
+                confirmed_filled,
+            },
+        )
+    }
+
     fn resolve_order_report(
         &self,
         mut report: OrderStatusReport,
         application: OrderApplication,
     ) -> ArtifactAdmission<OrderStatusReport> {
         let guard = self.inner.lock().expect(MUTEX_POISONED);
+        if report.client_order_id.is_some_and(|client| {
+            guard
+                .client_to_venue
+                .get(&client)
+                .is_some_and(|known| *known != report.venue_order_id)
+        }) {
+            return ArtifactAdmission::Conflict(LocalOrderConflict);
+        }
         let Some(state) = guard.orders.get(&report.venue_order_id).copied() else {
+            if let OrderApplication::PointOfUse {
+                venue_filled,
+                confirmed_filled,
+            } = application
+            {
+                report.filled_qty = point_of_use_filled_qty(
+                    venue_filled,
+                    Quantity::zero(report.quantity.precision),
+                    confirmed_filled,
+                    report.quantity.precision,
+                );
+                normalize_terminal_order_report_quantity(&mut report);
+            }
             return ArtifactAdmission::Untracked(report);
         };
         if state.identity.instrument_id != report.instrument_id
@@ -358,14 +433,43 @@ impl LocalOrderCoordinator {
         // but not Nautilus's originating Limit/Market order type. The immutable
         // local identity is the authority for that missing field.
         report.order_type = state.identity.order_type;
-        if application == OrderApplication::Observe && report.filled_qty > state.cumulative_filled {
-            log::debug!(
-                "Capping filled_qty for {} from {} to {} while awaiting admitted fills",
-                report.venue_order_id,
-                report.filled_qty,
-                state.cumulative_filled,
-            );
-            report.filled_qty = state.cumulative_filled;
+        match application {
+            OrderApplication::Observe if report.filled_qty > state.cumulative_filled => {
+                log::debug!(
+                    "Capping filled_qty for {} from {} to {} while awaiting admitted fills",
+                    report.venue_order_id,
+                    report.filled_qty,
+                    state.cumulative_filled,
+                );
+                report.filled_qty = state.cumulative_filled;
+            }
+            OrderApplication::ResolveUnfilledTerminal if !state.cumulative_filled.is_zero() => {
+                return ArtifactAdmission::Conflict(LocalOrderConflict);
+            }
+            OrderApplication::ResolveUnfilledTerminal => {
+                report.filled_qty = state.cumulative_filled;
+            }
+            OrderApplication::ResolvePendingRecovery => {
+                report.filled_qty = state.cumulative_filled;
+                report.order_status = if state.cumulative_filled.is_zero() {
+                    OrderStatus::Accepted
+                } else {
+                    OrderStatus::PartiallyFilled
+                };
+            }
+            OrderApplication::PointOfUse {
+                venue_filled,
+                confirmed_filled,
+            } => {
+                report.filled_qty = point_of_use_filled_qty(
+                    venue_filled,
+                    state.cumulative_filled,
+                    confirmed_filled,
+                    report.quantity.precision,
+                );
+                normalize_terminal_order_report_quantity(&mut report);
+            }
+            _ => {}
         }
         ArtifactAdmission::Owned {
             artifact: report,
@@ -375,9 +479,10 @@ impl LocalOrderCoordinator {
 
     pub(crate) fn request_cancel(
         &self,
-        identity: OrderIdentity,
+        request: LocalOrderSnapshot,
         requested_venue_order_id: Option<VenueOrderId>,
     ) -> CancelAdmission {
+        let identity = request.identity;
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
         if let Some(preparing) = guard.preparing.get_mut(&identity.client_order_id) {
             return if preparing.identity == identity && requested_venue_order_id.is_none() {
@@ -392,8 +497,28 @@ impl LocalOrderCoordinator {
             .get(&identity.client_order_id)
             .copied()
         else {
-            if requested_venue_order_id.is_some() {
-                return CancelAdmission::Conflict;
+            if let Some(venue_order_id) = requested_venue_order_id {
+                if guard.orders.contains_key(&venue_order_id) {
+                    return CancelAdmission::Conflict;
+                }
+                guard.orders.insert(
+                    venue_order_id,
+                    new_order_state(
+                        identity,
+                        request.quantity,
+                        request.price,
+                        SubmissionState::Accepted,
+                    ),
+                );
+                guard
+                    .orders
+                    .get_mut(&venue_order_id)
+                    .expect("external order inserted under coordinator lock")
+                    .cumulative_filled = request.filled_qty;
+                guard
+                    .client_to_venue
+                    .insert(identity.client_order_id, venue_order_id);
+                return CancelAdmission::Ready(venue_order_id);
             }
             guard.preparing.insert(
                 identity.client_order_id,
@@ -821,6 +946,38 @@ fn snap_fill_qty_in(
     }
 }
 
+fn point_of_use_filled_qty(
+    venue_filled: Quantity,
+    local_filled: Quantity,
+    confirmed_filled: Option<Decimal>,
+    precision: u8,
+) -> Quantity {
+    let confirmed_filled = confirmed_filled
+        .and_then(|quantity| Quantity::from_decimal_dp(quantity, precision).ok())
+        .unwrap_or_else(|| Quantity::zero(precision));
+    venue_filled.min(local_filled.max(confirmed_filled))
+}
+
+pub(crate) fn normalize_terminal_order_report_quantity(report: &mut OrderStatusReport) {
+    if report.order_status != OrderStatus::Filled
+        || report.filled_qty.is_zero()
+        || report.filled_qty >= report.quantity
+    {
+        return;
+    }
+
+    let leaves = report.quantity.as_decimal() - report.filled_qty.as_decimal();
+    if leaves < DUST_SNAP_THRESHOLD_DEC {
+        log::debug!(
+            "Normalizing terminal order report {} quantity from {} to confirmed fills {}",
+            report.venue_order_id,
+            report.quantity,
+            report.filled_qty,
+        );
+        report.quantity = report.filled_qty;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_core::{UUID4, UnixNanos};
@@ -841,6 +998,15 @@ mod tests {
             order_side: side,
             order_type: OrderType::Limit,
             time_in_force: TimeInForce::Gtc,
+        }
+    }
+
+    fn cancel_request(identity: OrderIdentity) -> LocalOrderSnapshot {
+        LocalOrderSnapshot {
+            identity,
+            quantity: Quantity::from("10.0000"),
+            filled_qty: Quantity::zero(4),
+            price: Some(Price::from("0.5000")),
         }
     }
 
@@ -924,7 +1090,7 @@ mod tests {
         );
         assert_eq!(coordinator.identity(&v1), Some(first));
         assert_eq!(
-            coordinator.request_cancel(first, None),
+            coordinator.request_cancel(cancel_request(first), None),
             CancelAdmission::Deferred
         );
     }
@@ -1033,6 +1199,64 @@ mod tests {
     }
 
     #[rstest]
+    fn stale_unfilled_terminal_resolution_is_rejected_after_a_fill() {
+        let coordinator = LocalOrderCoordinator::new();
+        let venue = VenueOrderId::from("V-1");
+        let expected = identity("C-1", "I-1.POLYMARKET", OrderSide::Buy);
+        claim(&coordinator, venue, expected, Quantity::from("10.0000"));
+        coordinator.record_fill(&venue, Quantity::from("5.0000"));
+        let mut report = order_report("V-1", "I-1.POLYMARKET", OrderSide::Buy, "0.0000");
+        report.order_status = OrderStatus::Canceled;
+
+        assert!(matches!(
+            coordinator.admit_unfilled_terminal_order_report(report),
+            ArtifactAdmission::Conflict(_)
+        ));
+    }
+
+    #[rstest]
+    fn point_of_use_admission_refreshes_fill_quantity_after_async_work() {
+        let coordinator = LocalOrderCoordinator::new();
+        let venue = VenueOrderId::from("V-1");
+        let expected = identity("C-1", "I-1.POLYMARKET", OrderSide::Buy);
+        claim(&coordinator, venue, expected, Quantity::from("10.0000"));
+        let report = order_report("V-1", "I-1.POLYMARKET", OrderSide::Buy, "10.0000");
+        coordinator.record_fill(&venue, Quantity::from("5.0000"));
+
+        let ArtifactAdmission::Owned { artifact, .. } =
+            coordinator.admit_point_of_use_order_report(report, Quantity::from("10.0000"), None)
+        else {
+            panic!("expected owned order report");
+        };
+
+        assert_eq!(artifact.filled_qty, Quantity::from("5.0000"));
+    }
+
+    #[rstest]
+    #[case::below_threshold("99.995", "99.995")]
+    #[case::at_threshold("99.990", "100.000")]
+    fn point_of_use_admission_normalizes_only_sub_dust_terminal_leaves(
+        #[case] confirmed: &str,
+        #[case] expected_quantity: &str,
+    ) {
+        let coordinator = LocalOrderCoordinator::new();
+        let mut report = order_report("V-DUST", "I-1.POLYMARKET", OrderSide::Buy, "100.000");
+        report.order_status = OrderStatus::Filled;
+        report.quantity = Quantity::from("100.000");
+
+        let ArtifactAdmission::Untracked(artifact) = coordinator.admit_point_of_use_order_report(
+            report,
+            Quantity::from("100.000"),
+            Some(Decimal::from_str_exact(confirmed).unwrap()),
+        ) else {
+            panic!("expected untracked external report");
+        };
+
+        assert_eq!(artifact.quantity, Quantity::from(expected_quantity));
+        assert_eq!(artifact.filled_qty, Quantity::from(confirmed));
+    }
+
+    #[rstest]
     fn every_venue_order_identity_component_is_admitted_together() {
         let coordinator = LocalOrderCoordinator::new();
         let venue = VenueOrderId::from("V-1");
@@ -1064,6 +1288,31 @@ mod tests {
     }
 
     #[rstest]
+    fn known_client_cannot_be_relabelled_under_an_untracked_venue_order() {
+        let coordinator = LocalOrderCoordinator::new();
+        let expected = identity("C-1", "I-1.POLYMARKET", OrderSide::Buy);
+        claim(
+            &coordinator,
+            VenueOrderId::from("V-1"),
+            expected,
+            Quantity::from("10.0000"),
+        );
+        let mut fill = fill("V-2", "I-1.POLYMARKET", OrderSide::Buy, "2.0000");
+        fill.client_order_id = Some(expected.client_order_id);
+        let mut report = order_report("V-2", "I-1.POLYMARKET", OrderSide::Buy, "0.0000");
+        report.client_order_id = Some(expected.client_order_id);
+
+        assert!(matches!(
+            coordinator.admit_fill_report(fill),
+            ArtifactAdmission::Conflict(_)
+        ));
+        assert!(matches!(
+            coordinator.admit_order_report(report),
+            ArtifactAdmission::Conflict(_)
+        ));
+    }
+
+    #[rstest]
     fn reconciliation_preserves_confirmed_quantity_and_restores_missing_order_type() {
         let coordinator = LocalOrderCoordinator::new();
         let venue = VenueOrderId::from("V-FOK");
@@ -1092,7 +1341,7 @@ mod tests {
         let expected = identity("C-1", "I-1.POLYMARKET", OrderSide::Buy);
         coordinator.begin_submission(expected).unwrap();
         assert_eq!(
-            coordinator.request_cancel(expected, None),
+            coordinator.request_cancel(cancel_request(expected), None),
             CancelAdmission::Deferred
         );
         coordinator
@@ -1112,23 +1361,43 @@ mod tests {
         let expected = identity("C-1", "I-1.POLYMARKET", OrderSide::Buy);
 
         assert_eq!(
-            coordinator.request_cancel(expected, None),
+            coordinator.request_cancel(cancel_request(expected), None),
             CancelAdmission::Deferred
         );
         claim(&coordinator, venue, expected, Quantity::from("10.0000"));
         assert_eq!(
-            coordinator.request_cancel(expected, None),
+            coordinator.request_cancel(cancel_request(expected), None),
             CancelAdmission::Deferred
         );
         let acceptance = coordinator.accept_submission(venue, expected).unwrap();
         assert!(acceptance.cancel_requested);
         assert_eq!(
-            coordinator.request_cancel(expected, None),
+            coordinator.request_cancel(cancel_request(expected), None),
             CancelAdmission::Ready(venue)
         );
         assert_eq!(
-            coordinator.request_cancel(identity("C-1", "I-2.POLYMARKET", OrderSide::Buy), None,),
+            coordinator.request_cancel(
+                cancel_request(identity("C-1", "I-2.POLYMARKET", OrderSide::Buy)),
+                None,
+            ),
             CancelAdmission::Conflict
+        );
+    }
+
+    #[rstest]
+    fn cancel_atomically_claims_a_cached_external_order() {
+        let coordinator = LocalOrderCoordinator::new();
+        let venue = VenueOrderId::from("V-EXTERNAL");
+        let expected = identity("C-EXTERNAL", "I-1.POLYMARKET", OrderSide::Buy);
+
+        assert_eq!(
+            coordinator.request_cancel(cancel_request(expected), Some(venue)),
+            CancelAdmission::Ready(venue)
+        );
+        assert_eq!(coordinator.identity(&venue), Some(expected));
+        assert_eq!(
+            coordinator.snapshot(&venue).unwrap().quantity,
+            Quantity::from("10.0000")
         );
     }
 
@@ -1148,7 +1417,7 @@ mod tests {
 
         assert_eq!(coordinator.identity(&venue), Some(expected));
         assert_eq!(
-            coordinator.request_cancel(expected, Some(venue)),
+            coordinator.request_cancel(cancel_request(expected), Some(venue)),
             CancelAdmission::Conflict
         );
         assert!(

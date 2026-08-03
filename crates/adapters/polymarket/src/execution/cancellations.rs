@@ -24,7 +24,7 @@ use nautilus_model::{
 
 use super::{
     PolymarketExecutionClient,
-    local_orders::{CancelAdmission, OrderIdentity},
+    local_orders::{CancelAdmission, LocalOrderSnapshot},
 };
 use crate::{execution::types::CancelOutcome, http::query::CancelResponse};
 
@@ -61,10 +61,10 @@ impl PolymarketExecutionClient {
             return;
         }
 
-        let venue_order_id = match self
-            .local_orders
-            .request_cancel(OrderIdentity::from_order(order_ref), cmd.venue_order_id)
-        {
+        let venue_order_id = match self.local_orders.request_cancel(
+            LocalOrderSnapshot::from_order(order_ref),
+            cmd.venue_order_id,
+        ) {
             CancelAdmission::Ready(id) => id,
             CancelAdmission::Deferred => {
                 log::debug!(
@@ -134,7 +134,7 @@ impl PolymarketExecutionClient {
         for order in open_orders {
             match self
                 .local_orders
-                .request_cancel(OrderIdentity::from_order(&order), None)
+                .request_cancel(LocalOrderSnapshot::from_order(&order), None)
             {
                 CancelAdmission::Ready(venue_order_id) => {
                     venue_order_ids.push(venue_order_id.to_string());
@@ -197,7 +197,7 @@ impl PolymarketExecutionClient {
             if let Some(order) = self.core.cache().order(&c.client_order_id) {
                 match self
                     .local_orders
-                    .request_cancel(OrderIdentity::from_order(&order), c.venue_order_id)
+                    .request_cancel(LocalOrderSnapshot::from_order(&order), c.venue_order_id)
                 {
                     CancelAdmission::Ready(venue_order_id) => {
                         venue_to_order.push((venue_order_id.to_string(), order.clone()));

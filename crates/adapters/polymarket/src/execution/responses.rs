@@ -486,9 +486,11 @@ pub(super) async fn check_fok_status(
     );
     let ArtifactAdmission::Owned {
         artifact: report, ..
-    } = local_orders.admit_order_report(report)
+    } = local_orders.admit_unfilled_terminal_order_report(report)
     else {
-        log::error!("Rejecting FOK status response for {order_id}: local order identity conflict");
+        log::error!(
+            "Rejecting FOK status response for {order_id}: local identity changed or a fill arrived while REST was in flight"
+        );
         return;
     };
 
@@ -529,6 +531,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::execution::local_orders::LocalOrderSnapshot;
     use crate::{
         common::enums::PolymarketTradeStatus,
         http::{
@@ -761,7 +764,7 @@ mod tests {
         );
 
         assert_eq!(
-            local_orders.request_cancel(OrderIdentity::from_order(&order), None),
+            local_orders.request_cancel(LocalOrderSnapshot::from_order(&order), None),
             crate::execution::local_orders::CancelAdmission::Ready(expected_venue_order_id)
         );
 
@@ -801,7 +804,7 @@ mod tests {
         let local_orders = LocalOrderCoordinator::new();
         claim_order(&local_orders, &order, venue_order_id);
         assert_eq!(
-            local_orders.request_cancel(OrderIdentity::from_order(&order), None),
+            local_orders.request_cancel(LocalOrderSnapshot::from_order(&order), None),
             crate::execution::local_orders::CancelAdmission::Deferred
         );
         local_orders
@@ -836,7 +839,7 @@ mod tests {
             error_msg: None,
         };
         assert_eq!(
-            local_orders.request_cancel(OrderIdentity::from_order(&order), None),
+            local_orders.request_cancel(LocalOrderSnapshot::from_order(&order), None),
             crate::execution::local_orders::CancelAdmission::Deferred
         );
 
@@ -963,7 +966,7 @@ mod tests {
             .begin_submission(OrderIdentity::from_order(&order))
             .unwrap();
         assert_eq!(
-            local_orders.request_cancel(OrderIdentity::from_order(&order), None),
+            local_orders.request_cancel(LocalOrderSnapshot::from_order(&order), None),
             crate::execution::local_orders::CancelAdmission::Deferred
         );
 

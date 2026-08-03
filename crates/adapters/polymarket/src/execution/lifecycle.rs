@@ -1673,7 +1673,7 @@ mod tests {
             .lock()
             .expect(MUTEX_POISONED)
             .processed_fills
-            .add(dedup_key.clone());
+            .insert(dedup_key.clone());
 
         client.stop_client();
 

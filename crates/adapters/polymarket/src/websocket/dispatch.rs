@@ -27,8 +27,8 @@
 
 use std::str::FromStr;
 
+use ahash::{AHashMap, AHashSet};
 use indexmap::IndexMap;
-use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
 use nautilus_core::{UUID4, UnixNanos, collections::AtomicMap, time::AtomicTime};
 use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
@@ -71,16 +71,18 @@ pub(crate) struct AccountRefreshRequest;
 /// Mutable state retained across user WebSocket stream generations.
 #[derive(Debug, Default)]
 pub(crate) struct WsDispatchState {
-    pub processed_fills: FifoCache<String, 10_000>,
-    matched_fills: FifoCacheMap<String, Vec<OrderFilled>, 10_000>,
-    voided_trades: FifoCache<String, 10_000>,
-    confirmed_trades: FifoCache<String, 10_000>,
-    pending_untracked_fills: FifoCacheMap<String, Vec<FillReport>, 10_000>,
-    pending_terminal_orders: FifoCacheMap<VenueOrderId, PendingTerminalOrder, 10_000>,
+    // Settlement truth is process-lifetime state. Capacity eviction could replay a duplicate fill
+    // or discard the only provenance capable of voiding a failed provisional fill.
+    pub processed_fills: AHashSet<String>,
+    matched_fills: AHashMap<String, Vec<OrderFilled>>,
+    voided_trades: AHashSet<String>,
+    confirmed_trades: AHashSet<String>,
+    pending_untracked_fills: AHashMap<String, Vec<FillReport>>,
+    pending_terminal_orders: AHashMap<VenueOrderId, PendingTerminalOrder>,
     /// Cancel reports saved for orders known to be terminal at the venue.
     /// Re-emitted after a fill to restore terminal state when fills race
     /// ahead of (or arrive after) cancel messages.
-    terminal_cancel_reports: FifoCacheMap<VenueOrderId, OrderStatusReport, 10_000>,
+    terminal_cancel_reports: AHashMap<VenueOrderId, OrderStatusReport>,
 }
 
 pub(crate) enum RestoredTradeSettlementAction {
@@ -91,14 +93,14 @@ pub(crate) enum RestoredTradeSettlementAction {
 
 impl WsDispatchState {
     pub(crate) fn restore_matched_trade(&mut self, key: String, fills: Vec<OrderFilled>) {
-        self.processed_fills.add(key.clone());
+        self.processed_fills.insert(key.clone());
         self.matched_fills.insert(key, fills);
     }
 
     pub(crate) fn restore_voided_trade(&mut self, key: String) {
-        self.processed_fills.add(key.clone());
+        self.processed_fills.insert(key.clone());
         self.matched_fills.remove(&key);
-        self.voided_trades.add(key);
+        self.voided_trades.insert(key);
     }
 
     pub(crate) fn restore_trade_settlement(
@@ -114,10 +116,10 @@ impl WsDispatchState {
         }
 
         if status.is_finalized() {
-            self.processed_fills.add(key);
+            self.processed_fills.insert(key);
             for fill in &fills {
                 self.confirmed_trades
-                    .add(confirmed_trade_key(trade_id, fill.venue_order_id));
+                    .insert(confirmed_trade_key(trade_id, fill.venue_order_id));
             }
             return RestoredTradeSettlementAction::Confirmed(fills);
         }
@@ -134,7 +136,7 @@ impl WsDispatchState {
     }
 
     pub(crate) fn is_voided_trade(&self, key: &str) -> bool {
-        self.voided_trades.contains(&key.to_string())
+        self.voided_trades.contains(key)
     }
 
     pub(crate) fn is_confirmed_trade(&self, trade_id: &str, venue_order_id: VenueOrderId) -> bool {
@@ -367,8 +369,8 @@ fn void_failed_trade(
         emit_order_fill_voided(&fill, trade, Some(fill.event_id), ctx);
     }
 
-    state.processed_fills.add(dedup_key.clone());
-    state.voided_trades.add(dedup_key);
+    state.processed_fills.insert(dedup_key.clone());
+    state.voided_trades.insert(dedup_key);
 }
 
 fn has_unknown_trade_instrument(trade: &PolymarketUserTrade, ctx: &WsDispatchContext<'_>) -> bool {
@@ -397,7 +399,7 @@ fn dispatch_trade_fills(
         return;
     }
 
-    state.processed_fills.add(dedup_key.clone());
+    state.processed_fills.insert(dedup_key.clone());
     let fills = if trade.trader_side == PolymarketLiquiditySide::Maker {
         dispatch_maker_fills(trade, dedup_key, is_confirmed, ctx, state)
     } else {
@@ -453,7 +455,7 @@ fn confirm_trade(
         for fill in fills.clone() {
             let confirmed_key = confirmed_trade_key(&trade.id, fill.venue_order_id);
             if !state.confirmed_trades.contains(&confirmed_key) {
-                state.confirmed_trades.add(confirmed_key);
+                state.confirmed_trades.insert(confirmed_key);
                 newly_confirmed_fills.push(fill);
             }
         }
@@ -1287,6 +1289,11 @@ mod tests {
             ExecutionEvent::Order(OrderEventAny::Filled(event)) => event,
             other => panic!("expected matched fill, was {other:?}"),
         };
+        for index in 0..10_001 {
+            let unrelated = format!("unrelated-trade-{index}");
+            state.processed_fills.insert(unrelated.clone());
+            state.matched_fills.insert(unrelated, Vec::new());
+        }
         trade.status = crate::common::enums::PolymarketTradeStatus::Failed;
         let failed = dispatch_user_message(&UserWsMessage::Trade(trade.clone()), &ctx, &mut state);
         let voided = match receiver.try_recv().unwrap() {
@@ -1361,7 +1368,7 @@ mod tests {
             user_api_key: "test-key",
         };
         let mut state = WsDispatchState::default();
-        state.confirmed_trades.add(confirmed_trade_key(
+        state.confirmed_trades.insert(confirmed_trade_key(
             "trade-0xfill1",
             VenueOrderId::from(order.id.as_str()),
         ));
