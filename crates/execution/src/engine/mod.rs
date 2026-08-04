@@ -91,7 +91,7 @@ use rust_decimal::Decimal;
 use crate::{
     client::ExecutionClientAdapter,
     reconciliation::{
-        ReconciliationReportIdentity, ReportOrderResolution, check_position_reconciliation,
+        ReportOrderResolution, check_position_reconciliation,
         generate_external_order_status_events, generate_reconciliation_order_events,
         generate_reconciliation_order_pre_fill_events,
         generate_reconciliation_order_snapshot_events, reconcile_fill_report as reconcile_fill,
@@ -1011,15 +1011,7 @@ impl ExecutionEngine {
 
         let cache = self.cache.borrow();
 
-        let order = resolve_report_order(
-            &cache,
-            ReconciliationReportIdentity {
-                instrument_id: report.instrument_id,
-                client_order_id: report.client_order_id,
-                venue_order_id: report.venue_order_id,
-                order_side: report.order_side,
-            },
-        );
+        let order = resolve_report_order(&cache, report.into());
 
         let instrument = cache.instrument(&report.instrument_id).cloned();
 
@@ -1374,15 +1366,7 @@ impl ExecutionEngine {
 
         let cache = self.cache.borrow();
 
-        let order = resolve_report_order(
-            &cache,
-            ReconciliationReportIdentity {
-                instrument_id: report.instrument_id,
-                client_order_id: report.client_order_id,
-                venue_order_id: report.venue_order_id,
-                order_side: report.order_side,
-            },
-        );
+        let order = resolve_report_order(&cache, report.into());
 
         let instrument = cache.instrument(&report.instrument_id).cloned();
 
@@ -1478,15 +1462,7 @@ impl ExecutionEngine {
         }
 
         let cache = self.cache.borrow();
-        let order = resolve_report_order(
-            &cache,
-            ReconciliationReportIdentity {
-                instrument_id: report.instrument_id,
-                client_order_id: report.client_order_id,
-                venue_order_id: report.venue_order_id,
-                order_side: report.order_side,
-            },
-        );
+        let order = resolve_report_order(&cache, report.into());
         let instrument = cache.instrument(&report.instrument_id).cloned();
         drop(cache);
 
@@ -1581,15 +1557,7 @@ impl ExecutionEngine {
         let client_order_id = order.client_order_id();
 
         for fill in fills {
-            if !report_identity_matches_order(
-                &order,
-                ReconciliationReportIdentity {
-                    instrument_id: fill.instrument_id,
-                    client_order_id: fill.client_order_id,
-                    venue_order_id: fill.venue_order_id,
-                    order_side: fill.order_side,
-                },
-            ) {
+            if !report_identity_matches_order(&order, fill.into()) {
                 log::error!(
                     "Rejecting companion fill for venue_order_id={}: report identity conflicts with reconciled order",
                     fill.venue_order_id,

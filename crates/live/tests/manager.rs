@@ -8643,6 +8643,80 @@ async fn test_filtered_client_order_ids_skips_matching_orders() {
 }
 
 #[tokio::test]
+async fn test_filtered_client_order_ids_skips_venue_only_cached_order_report() {
+    let filtered_id = ClientOrderId::from("O-FILTERED-VENUE-ONLY");
+    let venue_order_id = VenueOrderId::from("V-FILTERED-VENUE-ONLY");
+    let config = ExecutionManagerConfig {
+        filtered_client_order_ids: IndexSet::from([filtered_id]),
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    let instrument_id = test_instrument_id();
+    ctx.add_instrument(test_instrument());
+    insert_accepted_limit_order(&ctx, filtered_id, venue_order_id, test_client_id());
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    mass_status.add_order_reports(vec![create_order_status_report(
+        None,
+        venue_order_id,
+        instrument_id,
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    )]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert!(result.events.is_empty());
+    assert_eq!(
+        ctx.get_order(&filtered_id).unwrap().status(),
+        OrderStatus::Accepted,
+    );
+}
+
+#[tokio::test]
+async fn test_filtered_client_order_ids_skips_periodic_cached_order_report() {
+    let filtered_id = ClientOrderId::from("O-FILTERED-PERIODIC");
+    let venue_order_id = VenueOrderId::from("V-FILTERED-PERIODIC");
+    let config = ExecutionManagerConfig {
+        filtered_client_order_ids: IndexSet::from([filtered_id]),
+        open_check_threshold_ns: 0,
+        open_check_open_only: true,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    ctx.add_instrument(test_instrument());
+    insert_accepted_limit_order(&ctx, filtered_id, venue_order_id, test_client_id());
+    let report = create_order_status_report(
+        None,
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let mock_client = MockExecutionClient::new(vec![report]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_open_orders(&clients).await;
+
+    assert!(events.is_empty());
+    assert_eq!(
+        ctx.get_order(&filtered_id).unwrap().status(),
+        OrderStatus::Accepted,
+    );
+}
+
+#[tokio::test]
 async fn test_filtered_client_order_ids_skips_orphan_fills() {
     // Orphan fills (fills without order reports) should also be filtered
     let filtered_id = ClientOrderId::from("O-FILTERED-002");
@@ -9748,6 +9822,171 @@ async fn test_check_open_orders_rejects_split_client_and_venue_order_identity() 
 
 #[rstest]
 #[tokio::test]
+async fn test_check_open_orders_bulk_selects_most_advanced_valid_report() {
+    let config = ExecutionManagerConfig {
+        open_check_threshold_ns: 0,
+        open_check_open_only: true,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    ctx.add_instrument(test_instrument());
+
+    let client_order_id = ClientOrderId::from("O-BULK-ADVANCED");
+    let venue_order_id = VenueOrderId::from("V-BULK-ADVANCED");
+    insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, test_client_id());
+
+    let stale_report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::PartiallyFilled,
+        Quantity::from("10.0"),
+        Quantity::from("5.0"),
+    )
+    .with_avg_px(dec!(100.0));
+    let current_report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::PartiallyFilled,
+        Quantity::from("10.0"),
+        Quantity::from("8.0"),
+    )
+    .with_avg_px(dec!(100.0));
+    let first_client = MockExecutionClient::new(vec![stale_report]);
+    let second_client = MockExecutionClient::for_venue(
+        ClientId::from("CLIENT-BULK-CURRENT"),
+        test_venue(),
+        vec![current_report],
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&first_client, &second_client];
+
+    let events = ctx.manager.check_open_orders(&clients).await;
+
+    assert_eq!(events.len(), 1);
+    let OrderEventAny::Filled(fill) = &events[0] else {
+        panic!("Expected OrderFilled event, was {:?}", events[0]);
+    };
+    assert_eq!(fill.last_qty, Quantity::from("8.0"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_open_orders_bulk_defers_equal_authority_conflict() {
+    let config = ExecutionManagerConfig {
+        open_check_threshold_ns: 0,
+        open_check_open_only: true,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    ctx.add_instrument(test_instrument());
+
+    let client_order_id = ClientOrderId::from("O-BULK-CONFLICT");
+    let venue_order_id = VenueOrderId::from("V-BULK-CONFLICT");
+    insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, test_client_id());
+
+    let canceled = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let expired = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Expired,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let first_client = MockExecutionClient::new(vec![canceled]);
+    let second_client = MockExecutionClient::for_venue(
+        ClientId::from("CLIENT-BULK-CONFLICT"),
+        test_venue(),
+        vec![expired],
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&first_client, &second_client];
+
+    let events = ctx.manager.check_open_orders(&clients).await;
+
+    assert!(events.is_empty());
+    assert_eq!(
+        ctx.get_order(&client_order_id).unwrap().status(),
+        OrderStatus::Accepted,
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_open_orders_historical_bulk_report_does_not_hide_current_venue() {
+    let config = ExecutionManagerConfig {
+        open_check_threshold_ns: 0,
+        open_check_missing_retries: 1,
+        open_check_open_only: false,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    ctx.add_instrument(test_instrument());
+
+    let client_order_id = ClientOrderId::from("O-BULK-HISTORICAL");
+    let historical_venue_order_id = VenueOrderId::from("V-BULK-HISTORICAL");
+    let current_venue_order_id = VenueOrderId::from("V-BULK-CURRENT");
+    insert_accepted_limit_order(
+        &ctx,
+        client_order_id,
+        historical_venue_order_id,
+        test_client_id(),
+    );
+    let order = ctx.get_order(&client_order_id).unwrap();
+    let updated = OrderEventAny::Updated(
+        OrderUpdatedSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(client_order_id)
+            .quantity(order.quantity())
+            .venue_order_id(current_venue_order_id)
+            .account_id(test_account_id())
+            .price(order.price().unwrap())
+            .build(),
+    );
+    ctx.cache.borrow_mut().update_order(&updated).unwrap();
+
+    let historical_report = create_order_status_report(
+        Some(client_order_id),
+        historical_venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Accepted,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let current_report = create_order_status_report(
+        Some(client_order_id),
+        current_venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let mock_client =
+        MockExecutionClient::new(vec![historical_report]).with_order_report(current_report);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_open_orders(&clients).await;
+
+    assert_eq!(mock_client.order_report_query_count.get(), 1);
+    assert_eq!(events.len(), 1);
+    let OrderEventAny::Canceled(canceled) = &events[0] else {
+        panic!("Expected OrderCanceled event, was {:?}", events[0]);
+    };
+    assert_eq!(canceled.venue_order_id, Some(current_venue_order_id));
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_check_open_orders_submitted_missing_at_venue_generates_rejected() {
     // A SUBMITTED order with no venue_order_id that the venue doesn't know
     // about should eventually be rejected after retries are exhausted.
@@ -10216,6 +10455,65 @@ async fn test_check_open_orders_targeted_query_prefers_current_venue_report() {
         panic!("Expected OrderCanceled event, was {:?}", events[0]);
     };
     assert_eq!(canceled.venue_order_id, Some(current_venue_order_id));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_open_orders_targeted_query_rejects_historical_only_report() {
+    let config = ExecutionManagerConfig {
+        open_check_threshold_ns: 0,
+        open_check_missing_retries: 1,
+        open_check_open_only: false,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    ctx.add_instrument(test_instrument());
+
+    let client_order_id = ClientOrderId::from("O-TARGETED-HISTORICAL-ONLY");
+    let historical_venue_order_id = VenueOrderId::from("V-TARGETED-HISTORICAL-ONLY");
+    let current_venue_order_id = VenueOrderId::from("V-TARGETED-HISTORICAL-CURRENT");
+    insert_accepted_limit_order(
+        &ctx,
+        client_order_id,
+        historical_venue_order_id,
+        test_client_id(),
+    );
+    let order = ctx.get_order(&client_order_id).unwrap();
+    let updated = OrderEventAny::Updated(
+        OrderUpdatedSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(client_order_id)
+            .quantity(order.quantity())
+            .venue_order_id(current_venue_order_id)
+            .account_id(test_account_id())
+            .price(order.price().unwrap())
+            .build(),
+    );
+    ctx.cache.borrow_mut().update_order(&updated).unwrap();
+
+    let historical_report = create_order_status_report(
+        Some(client_order_id),
+        historical_venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let mock_client = MockExecutionClient::new(Vec::new()).with_order_report(historical_report);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_open_orders(&clients).await;
+
+    assert_eq!(mock_client.order_report_query_count.get(), 1);
+    assert!(events.is_empty());
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 1);
+    assert_eq!(
+        ctx.get_order(&client_order_id).unwrap().status(),
+        OrderStatus::Accepted,
+    );
 }
 
 #[rstest]

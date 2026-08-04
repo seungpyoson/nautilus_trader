@@ -3206,10 +3206,10 @@ mod tests {
 
     #[rstest]
     #[case(false, false, OrderStatus::Canceled, 1)]
-    #[case(false, true, OrderStatus::Accepted, 0)]
+    #[case(false, true, OrderStatus::Accepted, 1)]
     #[case(true, false, OrderStatus::Canceled, 1)]
-    #[case(true, true, OrderStatus::Accepted, 0)]
-    fn test_process_exec_event_clears_terminal_activity_only_after_cached_order_closes(
+    #[case(true, true, OrderStatus::Accepted, 1)]
+    fn test_process_exec_event_tracks_terminal_activity_only_for_current_order_identity(
         #[case] with_fills: bool,
         #[case] superseded: bool,
         #[case] expected_status: OrderStatus,

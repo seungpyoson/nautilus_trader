@@ -20,7 +20,7 @@ use nautilus_model::{
     enums::{OrderSide, OrderStatus},
     identifiers::{ClientOrderId, InstrumentId, VenueOrderId},
     orders::{Order, OrderAny},
-    reports::OrderStatusReport,
+    reports::{FillReport, OrderStatusReport},
 };
 
 /// Identity carried by an execution report when resolving its cached order.
@@ -30,6 +30,28 @@ pub struct ReconciliationReportIdentity {
     pub client_order_id: Option<ClientOrderId>,
     pub venue_order_id: VenueOrderId,
     pub order_side: OrderSide,
+}
+
+impl From<&OrderStatusReport> for ReconciliationReportIdentity {
+    fn from(report: &OrderStatusReport) -> Self {
+        Self {
+            instrument_id: report.instrument_id,
+            client_order_id: report.client_order_id,
+            venue_order_id: report.venue_order_id,
+            order_side: report.order_side,
+        }
+    }
+}
+
+impl From<&FillReport> for ReconciliationReportIdentity {
+    fn from(report: &FillReport) -> Self {
+        Self {
+            instrument_id: report.instrument_id,
+            client_order_id: report.client_order_id,
+            venue_order_id: report.venue_order_id,
+            order_side: report.order_side,
+        }
+    }
 }
 
 /// Result of resolving an execution report against both cache identity indexes.
@@ -43,7 +65,7 @@ pub enum ReportOrderResolution {
 /// Result of reducing identity-valid reports for one cached order.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ReconciliationReportSelection<'a> {
-    /// No identity-valid report was available.
+    /// No report for the current venue ID was available.
     None,
     /// One report is the deterministic most-advanced snapshot.
     Selected(&'a OrderStatusReport),
@@ -103,25 +125,47 @@ pub fn report_identity_matches_order(
         && venue_id_matches
 }
 
-/// Selects the deterministic most-advanced snapshot for one cached order.
+/// Returns whether a companion artifact can belong to an external order report.
 ///
-/// Filled quantity is monotonic, then the current venue ID, venue status progress,
-/// and venue event time. Equally authoritative reports must describe the same
-/// reconciliation state; otherwise the selection fails closed.
+/// The order report is authoritative for identity creation. A companion may omit
+/// its client order ID, but a claimed client order ID must agree.
 #[must_use]
-pub fn select_reconciliation_order_report<'a>(
+pub fn report_identity_matches_report(
+    order: ReconciliationReportIdentity,
+    companion: ReconciliationReportIdentity,
+) -> bool {
+    order.instrument_id == companion.instrument_id
+        && order.venue_order_id == companion.venue_order_id
+        && order.order_side == companion.order_side
+        && companion
+            .client_order_id
+            .is_none_or(|client_order_id| order.client_order_id == Some(client_order_id))
+}
+
+/// Selects the deterministic most-advanced snapshot for an order's current venue ID.
+///
+/// Historical venue IDs are valid event identities but cannot prove the current
+/// order is still present. Filled quantity is monotonic, followed by venue status
+/// progress and venue event time. Equally authoritative reports must describe the
+/// same reconciliation state; otherwise the selection fails closed.
+#[must_use]
+pub fn select_current_reconciliation_order_report<'a>(
     order: &OrderAny,
     reports: &'a [OrderStatusReport],
 ) -> ReconciliationReportSelection<'a> {
     let mut selected: Option<&OrderStatusReport> = None;
+    let current_venue_order_id = order.venue_order_id();
 
     for candidate in reports {
+        if current_venue_order_id.is_some_and(|current| candidate.venue_order_id != current) {
+            continue;
+        }
         let Some(current) = selected else {
             selected = Some(candidate);
             continue;
         };
 
-        match compare_order_report_progress(order.venue_order_id(), candidate, current) {
+        match compare_order_report_progress(current_venue_order_id, candidate, current) {
             Ordering::Greater => selected = Some(candidate),
             Ordering::Less => {}
             Ordering::Equal if reconciliation_order_report_state_matches(candidate, current) => {}
@@ -136,8 +180,7 @@ pub fn select_reconciliation_order_report<'a>(
 }
 
 /// Compares mutable order-report progress without using response order.
-#[must_use]
-pub fn compare_order_report_progress(
+fn compare_order_report_progress(
     current_venue_order_id: Option<VenueOrderId>,
     a: &OrderStatusReport,
     b: &OrderStatusReport,
