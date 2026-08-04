@@ -47,12 +47,14 @@ use nautilus_core::{
 use nautilus_execution::{
     engine::ExecutionEngine,
     reconciliation::{
-        ReconciliationReportIdentity, ReportOrderResolution, calculate_reconciliation_price,
+        ReconciliationReportIdentity, ReconciliationReportSelection, ReportOrderResolution,
+        calculate_reconciliation_price, compare_order_report_progress,
         create_inferred_fill_for_qty, create_position_reconciliation_venue_order_id,
         create_reconciliation_rejected, create_reconciliation_triggered,
         generate_external_order_status_events, generate_reconciliation_order_pre_fill_events,
         generate_reconciliation_order_snapshot_events, process_mass_status_for_reconciliation,
-        reconcile_order_report, resolve_report_order, should_reconciliation_update,
+        reconcile_order_report, resolve_report_order, select_reconciliation_order_report,
+        should_reconciliation_update,
     },
 };
 use nautilus_model::{
@@ -180,6 +182,7 @@ pub(crate) struct TargetedOrderQuery {
     client_order_id: ClientOrderId,
     responsible_clients: IndexSet<ClientId>,
     command: GenerateOrderStatusReport,
+    order_snapshot: TargetedOrderSnapshot,
 }
 
 impl TargetedOrderQuery {
@@ -194,6 +197,33 @@ pub(crate) struct TargetedOrderReportResult {
     client_order_id: ClientOrderId,
     reports: Vec<OrderStatusReport>,
     coverage_complete: bool,
+    order_snapshot: TargetedOrderSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetedOrderSnapshot {
+    instrument_id: InstrumentId,
+    venue_order_id: Option<VenueOrderId>,
+    order_side: OrderSide,
+    event_count: usize,
+}
+
+impl TargetedOrderSnapshot {
+    fn from_order(order: &OrderAny) -> Self {
+        Self {
+            instrument_id: order.instrument_id(),
+            venue_order_id: order.venue_order_id(),
+            order_side: order.order_side(),
+            event_count: order.event_count(),
+        }
+    }
+
+    fn still_current(self, order: &OrderAny) -> bool {
+        self.instrument_id == order.instrument_id()
+            && self.venue_order_id == order.venue_order_id()
+            && self.order_side == order.order_side()
+            && self.event_count == order.event_count()
+    }
 }
 
 /// Snapshot and command for one continuous open-order reconciliation check.
@@ -1572,6 +1602,7 @@ impl ExecutionManager {
             targeted_queries.push(TargetedOrderQuery {
                 client_order_id,
                 responsible_clients,
+                order_snapshot: TargetedOrderSnapshot::from_order(&order),
                 command: GenerateOrderStatusReport::new(
                     UUID4::new(),
                     self.clock.borrow().timestamp_ns(),
@@ -1607,10 +1638,16 @@ impl ExecutionManager {
             self.targeted_order_queries.shift_remove(&client_order_id);
 
             let had_reports = !result.reports.is_empty();
-            let mut matched_report = None;
-            for report in result.reports {
-                let resolution = {
-                    let cache = self.cache.borrow();
+            let (order, matched_reports) = {
+                let cache = self.cache.borrow();
+                let Some(order) = cache.order(&client_order_id).map(|order| order.clone()) else {
+                    continue;
+                };
+                let matched_reports = result
+                    .reports
+                    .into_iter()
+                    .filter(|report| {
+                        let resolution =
                     resolve_report_order(
                         &cache,
                         ReconciliationReportIdentity {
@@ -1619,47 +1656,57 @@ impl ExecutionManager {
                             venue_order_id: report.venue_order_id,
                             order_side: report.order_side,
                         },
-                    )
-                };
-                if resolution == ReportOrderResolution::Matched(client_order_id) {
-                    matched_report = Some(report);
-                    break;
-                }
+                    );
+                        if resolution == ReportOrderResolution::Matched(client_order_id) {
+                            true
+                        } else {
+                            log::error!(
+                                "Rejecting targeted order report for {client_order_id}: report identity does not resolve to the queried order",
+                            );
+                            false
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                (order, matched_reports)
+            };
 
-                log::error!(
-                    "Rejecting targeted order report for {client_order_id}: report identity does not resolve to the queried order",
-                );
-            }
+            match select_reconciliation_order_report(&order, &matched_reports) {
+                ReconciliationReportSelection::Selected(report) => {
+                    self.recon_check_retries.shift_remove(&client_order_id);
+                    self.missing_order_coverage_warnings
+                        .shift_remove(&client_order_id);
+                    let instrument = self.get_instrument(&report.instrument_id);
 
-            if let Some(report) = matched_report {
-                self.recon_check_retries.shift_remove(&client_order_id);
-                self.missing_order_coverage_warnings
-                    .shift_remove(&client_order_id);
+                    log::info!(
+                        color = LogColor::Blue as u8;
+                        "Found {client_order_id} via targeted order status query: {}",
+                        report.order_status,
+                    );
 
-                let Some(order) = self.get_order(client_order_id) else {
+                    if let Some(event) =
+                        self.reconcile_order_report(&order, report, instrument.as_ref())
+                    {
+                        events.push(event);
+                    }
                     continue;
-                };
-                let instrument = self.get_instrument(&report.instrument_id);
-
-                log::info!(
-                    color = LogColor::Blue as u8;
-                    "Found {client_order_id} via targeted order status query: {}",
-                    report.order_status,
-                );
-
-                if let Some(event) =
-                    self.reconcile_order_report(&order, &report, instrument.as_ref())
-                {
-                    events.push(event);
                 }
-                continue;
+                ReconciliationReportSelection::Conflict => {
+                    log::error!(
+                        "Deferring targeted order reconciliation for {client_order_id}: equally authoritative reports disagree",
+                    );
+                    continue;
+                }
+                ReconciliationReportSelection::None => {}
             }
 
-            if result.coverage_complete && !had_reports {
+            if result.coverage_complete
+                && !had_reports
+                && result.order_snapshot.still_current(&order)
+            {
                 events.extend(self.resolve_missing_order(client_order_id));
             } else {
                 log::warn!(
-                    "Deferring missing-order resolution for {client_order_id}: targeted order status coverage was incomplete"
+                    "Deferring missing-order resolution for {client_order_id}: targeted order status evidence was incomplete, conflicting, or stale"
                 );
             }
         }
@@ -3749,7 +3796,10 @@ impl ExecutionManager {
         for report in reports {
             let dominated = best_reports
                 .get(&report.venue_order_id)
-                .is_some_and(|existing| Self::is_more_advanced(existing, report));
+                .is_some_and(|existing| {
+                    compare_order_report_progress(Some(report.venue_order_id), existing, report)
+                        .is_gt()
+                });
 
             if !dominated {
                 best_reports.insert(report.venue_order_id, report);
@@ -3757,31 +3807,6 @@ impl ExecutionManager {
         }
 
         best_reports
-    }
-
-    fn is_more_advanced(a: &OrderStatusReport, b: &OrderStatusReport) -> bool {
-        if a.filled_qty > b.filled_qty {
-            return true;
-        }
-
-        if a.filled_qty < b.filled_qty {
-            return false;
-        }
-
-        // Equal filled_qty - compare status (terminal states are more advanced)
-        Self::status_priority(a.order_status) > Self::status_priority(b.order_status)
-    }
-
-    const fn status_priority(status: OrderStatus) -> u8 {
-        match status {
-            OrderStatus::Initialized | OrderStatus::Submitted | OrderStatus::Emulated => 0,
-            OrderStatus::Released | OrderStatus::Denied => 1,
-            OrderStatus::Accepted | OrderStatus::PendingUpdate | OrderStatus::PendingCancel => 2,
-            OrderStatus::Triggered => 3,
-            OrderStatus::PartiallyFilled => 4,
-            OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::Rejected => 5,
-            OrderStatus::Filled | OrderStatus::Voided => 6,
-        }
     }
 
     fn is_exact_order_match(order: &OrderAny, report: &OrderStatusReport) -> bool {
@@ -3887,6 +3912,7 @@ pub(crate) async fn request_targeted_order_reports(
             client_order_id: query.client_order_id,
             reports,
             coverage_complete,
+            order_snapshot: query.order_snapshot,
         });
     }
 

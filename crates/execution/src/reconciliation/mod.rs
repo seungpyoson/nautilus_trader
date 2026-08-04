@@ -48,8 +48,9 @@ mod proptests;
 mod tests;
 
 pub use identity::{
-    ReconciliationReportIdentity, ReportOrderResolution, report_identity_matches_order,
-    resolve_report_order,
+    ReconciliationReportIdentity, ReconciliationReportSelection, ReportOrderResolution,
+    compare_order_report_progress, report_identity_matches_order, resolve_report_order,
+    select_reconciliation_order_report,
 };
 pub use ids::{
     create_inferred_reconciliation_trade_id, create_position_reconciliation_venue_order_id,
