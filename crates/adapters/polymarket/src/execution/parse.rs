@@ -53,6 +53,8 @@ pub enum ReportParseError {
     Price,
     #[error("timestamp is not representable")]
     Timestamp,
+    #[error("conflicting duplicate fill evidence")]
+    ConflictingFill,
 }
 
 /// Converts a [`PolymarketLiquiditySide`] to a Nautilus [`LiquiditySide`].
@@ -184,23 +186,32 @@ pub fn parse_order_status_report(
         None, // report_id
     );
     report.price = Some(price);
-    // CLOB V2 emits `expiration` as Unix seconds; "0" means no expiration.
-    if let Some(nanos) = order.expiration.as_deref().and_then(parse_expiration_nanos) {
-        report.expire_time = Some(UnixNanos::from(nanos));
-    }
+    report.expire_time =
+        parse_expiration_nanos(order.expiration.as_deref(), time_in_force)?.map(UnixNanos::from);
     Ok(report)
 }
 
-/// Parses a CLOB V2 `expiration` string into a Unix-nanos value. Returns
-/// `None` for `"0"`, missing values, unparsable input, or values that
-/// overflow `u64` when scaled to nanoseconds (e.g. accidentally-passed
-/// millisecond timestamps that exceed Unix-seconds bounds).
-fn parse_expiration_nanos(value: &str) -> Option<u64> {
-    let secs: u64 = value.parse().ok()?;
-    if secs == 0 {
-        return None;
+/// Parses CLOB V2 Unix-second expiration evidence without collapsing malformed
+/// values into an absent expiry. GTD orders require a positive expiration.
+fn parse_expiration_nanos(
+    value: Option<&str>,
+    time_in_force: TimeInForce,
+) -> Result<Option<u64>, ReportParseError> {
+    match (time_in_force, value) {
+        (TimeInForce::Gtd, None | Some("0")) => Err(ReportParseError::Timestamp),
+        (TimeInForce::Gtd, Some(value)) => {
+            let seconds = value
+                .parse::<u64>()
+                .map_err(|_| ReportParseError::Timestamp)?;
+            let nanos = seconds
+                .checked_mul(NANOSECONDS_IN_SECOND)
+                .filter(|_| seconds > 0)
+                .ok_or(ReportParseError::Timestamp)?;
+            Ok(Some(nanos))
+        }
+        (_, None | Some("0")) => Ok(None),
+        (_, Some(_)) => Err(ReportParseError::Timestamp),
     }
-    secs.checked_mul(NANOSECONDS_IN_SECOND)
 }
 
 /// Parses a [`PolymarketTradeReport`] into a [`FillReport`].
@@ -631,11 +642,13 @@ pub fn calculate_market_price(
 /// and RFC3339 strings ("2024-01-01T00:00:00Z").
 pub fn parse_timestamp(ts_str: &str) -> Option<UnixNanos> {
     if let Ok(n) = ts_str.parse::<u64>() {
-        return if n > 1_000_000_000_000 {
-            Some(UnixNanos::from(n * NANOSECONDS_IN_MILLISECOND))
+        const MILLISECOND_TIMESTAMP_THRESHOLD: u64 = 100_000_000_000;
+        let nanos_per_unit = if n >= MILLISECOND_TIMESTAMP_THRESHOLD {
+            NANOSECONDS_IN_MILLISECOND
         } else {
-            Some(UnixNanos::from(n * NANOSECONDS_IN_SECOND))
+            NANOSECONDS_IN_SECOND
         };
+        return n.checked_mul(nanos_per_unit).map(UnixNanos::from);
     }
     let dt = ts_str.parse::<Timestamp>().ok()?;
     Some(UnixNanos::from(u64::try_from(dt.as_nanosecond()).ok()?))
@@ -657,6 +670,12 @@ mod tests {
     use crate::common::enums::{
         PolymarketOrderSide, PolymarketOrderStatus, PolymarketOrderType, PolymarketOutcome,
     };
+
+    fn load<T: serde::de::DeserializeOwned>(filename: &str) -> T {
+        let content = std::fs::read_to_string(format!("test_data/{filename}"))
+            .expect("failed to read test data");
+        serde_json::from_str(&content).expect("failed to parse test data")
+    }
 
     // Symmetric dust band: at terminal Filled, snap filled_qty to quantity
     // when within 0.01 shares. Other statuses (Accepted, Canceled, etc.)
@@ -1266,6 +1285,18 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_timestamp_ms_at_previous_boundary() {
+        let ts = parse_timestamp("1000000000000").unwrap();
+        assert_eq!(ts, UnixNanos::from(1_000_000_000_000_000_000u64));
+    }
+
+    #[rstest]
+    fn test_parse_timestamp_earlier_twelve_digit_milliseconds() {
+        let ts = parse_timestamp("100000000000").unwrap();
+        assert_eq!(ts, UnixNanos::from(100_000_000_000_000_000u64));
+    }
+
+    #[rstest]
     fn test_parse_timestamp_secs() {
         let ts = parse_timestamp("1703875200").unwrap();
         assert_eq!(ts, UnixNanos::from(1_703_875_200_000_000_000u64));
@@ -1275,6 +1306,16 @@ mod tests {
     fn test_parse_timestamp_rfc3339() {
         let ts = parse_timestamp("2024-01-01T00:00:00Z").unwrap();
         assert_eq!(ts, UnixNanos::from(1_704_067_200_000_000_000u64));
+    }
+
+    #[rstest]
+    fn test_parse_timestamp_rejects_integer_overflow() {
+        assert_eq!(parse_timestamp("18446744073709551615"), None);
+    }
+
+    #[rstest]
+    fn test_parse_timestamp_does_not_reinterpret_overflowing_seconds_as_milliseconds() {
+        assert_eq!(parse_timestamp("20000000000"), None);
     }
 
     #[rstest]
@@ -1447,18 +1488,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::null(None, None)]
-    #[case::zero_string(Some("0"), None)]
-    #[case::empty_string(Some(""), None)]
-    #[case::garbage(Some("not-a-number"), None)]
-    #[case::positive_seconds(
-        Some("1735689600"),
-        Some(UnixNanos::from(1_735_689_600_000_000_000u64))
-    )]
-    fn test_parse_order_status_report_expiration(
-        #[case] raw: Option<&str>,
-        #[case] expected: Option<UnixNanos>,
-    ) {
+    fn test_parse_order_status_report_expiration() {
         let order = PolymarketOpenOrder {
             associate_trades: None,
             id: "0xid".to_string(),
@@ -1472,7 +1502,7 @@ mod tests {
             side: PolymarketOrderSide::Buy,
             size_matched: dec!(0),
             asset_id: Ustr::from("token"),
-            expiration: raw.map(|s| s.to_string()),
+            expiration: Some("1735689600".to_string()),
             order_type: PolymarketOrderType::GTD,
             created_at: 1_703_875_200,
         };
@@ -1488,7 +1518,75 @@ mod tests {
         )
         .expect("expiration fixture should be valid");
 
-        assert_eq!(report.expire_time, expected);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from(1_735_689_600_000_000_000u64)),
+        );
+    }
+
+    #[rstest]
+    #[case::missing(None)]
+    #[case::zero(Some("0"))]
+    #[case::empty(Some(""))]
+    #[case::garbage(Some("not-a-number"))]
+    #[case::overflow(Some("18446744074"))]
+    fn test_parse_order_status_report_rejects_invalid_gtd_expiration(#[case] raw: Option<&str>) {
+        let mut order: PolymarketOpenOrder = load("http_open_order.json");
+        order.order_type = PolymarketOrderType::GTD;
+        order.expiration = raw.map(str::to_string);
+
+        let result = parse_order_status_report(
+            &order,
+            InstrumentId::from("TEST-TOKEN.POLYMARKET"),
+            AccountId::from("POLYMARKET-001"),
+            None,
+            4,
+            6,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(result, Err(ReportParseError::Timestamp));
+    }
+
+    #[rstest]
+    #[case::missing(None)]
+    #[case::zero(Some("0"))]
+    fn test_parse_order_status_report_allows_absent_non_gtd_expiration(#[case] raw: Option<&str>) {
+        let mut order: PolymarketOpenOrder = load("http_open_order.json");
+        order.order_type = PolymarketOrderType::GTC;
+        order.expiration = raw.map(str::to_string);
+
+        let report = parse_order_status_report(
+            &order,
+            InstrumentId::from("TEST-TOKEN.POLYMARKET"),
+            AccountId::from("POLYMARKET-001"),
+            None,
+            4,
+            6,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("non-GTD orders do not require an expiration");
+
+        assert_eq!(report.expire_time, None);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_rejects_positive_non_gtd_expiration() {
+        let mut order: PolymarketOpenOrder = load("http_open_order.json");
+        order.order_type = PolymarketOrderType::GTC;
+        order.expiration = Some("1735689600".to_string());
+
+        let result = parse_order_status_report(
+            &order,
+            InstrumentId::from("TEST-TOKEN.POLYMARKET"),
+            AccountId::from("POLYMARKET-001"),
+            None,
+            4,
+            6,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(result, Err(ReportParseError::Timestamp));
     }
 
     #[rstest]
