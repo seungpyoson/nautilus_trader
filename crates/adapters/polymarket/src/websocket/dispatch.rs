@@ -142,7 +142,7 @@ fn dispatch_order_update(
     let mut report =
         build_ws_order_status_report(order, instrument, ctx.account_id, ts_event, ts_init);
     let local_client_order_id = ctx.pending_submits.client_order_id(&venue_order_id);
-    let mut is_accepted = ctx.fill_tracker.contains(&venue_order_id);
+    let is_accepted = ctx.fill_tracker.contains(&venue_order_id);
     report.client_order_id = local_client_order_id;
 
     // A known own order (submit in flight) self-registers on its first WS update
@@ -150,7 +150,6 @@ fn dispatch_order_update(
         && !is_accepted
         && report.order_status != OrderStatus::Rejected
     {
-        is_accepted = true;
         ctx.fill_tracker.register_reconciled_order(
             venue_order_id,
             report.quantity,
@@ -182,19 +181,12 @@ fn dispatch_order_update(
     }
 
     // Tracked own orders route through order events; externally-managed orders
-    // (no captured identity) buffer until accepted or fall back to reports.
+    // without captured identity fall back to authenticated reports.
     let identity = ctx.order_identities.get(&venue_order_id);
 
-    if is_accepted || local_client_order_id.is_some() {
-        match identity {
-            Some(identity) => emit_tracked_order_status(&report, &identity, ts_event, ctx),
-            None => ctx.emitter.send_order_status_report(report),
-        }
-    } else {
-        match ctx.order_identities.get(&venue_order_id) {
-            Some(identity) => emit_tracked_order_status(&report, &identity, ts_event, ctx),
-            None => ctx.emitter.send_order_status_report(report),
-        }
+    match identity {
+        Some(identity) => emit_tracked_order_status(&report, &identity, ts_event, ctx),
+        None => ctx.emitter.send_order_status_report(report),
     }
 
     if order.status == PolymarketOrderStatus::Matched

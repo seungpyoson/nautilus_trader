@@ -196,7 +196,7 @@ where
     K: Deserialize<'de> + Eq + Hash,
     V: Deserialize<'de>,
 {
-    struct GroupedReportsVisitor<K, V>(PhantomData<fn() -> IndexMap<K, Vec<V>>>);
+    struct GroupedReportsVisitor<K, V>(PhantomData<(K, V)>);
 
     impl<'de, K, V> Visitor<'de> for GroupedReportsVisitor<K, V>
     where

@@ -115,8 +115,11 @@ impl NormalizedExecutionMassStatus {
     }
 
     /// Rebuilds the model snapshot without reopening normalization invariants.
-    #[must_use]
-    pub fn into_mass_status(self) -> ExecutionMassStatus {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the normalized order evidence cannot be reconstructed.
+    pub fn into_mass_status(self) -> anyhow::Result<ExecutionMassStatus> {
         let mut mass_status = ExecutionMassStatus::new(
             self.client_id,
             self.account_id,
@@ -124,12 +127,10 @@ impl NormalizedExecutionMassStatus {
             self.ts_init,
             Some(self.report_id),
         );
-        mass_status
-            .add_order_reports(self.order_reports.into_values().collect())
-            .expect("normalized order reports are unique");
+        mass_status.add_order_reports(self.order_reports.into_values().collect())?;
         mass_status.add_fill_reports(self.fill_reports.into_values().flatten().collect());
         mass_status.add_position_reports(self.position_reports.into_values().flatten().collect());
-        mass_status
+        Ok(mass_status)
     }
 }
 
@@ -337,7 +338,7 @@ fn merge_repeated_fill(lhs: &FillReport, rhs: &FillReport) -> anyhow::Result<Fil
     canonical_rhs.report_id = canonical_lhs.report_id;
     canonical_rhs.ts_init = canonical_lhs.ts_init;
     ensure!(
-        canonical_lhs == canonical_rhs,
+        canonical_lhs.has_same_execution(&canonical_rhs),
         "Conflicting repeated fill {} for {}",
         merged.trade_id,
         merged.instrument_id

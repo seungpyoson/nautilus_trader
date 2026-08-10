@@ -378,7 +378,9 @@ impl Harness {
             .expect("generate_mass_status failed")
             .expect("mass status was None");
         let source_client_id = normalized.source_client_id();
-        let mass_status = normalized.into_mass_status();
+        let mass_status = normalized
+            .into_mass_status()
+            .expect("normalized mass status should reconstruct");
         let authenticated = self
             .exec_engine
             .borrow()

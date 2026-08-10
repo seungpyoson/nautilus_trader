@@ -434,9 +434,9 @@ impl ExecutionManager {
     pub fn reconcile_execution_mass_status(
         &mut self,
         normalized: NormalizedExecutionMassStatus,
-        exec_engine: Rc<RefCell<ExecutionEngine>>,
+        exec_engine: &Rc<RefCell<ExecutionEngine>>,
     ) -> anyhow::Result<ReconciliationResult> {
-        let prepared = self.prepare_execution_mass_status(normalized, exec_engine.clone())?;
+        let prepared = self.prepare_execution_mass_status(normalized, exec_engine)?;
         self.commit_execution_mass_statuses(vec![prepared], exec_engine)
     }
 
@@ -444,11 +444,11 @@ impl ExecutionManager {
     pub(crate) fn prepare_execution_mass_status(
         &self,
         normalized: NormalizedExecutionMassStatus,
-        exec_engine: Rc<RefCell<ExecutionEngine>>,
+        exec_engine: &Rc<RefCell<ExecutionEngine>>,
     ) -> anyhow::Result<PreparedMassStatusReconciliation> {
         let source_client_id = normalized.source_client_id();
         let source_id = normalized.source_id();
-        let mass_status = normalized.into_mass_status();
+        let mass_status = normalized.into_mass_status()?;
         let venue = mass_status.venue;
         let order_count = mass_status.order_reports().len();
         let fill_count: usize = mass_status.fill_reports().values().map(Vec::len).sum();
@@ -576,7 +576,7 @@ impl ExecutionManager {
     pub(crate) fn commit_execution_mass_statuses(
         &mut self,
         prepared: Vec<PreparedMassStatusReconciliation>,
-        exec_engine: Rc<RefCell<ExecutionEngine>>,
+        exec_engine: &Rc<RefCell<ExecutionEngine>>,
     ) -> anyhow::Result<ReconciliationResult> {
         let venues = prepared
             .iter()

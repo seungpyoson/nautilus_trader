@@ -900,13 +900,13 @@ impl LiveNode {
 
             prepared.push(
                 self.exec_manager
-                    .prepare_execution_mass_status(mass_status, self.kernel.exec_engine.clone())?,
+                    .prepare_execution_mass_status(mass_status, &self.kernel.exec_engine)?,
             );
         }
 
         let result = self
             .exec_manager
-            .commit_execution_mass_statuses(prepared, self.kernel.exec_engine.clone())?;
+            .commit_execution_mass_statuses(prepared, &self.kernel.exec_engine)?;
         log::info!(
             color = LogColor::Blue as u8;
             "Startup reconciliation committed {} event(s)",

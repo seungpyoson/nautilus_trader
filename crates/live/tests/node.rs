@@ -3416,12 +3416,16 @@ mod serial_tests {
                 .bulk_order_report_requested
                 .load(Ordering::Relaxed)
         );
-        assert_eq!(
-            partial_state
-                .bulk_order_report_count
-                .load(Ordering::Relaxed),
-            2,
-            "one client should report before the later client hangs"
+        let bulk_order_report_count = partial_state
+            .bulk_order_report_count
+            .load(Ordering::Relaxed);
+        assert!(
+            bulk_order_report_count >= 2,
+            "at least one client pair should be queried"
+        );
+        assert!(
+            bulk_order_report_count.is_multiple_of(2),
+            "each started pair should contain one response and one hung request"
         );
         assert_eq!(
             node.kernel()

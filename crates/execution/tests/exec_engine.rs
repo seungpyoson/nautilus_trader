@@ -2947,23 +2947,64 @@ fn test_fill_confirmation_updates_only_order_finality(mut execution_engine: Exec
     );
     execution_engine.process(&OrderEventAny::FillConfirmed(confirmation));
 
+    {
+        let cache = execution_engine.cache().borrow();
+        let confirmed_order = cache
+            .order(&order.client_order_id())
+            .expect("confirmed order should be cached");
+        let position_after = cache
+            .position(&position_id)
+            .expect("position should remain cached");
+
+        assert_eq!(confirmed_order.status(), OrderStatus::Filled);
+        assert_eq!(confirmed_order.events().len(), order_event_count + 1);
+        assert!(matches!(
+            confirmed_order.events().last(),
+            Some(OrderEventAny::FillConfirmed(_))
+        ));
+        assert_eq!(position_after.quantity, position_before.quantity);
+        assert_eq!(position_after.trade_ids(), position_before.trade_ids());
+        assert_eq!(position_after.commissions(), position_before.commissions());
+    }
+
+    let late_void = OrderEventAny::FillVoided(
+        OrderFillVoidedSpec::builder()
+            .trader_id(fill.trader_id)
+            .strategy_id(fill.strategy_id)
+            .instrument_id(fill.instrument_id)
+            .client_order_id(fill.client_order_id)
+            .venue_order_id(fill.venue_order_id)
+            .account_id(fill.account_id)
+            .trade_id(fill.trade_id)
+            .voided_qty(fill.last_qty)
+            .commission_voided(fill.commission.expect("test fill has commission"))
+            .order_side(fill.order_side)
+            .order_type(fill.order_type)
+            .last_px(fill.last_px)
+            .currency(fill.currency)
+            .liquidity_side(fill.liquidity_side)
+            .build(),
+    );
+    execution_engine.process(&late_void);
+
     let cache = execution_engine.cache().borrow();
     let confirmed_order = cache
         .order(&order.client_order_id())
-        .expect("confirmed order should be cached");
-    let position_after = cache
+        .expect("confirmed order should remain cached");
+    let position_after_late_void = cache
         .position(&position_id)
-        .expect("position should remain cached");
-
+        .expect("confirmed position should remain cached");
     assert_eq!(confirmed_order.status(), OrderStatus::Filled);
     assert_eq!(confirmed_order.events().len(), order_event_count + 1);
-    assert!(matches!(
-        confirmed_order.events().last(),
-        Some(OrderEventAny::FillConfirmed(_))
-    ));
-    assert_eq!(position_after.quantity, position_before.quantity);
-    assert_eq!(position_after.trade_ids(), position_before.trade_ids());
-    assert_eq!(position_after.commissions(), position_before.commissions());
+    assert_eq!(position_after_late_void.quantity, position_before.quantity);
+    assert_eq!(
+        position_after_late_void.trade_ids(),
+        position_before.trade_ids()
+    );
+    assert_eq!(
+        position_after_late_void.commissions(),
+        position_before.commissions()
+    );
 }
 
 #[rstest]

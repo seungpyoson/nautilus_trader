@@ -67,6 +67,12 @@ impl ExecutionSourceId {
     }
 }
 
+impl Default for ExecutionSourceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Execution evidence paired with the client that emitted it.
 ///
 /// The source is assigned by the trusted execution ingress (the client's event

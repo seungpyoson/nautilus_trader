@@ -272,7 +272,7 @@ impl TestContext {
         let normalized = self.normalize_mass_status(mass_status).unwrap();
 
         self.manager
-            .reconcile_execution_mass_status(normalized, self.exec_engine.clone())
+            .reconcile_execution_mass_status(normalized, &self.exec_engine)
     }
 
     fn normalize_mass_status(

@@ -144,6 +144,8 @@ pub enum OrderError {
     DuplicateFillConfirmation(TradeId),
     #[error("Invalid fill confirmation for trade_id {0}")]
     InvalidFillConfirmation(TradeId),
+    #[error("Cannot void confirmed fill for trade_id {0}")]
+    ConfirmedFillVoid(TradeId),
     #[error("Duplicate fill void: trade_id {0} already has this cumulative correction")]
     DuplicateFillVoid(TradeId),
     #[error("Fill void for trade_id {0} is older than the applied correction")]
@@ -1023,6 +1025,12 @@ impl OrderCore {
     }
 
     fn validate_fill_void(&self, event: &OrderFillVoided) -> Result<(), OrderError> {
+        if self.events.iter().any(
+            |candidate| matches!(candidate, OrderEventAny::FillConfirmed(existing) if existing.trade_id == event.trade_id),
+        ) {
+            return Err(OrderError::ConfirmedFillVoid(event.trade_id));
+        }
+
         let fill = self.events.iter().find_map(|candidate| match candidate {
             OrderEventAny::Filled(fill) if fill.trade_id == event.trade_id => Some(fill),
             _ => None,
@@ -2118,6 +2126,44 @@ mod tests {
         assert!(matches!(
             order.apply(OrderEventAny::FillConfirmed(confirmation)),
             Err(OrderError::DuplicateFillConfirmation(_))
+        ));
+    }
+
+    #[rstest]
+    fn test_confirmed_fill_cannot_be_voided() {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(100_000))
+            .build();
+        let fill = OrderFilledSpec::builder()
+            .trade_id(TradeId::from("TRADE-FINAL"))
+            .last_qty(Quantity::from(100_000))
+            .build();
+        let confirmation = OrderFillConfirmed::new(
+            &fill,
+            Ustr::from("CONFIRMED:TRADE-FINAL"),
+            Ustr::from("TRADE-FINAL"),
+            UUID4::new(),
+            UnixNanos::from(2),
+            UnixNanos::from(3),
+        );
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        order.apply(OrderEventAny::Filled(fill.clone())).unwrap();
+        order
+            .apply(OrderEventAny::FillConfirmed(confirmation))
+            .unwrap();
+
+        let voided = OrderFillVoidedSpec::builder()
+            .trade_id(fill.trade_id)
+            .voided_qty(fill.last_qty)
+            .build();
+        assert!(matches!(
+            order.apply(OrderEventAny::FillVoided(voided)),
+            Err(OrderError::ConfirmedFillVoid(_))
         ));
     }
 

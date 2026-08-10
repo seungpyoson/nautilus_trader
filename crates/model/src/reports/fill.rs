@@ -119,6 +119,27 @@ impl FillReport {
     pub const fn has_venue_position_id(&self) -> bool {
         self.venue_position_id.is_some()
     }
+
+    /// Returns whether both reports describe the same venue execution.
+    ///
+    /// Transport/update metadata (`report_id`, `ts_event`, and `ts_init`) is
+    /// excluded: repeated delivery may legitimately regenerate it, while every
+    /// identity and economic field authored by the venue must remain stable.
+    #[must_use]
+    pub fn has_same_execution(&self, other: &Self) -> bool {
+        self.account_id == other.account_id
+            && self.instrument_id == other.instrument_id
+            && self.venue_order_id == other.venue_order_id
+            && self.trade_id == other.trade_id
+            && self.order_side == other.order_side
+            && self.last_qty == other.last_qty
+            && self.last_px == other.last_px
+            && self.commission == other.commission
+            && self.liquidity_side == other.liquidity_side
+            && self.avg_px == other.avg_px
+            && self.client_order_id == other.client_order_id
+            && self.venue_position_id == other.venue_position_id
+    }
 }
 
 impl Display for FillReport {
@@ -233,6 +254,17 @@ mod tests {
 
         report.venue_position_id = None;
         assert!(!report.has_venue_position_id());
+    }
+
+    #[rstest]
+    fn test_same_execution_ignores_transport_and_update_metadata() {
+        let report = test_fill_report();
+        let mut replay = report.clone();
+        replay.report_id = UUID4::new();
+        replay.ts_event = UnixNanos::from(3_000_000_000);
+        replay.ts_init = UnixNanos::from(4_000_000_000);
+
+        assert!(report.has_same_execution(&replay));
     }
 
     #[rstest]

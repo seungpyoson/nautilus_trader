@@ -658,7 +658,7 @@ fn unique_fill_evidence(fill_reports: &[FillReport]) -> Result<Vec<&FillReport>,
     for fill in fill_reports {
         let fill_key = (fill.account_id, fill.instrument_id, fill.trade_id);
         if let Some(previous) = seen.insert(fill_key, fill) {
-            if !same_fill_evidence(previous, fill) {
+            if !previous.has_same_execution(fill) {
                 return Err(ReportParseError::ConflictingFill);
             }
         } else {
@@ -666,22 +666,6 @@ fn unique_fill_evidence(fill_reports: &[FillReport]) -> Result<Vec<&FillReport>,
         }
     }
     Ok(unique)
-}
-
-fn same_fill_evidence(left: &FillReport, right: &FillReport) -> bool {
-    left.account_id == right.account_id
-        && left.instrument_id == right.instrument_id
-        && left.venue_order_id == right.venue_order_id
-        && left.trade_id == right.trade_id
-        && left.order_side == right.order_side
-        && left.last_qty == right.last_qty
-        && left.last_px == right.last_px
-        && left.commission == right.commission
-        && left.liquidity_side == right.liquidity_side
-        && left.avg_px == right.avg_px
-        && left.ts_event == right.ts_event
-        && left.client_order_id == right.client_order_id
-        && left.venue_position_id == right.venue_position_id
 }
 
 pub(crate) fn cap_order_report_filled_qty(

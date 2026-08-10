@@ -810,12 +810,11 @@ impl ExecutionEngine {
             .copied()
             .or(self.default_client_id);
 
-        if let Some(client_id) = client_id {
-            if let Err(error) =
+        if let Some(client_id) = client_id
+            && let Err(error) =
                 self.register_external_order_with_client(client_id, order, venue_order_id, ts_init)
-            {
-                log::error!("Cannot register external order with execution client: {error}");
-            }
+        {
+            log::error!("Cannot register external order with execution client: {error}");
         }
     }
 
@@ -2062,7 +2061,7 @@ impl ExecutionEngine {
     ) -> anyhow::Result<()> {
         self.report_count += 1;
         let source_client_id = normalized.source_client_id();
-        let mass_status = normalized.into_mass_status();
+        let mass_status = normalized.into_mass_status()?;
 
         log::info!(
             "Reconciling mass status for client={}, account={}, venue={}",
@@ -2400,7 +2399,12 @@ impl ExecutionEngine {
             };
             let projected = projected_orders
                 .get(&reconciliation.client_order_id)
-                .expect("prepared order projection must exist");
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Prepared reconciliation has no canonical order {}",
+                        reconciliation.client_order_id,
+                    )
+                })?;
             Self::ensure_order_projection_matches(projected, report)?;
         }
 
@@ -2808,7 +2812,7 @@ impl ExecutionEngine {
         normalized: NormalizedExecutionMassStatus,
     ) -> anyhow::Result<ExecutionPositionProjection> {
         let source_client_id = normalized.source_client_id();
-        let mass_status = normalized.into_mass_status();
+        let mass_status = normalized.into_mass_status()?;
         Ok(self
             .prepare_execution_mass_status(&mass_status, source_client_id, &AHashSet::new())?
             .position_projection)
@@ -2866,7 +2870,7 @@ impl ExecutionEngine {
         let source_client_id = normalized.source_client_id();
         let source_id = normalized.source_id();
         self.validate_execution_source(source_client_id, source_id)?;
-        let mut mass_status = normalized.into_mass_status();
+        let mut mass_status = normalized.into_mass_status()?;
         let existing_venue_order_ids = mass_status
             .order_reports()
             .into_keys()
@@ -2900,7 +2904,7 @@ impl ExecutionEngine {
             AuthenticatedExecutionMassStatus::new(source_client_id, source_id, mass_status),
         )?;
         self.validate_normalized_execution_mass_status(&normalized)?;
-        let mass_status = normalized.into_mass_status();
+        let mass_status = normalized.into_mass_status()?;
         let prepared = self.prepare_execution_mass_status(
             &mass_status,
             source_client_id,
@@ -2995,7 +2999,8 @@ impl ExecutionEngine {
         &mut self,
         prepared: PreparedExecutionReconciliation,
     ) -> anyhow::Result<ExecutionReconciliationReceipt> {
-        let projected = self.project_execution_reconciliation_recipes(&prepared.recipes)?;
+        let PreparedExecutionReconciliation { recipes } = prepared;
+        let projected = self.project_execution_reconciliation_recipes(&recipes)?;
         self.commit_projected_execution_reconciliation(projected)
     }
 

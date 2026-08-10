@@ -20,11 +20,12 @@ use std::sync::Mutex;
 use ahash::{AHashMap, AHashSet};
 use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
 use nautilus_core::MUTEX_POISONED;
-#[cfg(test)]
-use nautilus_model::identifiers::InstrumentId;
 use nautilus_model::{
-    enums::OrderSide, events::OrderFilled, identifiers::VenueOrderId, reports::FillReport,
-    types::Quantity,
+    enums::{LiquiditySide, OrderSide},
+    events::OrderFilled,
+    identifiers::{AccountId, InstrumentId, TradeId, VenueOrderId},
+    reports::FillReport,
+    types::{Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 
@@ -79,6 +80,7 @@ pub(crate) enum TradeFillApplication {
     Ready(Vec<ReadyTradeFill>),
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TradeSettlement {
     Confirmed,
@@ -86,8 +88,108 @@ enum TradeSettlement {
 }
 
 #[derive(Debug)]
+struct SettledTradeCorrection {
+    #[cfg(test)]
+    settlement: TradeSettlement,
+    evidence: Option<Vec<TradeFillEvidence>>,
+}
+
+impl SettledTradeCorrection {
+    fn confirmed(evidence: Vec<TradeFillEvidence>) -> Self {
+        Self {
+            #[cfg(test)]
+            settlement: TradeSettlement::Confirmed,
+            evidence: Some(evidence),
+        }
+    }
+
+    fn voided(evidence: Option<Vec<TradeFillEvidence>>) -> Self {
+        Self {
+            #[cfg(test)]
+            settlement: TradeSettlement::Voided,
+            evidence,
+        }
+    }
+
+    fn ensure_matches(&self, evidence: &[TradeFillEvidence]) -> anyhow::Result<()> {
+        if let Some(expected) = &self.evidence {
+            anyhow::ensure!(
+                expected == evidence,
+                "Conflicting evidence for a settled Polymarket trade correction"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 struct TradeCorrectionState {
     fills: Vec<OrderFilled>,
+    evidence: Vec<TradeFillEvidence>,
+}
+
+/// Canonical venue-authored execution fields used across pending, confirmed,
+/// and event-store-restored correction state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TradeFillEvidence {
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    venue_order_id: VenueOrderId,
+    trade_id: TradeId,
+    order_side: OrderSide,
+    last_qty: Quantity,
+    last_px: Price,
+    commission: Option<Money>,
+    liquidity_side: LiquiditySide,
+}
+
+impl TradeFillEvidence {
+    fn from_report(report: &FillReport) -> Self {
+        Self {
+            account_id: report.account_id,
+            instrument_id: report.instrument_id,
+            venue_order_id: report.venue_order_id,
+            trade_id: report.trade_id,
+            order_side: report.order_side,
+            last_qty: report.last_qty,
+            last_px: report.last_px,
+            commission: Some(report.commission),
+            liquidity_side: report.liquidity_side,
+        }
+    }
+
+    fn from_event(event: &OrderFilled) -> Self {
+        Self {
+            account_id: event.account_id,
+            instrument_id: event.instrument_id,
+            venue_order_id: event.venue_order_id,
+            trade_id: event.trade_id,
+            order_side: event.order_side,
+            last_qty: event.last_qty,
+            last_px: event.last_px,
+            commission: event.commission,
+            liquidity_side: event.liquidity_side,
+        }
+    }
+}
+
+impl TradeCorrectionState {
+    fn from_live(fills: Vec<OrderFilled>, evidence: Vec<TradeFillEvidence>) -> Self {
+        Self { fills, evidence }
+    }
+
+    fn from_restored(fills: Vec<OrderFilled>) -> Self {
+        let evidence = canonical_trade_evidence(fills.iter().map(TradeFillEvidence::from_event));
+        Self { fills, evidence }
+    }
+
+    fn ensure_matches(&self, evidence: &[TradeFillEvidence]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.evidence == evidence,
+            "Conflicting evidence for an existing Polymarket trade correction"
+        );
+        Ok(())
+    }
 }
 
 /// Active order state and bounded settlement history under one mutex.
@@ -96,7 +198,7 @@ struct TrackerInner {
     orders: AHashMap<VenueOrderId, OrderFillState>,
     retired_orders: FifoCacheMap<VenueOrderId, AHashSet<String>, 10_000>,
     active_corrections: AHashMap<String, TradeCorrectionState>,
-    settled_corrections: FifoCacheMap<String, TradeSettlement, 10_000>,
+    settled_corrections: FifoCacheMap<String, SettledTradeCorrection, 10_000>,
     confirmed_venue_trades: FifoCache<String, 10_000>,
     voiding_orders: AHashSet<VenueOrderId>,
 }
@@ -207,23 +309,32 @@ impl OrderFillTrackerMap {
         fills: Vec<PreparedTradeFill>,
         correction: FillCorrectionMetadata,
     ) -> anyhow::Result<TradeFillApplication> {
+        let fills = normalize_prepared_trade_fills(fills)?;
+        let evidence = canonical_trade_evidence(
+            fills
+                .iter()
+                .map(|fill| TradeFillEvidence::from_report(fill.report())),
+        );
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
         let correction_key = &correction.correction_key;
-        if guard.settled_corrections.contains_key(correction_key) {
+        if let Some(settled) = guard.settled_corrections.get(correction_key) {
+            settled.ensure_matches(&evidence)?;
             return Ok(TradeFillApplication::AlreadyProcessed);
         }
-        if guard.active_corrections.contains_key(correction_key) {
+        if let Some(active) = guard.active_corrections.get(correction_key) {
+            active.ensure_matches(&evidence)?;
             if !correction.is_confirmed {
                 return Ok(TradeFillApplication::AlreadyProcessed);
             }
-            let fills = guard
+            let active = guard
                 .active_corrections
                 .remove(correction_key)
-                .expect("active correction was checked")
-                .fills;
-            guard
-                .settled_corrections
-                .insert(correction.correction_key, TradeSettlement::Confirmed);
+                .ok_or_else(|| anyhow::anyhow!("Active trade correction disappeared under lock"))?;
+            let fills = active.fills;
+            guard.settled_corrections.insert(
+                correction.correction_key,
+                SettledTradeCorrection::confirmed(active.evidence),
+            );
             guard.confirmed_venue_trades.add(correction.venue_trade_id);
             return Ok(TradeFillApplication::Confirmed(fills));
         }
@@ -322,14 +433,15 @@ impl OrderFillTrackerMap {
             }
         }
         if correction.is_confirmed {
-            guard
-                .settled_corrections
-                .insert(correction.correction_key, TradeSettlement::Confirmed);
+            guard.settled_corrections.insert(
+                correction.correction_key,
+                SettledTradeCorrection::confirmed(evidence),
+            );
             guard.confirmed_venue_trades.add(correction.venue_trade_id);
         } else {
             guard.active_corrections.insert(
                 correction.correction_key,
-                TradeCorrectionState { fills: applied },
+                TradeCorrectionState::from_live(applied, evidence),
             );
         }
         Ok(TradeFillApplication::Ready(ready))
@@ -361,13 +473,14 @@ impl OrderFillTrackerMap {
                     order.trade_keys.insert(key.clone());
                 }
             }
-            let fills = guard
-                .active_corrections
-                .remove(&key)
-                .map_or_else(Vec::new, |trade| trade.fills);
-            guard
-                .settled_corrections
-                .insert(key, TradeSettlement::Voided);
+            let (fills, settled) = match guard.active_corrections.remove(&key) {
+                Some(trade) => (
+                    trade.fills,
+                    SettledTradeCorrection::voided(Some(trade.evidence)),
+                ),
+                None => (Vec::new(), SettledTradeCorrection::voided(None)),
+            };
+            guard.settled_corrections.insert(key, settled);
             guard
                 .confirmed_venue_trades
                 .remove(&venue_trade_id.to_string());
@@ -400,11 +513,12 @@ impl OrderFillTrackerMap {
         }
         guard
             .active_corrections
-            .insert(key, TradeCorrectionState { fills });
+            .insert(key, TradeCorrectionState::from_restored(fills));
     }
 
     pub(crate) fn restore_voided_trade(&self, key: String, fills: Vec<OrderFilled>) {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let evidence = canonical_trade_evidence(fills.iter().map(TradeFillEvidence::from_event));
         for fill in fills {
             if let Some(order) = guard.orders.get_mut(&fill.venue_order_id) {
                 order.trade_keys.insert(key.clone());
@@ -412,7 +526,7 @@ impl OrderFillTrackerMap {
         }
         guard
             .settled_corrections
-            .insert(key, TradeSettlement::Voided);
+            .insert(key, SettledTradeCorrection::voided(Some(evidence)));
     }
 
     pub(crate) fn restore_confirmed_trade(
@@ -422,6 +536,7 @@ impl OrderFillTrackerMap {
         fills: Vec<OrderFilled>,
     ) {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let evidence = canonical_trade_evidence(fills.iter().map(TradeFillEvidence::from_event));
         for fill in fills {
             if let Some(order) = guard.orders.get_mut(&fill.venue_order_id) {
                 order.trade_keys.insert(key.clone());
@@ -429,7 +544,7 @@ impl OrderFillTrackerMap {
         }
         guard
             .settled_corrections
-            .insert(key, TradeSettlement::Confirmed);
+            .insert(key, SettledTradeCorrection::confirmed(evidence));
         guard.confirmed_venue_trades.add(venue_trade_id);
     }
 
@@ -458,7 +573,7 @@ impl OrderFillTrackerMap {
             .expect(MUTEX_POISONED)
             .settled_corrections
             .get(&key.to_string())
-            .is_some_and(|settlement| *settlement == TradeSettlement::Voided)
+            .is_some_and(|settlement| settlement.settlement == TradeSettlement::Voided)
     }
 
     #[cfg(test)]
@@ -594,6 +709,44 @@ impl OrderFillTrackerMap {
     }
 }
 
+fn normalize_prepared_trade_fills(
+    fills: Vec<PreparedTradeFill>,
+) -> anyhow::Result<Vec<PreparedTradeFill>> {
+    let mut evidence_by_key = AHashMap::new();
+    let mut unique = Vec::with_capacity(fills.len());
+
+    for fill in fills {
+        let evidence = TradeFillEvidence::from_report(fill.report());
+        let key = (evidence.venue_order_id, evidence.trade_id);
+        if let Some(previous) = evidence_by_key.get(&key) {
+            anyhow::ensure!(
+                previous == &evidence,
+                "Conflicting duplicate execution {} for venue order {}",
+                evidence.trade_id,
+                evidence.venue_order_id,
+            );
+            continue;
+        }
+        evidence_by_key.insert(key, evidence);
+        unique.push(fill);
+    }
+
+    Ok(unique)
+}
+
+fn canonical_trade_evidence(
+    evidence: impl IntoIterator<Item = TradeFillEvidence>,
+) -> Vec<TradeFillEvidence> {
+    let mut evidence = evidence.into_iter().collect::<Vec<_>>();
+    evidence.sort_by(|left, right| {
+        left.venue_order_id
+            .as_str()
+            .cmp(right.venue_order_id.as_str())
+            .then_with(|| left.trade_id.as_str().cmp(right.trade_id.as_str()))
+    });
+    evidence
+}
+
 fn retire_order_in(inner: &mut TrackerInner, venue_order_id: VenueOrderId) {
     let mut trade_keys = inner
         .retired_orders
@@ -677,13 +830,14 @@ impl OrderFillTrackerMap {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn is_trade_confirmed(&self, correction_key: &str) -> bool {
         self.inner
             .lock()
             .expect(MUTEX_POISONED)
             .settled_corrections
             .get(&correction_key.to_string())
-            .is_some_and(|settlement| *settlement == TradeSettlement::Confirmed)
+            .is_some_and(|settlement| settlement.settlement == TradeSettlement::Confirmed)
     }
 }
 
@@ -1144,6 +1298,172 @@ mod tests {
             Some(Quantity::zero(0)),
         );
         assert!(!tracker.is_trade_processed(correction_key));
+    }
+
+    #[rstest]
+    fn test_trade_correction_rejects_changed_confirmation_evidence_without_mutation() {
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("tracked-conflict");
+        let instrument_id = InstrumentId::from("TEST.POLYMARKET");
+        tracker.register(
+            venue_order_id,
+            Quantity::from("10.000000"),
+            OrderSide::Buy,
+            instrument_id,
+            6,
+            2,
+        );
+        let correction_key = "tracked-conflict-correction";
+        let (report, identity, event) = tracked_fill_evidence(
+            venue_order_id,
+            instrument_id,
+            "tracked-conflict-trade",
+            Quantity::from("5.000000"),
+        );
+        let pending = tracker
+            .apply_trade_fills_atomically(
+                vec![PreparedTradeFill::Tracked {
+                    report,
+                    identity,
+                    event,
+                }],
+                FillCorrectionMetadata {
+                    correction_key: correction_key.to_string(),
+                    venue_trade_id: "tracked-conflict-trade".to_string(),
+                    is_confirmed: false,
+                },
+            )
+            .unwrap();
+        assert!(matches!(pending, TradeFillApplication::Ready(ready) if ready.len() == 1));
+
+        let (report, identity, event) = tracked_fill_evidence(
+            venue_order_id,
+            instrument_id,
+            "tracked-conflict-trade",
+            Quantity::from("6.000000"),
+        );
+        let conflict = tracker.apply_trade_fills_atomically(
+            vec![PreparedTradeFill::Tracked {
+                report,
+                identity,
+                event,
+            }],
+            FillCorrectionMetadata {
+                correction_key: correction_key.to_string(),
+                venue_trade_id: "tracked-conflict-trade".to_string(),
+                is_confirmed: true,
+            },
+        );
+
+        assert!(conflict.is_err());
+        assert_eq!(
+            tracker.get_cumulative_filled(&venue_order_id),
+            Some(Quantity::from("5.000000")),
+        );
+        assert_eq!(tracker.active_correction_count(), 1);
+
+        let (mut report, identity, mut event) = tracked_fill_evidence(
+            venue_order_id,
+            instrument_id,
+            "tracked-conflict-trade",
+            Quantity::from("5.000000"),
+        );
+        report.ts_event = UnixNanos::from(1_000_000);
+        event.ts_event = report.ts_event;
+        let confirmed = tracker
+            .apply_trade_fills_atomically(
+                vec![PreparedTradeFill::Tracked {
+                    report,
+                    identity,
+                    event,
+                }],
+                FillCorrectionMetadata {
+                    correction_key: correction_key.to_string(),
+                    venue_trade_id: "tracked-conflict-trade".to_string(),
+                    is_confirmed: true,
+                },
+            )
+            .unwrap();
+        assert!(matches!(confirmed, TradeFillApplication::Confirmed(_)));
+
+        let (report, identity, event) = tracked_fill_evidence(
+            venue_order_id,
+            instrument_id,
+            "tracked-conflict-trade",
+            Quantity::from("6.000000"),
+        );
+        let settled_conflict = tracker.apply_trade_fills_atomically(
+            vec![PreparedTradeFill::Tracked {
+                report,
+                identity,
+                event,
+            }],
+            FillCorrectionMetadata {
+                correction_key: correction_key.to_string(),
+                venue_trade_id: "tracked-conflict-trade".to_string(),
+                is_confirmed: true,
+            },
+        );
+        assert!(settled_conflict.is_err());
+        assert_eq!(
+            tracker.get_cumulative_filled(&venue_order_id),
+            Some(Quantity::from("5.000000")),
+        );
+    }
+
+    #[rstest]
+    fn test_equivalent_duplicate_fill_in_one_trade_is_applied_once() {
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("tracked-duplicate");
+        let instrument_id = InstrumentId::from("TEST.POLYMARKET");
+        tracker.register(
+            venue_order_id,
+            Quantity::from("10.000000"),
+            OrderSide::Buy,
+            instrument_id,
+            6,
+            2,
+        );
+        let first = tracked_fill_evidence(
+            venue_order_id,
+            instrument_id,
+            "tracked-duplicate-trade",
+            Quantity::from("5.000000"),
+        );
+        let second = tracked_fill_evidence(
+            venue_order_id,
+            instrument_id,
+            "tracked-duplicate-trade",
+            Quantity::from("5.000000"),
+        );
+
+        let result = tracker
+            .apply_trade_fills_atomically(
+                vec![
+                    PreparedTradeFill::Tracked {
+                        report: first.0,
+                        identity: first.1,
+                        event: first.2,
+                    },
+                    PreparedTradeFill::Tracked {
+                        report: second.0,
+                        identity: second.1,
+                        event: second.2,
+                    },
+                ],
+                FillCorrectionMetadata {
+                    correction_key: "tracked-duplicate-correction".to_string(),
+                    venue_trade_id: "tracked-duplicate-trade".to_string(),
+                    is_confirmed: true,
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(result, TradeFillApplication::Ready(ready) if ready.len() == 1));
+        assert_eq!(
+            tracker.get_cumulative_filled(&venue_order_id),
+            Some(Quantity::from("5.000000")),
+        );
     }
 
     #[rstest]
