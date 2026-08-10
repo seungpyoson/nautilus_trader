@@ -18,13 +18,14 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_core::{UnixNanos, datetime::checked_mins_to_nanos, time::get_atomic_clock_realtime};
+#[cfg(test)]
+use nautilus_model::identifiers::{ClientOrderId, InstrumentId, StrategyId};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
-    identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
-    },
+    identifiers::{AccountId, ClientId, Venue, VenueOrderId},
     instruments::InstrumentAny,
+    orders::OrderAny,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
@@ -32,9 +33,9 @@ use rust_decimal::Decimal;
 
 use super::log_not_implemented;
 use crate::messages::execution::{
-    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-    GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
-    GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionSourceId,
+    GenerateFillReports, GenerateFillReportsBuilder, GenerateOrderStatusReport,
+    GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
     GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
     SubmitOrderList,
 };
@@ -57,6 +58,12 @@ pub trait ExecutionClient {
     fn venue(&self) -> Venue;
     fn oms_type(&self) -> OmsType;
     fn get_account(&self) -> Option<AccountAny>;
+
+    /// Binds the opaque source capability used for every runtime reconciliation report.
+    ///
+    /// Clients which emit `ExecutionReport` messages must override this and install the
+    /// capability into their report emitter. The engine calls it exactly once at registration.
+    fn bind_execution_source(&mut self, _source_id: ExecutionSourceId) {}
 
     /// Returns the maximum absolute position difference tolerated during reconciliation.
     fn position_reconciliation_tolerance(&self) -> Decimal {
@@ -363,7 +370,7 @@ pub trait ExecutionClient {
             ts_init,
             None,
         );
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 
@@ -376,10 +383,8 @@ pub trait ExecutionClient {
     /// execution client to track it for subsequent events (e.g., cancellations).
     fn register_external_order(
         &self,
-        _client_order_id: ClientOrderId,
+        _order: &OrderAny,
         _venue_order_id: VenueOrderId,
-        _instrument_id: InstrumentId,
-        _strategy_id: StrategyId,
         _ts_init: UnixNanos,
     ) {
         // Default no-op implementation

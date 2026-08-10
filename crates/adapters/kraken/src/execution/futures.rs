@@ -111,6 +111,7 @@ impl KrakenFuturesExecutionClient {
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
+            core.client_id,
             core.account_id,
             AccountType::Margin,
             None,
@@ -525,6 +526,10 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
         self.core.client_id
     }
 
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
+    }
+
     fn account_id(&self) -> AccountId {
         self.core.account_id
     }
@@ -804,7 +809,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
             self.clock.get_time_ns(),
             None,
         );
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 

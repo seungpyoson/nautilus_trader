@@ -422,6 +422,7 @@ mod tests {
         let mut emitter = ExecutionEventEmitter::new(
             clock,
             TraderId::from("TESTER-001"),
+            nautilus_model::identifiers::ClientId::from("BINANCE"),
             AccountId::from("BINANCE-001"),
             AccountType::Margin,
             None,

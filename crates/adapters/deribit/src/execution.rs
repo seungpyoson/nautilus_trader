@@ -125,6 +125,7 @@ impl DeribitExecutionClient {
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
+            core.client_id,
             core.account_id,
             AccountType::Margin,
             None,
@@ -330,6 +331,10 @@ impl ExecutionClient for DeribitExecutionClient {
 
     fn client_id(&self) -> ClientId {
         self.core.client_id
+    }
+
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
     }
 
     fn account_id(&self) -> AccountId {
@@ -658,7 +663,7 @@ impl ExecutionClient for DeribitExecutionClient {
             None,
         );
 
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 
@@ -1133,6 +1138,7 @@ mod tests {
         let mut emitter = ExecutionEventEmitter::new(
             get_atomic_clock_realtime(),
             trader_id,
+            nautilus_model::identifiers::ClientId::from("DERIBIT"),
             account_id,
             AccountType::Margin,
             None,
@@ -1208,7 +1214,8 @@ mod tests {
 
         assert!(matches!(
             rx.try_recv().unwrap(),
-            ExecutionEvent::Report(ExecutionReport::Fill(_))
+            ExecutionEvent::Report(authenticated)
+                if matches!(authenticated.report, ExecutionReport::Fill(_))
         ));
         assert!(rx.try_recv().is_err());
     }

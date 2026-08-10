@@ -40,6 +40,8 @@ impl InteractiveBrokersExecutionClient {
         let instrument_provider = Arc::clone(&self.instrument_provider);
         let exec_sender = get_exec_event_sender();
         let clock = get_atomic_clock_realtime();
+        let source_client_id = self.core.client_id;
+        let source_id = self.execution_source_id;
         let account_id = self.core.account_id;
         let commission_cache = Arc::clone(&self.commission_cache);
         let pending_execution_cache = Arc::clone(&self.pending_execution_cache);
@@ -63,6 +65,8 @@ impl InteractiveBrokersExecutionClient {
                 &instrument_provider,
                 &exec_sender,
                 clock,
+                source_client_id,
+                source_id,
                 account_id,
                 &commission_cache,
                 &pending_execution_cache,
@@ -96,6 +100,8 @@ impl InteractiveBrokersExecutionClient {
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         clock: &'static AtomicTime,
+        source_client_id: ClientId,
+        source_id: ExecutionSourceId,
         account_id: AccountId,
         commission_cache: &Arc<Mutex<CommissionCache>>,
         pending_execution_cache: &Arc<Mutex<PendingExecutionCache>>,
@@ -121,6 +127,8 @@ impl InteractiveBrokersExecutionClient {
                         instrument_provider,
                         exec_sender,
                         clock,
+                        source_client_id,
+                        source_id,
                         account_id,
                         commission_cache,
                         instrument_id_map,
@@ -159,6 +167,8 @@ impl InteractiveBrokersExecutionClient {
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         clock: &'static AtomicTime,
+        source_client_id: ClientId,
+        source_id: ExecutionSourceId,
         account_id: AccountId,
         commission_cache: &Arc<Mutex<CommissionCache>>,
         instrument_id_map: &Arc<Mutex<AHashMap<i32, InstrumentId>>>,
@@ -226,6 +236,8 @@ impl InteractiveBrokersExecutionClient {
                     instrument_provider,
                     exec_sender,
                     ts_init,
+                    source_client_id,
+                    source_id,
                     account_id,
                     commission_cache,
                     spread_fill_tracking,
@@ -270,6 +282,8 @@ impl InteractiveBrokersExecutionClient {
                         instrument_provider,
                         exec_sender,
                         ts_init,
+                        source_client_id,
+                        source_id,
                         account_id,
                         commission_cache,
                         spread_fill_tracking,
@@ -752,6 +766,8 @@ impl InteractiveBrokersExecutionClient {
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         ts_init: UnixNanos,
+        source_client_id: ClientId,
+        source_id: ExecutionSourceId,
         account_id: AccountId,
         commission_cache: &Arc<Mutex<CommissionCache>>,
         spread_fill_tracking: &Arc<Mutex<AHashMap<ClientOrderId, ahash::AHashSet<String>>>>,
@@ -896,6 +912,8 @@ impl InteractiveBrokersExecutionClient {
                 instrument_provider,
                 exec_sender,
                 ts_init,
+                source_client_id,
+                source_id,
                 account_id,
                 spread_fill_tracking,
                 context,
@@ -960,9 +978,11 @@ impl InteractiveBrokersExecutionClient {
             );
             exec_sender.send(ExecutionEvent::Order(OrderEventAny::Filled(event)))?;
         } else {
-            exec_sender.send(ExecutionEvent::Report(ExecutionReport::Fill(Box::new(
-                fill_report,
-            ))))?;
+            exec_sender.send(ExecutionEvent::report(
+                source_client_id,
+                source_id,
+                ExecutionReport::Fill(Box::new(fill_report)),
+            ))?;
         }
 
         Ok(())
@@ -1209,6 +1229,8 @@ impl InteractiveBrokersExecutionClient {
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         ts_init: UnixNanos,
+        source_client_id: ClientId,
+        source_id: ExecutionSourceId,
         account_id: AccountId,
         spread_fill_tracking: &Arc<Mutex<AHashMap<ClientOrderId, ahash::AHashSet<String>>>>,
         context: &TrackedOrderContext,
@@ -1302,6 +1324,8 @@ impl InteractiveBrokersExecutionClient {
             instrument_provider,
             exec_sender,
             ts_init,
+            source_client_id,
+            source_id,
             account_id,
             avg_px,
         )?;
@@ -1400,6 +1424,8 @@ impl InteractiveBrokersExecutionClient {
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         ts_init: UnixNanos,
+        source_client_id: ClientId,
+        source_id: ExecutionSourceId,
         account_id: AccountId,
         avg_px: Option<Price>,
     ) -> anyhow::Result<()> {
@@ -1455,9 +1481,11 @@ impl InteractiveBrokersExecutionClient {
             fill_report.avg_px = Some(price.as_decimal());
         }
 
-        exec_sender.send(ExecutionEvent::Report(ExecutionReport::Fill(Box::new(
-            fill_report,
-        ))))?;
+        exec_sender.send(ExecutionEvent::report(
+            source_client_id,
+            source_id,
+            ExecutionReport::Fill(Box::new(fill_report)),
+        ))?;
 
         tracing::debug!(
             "Generated leg fill: instrument_id={}, client_order_id={}, quantity={}, price={}",

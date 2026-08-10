@@ -53,7 +53,7 @@ use nautilus_model::{
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
     },
-    orders::{LimitOrder, Order, OrderAny, builder::OrderTestBuilder},
+    orders::{LimitOrder, Order, OrderAny, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
     types::{AccountBalance, Money, Price, Quantity},
 };
 use rstest::rstest;
@@ -108,6 +108,35 @@ fn create_test_execution_client(
     let client = AxExecutionClient::new(core, config).expect("Failed to create exec client");
 
     (client, rx, cache)
+}
+
+fn external_order_for_registration(
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    instrument_id: InstrumentId,
+) -> OrderAny {
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .strategy_id(StrategyId::from("S-001"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("5"))
+        .price(Price::from("50000.00"))
+        .build();
+    order
+        .apply(TestOrderEventStubs::submitted(
+            &order,
+            AccountId::from("AX-001"),
+        ))
+        .unwrap();
+    order
+        .apply(TestOrderEventStubs::accepted(
+            &order,
+            AccountId::from("AX-001"),
+            venue_order_id,
+        ))
+        .unwrap();
+    order
 }
 
 fn add_test_account_to_cache(cache: &Rc<RefCell<Cache>>, account_id: AccountId) {
@@ -1736,13 +1765,9 @@ async fn test_modify_order_success_emits_no_rejection() {
 
     // Register the order metadata in the WS orders cache so the modify
     // success path finds it when updating venue_to_client_id and metadata.
-    client.register_external_order(
-        client_order_id,
-        old_venue_order_id,
-        instrument_id,
-        StrategyId::from("S-001"),
-        UnixNanos::default(),
-    );
+    let external_order =
+        external_order_for_registration(client_order_id, old_venue_order_id, instrument_id);
+    client.register_external_order(&external_order, old_venue_order_id, UnixNanos::default());
 
     let cmd = ModifyOrder::new(
         TraderId::from("TESTER-001"),
@@ -1807,13 +1832,9 @@ async fn test_modify_order_http_error_emits_no_rejection() {
     let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
     let client_order_id = ClientOrderId::from("O-MOD-ERR");
     let venue_order_id = VenueOrderId::new("OLD-OID-ERR");
-    client.register_external_order(
-        client_order_id,
-        venue_order_id,
-        instrument_id,
-        StrategyId::from("S-001"),
-        UnixNanos::default(),
-    );
+    let external_order =
+        external_order_for_registration(client_order_id, venue_order_id, instrument_id);
+    client.register_external_order(&external_order, venue_order_id, UnixNanos::default());
 
     let cmd = ModifyOrder::new(
         TraderId::from("TESTER-001"),
@@ -1876,13 +1897,9 @@ async fn test_modify_order_invalid_replacement_id_does_not_panic_or_reject() {
     let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
     let client_order_id = ClientOrderId::from("O-MOD-BAD-OID");
     let venue_order_id = VenueOrderId::new("OLD-OID-BAD-OID");
-    client.register_external_order(
-        client_order_id,
-        venue_order_id,
-        instrument_id,
-        StrategyId::from("S-001"),
-        UnixNanos::default(),
-    );
+    let external_order =
+        external_order_for_registration(client_order_id, venue_order_id, instrument_id);
+    client.register_external_order(&external_order, venue_order_id, UnixNanos::default());
     let cmd = ModifyOrder::new(
         TraderId::from("TESTER-001"),
         Some(*AX_CLIENT_ID),

@@ -116,9 +116,16 @@ impl AxExecutionClient {
 
         let clock = get_atomic_clock_realtime();
         let trader_id = core.trader_id;
+        let client_id = core.client_id;
         let account_id = core.account_id;
-        let emitter =
-            ExecutionEventEmitter::new(clock, trader_id, account_id, AccountType::Margin, None);
+        let emitter = ExecutionEventEmitter::new(
+            clock,
+            trader_id,
+            client_id,
+            account_id,
+            AccountType::Margin,
+            None,
+        );
         let mut ws_url = config.ws_private_url();
         if config.cancel_on_disconnect {
             let separator = if ws_url.contains('?') { "&" } else { "?" };
@@ -416,6 +423,10 @@ impl ExecutionClient for AxExecutionClient {
 
     fn client_id(&self) -> ClientId {
         self.core.client_id
+    }
+
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
     }
 
     fn account_id(&self) -> AccountId {
@@ -1119,7 +1130,7 @@ impl ExecutionClient for AxExecutionClient {
             None,
         );
 
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 
@@ -1128,17 +1139,15 @@ impl ExecutionClient for AxExecutionClient {
 
     fn register_external_order(
         &self,
-        client_order_id: ClientOrderId,
+        order: &OrderAny,
         venue_order_id: VenueOrderId,
-        instrument_id: InstrumentId,
-        strategy_id: StrategyId,
         _ts_init: UnixNanos,
     ) {
         self.ws_orders.register_external_order(
-            client_order_id,
+            order.client_order_id(),
             venue_order_id,
-            instrument_id,
-            strategy_id,
+            order.instrument_id(),
+            order.strategy_id(),
         );
     }
 }
@@ -2303,6 +2312,7 @@ mod tests {
         let mut emitter = ExecutionEventEmitter::new(
             clock,
             TraderId::from("TESTER-001"),
+            nautilus_model::identifiers::ClientId::from("ARCHITECT_AX"),
             account_id,
             AccountType::Margin,
             None,

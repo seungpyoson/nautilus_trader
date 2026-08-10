@@ -125,6 +125,7 @@ pub(crate) fn bench_emitter() -> (
     let mut emitter = ExecutionEventEmitter::new(
         clock(),
         trader_id(),
+        nautilus_model::identifiers::ClientId::from("HYPERLIQUID"),
         account_id(),
         AccountType::Margin,
         Some(Currency::from("USDC")),

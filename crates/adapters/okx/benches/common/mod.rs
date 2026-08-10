@@ -182,6 +182,7 @@ pub(crate) fn bench_emitter() -> (
     let mut emitter = ExecutionEventEmitter::new(
         clock(),
         trader_id(),
+        nautilus_model::identifiers::ClientId::from("OKX"),
         account_id(),
         AccountType::Cash,
         Some(Currency::from("USDT")),

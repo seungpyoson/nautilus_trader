@@ -55,10 +55,9 @@ use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, LiquiditySide, OmsType},
     events::{OrderEventAny, PositionEvent},
-    identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
-    },
+    identifiers::{AccountId, ClientId, InstrumentId, Venue, VenueOrderId},
     instruments::InstrumentAny,
+    orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
@@ -70,7 +69,7 @@ use ustr::Ustr;
 
 pub(crate) use self::reports::get_pusd_currency;
 use self::{
-    identity::OrderIdentityRegistry,
+    identity::{OrderIdentity, OrderIdentityRegistry},
     order_builder::PolymarketOrderBuilder,
     order_fill_tracker::OrderFillTrackerMap,
     pending::{PendingCancelTracker, PendingSubmitTracker},
@@ -189,6 +188,7 @@ impl PolymarketExecutionClient {
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
+            core.client_id,
             core.account_id,
             AccountType::Cash,
             Some(pusd),
@@ -265,6 +265,10 @@ impl ExecutionClient for PolymarketExecutionClient {
 
     fn client_id(&self) -> ClientId {
         self.core.client_id
+    }
+
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
     }
 
     fn account_id(&self) -> AccountId {
@@ -355,12 +359,19 @@ impl ExecutionClient for PolymarketExecutionClient {
 
     fn register_external_order(
         &self,
-        _client_order_id: ClientOrderId,
-        _venue_order_id: VenueOrderId,
-        _instrument_id: InstrumentId,
-        _strategy_id: StrategyId,
+        order: &OrderAny,
+        venue_order_id: VenueOrderId,
         _ts_init: UnixNanos,
     ) {
+        self.order_identities
+            .register_order_identity(venue_order_id, OrderIdentity::from_order(order));
+        self.order_identities.mark_accepted(venue_order_id);
+        self.fill_tracker.register_reconciled_order(
+            venue_order_id,
+            order.quantity(),
+            order.filled_qty(),
+            order.order_side(),
+        );
     }
 
     fn on_instrument(&mut self, instrument: InstrumentAny) {

@@ -28,12 +28,12 @@ use ibapi::{
 };
 use nautilus_common::{
     live::runner::get_exec_event_sender,
-    messages::{ExecutionEvent, ExecutionReport},
+    messages::{ExecutionEvent, ExecutionReport, ExecutionSourceId},
 };
 use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{
     enums::PositionSideSpecified,
-    identifiers::AccountId,
+    identifiers::{AccountId, ClientId},
     instruments::Instrument,
     reports::PositionStatusReport,
     types::{AccountBalance, Currency, MarginBalance, Money, Quantity},
@@ -359,6 +359,8 @@ pub async fn initialize_position_tracking(
 /// Returns an error if subscription fails.
 pub async fn subscribe_positions(
     client: &Arc<Client>,
+    client_id: ClientId,
+    source_id: ExecutionSourceId,
     account_id: AccountId,
     position_tracker: PositionTracker,
     instrument_provider: Arc<crate::providers::instruments::InteractiveBrokersInstrumentProvider>,
@@ -452,9 +454,11 @@ pub async fn subscribe_positions(
                                     None,
                                     avg_px_open,
                                 );
-                                let event = ExecutionEvent::Report(ExecutionReport::Position(
-                                    Box::new(report),
-                                ));
+                                let event = ExecutionEvent::report(
+                                    client_id,
+                                    source_id,
+                                    ExecutionReport::Position(Box::new(report)),
+                                );
 
                                 if exec_sender.send(event).is_err() {
                                     tracing::warn!(

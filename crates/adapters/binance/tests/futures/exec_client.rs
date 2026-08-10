@@ -3230,8 +3230,11 @@ async fn test_query_order_bypasses_regular_order_id_collision() {
         .await
         .expect("timed out waiting for query_order report")
         .expect("execution event channel closed");
-    let ExecutionEvent::Report(ExecutionReport::Order(report)) = event else {
-        panic!("Expected OrderStatusReport, was {event:?}");
+    let ExecutionEvent::Report(authenticated) = event else {
+        panic!("Expected execution report");
+    };
+    let ExecutionReport::Order(report) = authenticated.report else {
+        panic!("Expected order status report");
     };
     assert_eq!(
         report.client_order_id,

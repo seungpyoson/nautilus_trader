@@ -43,8 +43,9 @@ use nautilus_common::{
             InstrumentResponse, InstrumentsResponse, QuotesResponse, TradesResponse,
         },
         execution::{
-            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
-            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+            AuthenticatedExecutionReport, BatchCancelOrders, BatchModifyOrders, CancelAllOrders,
+            CancelOrder, ExecutionReport, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+            SubmitOrderList, TradingCommand,
         },
     },
     timer::TimeEvent,
@@ -54,10 +55,10 @@ use nautilus_model::{
     data::DataType,
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
-        OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSubmitted, OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged,
-        PositionClosed, PositionEvent, PositionOpened,
+        OrderEmulated, OrderEventAny, OrderExpired, OrderFillConfirmed, OrderFillVoided,
+        OrderFilled, OrderInitialized, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
+        OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
+        PositionAdjusted, PositionChanged, PositionClosed, PositionEvent, PositionOpened,
     },
     identifiers::{ClientId, InstrumentId, Venue},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -126,6 +127,8 @@ pub const PAYLOAD_TYPE_ORDER_CANCEL_REJECTED: &str = "OrderCancelRejected";
 pub const PAYLOAD_TYPE_ORDER_UPDATED: &str = "OrderUpdated";
 /// The canonical `payload_type` tag for [`OrderFilled`].
 pub const PAYLOAD_TYPE_ORDER_FILLED: &str = "OrderFilled";
+/// The canonical `payload_type` tag for [`OrderFillConfirmed`].
+pub const PAYLOAD_TYPE_ORDER_FILL_CONFIRMED: &str = "OrderFillConfirmed";
 /// The canonical `payload_type` tag for [`OrderFillVoided`].
 pub const PAYLOAD_TYPE_ORDER_FILL_VOIDED: &str = "OrderFillVoided";
 /// The canonical `payload_type` tag for [`OrderStatusReport`].
@@ -233,6 +236,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_ORDER_CANCEL_REJECTED,
     PAYLOAD_TYPE_ORDER_UPDATED,
     PAYLOAD_TYPE_ORDER_FILLED,
+    PAYLOAD_TYPE_ORDER_FILL_CONFIRMED,
     PAYLOAD_TYPE_ORDER_FILL_VOIDED,
     PAYLOAD_TYPE_ORDER_STATUS_REPORT,
     PAYLOAD_TYPE_FILL_REPORT,
@@ -284,7 +288,7 @@ pub fn default_registry() -> EncoderRegistry {
 /// type directly (the kernel's `RunStarted` path and a few internal tests). The envelope
 /// registrations are what production bus traffic actually hits: `send_trading_command`
 /// reaches the tap as [`TradingCommand`], `publish_order_event` reaches it as
-/// [`OrderEventAny`], `send_execution_report` reaches it as [`ExecutionReport`],
+/// [`OrderEventAny`], `send_execution_report` reaches it as [`AuthenticatedExecutionReport`],
 /// `publish_position_event` reaches it as [`PositionEvent`], and `send_data_response`
 /// reaches it as [`DataResponse`]. Without these wrapper-aware dispatchers the tap looks
 /// up the wrapper's [`std::any::TypeId`], finds no encoder, and silently drops the
@@ -320,9 +324,9 @@ pub fn register_default(registry: &mut EncoderRegistry) {
         payload_type(PAYLOAD_TYPE_ORDER_EVENT_ANY),
         encode_order_event_any,
     );
-    registry.register::<ExecutionReport, _>(
+    registry.register::<AuthenticatedExecutionReport, _>(
         payload_type(PAYLOAD_TYPE_EXECUTION_REPORT),
-        encode_execution_report,
+        encode_authenticated_execution_report,
     );
     registry.register::<PositionEvent, _>(
         payload_type(PAYLOAD_TYPE_POSITION_EVENT),
@@ -430,6 +434,7 @@ fn extract_order_event_any_identity(event: &OrderEventAny) -> UUID4 {
         OrderEventAny::CancelRejected(e) => e.event_id,
         OrderEventAny::Updated(e) => e.event_id,
         OrderEventAny::Filled(e) => e.event_id,
+        OrderEventAny::FillConfirmed(e) => e.event_id,
         OrderEventAny::FillVoided(e) => e.event_id,
     }
 }
@@ -619,13 +624,14 @@ pub fn encode_order_event_any(event: &OrderEventAny) -> Result<EncodedPayload, E
         OrderEventAny::CancelRejected(e) => encode_order_cancel_rejected(e),
         OrderEventAny::Updated(e) => encode_order_updated(e),
         OrderEventAny::Filled(e) => Ok(retag(encode_order_filled(e)?, PAYLOAD_TYPE_ORDER_FILLED)),
+        OrderEventAny::FillConfirmed(e) => encode_order_fill_confirmed(e),
         OrderEventAny::FillVoided(e) => encode_order_fill_voided(e),
     }
 }
 
-/// Encodes an [`ExecutionReport`] envelope by dispatching on the variant.
+/// Encodes an authenticated execution report by dispatching on its report variant.
 ///
-/// `send_execution_report` hands the bus tap an [`ExecutionReport`] wrapper, so the tap
+/// `send_execution_report` hands the bus tap an [`AuthenticatedExecutionReport`], so the tap
 /// dispatches by the wrapper's [`std::any::TypeId`] and the inner variants never reach
 /// their bare-type encoders. The dispatcher unwraps each variant, encodes the inner type
 /// with its own index keys, and stamps the inner-variant tag so forensics scans see
@@ -650,6 +656,16 @@ pub fn encode_execution_report(report: &ExecutionReport) -> Result<EncodedPayloa
         ExecutionReport::Position(r) => encode_position_status_report(r),
         ExecutionReport::MassStatus(s) => encode_execution_mass_status(s),
     }
+}
+
+/// Encodes the report carried by an authenticated ingress envelope.
+///
+/// The client source governs live mutation but is not duplicated into the
+/// existing per-report forensic payload formats.
+pub fn encode_authenticated_execution_report(
+    report: &AuthenticatedExecutionReport,
+) -> Result<EncodedPayload, EncodeError> {
+    encode_execution_report(&report.report)
 }
 
 /// Encodes a [`FillReport`] into canonical bytes plus its `venue_order_id` index and,
@@ -1153,6 +1169,15 @@ fn encode_order_fill_voided(e: &OrderFillVoided) -> Result<EncodedPayload, Encod
     encode_with_order_ids(
         e,
         PAYLOAD_TYPE_ORDER_FILL_VOIDED,
+        e.client_order_id.to_string(),
+        Some(e.venue_order_id.to_string()),
+    )
+}
+
+fn encode_order_fill_confirmed(e: &OrderFillConfirmed) -> Result<EncodedPayload, EncodeError> {
+    encode_with_order_ids(
+        e,
+        PAYLOAD_TYPE_ORDER_FILL_CONFIRMED,
         e.client_order_id.to_string(),
         Some(e.venue_order_id.to_string()),
     )
@@ -1709,8 +1734,8 @@ mod tests {
                 registry.contains::<OrderEventAny>(),
             ),
             (
-                "send_execution_report / ExecutionReport",
-                registry.contains::<ExecutionReport>(),
+                "send_execution_report / AuthenticatedExecutionReport",
+                registry.contains::<AuthenticatedExecutionReport>(),
             ),
             (
                 "publish_position_event / PositionEvent",
@@ -2088,6 +2113,18 @@ mod tests {
         OrderEventAny::Filled(make_order_filled())
     }
 
+    fn ev_fill_confirmed() -> OrderEventAny {
+        let fill = make_order_filled();
+        OrderEventAny::FillConfirmed(OrderFillConfirmed::new(
+            &fill,
+            Ustr::from("CONFIRMED-001"),
+            Ustr::from("SETTLEMENT-001"),
+            UUID4::new(),
+            UnixNanos::from(2),
+            UnixNanos::from(3),
+        ))
+    }
+
     fn ev_fill_voided() -> OrderEventAny {
         OrderEventAny::FillVoided(
             OrderFillVoidedSpec::builder()
@@ -2309,6 +2346,7 @@ mod tests {
     )]
     #[case::updated(ev_updated(Some(venue_order_id())), PAYLOAD_TYPE_ORDER_UPDATED, true)]
     #[case::filled(ev_filled(), PAYLOAD_TYPE_ORDER_FILLED, true)]
+    #[case::fill_confirmed(ev_fill_confirmed(), PAYLOAD_TYPE_ORDER_FILL_CONFIRMED, true)]
     #[case::fill_voided(ev_fill_voided(), PAYLOAD_TYPE_ORDER_FILL_VOIDED, true)]
     fn order_event_any_envelope_stamps_inner_tag_for_every_variant(
         #[case] event: OrderEventAny,
@@ -2524,7 +2562,9 @@ mod tests {
             UnixNanos::from(60),
             None,
         );
-        status.add_order_reports(vec![make_order_status_report()]);
+        status
+            .add_order_reports(vec![make_order_status_report()])
+            .unwrap();
         status.add_fill_reports(vec![make_fill_report()]);
         status.add_position_reports(vec![make_position_status_report()]);
         status
@@ -2711,7 +2751,7 @@ mod tests {
             client_order_id: Some(ClientOrderId::from("O-C")),
             ..make_fill_report()
         };
-        status.add_order_reports(vec![order_a, order_b]);
+        status.add_order_reports(vec![order_a, order_b]).unwrap();
         status.add_fill_reports(vec![fill_c]);
 
         let encoded = encode_execution_report(&ExecutionReport::MassStatus(Box::new(status)))

@@ -42,6 +42,7 @@ pub(crate) fn test_emitter() -> (
     let mut emitter = ExecutionEventEmitter::new(
         clock,
         TraderId::from("TESTER-001"),
+        nautilus_model::identifiers::ClientId::from("KRAKEN"),
         AccountId::from("KRAKEN-001"),
         AccountType::Margin,
         None,

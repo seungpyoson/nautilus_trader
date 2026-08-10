@@ -37,7 +37,10 @@ pub mod defi;
 
 // Re-exports
 pub use data::{DataResponse, SubscribeCommand, UnsubscribeCommand};
-pub use execution::ExecutionReport;
+pub use execution::{
+    AuthenticatedExecution, AuthenticatedExecutionMassStatus, AuthenticatedExecutionReport,
+    ExecutionReport, ExecutionSourceId,
+};
 
 // TODO: Refine this to reduce disparity between enum sizes
 #[allow(
@@ -66,6 +69,22 @@ pub enum ExecutionEvent {
     OrderSubmittedBatch(OrderSubmittedBatch),
     OrderAcceptedBatch(OrderAcceptedBatch),
     OrderCanceledBatch(OrderCanceledBatch),
-    Report(ExecutionReport),
+    Report(AuthenticatedExecutionReport),
     Account(AccountState),
+}
+
+impl ExecutionEvent {
+    /// Creates a report event with authenticated client provenance.
+    #[must_use]
+    pub const fn report(
+        source_client_id: nautilus_model::identifiers::ClientId,
+        source_id: ExecutionSourceId,
+        report: ExecutionReport,
+    ) -> Self {
+        Self::Report(AuthenticatedExecutionReport::new(
+            source_client_id,
+            source_id,
+            report,
+        ))
+    }
 }

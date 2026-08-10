@@ -37,10 +37,9 @@ use nautilus_core::UnixNanos;
 use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
-    identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
-    },
+    identifiers::{AccountId, ClientId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
+    orders::OrderAny,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
@@ -322,19 +321,13 @@ impl ExecutionClient for LiveExecutionClient {
 
     fn register_external_order(
         &self,
-        client_order_id: ClientOrderId,
+        order: &OrderAny,
         venue_order_id: VenueOrderId,
-        instrument_id: InstrumentId,
-        strategy_id: StrategyId,
         ts_init: UnixNanos,
     ) {
-        self.client.borrow().register_external_order(
-            client_order_id,
-            venue_order_id,
-            instrument_id,
-            strategy_id,
-            ts_init,
-        );
+        self.client
+            .borrow()
+            .register_external_order(order, venue_order_id, ts_init);
     }
 
     fn on_instrument(&mut self, instrument: InstrumentAny) {

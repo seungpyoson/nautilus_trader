@@ -170,6 +170,7 @@ impl BetfairExecutionClient {
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
+            core.client_id,
             core.account_id,
             AccountType::Betting,
             None,
@@ -1047,6 +1048,10 @@ impl ExecutionClient for BetfairExecutionClient {
         self.core.client_id
     }
 
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
+    }
+
     fn account_id(&self) -> AccountId {
         self.core.account_id
     }
@@ -1541,7 +1546,7 @@ impl ExecutionClient for BetfairExecutionClient {
             None,
         );
 
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_fill_reports(fill_reports);
 
         Ok(Some(mass_status))
@@ -3021,7 +3026,7 @@ async fn fetch_post_reconnect_mass_status(
 
     let mut mass_status =
         ExecutionMassStatus::new(client_id, account_id, *BETFAIR_VENUE, ts_now, None);
-    mass_status.add_order_reports(order_reports);
+    mass_status.add_order_reports(order_reports)?;
     mass_status.add_fill_reports(fill_reports);
     Ok(mass_status)
 }
@@ -3515,6 +3520,7 @@ mod tests {
         let mut emitter = ExecutionEventEmitter::new(
             clock,
             TraderId::from("TESTER-001"),
+            nautilus_model::identifiers::ClientId::from("BETFAIR"),
             account_id,
             AccountType::Betting,
             None,
@@ -3522,6 +3528,13 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(tx);
         (emitter, rx)
+    }
+
+    fn into_execution_report(event: ExecutionEvent) -> ExecutionReport {
+        match event {
+            ExecutionEvent::Report(authenticated) => authenticated.report,
+            other => panic!("expected execution report, was {other:?}"),
+        }
     }
 
     #[expect(
@@ -3712,8 +3725,8 @@ mod tests {
 
         assert!(processed);
 
-        match rx.try_recv().expect("expected an execution event") {
-            ExecutionEvent::Report(ExecutionReport::Order(report)) => {
+        match into_execution_report(rx.try_recv().expect("expected an execution event")) {
+            ExecutionReport::Order(report) => {
                 assert_eq!(report.order_status, OrderStatus::Canceled);
                 assert_eq!(report.venue_order_id, VenueOrderId::from("bet_external"));
             }
@@ -3749,16 +3762,16 @@ mod tests {
 
         assert!(processed);
 
-        match rx.try_recv().expect("expected a fill report") {
-            ExecutionEvent::Report(ExecutionReport::Fill(fill)) => {
+        match into_execution_report(rx.try_recv().expect("expected a fill report")) {
+            ExecutionReport::Fill(fill) => {
                 assert_eq!(fill.client_order_id, Some(client_order_id));
                 assert_eq!(fill.last_qty.as_decimal(), Decimal::new(10, 0));
             }
             other => panic!("expected a FillReport for untracked fill, was {other:?}"),
         }
 
-        match rx.try_recv().expect("expected a status report") {
-            ExecutionEvent::Report(ExecutionReport::Order(_)) => {}
+        match into_execution_report(rx.try_recv().expect("expected a status report")) {
+            ExecutionReport::Order(_) => {}
             other => panic!("expected an OrderStatusReport, was {other:?}"),
         }
     }
@@ -3929,8 +3942,8 @@ mod tests {
             ts,
             ts,
         );
-        let report = match rx.try_recv().unwrap() {
-            ExecutionEvent::Report(ExecutionReport::Order(report)) => report,
+        let report = match into_execution_report(rx.try_recv().unwrap()) {
+            ExecutionReport::Order(report) => report,
             other => panic!("expected an order status report, was {other:?}"),
         };
         let duplicate = BetfairExecutionClient::process_unmatched_order(

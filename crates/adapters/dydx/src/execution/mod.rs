@@ -212,10 +212,17 @@ impl DydxExecutionClient {
         subaccount_number: u32,
     ) -> anyhow::Result<Self> {
         let trader_id = core.trader_id;
+        let client_id = core.client_id;
         let account_id = core.account_id;
         let clock = get_atomic_clock_realtime();
-        let emitter =
-            ExecutionEventEmitter::new(clock, trader_id, account_id, AccountType::Margin, None);
+        let emitter = ExecutionEventEmitter::new(
+            clock,
+            trader_id,
+            client_id,
+            account_id,
+            AccountType::Margin,
+            None,
+        );
 
         let retry_config = RetryConfig {
             max_retries: config.max_retries,
@@ -1159,6 +1166,10 @@ impl ExecutionClient for DydxExecutionClient {
 
     fn client_id(&self) -> ClientId {
         self.core.client_id
+    }
+
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
     }
 
     fn account_id(&self) -> AccountId {
@@ -2985,7 +2996,7 @@ impl ExecutionClient for DydxExecutionClient {
             None, // report_id will be auto-generated
         );
 
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_position_reports(position_reports);
         mass_status.add_fill_reports(fill_reports);
 
@@ -3638,6 +3649,7 @@ mod tests {
         let mut emitter = ExecutionEventEmitter::new(
             clock,
             TraderId::from("TRADER-001"),
+            nautilus_model::identifiers::ClientId::from("DYDX"),
             AccountId::from("DYDX-001"),
             AccountType::Margin,
             None,

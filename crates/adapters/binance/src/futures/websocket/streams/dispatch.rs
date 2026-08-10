@@ -1570,6 +1570,13 @@ mod tests {
         },
     };
 
+    fn execution_report(event: &ExecutionEvent) -> Option<&ExecutionReport> {
+        match event {
+            ExecutionEvent::Report(authenticated) => Some(&authenticated.report),
+            _ => None,
+        }
+    }
+
     #[rstest]
     #[case::long(BinancePositionSide::Long, "ETHUSDT-PERP.BINANCE-LONG")]
     #[case::short(BinancePositionSide::Short, "ETHUSDT-PERP.BINANCE-SHORT")]
@@ -1637,8 +1644,8 @@ mod tests {
         let events = collect_events(&mut rx);
         assert_eq!(events.len(), 1);
         assert!(matches!(
-            events[0],
-            ExecutionEvent::Report(ExecutionReport::OrderWithFills(_, ref fills)) if fills.len() == 1
+            execution_report(&events[0]),
+            Some(ExecutionReport::OrderWithFills(_, fills)) if fills.len() == 1
         ));
     }
 
@@ -1652,8 +1659,8 @@ mod tests {
         let events = collect_events(&mut rx);
         assert_eq!(events.len(), 1);
         assert!(matches!(
-            events[0],
-            ExecutionEvent::Report(ExecutionReport::Order(_))
+            execution_report(&events[0]),
+            Some(ExecutionReport::Order(_))
         ));
     }
 
@@ -1667,8 +1674,8 @@ mod tests {
         let events = collect_events(&mut rx);
         assert_eq!(events.len(), 1);
         assert!(matches!(
-            events[0],
-            ExecutionEvent::Report(ExecutionReport::Fill(_))
+            execution_report(&events[0]),
+            Some(ExecutionReport::Fill(_))
         ));
     }
 
@@ -1810,8 +1817,8 @@ mod tests {
             events
                 .iter()
                 .filter(|event| matches!(
-                    event,
-                    ExecutionEvent::Report(ExecutionReport::OrderWithFills(status, fills))
+                    execution_report(event),
+                    Some(ExecutionReport::OrderWithFills(status, fills))
                         if status.client_order_id == Some(ClientOrderId::from("TEST"))
                             && fills.len() == 1
                             && fills[0].trade_id == TradeId::new("12345678")
@@ -2132,8 +2139,8 @@ mod tests {
             events
                 .iter()
                 .filter(|event| matches!(
-                    event,
-                    ExecutionEvent::Report(ExecutionReport::OrderWithFills(status, fills))
+                    execution_report(event),
+                    Some(ExecutionReport::OrderWithFills(status, fills))
                         if status.order_status == OrderStatus::Filled
                             && fills.len() == 1
                             && fills[0].trade_id == TradeId::new("12345999")
@@ -2176,6 +2183,7 @@ mod tests {
         let mut emitter = ExecutionEventEmitter::new(
             clock,
             TraderId::from("TESTER-001"),
+            nautilus_model::identifiers::ClientId::from("BINANCE"),
             AccountId::from("BINANCE-001"),
             AccountType::Margin,
             None,
@@ -3431,8 +3439,8 @@ mod tests {
             .iter()
             .filter(|event| {
                 matches!(
-                    event,
-                    ExecutionEvent::Report(ExecutionReport::OrderWithFills(_, fills))
+                    execution_report(event),
+                    Some(ExecutionReport::OrderWithFills(_, fills))
                         if fills.len() == 1
                 )
             })

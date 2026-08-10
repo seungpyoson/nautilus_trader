@@ -494,12 +494,13 @@ Trades on Polymarket can have the following statuses:
 
 Once a trade is initially matched, subsequent status updates arrive through the user WebSocket.
 The execution adapter emits one `OrderFilled` at `MATCHED`. It treats `MINED` and `RETRYING` as
-settlement updates without emitting another fill. `CONFIRMED` records finality and refreshes the
-account. If the trade reaches `FAILED`, the adapter emits one `OrderFillVoided` for each locally
-applied fill and refreshes the account. The correction does not relist the failed quantity, but it
-preserves any maker-order remainder that was already working. An execution-complete order becomes
-`VOIDED`. Matched WebSocket fills retain the raw trade fields in the `info` field of the
-`OrderFilled` event.
+settlement updates without emitting another fill. `CONFIRMED` emits one persisted
+`OrderFillConfirmed` for each provisional fill, then refreshes the account. The confirmation
+references the original fill event and carries no duplicate economics. If the trade reaches
+`FAILED`, the adapter emits one `OrderFillVoided` for each locally applied fill and refreshes the
+account. The correction does not relist the failed quantity, but it preserves any maker-order
+remainder that was already working. An execution-complete order becomes `VOIDED`. Matched WebSocket
+fills retain the raw trade fields in the `info` field of the `OrderFilled` event.
 
 ### Trade ID derivation
 
@@ -589,6 +590,17 @@ create an inferred fill. Runtime order checks fetch confirmed trade history when
 more matched quantity than the local order and WebSocket fill tracker contain. Unpaired fill reports
 retain the normal fill-only path.
 
+The REST mass status is emitted only when its evidence is authoritative. `MATCHED`, `MINED`, and
+`RETRYING` trades make the complete snapshot unavailable until settlement finishes; the user
+WebSocket remains the sole source of provisional fills and their `FAILED` corrections. A report row
+that cannot be mapped or represented also rejects the snapshot instead of producing partial state.
+Startup reconciliation propagates that error and stops.
+
+Data API rows with zero size are not position-close evidence and do not produce `Flat` reports.
+Position reductions and closes come from venue `CONFIRMED` fills, while positive Data API positions
+require a representable size and an average price strictly between zero and one. Collection report
+routes emit one summary containing the reports produced and each reason an input row was omitted.
+
 ### Single-order recovery from trades
 
 `/data/order/{id}` can return live or terminal orders. When it returns no order for a known ID,
@@ -619,9 +631,11 @@ from trade history alone:
 
 The bulk open-order check cannot use this fallback for matched orders omitted by `GET /orders`.
 With the default `open_check_open_only=true`, the engine leaves those cached orders open for later
-reconciliation. With `open_check_open_only=false`, missing-order retries can mark an order rejected
-before its pending settlement confirms. A singular order query or the next startup reconciliation
-recovers the settled quantity from confirmed trade history.
+reconciliation. With `open_check_open_only=false`, the complete bulk miss triggers a targeted
+`generate_order_status_report` query before any terminal resolution. Pending settlement returns a
+non-terminal report preserving the locally applied quantity; invalid or unavailable trade evidence
+makes targeted coverage incomplete and defers resolution. Once settlement confirms, that targeted
+query or the next startup reconciliation recovers the settled quantity from confirmed trade history.
 
 ## Fill quantity normalization
 
@@ -895,8 +909,10 @@ The execution adapter keeps a `user` channel connection for order and trade even
 subscriptions as needed for instruments seen during trading.
 
 The adapter supports dynamic WebSocket subscribe and unsubscribe operations.
-Matched WebSocket fills and their corrections are restored from cached order history and
-deduplicated across reconnects. If a trade arrives before its instrument is available, the adapter
+Matched WebSocket fills and their terminal `OrderFillConfirmed` or `OrderFillVoided` events are
+restored from cached order history and deduplicated across reconnects. Closed orders are not restored
+as active tracker entries; their persisted settlement events still distinguish final fills from
+correctable provisional fills. If a trade arrives before its instrument is available, the adapter
 leaves it out of the dedup state. A redelivered event or later REST reconciliation can apply it after
 instrument loading completes.
 For a fully matched order, terminal quantity normalization waits for every trade ID in the order's

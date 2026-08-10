@@ -254,6 +254,7 @@ impl LighterExecutionClient {
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
+            core.client_id,
             core.account_id,
             AccountType::Margin,
             None,
@@ -3202,6 +3203,10 @@ impl ExecutionClient for LighterExecutionClient {
         self.core.client_id
     }
 
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
+    }
+
     fn account_id(&self) -> AccountId {
         self.core.account_id
     }
@@ -4259,7 +4264,7 @@ impl ExecutionClient for LighterExecutionClient {
             ts_init,
             None,
         );
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 
@@ -8059,6 +8064,7 @@ mod tests {
         let mut emitter = ExecutionEventEmitter::new(
             get_atomic_clock_realtime(),
             trader_id(),
+            nautilus_model::identifiers::ClientId::from("LIGHTER"),
             account_id(),
             AccountType::Margin,
             None,
@@ -8687,7 +8693,7 @@ mod tests {
         let events = drain_events(&mut rig.rx);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ExecutionEvent::Report(report) => match report {
+            ExecutionEvent::Report(authenticated) => match &authenticated.report {
                 EngineExecutionReport::Order(r) => {
                     assert_eq!(r.venue_order_id.to_string(), "281476929510110");
                 }
@@ -8721,13 +8727,16 @@ mod tests {
         let external = drain_events(&mut rig.rx);
         assert_eq!(external.len(), 1);
         match &external[0] {
-            ExecutionEvent::Report(EngineExecutionReport::Order(report)) => {
-                assert_eq!(report.venue_order_id, venue_order_id);
-                assert_eq!(
-                    report.client_order_id,
-                    Some(ClientOrderId::new(venue_order_id.as_str())),
-                );
-            }
+            ExecutionEvent::Report(authenticated) => match &authenticated.report {
+                EngineExecutionReport::Order(report) => {
+                    assert_eq!(report.venue_order_id, venue_order_id);
+                    assert_eq!(
+                        report.client_order_id,
+                        Some(ClientOrderId::new(venue_order_id.as_str())),
+                    );
+                }
+                other => panic!("expected one external order report, was {other:?}"),
+            },
             other => panic!("expected one external order report, was {other:?}"),
         }
         assert!(!rig.dispatch.accepted_was_emitted(&rig.cloid));
@@ -8748,13 +8757,16 @@ mod tests {
         let replayed_external = drain_events(&mut rig.rx);
         assert_eq!(replayed_external.len(), 1);
         match &replayed_external[0] {
-            ExecutionEvent::Report(EngineExecutionReport::Order(report)) => {
-                assert_eq!(report.venue_order_id, venue_order_id);
-                assert_eq!(
-                    report.client_order_id,
-                    Some(ClientOrderId::new(venue_order_id.as_str())),
-                );
-            }
+            ExecutionEvent::Report(authenticated) => match &authenticated.report {
+                EngineExecutionReport::Order(report) => {
+                    assert_eq!(report.venue_order_id, venue_order_id);
+                    assert_eq!(
+                        report.client_order_id,
+                        Some(ClientOrderId::new(venue_order_id.as_str())),
+                    );
+                }
+                other => panic!("expected replayed external order report, was {other:?}"),
+            },
             other => panic!("expected replayed external order report, was {other:?}"),
         }
         assert!(!rig.dispatch.accepted_was_emitted(&rig.cloid));

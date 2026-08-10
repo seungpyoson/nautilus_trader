@@ -166,6 +166,7 @@ impl BybitExecutionClient {
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
+            core.client_id,
             core.account_id,
             core.account_type,
             None,
@@ -566,6 +567,10 @@ impl ExecutionClient for BybitExecutionClient {
 
     fn client_id(&self) -> ClientId {
         self.core.client_id
+    }
+
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
     }
 
     fn account_id(&self) -> AccountId {
@@ -1129,7 +1134,7 @@ impl ExecutionClient for BybitExecutionClient {
             None,
         );
 
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 

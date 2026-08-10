@@ -180,6 +180,7 @@ impl BinanceSpotExecutionClient {
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
+            core.client_id,
             core.account_id,
             core.account_type,
             core.base_currency,
@@ -689,6 +690,10 @@ impl ExecutionClient for BinanceSpotExecutionClient {
 
     fn client_id(&self) -> ClientId {
         self.core.client_id
+    }
+
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
     }
 
     fn account_id(&self) -> AccountId {
@@ -1484,7 +1489,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             None,
         );
 
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 
@@ -3446,6 +3451,7 @@ mod tests {
         let mut emitter = ExecutionEventEmitter::new(
             clock,
             TraderId::from("TESTER-001"),
+            nautilus_model::identifiers::ClientId::from("BINANCE"),
             AccountId::from("BINANCE-001"),
             AccountType::Cash,
             None,

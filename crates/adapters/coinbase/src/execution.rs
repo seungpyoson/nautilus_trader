@@ -346,6 +346,7 @@ impl CoinbaseExecutionClient {
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
+            core.client_id,
             core.account_id,
             core.account_type,
             None,
@@ -445,6 +446,10 @@ impl ExecutionClient for CoinbaseExecutionClient {
 
     fn client_id(&self) -> ClientId {
         self.core.client_id
+    }
+
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
     }
 
     fn account_id(&self) -> AccountId {
@@ -924,7 +929,7 @@ impl ExecutionClient for CoinbaseExecutionClient {
             None,
         );
 
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 
@@ -2263,6 +2268,7 @@ mod tests {
         let mut emitter = ExecutionEventEmitter::new(
             get_atomic_clock_realtime(),
             TraderId::from("TRADER-001"),
+            nautilus_model::identifiers::ClientId::from("COINBASE"),
             AccountId::new("COINBASE-001"),
             AccountType::Cash,
             None,
@@ -2341,7 +2347,9 @@ mod tests {
         let mut reports = Vec::new();
 
         while let Ok(event) = rx.try_recv() {
-            if let ExecutionEvent::Report(ExecutionReport::Fill(report)) = event {
+            if let ExecutionEvent::Report(authenticated) = event
+                && let ExecutionReport::Fill(report) = authenticated.report
+            {
                 reports.push(*report);
             }
         }
@@ -2360,8 +2368,11 @@ mod tests {
 
         while let Ok(event) = rx.try_recv() {
             match event {
-                ExecutionEvent::Report(ExecutionReport::Order(r)) => orders.push(*r),
-                ExecutionEvent::Report(ExecutionReport::Fill(r)) => fills.push(*r),
+                ExecutionEvent::Report(authenticated) => match authenticated.report {
+                    ExecutionReport::Order(r) => orders.push(*r),
+                    ExecutionReport::Fill(r) => fills.push(*r),
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -2374,7 +2385,9 @@ mod tests {
         let mut reports = Vec::new();
 
         while let Ok(event) = rx.try_recv() {
-            if let ExecutionEvent::Report(ExecutionReport::Order(report)) = event {
+            if let ExecutionEvent::Report(authenticated) = event
+                && let ExecutionReport::Order(report) = authenticated.report
+            {
                 reports.push(*report);
             }
         }
@@ -2414,10 +2427,12 @@ mod tests {
         let mut got_fill = false;
 
         while let Ok(event) = rx.try_recv() {
-            match event {
-                ExecutionEvent::Report(ExecutionReport::Order(_)) => got_status = true,
-                ExecutionEvent::Report(ExecutionReport::Fill(_)) => got_fill = true,
-                _ => {}
+            if let ExecutionEvent::Report(authenticated) = event {
+                match authenticated.report {
+                    ExecutionReport::Order(_) => got_status = true,
+                    ExecutionReport::Fill(_) => got_fill = true,
+                    _ => {}
+                }
             }
         }
         assert!(got_status);
@@ -2644,7 +2659,9 @@ mod tests {
         let mut got_terminal_report: Option<OrderStatusReport> = None;
 
         while let Ok(event) = rx.try_recv() {
-            if let ExecutionEvent::Report(ExecutionReport::Order(r)) = event {
+            if let ExecutionEvent::Report(authenticated) = event
+                && let ExecutionReport::Order(r) = authenticated.report
+            {
                 got_terminal_report = Some(*r);
             }
         }

@@ -1346,7 +1346,7 @@ async fn test_exec_client_get_account_after_cache_add() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_empty_without_instruments() {
+async fn test_generate_order_status_reports_reject_unmapped_orders() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
     let (client, _rx, _cache) = create_test_execution_client(addr);
@@ -1364,10 +1364,15 @@ async fn test_generate_order_status_reports_empty_without_instruments() {
         causation_id: None,
     };
 
-    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+    let error = client
+        .generate_order_status_reports(&cmd)
+        .await
+        .expect_err("unmapped orders must make bulk coverage incomplete");
 
-    // Without loaded instruments, orders cannot be resolved to instrument IDs
-    assert!(reports.is_empty());
+    assert_eq!(
+        error.to_string(),
+        "Order reports is not authoritative: UnmappedOrder=2",
+    );
 }
 
 #[rstest]
@@ -1415,8 +1420,8 @@ async fn test_generate_order_status_reports_recovers_confirmed_rest_fill() {
         ts_init: UnixNanos::default(),
         open_only: false,
         instrument_id: Some(instrument_id),
-        start: Some(UnixNanos::from(2_000_000_000_000_000_000u64)),
-        end: Some(UnixNanos::from(2_000_000_100_000_000_000u64)),
+        start: Some(UnixNanos::from(1_703_875_200_000_000_000u64)),
+        end: Some(UnixNanos::from(1_704_153_600_000_000_000u64)),
         params: None,
         log_receipt_level: LogLevel::Info,
         correlation_id: None,
@@ -1435,7 +1440,7 @@ async fn test_generate_order_status_reports_recovers_confirmed_rest_fill() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_fill_reports_empty_without_instruments() {
+async fn test_generate_fill_reports_rejects_unmapped_relevant_trade() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
     let (client, _rx, _cache) = create_test_execution_client(addr);
@@ -1445,6 +1450,36 @@ async fn test_generate_fill_reports_empty_without_instruments() {
         ts_init: UnixNanos::default(),
         instrument_id: None,
         venue_order_id: None,
+        start: None,
+        end: None,
+        params: None,
+        log_receipt_level: LogLevel::Info,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    let error = client.generate_fill_reports(cmd).await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("Fill reports is not authoritative")
+    );
+    assert!(error.to_string().contains("UnmappedFill=1"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_scopes_authority_to_requested_order() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let cmd = GenerateFillReports {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: None,
+        venue_order_id: Some(VenueOrderId::from("unrelated-order")),
         start: None,
         end: None,
         params: None,
@@ -1534,9 +1569,12 @@ async fn test_generate_order_status_report_single_requires_instrument_id() {
 async fn test_generate_order_status_report_single_returns_report() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
-    let (client, _rx, _cache) = create_test_execution_client(addr);
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
     let cmd = GenerateOrderStatusReport {
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
@@ -1856,6 +1894,123 @@ async fn test_generate_order_status_report_returns_none_without_cached_order() {
 
     let result = client.generate_order_status_report(&cmd).await.unwrap();
     assert!(result.is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_terminal_recovery_rejects_invalid_target_trade() {
+    let venue_order_id = "0xinvalid00000000000000000000000000000000000000000000000000000001";
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(Value::Null);
+    *state.trades_response_override.lock().await = Some(recovery_trades_response(
+        venue_order_id,
+        "10.0000",
+        "1.0000",
+    ));
+    let (client, cmd) = setup_terminal_recovery(state, venue_order_id, "O-INVALID-TRADE").await;
+
+    let error = client
+        .generate_order_status_report(&cmd)
+        .await
+        .expect_err("invalid target evidence must not synthesize a terminal order status");
+
+    assert_eq!(
+        error.to_string(),
+        format!("Order recovery for {venue_order_id} is not authoritative: InvalidFill(Price)=1"),
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_terminal_recovery_ignores_invalid_unrelated_trade() {
+    let venue_order_id = "0xtarget000000000000000000000000000000000000000000000000000000001";
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(Value::Null);
+    *state.trades_response_override.lock().await = Some(recovery_trades_response(
+        "0xunrelated00000000000000000000000000000000000000000000000000001",
+        "10.0000",
+        "1.0000",
+    ));
+    let (client, cmd) = setup_terminal_recovery(state, venue_order_id, "O-UNRELATED-TRADE").await;
+
+    let report = client
+        .generate_order_status_report(&cmd)
+        .await
+        .expect("unrelated evidence must not control target recovery")
+        .expect("the missing target order should be recovered");
+
+    assert_eq!(report.order_status, OrderStatus::Canceled);
+    assert_eq!(report.venue_order_id, VenueOrderId::from(venue_order_id));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_order_status_report_rejects_pending_fill_evidence() {
+    let venue_order_id = "0xpending00000000000000000000000000000000000000000000000000000001";
+    let state = TestServerState::default();
+    let mut order = load_json("http_open_order.json");
+    order["id"] = Value::String(venue_order_id.to_string());
+    order["status"] = Value::String("MATCHED".to_string());
+    order["original_size"] = Value::String("10.0000".to_string());
+    order["size_matched"] = Value::String("10.0000".to_string());
+    *state.single_order_response.lock().await = Some(order);
+    let mut trades = recovery_trades_response(venue_order_id, "10.0000", "0.5000");
+    trades["data"][0]["status"] = Value::String("MATCHED".to_string());
+    *state.trades_response_override.lock().await = Some(trades);
+    let (client, cmd) = setup_terminal_recovery(state, venue_order_id, "O-PENDING-TRADE").await;
+
+    let error = client
+        .generate_order_status_report(&cmd)
+        .await
+        .expect_err("pending evidence must make targeted coverage incomplete");
+
+    assert!(
+        format!("{error:#}").contains("PendingTrade=1"),
+        "unexpected error: {error}",
+    );
+}
+
+async fn setup_terminal_recovery(
+    state: TestServerState,
+    venue_order_id: &str,
+    client_order_id: &str,
+) -> (PolymarketExecutionClient, GenerateOrderStatusReport) {
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let client_order_id = ClientOrderId::from(client_order_id);
+    let mut order = make_limit_order_at_price_and_quantity(
+        client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+        Price::from("0.5000"),
+        Quantity::from("10.0000"),
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, venue_order_id);
+
+    let command = GenerateOrderStatusReport {
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        instrument_id: Some(instrument_id),
+        client_order_id: Some(client_order_id),
+        venue_order_id: Some(VenueOrderId::from(venue_order_id)),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+    (client, command)
 }
 
 fn recovery_trades_response(venue_order_id: &str, size: &str, price: &str) -> Value {
@@ -2879,7 +3034,7 @@ async fn test_submit_market_order_rejected_reason_carries_venue_error_text() {
 
 fn assert_order_status_report(event: ExecutionEvent, expected_status: OrderStatus) {
     match event {
-        ExecutionEvent::Report(report) => match report {
+        ExecutionEvent::Report(authenticated) => match authenticated.report {
             ExecutionReport::Order(r) => {
                 assert_eq!(
                     r.order_status, expected_status,
@@ -2919,7 +3074,7 @@ async fn test_fok_deferred_check_emits_terminal_event(
         "asset_id": "TEST-TOKEN",
         "expiration": null,
         "order_type": "FOK",
-        "created_at": 1_703_875_200_000_i64
+        "created_at": 1_703_875_200_i64
     }));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -2974,10 +3129,10 @@ async fn test_fok_deferred_check_emits_terminal_event(
     assert_order_event(event, expected_event);
 }
 
-// A MATCHED FOK report excludes provisional quantity until the trade confirms
+// A MATCHED FOK cannot emit a Filled report until the trade confirms.
 #[rstest]
 #[tokio::test]
-async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
+async fn test_fok_deferred_check_withholds_filled_without_confirmed_quantity() {
     let state = TestServerState::default();
     *state.single_order_response.lock().await = Some(json!({
         "associate_trades": [],
@@ -2994,7 +3149,7 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
         "asset_id": "TEST-TOKEN",
         "expiration": null,
         "order_type": "FOK",
-        "created_at": 1_703_875_200_000_i64
+        "created_at": 1_703_875_200_i64
     }));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -3026,19 +3181,21 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
         assert_order_event(event, expected);
     }
 
-    // Venue Filled with no confirmed local fills surfaces no fill quantity
-    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { state.last_path.lock().await.starts_with("/data/order/") }
+        },
+        Duration::from_secs(7),
+    )
+    .await;
 
-    match event {
-        ExecutionEvent::Report(ExecutionReport::Order(report)) => {
-            assert_eq!(report.order_status, OrderStatus::Filled);
-            assert_eq!(report.filled_qty, Quantity::zero(0));
-        }
-        other => panic!("Expected Order report, was {other:?}"),
-    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err(),
+        "unconfirmed venue quantity must not produce a Filled report"
+    );
 }
 
 fn make_stop_market_order(
@@ -6714,6 +6871,10 @@ async fn test_cancel_order_cache_fallback_with_rejection() {
 #[tokio::test]
 async fn test_query_order_does_not_block_within_runtime() {
     let state = TestServerState::default();
+    let mut order = load_json("http_open_order.json");
+    order["asset_id"] = Value::String("TEST-TOKEN".to_string());
+    order["size_matched"] = Value::String("0.0000".to_string());
+    *state.single_order_response.lock().await = Some(order);
     let addr = start_mock_server(state).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
     client.start().unwrap();
@@ -6748,7 +6909,7 @@ async fn test_query_order_does_not_block_within_runtime() {
 
 #[rstest]
 #[tokio::test]
-async fn test_query_order_excludes_unconfirmed_matched_quantity() {
+async fn test_query_order_withholds_filled_without_confirmed_quantity() {
     let state = TestServerState::default();
     *state.single_order_response.lock().await = Some(json!({
         "associate_trades": ["pending-trade"],
@@ -6767,7 +6928,7 @@ async fn test_query_order_excludes_unconfirmed_matched_quantity() {
         "order_type": "GTC",
         "created_at": 1_703_875_200_i64
     }));
-    let addr = start_mock_server(state).await;
+    let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
     client.start().unwrap();
 
@@ -6790,18 +6951,21 @@ async fn test_query_order_excludes_unconfirmed_matched_quantity() {
 
     client.query_order(cmd).unwrap();
 
-    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { state.last_path.lock().await.as_str() == "/data/trades" }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
 
-    match event {
-        ExecutionEvent::Report(ExecutionReport::Order(report)) => {
-            assert_eq!(report.order_status, OrderStatus::Filled);
-            assert_eq!(report.filled_qty, Quantity::zero(4));
-        }
-        other => panic!("Expected Order report, was {other:?}"),
-    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err(),
+        "unconfirmed venue quantity must not produce a Filled report"
+    );
 }
 
 #[rstest]

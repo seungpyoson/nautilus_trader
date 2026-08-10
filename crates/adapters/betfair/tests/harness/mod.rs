@@ -36,7 +36,7 @@ use nautilus_common::{
     clock::{Clock, TestClock},
     live::runner::{replace_data_event_sender, replace_exec_event_sender},
     messages::{
-        ExecutionEvent,
+        ExecutionEvent, ExecutionReport,
         execution::{TradingCommand, modify::ModifyOrder, submit::SubmitOrder},
     },
     msgbus::{self, MessageBus, MessagingSwitchboard},
@@ -370,16 +370,27 @@ impl Harness {
     )]
     pub(crate) async fn reconcile_from_venue(&self) -> ExecutionMassStatus {
         let client_id = self.client_id();
-        let mass_status = self
+        let normalized = self
             .exec_engine
             .borrow_mut()
             .generate_mass_status(&client_id, None)
             .await
             .expect("generate_mass_status failed")
             .expect("mass status was None");
+        let source_client_id = normalized.source_client_id();
+        let mass_status = normalized.into_mass_status();
+        let authenticated = self
+            .exec_engine
+            .borrow()
+            .authenticate_execution_report(
+                source_client_id,
+                ExecutionReport::MassStatus(Box::new(mass_status.clone())),
+            )
+            .expect("mass status authentication failed");
         self.exec_engine
             .borrow_mut()
-            .reconcile_execution_mass_status(&mass_status);
+            .reconcile_execution_report(&authenticated)
+            .expect("mass status reconciliation failed");
         mass_status
     }
 }

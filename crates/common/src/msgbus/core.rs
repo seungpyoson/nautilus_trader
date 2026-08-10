@@ -127,7 +127,7 @@ use crate::{
     enums::SerializationEncoding,
     messages::{
         data::{DataCommand, DataResponse},
-        execution::{ExecutionReport, TradingCommand},
+        execution::{AuthenticatedExecutionReport, TradingCommand},
     },
 };
 
@@ -278,7 +278,7 @@ pub struct MessageBus {
     pub(crate) endpoints_trading_commands: IntoEndpointMap<TradingCommand>,
     pub(crate) endpoints_data_commands: IntoEndpointMap<DataCommand>,
     pub(crate) endpoints_data_responses: IntoEndpointMap<DataResponse>,
-    pub(crate) endpoints_exec_reports: IntoEndpointMap<ExecutionReport>,
+    pub(crate) endpoints_exec_reports: IntoEndpointMap<AuthenticatedExecutionReport>,
     pub(crate) endpoints_order_events: IntoEndpointMap<OrderEventAny>,
     pub(crate) endpoints_data: IntoEndpointMap<Data>,
     routers_typed: AHashMap<TypeId, Box<dyn Any>>,

@@ -322,8 +322,9 @@ that window with a one‑second signing and transport margin.
 
 Use `post_only` on limit-style orders. The adapter does not synthesize maker-only market orders.
 Live mainnet testing confirms `reduce_only=true` for closing perpetual positions. Invalid
-reduce-only opens can be dropped by Lighter without a venue order report; the adapter reconciles
-them as `INFLIGHT_TIMEOUT` rather than a venue-supplied rejection reason.
+reduce-only opens can be dropped by Lighter without a venue order report. Query silence alone does
+not change local state; full-history open-order reconciliation resolves the order only after both
+bulk and targeted queries provide complete "not found" coverage.
 
 ### Advanced order features
 

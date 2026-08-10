@@ -30,6 +30,7 @@ use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId, StrategyId, VenueOrderId},
     orders::{Order, OrderAny},
+    types::Quantity,
 };
 
 /// Identity fields captured at submit so the cache-free WS dispatch can build order events.
@@ -43,6 +44,7 @@ pub(crate) struct OrderIdentity {
     pub strategy_id: StrategyId,
     pub instrument_id: InstrumentId,
     pub order_side: OrderSide,
+    pub quantity: Quantity,
     pub order_type: OrderType,
     pub time_in_force: TimeInForce,
 }
@@ -55,6 +57,7 @@ impl OrderIdentity {
             strategy_id: order.strategy_id(),
             instrument_id: order.instrument_id(),
             order_side: order.order_side(),
+            quantity: order.quantity(),
             order_type: order.order_type(),
             time_in_force: order.time_in_force(),
         }
@@ -148,6 +151,7 @@ mod tests {
             strategy_id: StrategyId::from("S-1"),
             instrument_id: InstrumentId::from("TEST.POLYMARKET"),
             order_side: OrderSide::Buy,
+            quantity: Quantity::from(1),
             order_type: OrderType::Limit,
             time_in_force: TimeInForce::Gtc,
         }

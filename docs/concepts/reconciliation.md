@@ -72,23 +72,24 @@ to produce an execution mass status:
 ```mermaid
 flowchart TD
     Start[Startup Reconciliation] --> Fetch[Fetch venue reports<br/>orders, fills, positions]
-    Fetch --> Dedup[Deduplicate reports<br/>log warnings for duplicates]
-    Dedup --> Orders[Order Reconciliation<br/>align order states, generate missing events]
-    Orders --> Fills[Fill Reconciliation<br/>verify fills, generate missing OrderFilled events]
-    Fills --> Pos[Position Reconciliation<br/>compare net positions per instrument]
-    Pos --> Match{Positions<br/>match venue?}
+    Fetch --> Normalize[Authenticate and normalize<br/>the complete snapshot]
+    Normalize --> Project[Project orders, fills,<br/>and positions without mutation]
+    Project --> Match{Projected state<br/>matches venue?}
     Match -->|Yes| Done[Reconciliation complete<br/>system ready for trading]
     Match -->|No| Gen[Generate missing orders<br/>strategy: EXTERNAL, tag: RECONCILIATION]
-    Gen --> Done
+    Gen --> Reproject[Reproject the complete snapshot]
+    Reproject --> Done
 ```
 
-These reports represent external reality. The procedure processes them in the order shown so each
-position check builds on reconciled order and fill state.
+These reports represent external reality. The engine authenticates their execution-client source,
+canonicalizes identities and repeated evidence, and projects the complete snapshot against cloned
+order and position state. It commits only after every report and generated correction is applicable.
 
 ### Report deduplication
 
-- Deduplicates order reports within the batch and logs warnings.
-- Logs duplicate trade IDs as warnings for investigation.
+- Collapses economically equivalent repeated order, fill, and position evidence.
+- Rejects the complete snapshot when repeated evidence conflicts or reuses an identity for a
+  different account, instrument, order, side, or position.
 
 ### Order reconciliation
 
@@ -137,8 +138,11 @@ Synthetic fills use calculated reconciliation prices to target correct average p
 
 ### Failure handling
 
-- Individual adapter failures do not abort the entire reconciliation process.
-- Fill reports arriving before order status reports are deferred until order state is available.
+- Startup requires an authoritative mass status from every registered execution client. A client
+  error, missing snapshot, invalid source, incomplete row, identity conflict, or unprojectable
+  report aborts startup before trading commands are released.
+- Runtime checks are scoped per client and entity. A failed or incomplete query defers that
+  reconciliation cycle and is never interpreted as terminal absence or a flat position.
 
 If reconciliation fails, the system logs an error and does not start.
 
@@ -158,7 +162,7 @@ The tables below cover startup reconciliation (mass status) and runtime checks
 | **Partially filled then canceled**     | Order partially filled then canceled by venue.                                  | Updates state to `CANCELED`, preserves fill history.                            |
 | **Different fill data**                | Venue reports different fill price/commission than cached.                      | Preserves cached data, logs discrepancies.                                      |
 | **Filtered orders**                    | Orders marked for filtering via config.                                         | Skips based on `filtered_client_order_ids` or instrument filters.               |
-| **Duplicate order reports**            | Multiple orders share the same identifier.                                      | Deduplicates with warning logged.                                               |
+| **Repeated report evidence**           | Equivalent rows repeat, or one identity carries conflicting economic state.      | Collapses equivalent rows; rejects the complete snapshot on conflict.           |
 | **Position quantity mismatch (long)**  | Internal long position differs from venue (e.g., 100 vs 150).                   | Generates BUY LIMIT with calculated price when `generate_missing_orders=True`.  |
 | **Position quantity mismatch (short)** | Internal short position differs from venue (e.g., -100 vs -150).                | Generates SELL LIMIT with calculated price when `generate_missing_orders=True`. |
 | **Position reduction**                 | Venue position smaller than internal (e.g., internal 150 long, venue 100 long). | Generates opposite‑side LIMIT order with calculated price.                      |
@@ -178,25 +182,18 @@ The loop waits for startup reconciliation to finish before starting periodic che
 The `reconciliation_startup_delay_secs` parameter adds a further delay *after* startup
 reconciliation completes, giving the system time to stabilize.
 
-| Scenario                            | Description                                               | System behavior                                 |
-| ----------------------------------- | --------------------------------------------------------- | ----------------------------------------------- |
-| **In‑flight submit timeout**        | `SUBMITTED` remains unconfirmed beyond retry exhaustion.  | Resolves to `REJECTED` with `INFLIGHT_TIMEOUT`. |
-| **In‑flight cancel/update timeout** | `PENDING_CANCEL` or `PENDING_UPDATE` exceeds the retries. | Resolves to `CANCELED` through reconciliation.  |
-| **Open orders check discrepancy**   | Periodic poll detects a venue state change.               | Confirms status and applies transitions.        |
-| **Position check discrepancy**      | Periodic poll detects a position mismatch.                | Generates reconciliation events when eligible.  |
-| **Own books audit mismatch**        | Own order books diverge from venue public books.          | Audits and logs inconsistencies.                |
+| Scenario                            | Description                                               | System behavior                                                |
+| ----------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------- |
+| **In‑flight query budget exhausted** | An order remains unresolved after bounded status probes. | Stops probing; makes no state transition without venue evidence. |
+| **Open orders check discrepancy**   | Periodic poll detects a venue state change.               | Confirms status and applies transitions.                       |
+| **Position check discrepancy**      | Periodic poll detects a position mismatch.                | Generates reconciliation events when eligible.                |
+| **Own books audit mismatch**        | Own order books diverge from venue public books.          | Audits and logs inconsistencies.                               |
 
-**In‑flight order timeout resolution** (venue does not respond after max retries):
-
-| Current status   | Resolved to | Rationale                                                      |
-| ---------------- | ----------- | -------------------------------------------------------------- |
-| `SUBMITTED`      | `REJECTED`  | No acceptance was received before the retry limit.             |
-| `PENDING_UPDATE` | `CANCELED`  | The in‑flight checker applies a terminal reconciliation event. |
-| `PENDING_CANCEL` | `CANCELED`  | The in‑flight checker applies a terminal reconciliation event. |
-
-These terminal results come from the in‑flight timeout checker. A missing open‑order report does
-not by itself prove a pending modify or cancel outcome, so the consistency checks below leave those
-states unresolved until another check can determine the venue state.
+**In‑flight liveness probing.** `SUBMITTED`, `PENDING_UPDATE`, and `PENDING_CANCEL` orders receive
+bounded `QueryOrder` probes after the configured threshold. A missing response is not authoritative:
+it can mean transport failure, parse failure, or incomplete venue evidence. Exhausting the liveness
+budget therefore emits no rejection or cancellation. Terminal "not found" resolution belongs only
+to the complete bulk-plus-targeted order-report path described below.
 
 **Order consistency checks** (when cache state differs from venue state):
 
@@ -235,16 +232,15 @@ open‑only mode is the default.
 
 :::
 
-**Retry coordination.** The in‑flight loop increments its own per‑order retry count against
-`inflight_check_retries` and mirrors that value into missing‑order tracking. The open‑order loop
-increments the missing‑order count against `open_check_missing_retries`. Each loop applies its own
-limit; neither setting automatically overrides the other.
+**Retry coordination.** The in‑flight loop owns only its bounded liveness-probe budget under
+`inflight_check_retries`. The open‑order loop independently owns authoritative missing-order
+evidence under `open_check_missing_retries`; liveness probes never create or advance that evidence.
 
 When the open‑order loop exhausts retries, the engine issues one targeted
 `GenerateOrderStatusReport` probe before applying a terminal state or leaving an ambiguous
 pending cancel/update unresolved. If the venue returns the order, reconciliation proceeds and
 missing‑order tracking clears. If a pending state remains unresolved, the engine also resets the
-in‑flight count before checking again after the configured threshold.
+in‑flight probe budget before checking again after the configured threshold.
 
 Position checks use separate retry counters per instrument and account. A successful position
 match clears the counter, while repeated unresolved discrepancies stop active reconciliation for
@@ -264,12 +260,12 @@ handles bulk query failures across hundreds of orders without overwhelming the v
 - **Split NETTING ownership**: Multiple strategies can hold cached positions for the same account
   and instrument, but venues report a single account-level net position. Prefer one claiming
   strategy per NETTING account/instrument pair when resuming external state.
-- **Duplicate order IDs**: Deduplicated with warnings logged. Frequent duplicates may indicate
-  venue data integrity issues.
+- **Repeated report identities**: Equivalent evidence is canonicalized. Conflicting evidence
+  rejects the snapshot and usually indicates a venue or adapter integrity issue.
 - **Precision differences**: Small decimal differences are handled using instrument precision.
   Large discrepancies may indicate missing orders.
-- **Out-of-order reports**: Fill reports arriving before order status reports are deferred until
-  order state is available.
+- **Out-of-order reports**: The startup collector continues processing queued venue events before
+  projecting the snapshot, so newer execution truth cannot be overwritten by an older snapshot.
 
 :::tip
 For persistent issues, drop cached state or flatten accounts before restarting.

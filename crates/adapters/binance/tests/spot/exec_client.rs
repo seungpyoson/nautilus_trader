@@ -3358,7 +3358,11 @@ async fn test_query_order_missing_order_emits_no_order_report() {
         .expect("Timed out waiting for authenticated order query");
 
     assert_no_event_matching(&mut rx, |event| {
-        matches!(event, ExecutionEvent::Report(ExecutionReport::Order(_)))
+        matches!(
+            event,
+            ExecutionEvent::Report(authenticated)
+                if matches!(&authenticated.report, ExecutionReport::Order(_))
+        )
     })
     .await;
 }

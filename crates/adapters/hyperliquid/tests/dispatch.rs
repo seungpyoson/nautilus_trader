@@ -63,6 +63,7 @@ fn test_emitter() -> (
     let mut emitter = ExecutionEventEmitter::new(
         clock,
         TraderId::from("TESTER-001"),
+        nautilus_model::identifiers::ClientId::from("HYPERLIQUID"),
         account_id(),
         AccountType::Margin,
         None,

@@ -1118,15 +1118,16 @@ async fn test_exec_client_query_order() {
         .expect("timed out waiting for query_order event")
         .expect("channel closed");
 
-    match event {
-        ExecutionEvent::Report(ExecutionReport::Order(report)) => {
-            assert_eq!(
-                report.client_order_id,
-                Some(ClientOrderId::from("client-open-1")),
-            );
-        }
-        other => panic!("Expected OrderStatusReport, was {other:?}"),
-    }
+    let ExecutionEvent::Report(authenticated) = event else {
+        panic!("Expected execution report");
+    };
+    let ExecutionReport::Order(report) = authenticated.report else {
+        panic!("Expected order status report");
+    };
+    assert_eq!(
+        report.client_order_id,
+        Some(ClientOrderId::from("client-open-1")),
+    );
 
     client.disconnect().await.unwrap();
 }

@@ -13,11 +13,15 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::fmt::Display;
+use std::{fmt::Display, hash::Hash, marker::PhantomData};
 
+use anyhow::ensure;
 use indexmap::IndexMap;
 use nautilus_core::{UUID4, UnixNanos};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{MapAccess, Visitor},
+};
 
 use crate::{
     identifiers::{AccountId, ClientId, InstrumentId, Venue, VenueOrderId},
@@ -26,7 +30,7 @@ use crate::{
 
 /// Represents an execution mass status report for an execution client - including
 /// status of all orders, trades for those orders and open positions.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type")]
 #[cfg_attr(
     feature = "python",
@@ -95,11 +99,29 @@ impl ExecutionMassStatus {
         self.position_reports.clone()
     }
 
-    /// Add order reports to the mass status.
-    pub fn add_order_reports(&mut self, reports: Vec<OrderStatusReport>) {
+    /// Adds order reports to the mass status without discarding repeated evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when reports for one venue order disagree on economic state.
+    pub fn add_order_reports(&mut self, reports: Vec<OrderStatusReport>) -> anyhow::Result<()> {
+        let mut validated = self.order_reports.clone();
         for report in reports {
-            self.order_reports.insert(report.venue_order_id, report);
+            if let Some(previous) = validated.get_mut(&report.venue_order_id) {
+                ensure!(
+                    equivalent_order_report(previous, &report),
+                    "Conflicting order reports for venue order {}",
+                    report.venue_order_id
+                );
+                if report.ts_last > previous.ts_last {
+                    *previous = report;
+                }
+            } else {
+                validated.insert(report.venue_order_id, report);
+            }
         }
+        self.order_reports = validated;
+        Ok(())
     }
 
     /// Add fill reports to the mass status.
@@ -121,6 +143,126 @@ impl ExecutionMassStatus {
                 .push(report);
         }
     }
+}
+
+fn equivalent_order_report(lhs: &OrderStatusReport, rhs: &OrderStatusReport) -> bool {
+    let mut rhs = rhs.clone();
+    rhs.report_id = lhs.report_id;
+    rhs.ts_last = lhs.ts_last;
+    rhs.ts_init = lhs.ts_init;
+    lhs == &rhs
+}
+
+impl<'de> Deserialize<'de> for ExecutionMassStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        struct WireExecutionMassStatus {
+            client_id: ClientId,
+            account_id: AccountId,
+            venue: Venue,
+            report_id: UUID4,
+            ts_init: UnixNanos,
+            #[serde(deserialize_with = "deserialize_order_reports")]
+            order_reports: IndexMap<VenueOrderId, OrderStatusReport>,
+            #[serde(deserialize_with = "deserialize_grouped_reports")]
+            fill_reports: IndexMap<VenueOrderId, Vec<FillReport>>,
+            #[serde(deserialize_with = "deserialize_grouped_reports")]
+            position_reports: IndexMap<InstrumentId, Vec<PositionStatusReport>>,
+        }
+
+        let wire = WireExecutionMassStatus::deserialize(deserializer)?;
+        Ok(Self {
+            client_id: wire.client_id,
+            account_id: wire.account_id,
+            venue: wire.venue,
+            report_id: wire.report_id,
+            ts_init: wire.ts_init,
+            order_reports: wire.order_reports,
+            fill_reports: wire.fill_reports,
+            position_reports: wire.position_reports,
+        })
+    }
+}
+
+fn deserialize_grouped_reports<'de, D, K, V>(
+    deserializer: D,
+) -> Result<IndexMap<K, Vec<V>>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Eq + Hash,
+    V: Deserialize<'de>,
+{
+    struct GroupedReportsVisitor<K, V>(PhantomData<fn() -> IndexMap<K, Vec<V>>>);
+
+    impl<'de, K, V> Visitor<'de> for GroupedReportsVisitor<K, V>
+    where
+        K: Deserialize<'de> + Eq + Hash,
+        V: Deserialize<'de>,
+    {
+        type Value = IndexMap<K, Vec<V>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map of grouped execution reports")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut grouped = IndexMap::<K, Vec<V>>::new();
+            while let Some((key, reports)) = map.next_entry::<K, Vec<V>>()? {
+                grouped.entry(key).or_default().extend(reports);
+            }
+            Ok(grouped)
+        }
+    }
+
+    deserializer.deserialize_map(GroupedReportsVisitor(PhantomData))
+}
+
+fn deserialize_order_reports<'de, D>(
+    deserializer: D,
+) -> Result<IndexMap<VenueOrderId, OrderStatusReport>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OrderReportsVisitor(PhantomData<fn() -> IndexMap<VenueOrderId, OrderStatusReport>>);
+
+    impl<'de> Visitor<'de> for OrderReportsVisitor {
+        type Value = IndexMap<VenueOrderId, OrderStatusReport>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map of non-conflicting order status reports")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut reports = IndexMap::new();
+            while let Some((venue_order_id, report)) = map.next_entry()? {
+                if let Some(previous) = reports.get_mut(&venue_order_id) {
+                    if !equivalent_order_report(previous, &report) {
+                        return Err(serde::de::Error::custom(format!(
+                            "conflicting order reports for venue order {venue_order_id}"
+                        )));
+                    }
+                    if report.ts_last > previous.ts_last {
+                        *previous = report;
+                    }
+                } else {
+                    reports.insert(venue_order_id, report);
+                }
+            }
+            Ok(reports)
+        }
+    }
+
+    deserializer.deserialize_map(OrderReportsVisitor(PhantomData))
 }
 
 impl Display for ExecutionMassStatus {
@@ -270,7 +412,9 @@ mod tests {
             None,
         );
 
-        mass_status.add_order_reports(vec![order_report1.clone(), order_report2.clone()]);
+        mass_status
+            .add_order_reports(vec![order_report1.clone(), order_report2.clone()])
+            .unwrap();
 
         let order_reports = mass_status.order_reports();
         assert_eq!(order_reports.len(), 2);
@@ -412,7 +556,9 @@ mod tests {
         let fill_report = create_test_fill_report();
         let position_report = create_test_position_report();
 
-        mass_status.add_order_reports(vec![order_report.clone()]);
+        mass_status
+            .add_order_reports(vec![order_report.clone()])
+            .unwrap();
         mass_status.add_fill_reports(vec![fill_report.clone()]);
         mass_status.add_position_reports(vec![position_report.clone()]);
 
@@ -486,7 +632,7 @@ mod tests {
         let mut mass_status = test_execution_mass_status();
 
         // Adding empty vectors should work without issues
-        mass_status.add_order_reports(vec![]);
+        mass_status.add_order_reports(vec![]).unwrap();
         mass_status.add_fill_reports(vec![]);
         mass_status.add_position_reports(vec![]);
 
@@ -497,13 +643,33 @@ mod tests {
     }
 
     #[rstest]
-    fn test_overwrite_order_reports() {
+    fn test_equivalent_order_reports_collapse_to_latest_timestamp() {
+        let mut mass_status = test_execution_mass_status();
+        let first = create_test_order_report();
+        let mut latest = first.clone();
+        latest.report_id = UUID4::new();
+        latest.ts_last = UnixNanos::from(4_000_000_000);
+        latest.ts_init = UnixNanos::from(5_000_000_000);
+
+        mass_status
+            .add_order_reports(vec![first, latest.clone()])
+            .unwrap();
+
+        let reports = mass_status.order_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports.get(&latest.venue_order_id), Some(&latest));
+    }
+
+    #[rstest]
+    fn test_conflicting_order_reports_are_rejected_without_overwrite() {
         let mut mass_status = test_execution_mass_status();
         let venue_order_id = VenueOrderId::from("1");
 
         // Add first order report
         let order_report1 = create_test_order_report();
-        mass_status.add_order_reports(vec![order_report1.clone()]);
+        mass_status
+            .add_order_reports(vec![order_report1.clone()])
+            .unwrap();
 
         // Add second order report with same venue order ID (should overwrite)
         let order_report2 = OrderStatusReport::new(
@@ -522,12 +688,100 @@ mod tests {
             UnixNanos::from(3_000_000_000),
             None,
         );
-        mass_status.add_order_reports(vec![order_report2.clone()]);
+        let result = mass_status.add_order_reports(vec![order_report2]);
 
-        // Should have only one report (the latest one)
+        assert!(result.is_err());
         let order_reports = mass_status.order_reports();
         assert_eq!(order_reports.len(), 1);
-        assert_eq!(order_reports.get(&venue_order_id), Some(&order_report2));
-        assert_ne!(order_reports.get(&venue_order_id), Some(&order_report1));
+        assert_eq!(order_reports.get(&venue_order_id), Some(&order_report1));
+    }
+
+    #[rstest]
+    fn test_add_order_reports_is_atomic_when_late_evidence_conflicts() {
+        let mut mass_status = test_execution_mass_status();
+        let first = create_test_order_report();
+        let mut second = create_test_order_report();
+        second.venue_order_id = VenueOrderId::from("2");
+        let mut conflicting_second = second.clone();
+        conflicting_second.order_side = OrderSide::Sell;
+
+        let result = mass_status.add_order_reports(vec![first, second, conflicting_second]);
+
+        assert!(result.is_err());
+        assert!(mass_status.order_reports().is_empty());
+    }
+
+    #[rstest]
+    fn test_deserialize_rejects_conflicting_duplicate_order_keys() {
+        let mass_status = test_execution_mass_status();
+        let first = create_test_order_report();
+        let mut conflicting = first.clone();
+        conflicting.order_side = OrderSide::Sell;
+        let first_json = serde_json::to_string(&first).unwrap();
+        let conflicting_json = serde_json::to_string(&conflicting).unwrap();
+        let duplicate_map =
+            format!("\"order_reports\":{{\"1\":{first_json},\"1\":{conflicting_json}}}");
+        let json = serde_json::to_string(&mass_status).unwrap().replacen(
+            "\"order_reports\":{}",
+            &duplicate_map,
+            1,
+        );
+
+        let result = serde_json::from_str::<ExecutionMassStatus>(&json);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("conflicting order reports")
+        );
+    }
+
+    #[rstest]
+    fn test_deserialize_preserves_duplicate_fill_and_position_groups() {
+        let mass_status = test_execution_mass_status();
+        let first_fill = create_test_fill_report();
+        let mut repeated_fill = first_fill.clone();
+        repeated_fill.report_id = UUID4::new();
+        let position = create_test_position_report();
+        let mut repeated_position = position.clone();
+        repeated_position.report_id = UUID4::new();
+
+        let first_fill_json = serde_json::to_string(&first_fill).unwrap();
+        let repeated_fill_json = serde_json::to_string(&repeated_fill).unwrap();
+        let position_json = serde_json::to_string(&position).unwrap();
+        let repeated_position_json = serde_json::to_string(&repeated_position).unwrap();
+        let fill_groups = format!(
+            "\"fill_reports\":{{\"{}\":[{first_fill_json}],\"{}\":[{repeated_fill_json}]}}",
+            first_fill.venue_order_id, first_fill.venue_order_id,
+        );
+        let position_groups = format!(
+            "\"position_reports\":{{\"{}\":[{position_json}],\"{}\":[{repeated_position_json}]}}",
+            position.instrument_id, position.instrument_id,
+        );
+        let json = serde_json::to_string(&mass_status)
+            .unwrap()
+            .replacen("\"fill_reports\":{}", &fill_groups, 1)
+            .replacen("\"position_reports\":{}", &position_groups, 1);
+
+        let deserialized = serde_json::from_str::<ExecutionMassStatus>(&json).unwrap();
+
+        assert_eq!(
+            deserialized
+                .fill_reports()
+                .get(&first_fill.venue_order_id)
+                .unwrap()
+                .len(),
+            2,
+        );
+        assert_eq!(
+            deserialized
+                .position_reports()
+                .get(&position.instrument_id)
+                .unwrap()
+                .len(),
+            2,
+        );
     }
 }

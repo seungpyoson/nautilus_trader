@@ -214,6 +214,7 @@ impl DeriveExecutionClient {
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
+            core.client_id,
             core.account_id,
             core.account_type,
             core.base_currency,
@@ -441,6 +442,10 @@ impl ExecutionClient for DeriveExecutionClient {
 
     fn client_id(&self) -> ClientId {
         self.core.client_id
+    }
+
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
     }
 
     fn account_id(&self) -> AccountId {
@@ -2223,8 +2228,8 @@ impl DeriveReconciliationContext {
         } = position_snapshot;
         let mut mass_status =
             ExecutionMassStatus::new(self.client_id, self.account_id, *DERIVE_VENUE, ts_now, None);
-        mass_status.add_order_reports(history_order_reports);
-        mass_status.add_order_reports(open_order_reports);
+        mass_status.add_order_reports(history_order_reports)?;
+        mass_status.add_order_reports(open_order_reports)?;
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 
@@ -3441,6 +3446,7 @@ mod tests {
         let mut emitter = ExecutionEventEmitter::new(
             clock,
             TraderId::from("TRADER-001"),
+            nautilus_model::identifiers::ClientId::from("DERIVE"),
             AccountId::from("DERIVE-001"),
             AccountType::Margin,
             Some(Currency::USDC()),

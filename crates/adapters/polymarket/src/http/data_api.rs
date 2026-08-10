@@ -424,12 +424,15 @@ fn parse_trade_ticks(
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::collections::AtomicMap;
     use nautilus_model::{
         enums::AggressorSide,
         identifiers::{AccountId, InstrumentId},
+        instruments::{InstrumentAny, stubs::binary_option},
     };
     use rstest::rstest;
     use rust_decimal_macros::dec;
+    use ustr::Ustr;
 
     use super::*;
     use crate::{
@@ -442,6 +445,17 @@ mod tests {
         let path = "test_data/data_api_positions_response.json";
         let content = std::fs::read_to_string(path).expect("Failed to read test data");
         serde_json::from_str(&content).expect("Failed to parse test data")
+    }
+
+    fn position_instruments(positions: &[DataApiPosition]) -> AtomicMap<Ustr, InstrumentAny> {
+        let instruments = AtomicMap::new();
+        for position in positions {
+            instruments.insert(
+                Ustr::from(position.asset.as_str()),
+                InstrumentAny::BinaryOption(binary_option()),
+            );
+        }
+        instruments
     }
 
     fn load_trades() -> Vec<DataApiTrade> {
@@ -469,13 +483,34 @@ mod tests {
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let output = build_position_reports(
+            &positions,
+            &position_instruments(&positions),
+            account_id,
+            ts_now,
+        );
 
         // 4 positions: 150.5, 0.0, 42.0, 0.005 (dust)
         // Only 150.5 and 42.0 pass the DUST_POSITION_THRESHOLD (0.01)
-        assert_eq!(reports.len(), 2);
-        assert!(reports[0].is_long());
-        assert!(reports[1].is_long());
+        assert_eq!(output.reports.len(), 2);
+        assert!(output.reports[0].is_long());
+        assert!(output.reports[1].is_long());
+        assert_eq!(
+            output.omissions.count(
+                crate::execution::reconciliation::ReconciliationOmission::Position(
+                    crate::execution::reconciliation::PositionOmission::Zero,
+                ),
+            ),
+            1,
+        );
+        assert_eq!(
+            output.omissions.count(
+                crate::execution::reconciliation::ReconciliationOmission::Position(
+                    crate::execution::reconciliation::PositionOmission::Dust,
+                ),
+            ),
+            1,
+        );
     }
 
     #[rstest]
@@ -484,7 +519,13 @@ mod tests {
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let reports = build_position_reports(
+            &positions,
+            &position_instruments(&positions),
+            account_id,
+            ts_now,
+        )
+        .reports;
 
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].avg_px_open, Some(dec!(0.55)));
@@ -497,7 +538,13 @@ mod tests {
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let reports = build_position_reports(
+            &positions,
+            &position_instruments(&positions),
+            account_id,
+            ts_now,
+        )
+        .reports;
 
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].quantity.precision, USDC_DECIMALS as u8);
@@ -515,10 +562,22 @@ mod tests {
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let output = build_position_reports(
+            &positions,
+            &position_instruments(&positions),
+            account_id,
+            ts_now,
+        );
 
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].avg_px_open, None);
+        assert!(output.reports.is_empty());
+        assert_eq!(
+            output.omissions.count(
+                crate::execution::reconciliation::ReconciliationOmission::Position(
+                    crate::execution::reconciliation::PositionOmission::InvalidAveragePrice,
+                ),
+            ),
+            1,
+        );
     }
 
     #[rstest]

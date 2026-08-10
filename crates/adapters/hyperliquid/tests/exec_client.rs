@@ -4169,7 +4169,11 @@ async fn drain_order_status_reports(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(ExecutionEvent::Report(ExecutionReport::Order(report)))) => out.push(*report),
+            Ok(Some(ExecutionEvent::Report(authenticated))) => {
+                if let ExecutionReport::Order(report) = authenticated.report {
+                    out.push(*report);
+                }
+            }
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => break,
         }

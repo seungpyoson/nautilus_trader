@@ -70,6 +70,13 @@ use serde_json::Value;
 
 use crate::common::*;
 
+fn into_execution_report(event: ExecutionEvent) -> ExecutionReport {
+    match event {
+        ExecutionEvent::Report(authenticated) => authenticated.report,
+        other => panic!("expected execution report, was {other:?}"),
+    }
+}
+
 fn create_test_execution_client_with_config(
     addr: SocketAddr,
     stream_port: u16,
@@ -1750,8 +1757,8 @@ async fn test_query_order_emits_order_status_report() {
         .expect("timed out waiting for query_order event")
         .expect("channel closed");
 
-    match event {
-        ExecutionEvent::Report(ExecutionReport::Order(report)) => {
+    match into_execution_report(event) {
+        ExecutionReport::Order(report) => {
             assert_eq!(report.venue_order_id.as_str(), "228059754671");
             assert_eq!(report.client_order_id, Some(client_order_id));
             assert_eq!(report.instrument_id, instrument_id);
@@ -1817,7 +1824,7 @@ async fn test_query_order_no_match_emits_nothing() {
     let mut report_seen = false;
 
     while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-        if matches!(event, ExecutionEvent::Report(ExecutionReport::Order(_))) {
+        if matches!(into_execution_report(event), ExecutionReport::Order(_)) {
             report_seen = true;
             break;
         }
@@ -2657,7 +2664,9 @@ async fn test_ocm_multiple_incremental_fills_emits_one_report_per_step() {
 
     for _ in 0..20 {
         match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
-            Ok(Some(ExecutionEvent::Report(ExecutionReport::Fill(_)))) => {
+            Ok(Some(ExecutionEvent::Report(authenticated)))
+                if matches!(authenticated.report, ExecutionReport::Fill(_)) =>
+            {
                 fill_reports += 1;
                 if fill_reports >= 3 {
                     break;
@@ -2714,7 +2723,7 @@ async fn test_ocm_duplicate_frame_dedupes_fill_report() {
     let mut fill_reports = 0;
 
     while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-        if matches!(event, ExecutionEvent::Report(ExecutionReport::Fill(_))) {
+        if matches!(into_execution_report(event), ExecutionReport::Fill(_)) {
             fill_reports += 1;
         }
     }
@@ -3475,8 +3484,8 @@ async fn test_query_order_recovers_from_no_session() {
         .expect("timed out waiting for query_order recovery event")
         .expect("channel closed");
 
-    match event {
-        ExecutionEvent::Report(ExecutionReport::Order(report)) => {
+    match into_execution_report(event) {
+        ExecutionReport::Order(report) => {
             assert_eq!(report.venue_order_id.as_str(), "228059754671");
         }
         other => panic!("Expected OrderStatusReport after recovery, was {other:?}"),
@@ -4026,10 +4035,12 @@ async fn test_ocm_duplicate_terminal_event_is_deduped() {
     let mut fill_reports = 0;
 
     while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-        match event {
-            ExecutionEvent::Report(ExecutionReport::Order(_)) => order_status_reports += 1,
-            ExecutionEvent::Report(ExecutionReport::Fill(_)) => fill_reports += 1,
-            _ => {}
+        if let ExecutionEvent::Report(authenticated) = event {
+            match authenticated.report {
+                ExecutionReport::Order(_) => order_status_reports += 1,
+                ExecutionReport::Fill(_) => fill_reports += 1,
+                _ => {}
+            }
         }
     }
 
@@ -4090,8 +4101,9 @@ async fn test_post_reconnect_dispatches_mass_status() {
     let mut saw_mass_status = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(ExecutionEvent::Report(ExecutionReport::MassStatus(_)))) =
+        if let Ok(Some(ExecutionEvent::Report(authenticated))) =
             tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            && matches!(authenticated.report, ExecutionReport::MassStatus(_))
         {
             saw_mass_status = true;
             break;
@@ -4251,7 +4263,9 @@ async fn test_queued_reconnect_re_asserts_halt() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while mass_status_count < 2 && tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-            Ok(Some(ExecutionEvent::Report(ExecutionReport::MassStatus(_)))) => {
+            Ok(Some(ExecutionEvent::Report(authenticated)))
+                if matches!(authenticated.report, ExecutionReport::MassStatus(_)) =>
+            {
                 mass_status_count += 1;
                 if mass_status_count == 1 {
                     // iter#2 should re-assert the halt at the top of its iteration.

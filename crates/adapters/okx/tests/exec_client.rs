@@ -104,6 +104,7 @@ fn test_emitter() -> (
     let mut emitter = ExecutionEventEmitter::new(
         clock,
         TraderId::from("TESTER-001"),
+        nautilus_model::identifiers::ClientId::from("OKX"),
         AccountId::from("OKX-001"),
         AccountType::Margin,
         None,
@@ -1374,24 +1375,31 @@ fn test_dispatch_tracked_post_only_cancel_from_fixture(
 
     let untracked_events = drain_events(&mut untracked_rx);
     assert_eq!(untracked_events.len(), 1);
-    match &untracked_events[0] {
-        ExecutionEvent::Report(CommonExecutionReport::Order(report)) => {
-            assert_eq!(report.account_id, AccountId::from("OKX-001"));
-            assert_eq!(report.instrument_id, instrument_id);
-            assert_eq!(report.client_order_id, Some(client_order_id));
-            assert_eq!(report.venue_order_id, VenueOrderId::new(venue_order_id));
-            assert_eq!(report.order_side, OrderSide::Buy);
-            assert_eq!(report.order_type, OrderType::Limit);
-            assert_eq!(report.time_in_force, TimeInForce::Gtc);
-            assert_eq!(report.order_status, OrderStatus::Canceled);
-            assert!(report.post_only);
-            assert_eq!(
-                report.cancel_reason.as_deref(),
-                Some(OKX_POST_ONLY_CANCEL_REASON),
-            );
-        }
-        other => panic!("Expected first-seen untracked order status report, was {other:?}"),
-    }
+    let ExecutionEvent::Report(authenticated) = &untracked_events[0] else {
+        panic!(
+            "Expected first-seen untracked order status report, was {:?}",
+            untracked_events[0]
+        );
+    };
+    let CommonExecutionReport::Order(report) = &authenticated.report else {
+        panic!(
+            "Expected order status report, was {:?}",
+            authenticated.report
+        );
+    };
+    assert_eq!(report.account_id, AccountId::from("OKX-001"));
+    assert_eq!(report.instrument_id, instrument_id);
+    assert_eq!(report.client_order_id, Some(client_order_id));
+    assert_eq!(report.venue_order_id, VenueOrderId::new(venue_order_id));
+    assert_eq!(report.order_side, OrderSide::Buy);
+    assert_eq!(report.order_type, OrderType::Limit);
+    assert_eq!(report.time_in_force, TimeInForce::Gtc);
+    assert_eq!(report.order_status, OrderStatus::Canceled);
+    assert!(report.post_only);
+    assert_eq!(
+        report.cancel_reason.as_deref(),
+        Some(OKX_POST_ONLY_CANCEL_REASON),
+    );
 
     let venue_order_id_key = Ustr::from(venue_order_id);
     let mut fee_cache = AHashMap::new();
@@ -1628,18 +1636,25 @@ fn test_dispatch_untracked_spread_order_emits_status_report() {
 
     let events = drain_events(&mut rx);
     assert_eq!(events.len(), 1);
-    match &events[0] {
-        ExecutionEvent::Report(CommonExecutionReport::Order(report)) => {
-            assert_eq!(report.client_order_id, Some(cid));
-            assert_eq!(report.venue_order_id, VenueOrderId::new(venue_order_id));
-            assert_eq!(
-                report.instrument_id,
-                InstrumentId::from("BCH-USDT_BCH-USDT-SWAP.OKX")
-            );
-            assert_eq!(report.order_status, OrderStatus::Accepted);
-        }
-        other => panic!("Expected untracked spread order status report, was {other:?}"),
-    }
+    let ExecutionEvent::Report(authenticated) = &events[0] else {
+        panic!(
+            "Expected untracked spread order status report, was {:?}",
+            events[0]
+        );
+    };
+    let CommonExecutionReport::Order(report) = &authenticated.report else {
+        panic!(
+            "Expected order status report, was {:?}",
+            authenticated.report
+        );
+    };
+    assert_eq!(report.client_order_id, Some(cid));
+    assert_eq!(report.venue_order_id, VenueOrderId::new(venue_order_id));
+    assert_eq!(
+        report.instrument_id,
+        InstrumentId::from("BCH-USDT_BCH-USDT-SWAP.OKX")
+    );
+    assert_eq!(report.order_status, OrderStatus::Accepted);
 }
 
 fn make_order_init(

@@ -39,6 +39,7 @@
 mod ids;
 mod orders;
 mod positions;
+mod snapshot;
 mod types;
 
 #[cfg(test)]
@@ -49,6 +50,7 @@ mod tests;
 pub use ids::{
     create_inferred_reconciliation_trade_id, create_position_reconciliation_venue_order_id,
 };
+pub(crate) use orders::is_superseded_cancel_report;
 pub use orders::{
     create_incremental_inferred_fill, create_inferred_fill_for_qty, create_reconciliation_rejected,
     create_reconciliation_triggered, generate_external_order_status_events,
@@ -60,4 +62,5 @@ pub use positions::{
     calculate_reconciliation_price, check_position_reconciliation,
     process_mass_status_for_reconciliation,
 };
+pub use snapshot::NormalizedExecutionMassStatus;
 pub use types::ReconciliationResult;

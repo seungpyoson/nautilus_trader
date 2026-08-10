@@ -836,6 +836,20 @@ fn build_client_with_cache(
     (client, receiver, cache)
 }
 
+fn execution_report(event: &ExecutionEvent) -> Option<&ExecutionReport> {
+    match event {
+        ExecutionEvent::Report(authenticated) => Some(&authenticated.report),
+        _ => None,
+    }
+}
+
+fn into_execution_report(event: ExecutionEvent) -> ExecutionReport {
+    match event {
+        ExecutionEvent::Report(authenticated) => authenticated.report,
+        other => panic!("Expected execution report, found {other:?}"),
+    }
+}
+
 async fn next_event_matching<F>(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     timeout: Duration,
@@ -3325,7 +3339,7 @@ async fn test_generate_fill_reports_skips_trade_seen_on_websocket() {
 
     state.push_frame(&trade_frame);
     next_event_matching(&mut rx, Duration::from_secs(2), |e| {
-        matches!(e, ExecutionEvent::Report(ExecutionReport::Fill(_)))
+        matches!(execution_report(e), Some(ExecutionReport::Fill(_)))
     })
     .await
     .expect("first fill report");
@@ -3824,8 +3838,8 @@ async fn test_account_all_positions_flat_snapshot_clears_cache_and_emits_flat_re
 
     let flat_report = next_event_matching(&mut rx, Duration::from_secs(2), |e| {
         matches!(
-            e,
-            ExecutionEvent::Report(ExecutionReport::Position(report))
+            execution_report(e),
+            Some(ExecutionReport::Position(report))
                 if report.instrument_id == eth_perp_id()
                     && report.position_side == PositionSideSpecified::Flat
                     && report.quantity.is_zero()
@@ -3834,7 +3848,7 @@ async fn test_account_all_positions_flat_snapshot_clears_cache_and_emits_flat_re
     .await
     .expect("flat position report");
 
-    let ExecutionEvent::Report(ExecutionReport::Position(flat_report)) = flat_report else {
+    let ExecutionReport::Position(flat_report) = into_execution_report(flat_report) else {
         unreachable!("predicate only accepts position reports");
     };
     assert_eq!(flat_report.account_id, account_id());
@@ -3849,8 +3863,8 @@ async fn test_account_all_positions_flat_snapshot_clears_cache_and_emits_flat_re
 
     let duplicate_flat = next_event_matching(&mut rx, Duration::from_millis(250), |e| {
         matches!(
-            e,
-            ExecutionEvent::Report(ExecutionReport::Position(report))
+            execution_report(e),
+            Some(ExecutionReport::Position(report))
                 if report.instrument_id == eth_perp_id()
                     && report.position_side == PositionSideSpecified::Flat
                     && report.quantity.is_zero()
@@ -3894,8 +3908,8 @@ async fn test_account_all_positions_invalid_known_market_does_not_flatten_cached
 
     next_event_matching(&mut rx, Duration::from_secs(2), |e| {
         matches!(
-            e,
-            ExecutionEvent::Report(ExecutionReport::Position(report))
+            execution_report(e),
+            Some(ExecutionReport::Position(report))
                 if report.instrument_id == eth_perp_id()
                     && report.quantity == Quantity::from("1.5000")
         )
@@ -3909,8 +3923,8 @@ async fn test_account_all_positions_invalid_known_market_does_not_flatten_cached
 
     let unexpected_flat = next_event_matching(&mut rx, Duration::from_millis(250), |e| {
         matches!(
-            e,
-            ExecutionEvent::Report(ExecutionReport::Position(report))
+            execution_report(e),
+            Some(ExecutionReport::Position(report))
                 if report.instrument_id == eth_perp_id()
                     && report.position_side == PositionSideSpecified::Flat
                     && report.quantity.is_zero()
@@ -4018,8 +4032,8 @@ async fn test_account_all_positions_empty_snapshot_after_reconnect_flattens_prio
 
     let flat_report = next_event_matching(&mut rx, Duration::from_secs(2), |e| {
         matches!(
-            e,
-            ExecutionEvent::Report(ExecutionReport::Position(report))
+            execution_report(e),
+            Some(ExecutionReport::Position(report))
                 if report.instrument_id == eth_perp_id()
                     && report.position_side == PositionSideSpecified::Flat
                     && report.quantity.is_zero()
@@ -4028,7 +4042,7 @@ async fn test_account_all_positions_empty_snapshot_after_reconnect_flattens_prio
     .await
     .expect("flat position report after reconnect");
 
-    let ExecutionEvent::Report(ExecutionReport::Position(flat_report)) = flat_report else {
+    let ExecutionReport::Position(flat_report) = into_execution_report(flat_report) else {
         unreachable!("predicate only accepts position reports");
     };
     assert_eq!(flat_report.instrument_id, eth_perp_id());

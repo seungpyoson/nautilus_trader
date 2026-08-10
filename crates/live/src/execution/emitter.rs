@@ -31,7 +31,7 @@
 
 use nautilus_common::{
     factories::OrderEventFactory,
-    messages::{ExecutionEvent, ExecutionReport},
+    messages::{AuthenticatedExecutionReport, ExecutionEvent, ExecutionReport, ExecutionSourceId},
 };
 use nautilus_core::{UUID4, UnixNanos, time::AtomicTime};
 use nautilus_model::{
@@ -41,8 +41,8 @@ use nautilus_model::{
         OrderModifyRejected, OrderRejected, OrderSubmittedBatch,
     },
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, TraderId,
-        VenueOrderId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
+        TraderId, VenueOrderId,
     },
     orders::OrderAny,
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
@@ -59,6 +59,8 @@ use nautilus_model::{
 #[derive(Debug, Clone)]
 pub struct ExecutionEventEmitter {
     clock: &'static AtomicTime,
+    client_id: ClientId,
+    execution_source_id: ExecutionSourceId,
     factory: OrderEventFactory,
     sender: Option<tokio::sync::mpsc::UnboundedSender<ExecutionEvent>>,
 }
@@ -71,12 +73,15 @@ impl ExecutionEventEmitter {
     pub fn new(
         clock: &'static AtomicTime,
         trader_id: TraderId,
+        client_id: ClientId,
         account_id: AccountId,
         account_type: AccountType,
         base_currency: Option<Currency>,
     ) -> Self {
         Self {
             clock,
+            client_id,
+            execution_source_id: ExecutionSourceId::new(),
             factory: OrderEventFactory::new(trader_id, account_id, account_type, base_currency),
             sender: None,
         }
@@ -89,6 +94,11 @@ impl ExecutionEventEmitter {
     /// Sets the sender. Call in adapter's `start()`.
     pub fn set_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>) {
         self.sender = Some(sender);
+    }
+
+    /// Binds the opaque source capability assigned by the execution engine.
+    pub fn bind_execution_source(&mut self, source_id: ExecutionSourceId) {
+        self.execution_source_id = source_id;
     }
 
     /// Returns true if the sender is initialized.
@@ -444,6 +454,8 @@ impl ExecutionEventEmitter {
     /// Emits an execution report.
     pub fn send_execution_report(&self, report: ExecutionReport) {
         if let Some(sender) = &self.sender {
+            let report =
+                AuthenticatedExecutionReport::new(self.client_id, self.execution_source_id, report);
             if let Err(e) = sender.send(ExecutionEvent::Report(report)) {
                 log::warn!("Failed to send execution report: {e}");
             }
@@ -470,5 +482,46 @@ impl ExecutionEventEmitter {
     /// Emits a position status report.
     pub fn send_position_report(&self, report: PositionStatusReport) {
         self.send_execution_report(ExecutionReport::Position(Box::new(report)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::{identifiers::Venue, reports::ExecutionMassStatus};
+
+    use super::*;
+
+    #[test]
+    fn execution_report_carries_emitter_client_identity() {
+        let client_id = ClientId::from("TEST-CLIENT");
+        let account_id = AccountId::from("TEST-ACCOUNT");
+        let mut emitter = ExecutionEventEmitter::new(
+            nautilus_core::time::get_atomic_clock_realtime(),
+            TraderId::from("TESTER-001"),
+            client_id,
+            account_id,
+            AccountType::Cash,
+            None,
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(sender);
+        let status = ExecutionMassStatus::new(
+            client_id,
+            account_id,
+            Venue::from("TEST"),
+            UnixNanos::default(),
+            None,
+        );
+
+        emitter.send_execution_report(ExecutionReport::MassStatus(Box::new(status)));
+
+        let ExecutionEvent::Report(authenticated) = receiver.try_recv().unwrap() else {
+            panic!("expected execution report");
+        };
+        assert_eq!(authenticated.source_client_id, client_id);
+        assert!(matches!(
+            authenticated.report,
+            ExecutionReport::MassStatus(_)
+        ));
     }
 }

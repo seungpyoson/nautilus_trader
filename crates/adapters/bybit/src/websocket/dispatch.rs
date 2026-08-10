@@ -1252,6 +1252,20 @@ mod tests {
         },
     };
 
+    fn execution_report(event: &ExecutionEvent) -> Option<&ExecutionReport> {
+        match event {
+            ExecutionEvent::Report(authenticated) => Some(&authenticated.report),
+            _ => None,
+        }
+    }
+
+    fn into_execution_report(event: ExecutionEvent) -> ExecutionReport {
+        match event {
+            ExecutionEvent::Report(authenticated) => authenticated.report,
+            other => panic!("Expected execution report, found {other:?}"),
+        }
+    }
+
     fn sample_fee_rate(
         symbol: &str,
         taker: &str,
@@ -1303,8 +1317,14 @@ mod tests {
         let clock = get_atomic_clock_realtime();
         let trader_id = TraderId::from("TESTER-001");
         let account_id = test_account_id();
-        let mut emitter =
-            ExecutionEventEmitter::new(clock, trader_id, account_id, AccountType::Margin, None);
+        let mut emitter = ExecutionEventEmitter::new(
+            clock,
+            trader_id,
+            nautilus_model::identifiers::ClientId::from("BYBIT"),
+            account_id,
+            AccountType::Margin,
+            None,
+        );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         emitter.set_sender(tx);
         (emitter, rx)
@@ -1511,8 +1531,8 @@ mod tests {
 
         let event = rx.try_recv().unwrap();
         assert!(matches!(
-            event,
-            ExecutionEvent::Report(ExecutionReport::Order(_))
+            execution_report(&event),
+            Some(ExecutionReport::Order(_))
         ));
     }
 
@@ -1697,8 +1717,8 @@ mod tests {
 
         // Second event: FillReport carrying the hedge venue_position_id.
         let event2 = rx.try_recv().unwrap();
-        match event2 {
-            ExecutionEvent::Report(ExecutionReport::Fill(report)) => {
+        match into_execution_report(event2) {
+            ExecutionReport::Fill(report) => {
                 assert_eq!(report.venue_position_id, Some(venue_position_id));
                 assert_eq!(report.client_order_id, Some(cid));
             }
@@ -1728,8 +1748,8 @@ mod tests {
 
         // No OrderAccepted is synthesized for untracked fills.
         let event = rx.try_recv().unwrap();
-        match event {
-            ExecutionEvent::Report(ExecutionReport::Fill(report)) => {
+        match into_execution_report(event) {
+            ExecutionReport::Fill(report) => {
                 assert_eq!(report.client_order_id, None);
                 assert_eq!(report.venue_position_id, None);
                 assert_eq!(report.liquidity_side, LiquiditySide::Maker);
@@ -1764,8 +1784,8 @@ mod tests {
 
         let event = rx.try_recv().unwrap();
         assert!(matches!(
-            event,
-            ExecutionEvent::Report(ExecutionReport::Fill(_))
+            execution_report(&event),
+            Some(ExecutionReport::Fill(_))
         ));
     }
 
@@ -1798,8 +1818,8 @@ mod tests {
         );
 
         let event = rx.try_recv().unwrap();
-        match event {
-            ExecutionEvent::Report(ExecutionReport::Fill(report)) => {
+        match into_execution_report(event) {
+            ExecutionReport::Fill(report) => {
                 assert_eq!(report.client_order_id, None);
                 assert_eq!(
                     report.venue_order_id,

@@ -18,7 +18,7 @@ use nautilus_core::{
     UUID4,
     python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3},
 };
-use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
+use pyo3::{basic::CompareOp, exceptions::PyValueError, prelude::*, types::PyDict};
 
 use crate::{
     identifiers::{AccountId, ClientId, InstrumentId, Venue, VenueOrderId},
@@ -114,8 +114,9 @@ impl ExecutionMassStatus {
 
     /// Add order reports to the mass status.
     #[pyo3(name = "add_order_reports")]
-    fn py_add_order_reports(&mut self, reports: Vec<OrderStatusReport>) {
-        self.add_order_reports(reports);
+    fn py_add_order_reports(&mut self, reports: Vec<OrderStatusReport>) -> PyResult<()> {
+        self.add_order_reports(reports)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     /// Add fill reports to the mass status.

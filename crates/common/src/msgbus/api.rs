@@ -68,7 +68,7 @@ use super::{
 };
 use crate::messages::{
     data::{DataCommand, DataResponse},
-    execution::{ExecutionReport, TradingCommand},
+    execution::{AuthenticatedExecutionReport, TradingCommand},
 };
 
 /// Registers a handler for an endpoint using runtime type dispatch (Any).
@@ -184,7 +184,7 @@ pub fn register_data_response_endpoint(
 /// Registers an execution report handler at an endpoint (ownership-based).
 pub fn register_execution_report_endpoint(
     endpoint: MStr<Endpoint>,
-    handler: TypedIntoHandler<ExecutionReport>,
+    handler: TypedIntoHandler<AuthenticatedExecutionReport>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -1478,7 +1478,7 @@ pub fn send_data_response(endpoint: MStr<Endpoint>, response: DataResponse) {
 }
 
 /// Sends an execution report to an endpoint handler, transferring ownership.
-pub fn send_execution_report(endpoint: MStr<Endpoint>, report: ExecutionReport) {
+pub fn send_execution_report(endpoint: MStr<Endpoint>, report: AuthenticatedExecutionReport) {
     send_endpoint_owned(
         endpoint,
         report,
@@ -3573,13 +3573,16 @@ mod tests {
             reports::ExecutionMassStatus,
         };
 
-        use crate::{messages::execution::ExecutionReport, msgbus::switchboard::get_trades_topic};
+        use crate::{
+            messages::execution::{AuthenticatedExecutionReport, ExecutionReport},
+            msgbus::switchboard::get_trades_topic,
+        };
 
         let _msgbus = get_message_bus();
         let topic_retrieved = Rc::new(RefCell::new(false));
         let topic_clone = topic_retrieved.clone();
 
-        let handler = TypedIntoHandler::from(move |_report: ExecutionReport| {
+        let handler = TypedIntoHandler::from(move |_report: AuthenticatedExecutionReport| {
             let _topic = get_trades_topic(InstrumentId::from("TEST.VENUE"));
             *topic_clone.borrow_mut() = true;
         });
@@ -3594,7 +3597,14 @@ mod tests {
             0.into(),
             None,
         )));
-        send_execution_report(endpoint, report);
+        send_execution_report(
+            endpoint,
+            AuthenticatedExecutionReport::new(
+                ClientId::new("SIM"),
+                crate::messages::ExecutionSourceId::new(),
+                report,
+            ),
+        );
 
         assert!(*topic_retrieved.borrow());
     }

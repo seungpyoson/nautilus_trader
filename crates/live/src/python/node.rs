@@ -3223,9 +3223,8 @@ class ClaimsStrategy(Strategy):
             );
         }
 
-        let result = node
-            .exec_manager_mut()
-            .claim_external_orders(instrument_id, StrategyId::from("OTHER-001"));
+        let result =
+            node.register_external_order_claims(StrategyId::from("OTHER-001"), &[instrument_id]);
 
         assert!(result.is_err());
         assert!(
@@ -3458,7 +3457,6 @@ class ClaimsStrategy(Strategy):
         });
 
         let strategy_ids = node.kernel().trader.borrow().strategy_ids();
-        let manager_claim = node.exec_manager().get_external_order_claim(&instrument_id);
         let engine_claim = node
             .kernel()
             .exec_engine
@@ -3472,7 +3470,6 @@ class ClaimsStrategy(Strategy):
         );
         assert!(!conflicting_strategy_registered);
         assert_eq!(strategy_ids, vec![first_strategy_id]);
-        assert_eq!(manager_claim, Some(first_strategy_id));
         assert_eq!(engine_claim, Some(first_strategy_id));
     }
 

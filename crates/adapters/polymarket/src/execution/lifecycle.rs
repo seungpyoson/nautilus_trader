@@ -29,6 +29,7 @@ use nautilus_common::{
     msgbus::{self, TypedHandler},
 };
 use nautilus_core::{MUTEX_POISONED, collections::AtomicMap, time::AtomicTime};
+use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     events::{OrderEventAny, OrderFilled, PositionEvent},
     identifiers::InstrumentId,
@@ -40,7 +41,10 @@ use ustr::Ustr;
 
 use super::PolymarketExecutionClient;
 use crate::{
-    execution::{identity::OrderIdentity, reports::fetch_and_emit_account_state},
+    execution::{
+        identity::OrderIdentity, order_fill_tracker::OrderFillTrackerMap,
+        reports::fetch_and_emit_account_state,
+    },
     http::{clob::HeartbeatResponse, error::Error as HttpError},
     websocket::{
         dispatch::{WsDispatchContext, WsDispatchState, dispatch_user_message},
@@ -113,10 +117,13 @@ impl PolymarketExecutionClient {
         let clock = self.clock;
         let shared_token_instruments = self.shared_token_instruments.clone();
         let neg_risk_index = self.neg_risk_index.clone();
+        let fill_tracker = self.fill_tracker.clone();
         let handler = TypedHandler::from(move |event: &OrderEventAny| {
             if !is_terminal_order_event(event) || event.instrument_id().venue != core.venue {
                 return;
             }
+
+            sync_fill_tracker_for_order_event(&core, &fill_tracker, event);
 
             sync_execution_lookup_for_instrument(
                 &core,
@@ -411,29 +418,22 @@ impl PolymarketExecutionClient {
         drop(cache);
 
         let mut matched_fills: AHashMap<String, Vec<OrderFilled>> = AHashMap::new();
+        let mut confirmed_trades = AHashMap::new();
         let mut voided_trades = AHashSet::new();
 
         for order in &orders {
-            let Some(venue_order_id) = order.venue_order_id() else {
-                continue;
-            };
-
-            self.order_identities
-                .register_order_identity(venue_order_id, OrderIdentity::from_order(order));
-            self.order_identities.mark_accepted(venue_order_id);
-            self.fill_tracker.restore_order(
-                venue_order_id,
-                order.quantity(),
-                order.filled_qty(),
-                order.order_side(),
-            );
-
             for event in order.events() {
                 match event {
                     OrderEventAny::Filled(fill) => {
                         if let Some(key) = polymarket_trade_key(fill.info.as_ref()) {
                             matched_fills.entry(key).or_default().push(fill.clone());
                         }
+                    }
+                    OrderEventAny::FillConfirmed(confirmed) => {
+                        confirmed_trades.insert(
+                            confirmed.confirmation_id.to_string(),
+                            confirmed.settlement_id.to_string(),
+                        );
                     }
                     OrderEventAny::FillVoided(voided) => {
                         if let Some(key) = polymarket_trade_key(voided.info.as_ref()) {
@@ -443,18 +443,40 @@ impl PolymarketExecutionClient {
                     _ => {}
                 }
             }
+
+            if order.is_open()
+                && let Some(venue_order_id) = order.venue_order_id()
+            {
+                self.order_identities
+                    .register_order_identity(venue_order_id, OrderIdentity::from_order(order));
+                self.order_identities.mark_accepted(venue_order_id);
+                self.fill_tracker.restore_order(
+                    venue_order_id,
+                    order.quantity(),
+                    order.filled_qty(),
+                    order.order_side(),
+                );
+            }
         }
 
-        let mut state = self.ws_dispatch_state.lock().expect(MUTEX_POISONED);
-
         for (key, fills) in matched_fills {
-            if !voided_trades.contains(&key) {
-                state.restore_matched_trade(key, fills);
+            if voided_trades.remove(&key) {
+                self.fill_tracker.restore_voided_trade(key, fills);
+            } else if let Some(venue_trade_id) = confirmed_trades.remove(&key) {
+                self.fill_tracker
+                    .restore_confirmed_trade(key, venue_trade_id, fills);
+            } else {
+                self.fill_tracker.restore_matched_trade(key, fills);
             }
         }
 
         for key in voided_trades {
-            state.restore_voided_trade(key);
+            self.fill_tracker.restore_voided_trade(key, Vec::new());
+        }
+
+        for (key, venue_trade_id) in confirmed_trades {
+            self.fill_tracker
+                .restore_confirmed_trade(key, venue_trade_id, Vec::new());
         }
 
         log::debug!("Loaded {} order lifecycles from cache", orders.len());
@@ -508,6 +530,7 @@ impl PolymarketExecutionClient {
         self.clear_position_event_subscription();
         self.shared_token_instruments.store(AHashMap::new());
         self.neg_risk_index.store(AHashMap::new());
+        self.fill_tracker.reset();
         *self.ws_dispatch_state.lock().expect(MUTEX_POISONED) = WsDispatchState::default();
     }
 
@@ -807,6 +830,35 @@ fn is_terminal_order_event(event: &OrderEventAny) -> bool {
     )
 }
 
+fn sync_fill_tracker_for_order_event(
+    core: &ExecutionClientCore,
+    fill_tracker: &OrderFillTrackerMap,
+    event: &OrderEventAny,
+) {
+    let Some(venue_order_id) = event.venue_order_id() else {
+        return;
+    };
+    let order_state = {
+        let cache = core.cache();
+        cache.order(&event.client_order_id()).map(|order| {
+            (
+                order.is_open(),
+                order.quantity(),
+                order.filled_qty(),
+                order.order_side(),
+            )
+        })
+    };
+
+    match order_state {
+        Some((true, quantity, filled_qty, side)) if !fill_tracker.contains(&venue_order_id) => {
+            fill_tracker.restore_order(venue_order_id, quantity, filled_qty, side);
+        }
+        Some((false, ..)) | None => fill_tracker.retire_order(venue_order_id),
+        Some((true, ..)) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, rc::Rc};
@@ -814,6 +866,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use nautilus_common::{
         cache::Cache,
+        clients::ExecutionClient,
         live::runner::set_exec_event_sender,
         msgbus::{publish_order_event, publish_position_event},
     };
@@ -821,7 +874,10 @@ mod tests {
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
         enums::{AccountType, OmsType, OrderSide, OrderStatus, PositionSide, TimeInForce},
-        events::{OrderEventAny, PositionClosed, PositionEvent, order::spec::OrderFillVoidedSpec},
+        events::{
+            OrderEventAny, OrderFillConfirmed, OrderFilled, PositionClosed, PositionEvent,
+            order::spec::OrderFillVoidedSpec,
+        },
         identifiers::{
             AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId,
             TraderId, VenueOrderId,
@@ -1025,6 +1081,39 @@ mod tests {
         cache.update_order(&accepted).unwrap()
     }
 
+    fn cached_polymarket_fill(
+        order: &OrderAny,
+        instrument: &InstrumentAny,
+        trade_id: &str,
+        venue_order_id: VenueOrderId,
+    ) -> OrderFilled {
+        let mut fill = match TestOrderEventStubs::filled(
+            order,
+            instrument,
+            None,
+            None,
+            Some(ModelPrice::from("0.5000")),
+            None,
+            None,
+            None,
+            None,
+            Some(AccountId::from("POLYMARKET-001")),
+        ) {
+            OrderEventAny::Filled(fill) => fill,
+            other => panic!("expected filled event, was {other:?}"),
+        };
+        fill.trade_id = TradeId::from(trade_id);
+        fill.venue_order_id = venue_order_id;
+        fill.info = Some(IndexMap::from([
+            (Ustr::from("id"), Ustr::from(trade_id)),
+            (
+                Ustr::from("taker_order_id"),
+                Ustr::from(venue_order_id.as_str()),
+            ),
+        ]));
+        fill
+    }
+
     fn open_position(instrument: &InstrumentAny) -> Position {
         let order = open_limit_order(instrument.id());
         let filled = match TestOrderEventStubs::filled(
@@ -1116,7 +1205,7 @@ mod tests {
     }
 
     #[rstest]
-    fn load_orders_from_cache_restores_failed_trade_correction_state() {
+    fn load_orders_from_cache_does_not_restore_closed_order_state() {
         let (client, cache) = test_client();
         let instrument = test_binary_option("0xRESTART", false, false);
         let venue_order_id = VenueOrderId::from("V-001");
@@ -1177,23 +1266,117 @@ mod tests {
 
         client.load_orders_from_cache();
 
-        let key = "trade-restart-V-001";
-        let identity = client
-            .order_identities
-            .get(&venue_order_id)
-            .expect("order identity restored");
-        let state = client.ws_dispatch_state.lock().expect(MUTEX_POISONED);
-
-        assert_eq!(identity.client_order_id, order.client_order_id());
-        assert!(!client.order_identities.mark_accepted(venue_order_id));
+        assert_eq!(order.status(), OrderStatus::Voided);
+        assert!(client.order_identities.get(&venue_order_id).is_none());
+        assert!(!client.fill_tracker.contains(&venue_order_id));
         assert_eq!(
             client.fill_tracker.get_cumulative_filled(&venue_order_id),
-            Some(order.filled_qty())
+            None
         );
-        assert_eq!(order.status(), OrderStatus::Voided);
-        assert!(state.processed_fills.contains(&key.to_string()));
-        assert_eq!(state.matched_fill_count(key), 0);
-        assert!(state.is_voided_trade(key));
+        assert!(
+            client
+                .fill_tracker
+                .is_trade_processed("trade-restart-V-001")
+        );
+        assert!(client.fill_tracker.is_voided_trade("trade-restart-V-001"));
+    }
+
+    #[rstest]
+    fn load_orders_from_cache_restores_closed_pending_fill_as_correctable() {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xRESTART-PENDING", false, false);
+        let venue_order_id = VenueOrderId::from("V-001");
+
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        let order = cache_accepted_open_order(&mut cache.borrow_mut(), instrument.id());
+        let fill = cached_polymarket_fill(&order, &instrument, "trade-pending", venue_order_id);
+        cache
+            .borrow_mut()
+            .update_order(&OrderEventAny::Filled(fill))
+            .unwrap();
+
+        client.load_orders_from_cache();
+
+        let key = "trade-pending-V-001";
+        assert!(client.fill_tracker.is_trade_processed(key));
+        assert!(!client.fill_tracker.is_trade_confirmed(key));
+        assert!(!client.fill_tracker.is_voided_trade(key));
+        assert!(client.order_identities.get(&venue_order_id).is_none());
+        assert!(!client.fill_tracker.contains(&venue_order_id));
+    }
+
+    #[rstest]
+    fn load_orders_from_cache_restores_closed_confirmed_fill_as_settled() {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xRESTART-CONFIRMED", false, false);
+        let venue_order_id = VenueOrderId::from("V-001");
+
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        let order = cache_accepted_open_order(&mut cache.borrow_mut(), instrument.id());
+        let fill = cached_polymarket_fill(&order, &instrument, "trade-confirmed", venue_order_id);
+        cache
+            .borrow_mut()
+            .update_order(&OrderEventAny::Filled(fill.clone()))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .update_order(&OrderEventAny::FillConfirmed(OrderFillConfirmed::new(
+                &fill,
+                Ustr::from("trade-confirmed-V-001"),
+                Ustr::from("trade-confirmed"),
+                UUID4::new(),
+                UnixNanos::from(2),
+                UnixNanos::from(3),
+            )))
+            .unwrap();
+
+        client.load_orders_from_cache();
+
+        let key = "trade-confirmed-V-001";
+        assert!(client.fill_tracker.is_trade_processed(key));
+        assert!(client.fill_tracker.is_trade_confirmed(key));
+        assert!(client.order_identities.get(&venue_order_id).is_none());
+        assert!(!client.fill_tracker.contains(&venue_order_id));
+    }
+
+    #[rstest]
+    fn register_external_order_installs_canonical_ws_tracking_identity() {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xEXTERNAL", false, false);
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        let order = open_limit_order(instrument.id());
+        let venue_order_id = VenueOrderId::from("V-RECONCILED-EXTERNAL");
+        assert!(order.venue_order_id().is_none());
+
+        assert!(!client.fill_tracker.contains(&venue_order_id));
+        assert!(client.order_identities.get(&venue_order_id).is_none());
+
+        ExecutionClient::register_external_order(
+            &client,
+            &order,
+            venue_order_id,
+            UnixNanos::default(),
+        );
+
+        let identity = client.order_identities.get(&venue_order_id).unwrap();
+        assert_eq!(identity.client_order_id, order.client_order_id());
+        assert_eq!(identity.instrument_id, order.instrument_id());
+        assert_eq!(identity.order_side, order.order_side());
+        assert_eq!(identity.quantity, order.quantity());
+        assert!(client.fill_tracker.contains(&venue_order_id));
+        assert_eq!(
+            client.fill_tracker.get_cumulative_filled(&venue_order_id),
+            Some(order.filled_qty()),
+        );
     }
 
     #[rstest]
@@ -1323,6 +1506,13 @@ mod tests {
             cache.add_instrument(expired.clone()).unwrap();
             order = cache_accepted_open_order(&mut cache, expired.id());
         }
+        client.fill_tracker.restore_order(
+            order.venue_order_id().expect("accepted order venue ID"),
+            order.quantity(),
+            order.filled_qty(),
+            order.order_side(),
+        );
+        assert!(client.fill_tracker.contains(&VenueOrderId::from("V-001")));
 
         sync_execution_lookup_for_instrument(
             &client.core,
@@ -1354,6 +1544,12 @@ mod tests {
                 .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
         );
         assert!(!client.neg_risk_index.contains_key(&expired.id()));
+        assert!(!client.fill_tracker.contains(&VenueOrderId::from("V-001")));
+        assert!(
+            client
+                .fill_tracker
+                .has_fills_or_settled(&VenueOrderId::from("V-001"))
+        );
     }
 
     #[rstest]
@@ -1368,6 +1564,12 @@ mod tests {
             cache.add_instrument(expired.clone()).unwrap();
             order = cache_accepted_open_order(&mut cache, expired.id());
         }
+        client.fill_tracker.restore_order(
+            order.venue_order_id().expect("accepted order venue ID"),
+            order.quantity(),
+            order.filled_qty(),
+            order.order_side(),
+        );
 
         sync_execution_lookup_for_instrument(
             &client.core,
@@ -1411,6 +1613,7 @@ mod tests {
                 .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
         );
         assert!(client.neg_risk_index.contains_key(&expired.id()));
+        assert!(!client.fill_tracker.contains(&VenueOrderId::from("V-001")));
     }
 
     #[rstest]
@@ -1467,11 +1670,8 @@ mod tests {
         client.ensure_order_event_subscription();
         client.ensure_position_event_subscription();
         client
-            .ws_dispatch_state
-            .lock()
-            .expect(MUTEX_POISONED)
-            .processed_fills
-            .add("trade-1".to_string());
+            .fill_tracker
+            .restore_voided_trade("trade-1".to_string(), Vec::new());
 
         client.reset_client();
 
@@ -1483,14 +1683,7 @@ mod tests {
                 .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
         );
         assert!(!client.neg_risk_index.contains_key(&expired.id()));
-        assert!(
-            !client
-                .ws_dispatch_state
-                .lock()
-                .expect(MUTEX_POISONED)
-                .processed_fills
-                .contains(&"trade-1".to_string())
-        );
+        assert!(!client.fill_tracker.is_trade_processed("trade-1"));
     }
 
     #[rstest]
@@ -1499,21 +1692,11 @@ mod tests {
         let dedup_key = "trade-reconnect".to_string();
         client.start_client();
         client
-            .ws_dispatch_state
-            .lock()
-            .expect(MUTEX_POISONED)
-            .processed_fills
-            .add(dedup_key.clone());
+            .fill_tracker
+            .restore_voided_trade(dedup_key.clone(), Vec::new());
 
         client.stop_client();
 
-        assert!(
-            client
-                .ws_dispatch_state
-                .lock()
-                .expect(MUTEX_POISONED)
-                .processed_fills
-                .contains(&dedup_key)
-        );
+        assert!(client.fill_tracker.is_trade_processed(&dedup_key));
     }
 }

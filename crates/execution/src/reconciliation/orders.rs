@@ -269,6 +269,22 @@ fn prepare_reconciliation_order(
         events.push(accepted);
     }
 
+    if report.ts_triggered.is_some()
+        && report.order_status != OrderStatus::Triggered
+        && TRIGGERABLE_ORDER_TYPES.contains(&working.order_type())
+        && working.status() != OrderStatus::Triggered
+    {
+        let triggered = create_reconciliation_triggered(&working, report, ts_now);
+        if let Err(e) = working.apply(triggered.clone()) {
+            log::warn!(
+                "Failed to pre-apply reconciliation trigger for {}: {e}",
+                order.client_order_id(),
+            );
+        } else {
+            events.push(triggered);
+        }
+    }
+
     if report_is_confirmed_state(report)
         && (local_accepts_amendment(&working)
             || (matches!(

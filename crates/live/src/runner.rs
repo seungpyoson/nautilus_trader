@@ -31,13 +31,9 @@
 //! - **Data events**: market data from adapters to the data engine.
 //! - **Data commands**: subscribe/unsubscribe requests to data clients.
 //!
-//! Both `AsyncRunner::run` and `LiveNode::run` use a `biased;` select with
-//! exec branches polled ahead of data branches, so a strategy action
-//! (cancel, submit) is not delayed behind a market-data backlog when the
-//! select polls receivers each iteration. The two loops use slightly
-//! different cmd/evt sub-orders because `LiveNode::run` also folds in the
-//! maintenance timer and signal handling that `AsyncRunner::run` does not
-//! see; check each `select!` block for the exact order at that site.
+//! Runtime channel arbitration is fair: no continuously-ready channel can
+//! starve account, order, fill, command, data, or shutdown traffic. FIFO order
+//! remains the responsibility of each individual channel.
 //!
 //! The runner can drive the event loop in two ways:
 //!
@@ -66,7 +62,8 @@ use std::{fmt::Debug, sync::Arc};
 use nautilus_common::{
     live::runner::{replace_data_event_sender, replace_exec_event_sender},
     messages::{
-        DataEvent, ExecutionEvent, ExecutionReport, data::DataCommand, execution::TradingCommand,
+        AuthenticatedExecutionReport, DataEvent, ExecutionEvent, data::DataCommand,
+        execution::TradingCommand,
     },
     msgbus::{self, MessagingSwitchboard},
     runner::{
@@ -157,7 +154,6 @@ pub struct AsyncRunnerChannels {
     pub data_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
 }
 
-#[cfg(feature = "node")]
 #[allow(
     clippy::large_enum_variant,
     reason = "runner events are consumed immediately; boxing would add routing allocations"
@@ -209,6 +205,27 @@ impl Debug for AsyncRunner {
 }
 
 impl AsyncRunner {
+    async fn recv_event(channels: &mut AsyncRunnerChannels) -> Option<PendingRunnerEvent> {
+        tokio::select! {
+            Some(message) = channels.time_evt_rx.recv() => {
+                Some(PendingRunnerEvent::Time(message))
+            }
+            Some(event) = channels.exec_evt_rx.recv() => {
+                Some(PendingRunnerEvent::ExecEvent(event))
+            }
+            Some(command) = channels.exec_cmd_rx.recv() => {
+                Some(PendingRunnerEvent::ExecCommand(command))
+            }
+            Some(event) = channels.data_evt_rx.recv() => {
+                Some(PendingRunnerEvent::DataEvent(event))
+            }
+            Some(command) = channels.data_cmd_rx.recv() => {
+                Some(PendingRunnerEvent::DataCommand(command))
+            }
+            else => None,
+        }
+    }
+
     /// Creates a new [`AsyncRunner`] instance.
     ///
     /// Creates channels but does not bind senders to thread-local storage.
@@ -335,31 +352,35 @@ impl AsyncRunner {
         log::info!("AsyncRunner starting");
 
         loop {
+            let signal_rx = &mut self.signal_rx;
+            let channels = &mut self.channels;
             tokio::select! {
-                biased;
-
-                Some(()) = self.signal_rx.recv() => {
+                Some(()) = signal_rx.recv() => {
                     log::info!("AsyncRunner received signal, shutting down");
                     return;
                 },
-                Some(handler) = self.channels.time_evt_rx.recv() => {
-                    let _ = Self::handle_time_event(handler);
-                },
-                Some(cmd) = self.channels.exec_cmd_rx.recv() => {
-                    Self::handle_trading_command(cmd);
-                },
-                Some(evt) = self.channels.exec_evt_rx.recv() => {
-                    Self::handle_exec_event(evt);
-                },
-                Some(cmd) = self.channels.data_cmd_rx.recv() => {
-                    Self::handle_data_command(cmd);
-                },
-                Some(evt) = self.channels.data_evt_rx.recv() => {
-                    Self::handle_data_event(evt);
-                },
-                else => {
-                    log::debug!("AsyncRunner all channels closed, exiting");
-                    return;
+                event = Self::recv_event(channels) => {
+                    match event {
+                        Some(PendingRunnerEvent::Time(message)) => {
+                            let _ = Self::handle_time_event(message);
+                        }
+                        Some(PendingRunnerEvent::ExecEvent(event)) => {
+                            Self::handle_exec_event(event);
+                        }
+                        Some(PendingRunnerEvent::ExecCommand(command)) => {
+                            Self::handle_trading_command(command);
+                        }
+                        Some(PendingRunnerEvent::DataEvent(event)) => {
+                            Self::handle_data_event(event);
+                        }
+                        Some(PendingRunnerEvent::DataCommand(command)) => {
+                            Self::handle_data_command(command);
+                        }
+                        None => {
+                            log::debug!("AsyncRunner all channels closed, exiting");
+                            return;
+                        }
+                    }
                 }
             };
         }
@@ -466,7 +487,7 @@ impl AsyncRunner {
     }
 
     #[inline]
-    pub fn handle_exec_report(report: ExecutionReport) {
+    pub fn handle_exec_report(report: AuthenticatedExecutionReport) {
         let endpoint = MessagingSwitchboard::exec_engine_reconcile_execution_report();
         msgbus::send_execution_report(endpoint, report);
     }
@@ -519,26 +540,7 @@ impl AsyncRunner {
     }
 
     pub(crate) async fn recv(&mut self) -> Option<PendingRunnerEvent> {
-        tokio::select! {
-            biased;
-
-            Some(message) = self.channels.time_evt_rx.recv() => {
-                Some(PendingRunnerEvent::Time(message))
-            }
-            Some(event) = self.channels.exec_evt_rx.recv() => {
-                Some(PendingRunnerEvent::ExecEvent(event))
-            }
-            Some(command) = self.channels.exec_cmd_rx.recv() => {
-                Some(PendingRunnerEvent::ExecCommand(command))
-            }
-            Some(event) = self.channels.data_evt_rx.recv() => {
-                Some(PendingRunnerEvent::DataEvent(event))
-            }
-            Some(command) = self.channels.data_cmd_rx.recv() => {
-                Some(PendingRunnerEvent::DataCommand(command))
-            }
-            else => None,
-        }
+        Self::recv_event(&mut self.channels).await
     }
 }
 
@@ -572,7 +574,7 @@ mod tests {
         clock::TestClock,
         live::runner::{get_data_event_sender, get_exec_event_sender},
         messages::{
-            ExecutionEvent, ExecutionReport,
+            ExecutionEvent, ExecutionReport, ExecutionSourceId,
             data::{SubscribeCommand, SubscribeCustomData},
             execution::{CancelAllOrders, TradingCommand},
         },
@@ -750,6 +752,85 @@ mod tests {
         assert_eq!(first, 5);
         assert_eq!(second, 1);
         assert_eq!(processed_by_channel, [1, 1, 1, 2, 1]);
+    }
+
+    #[cfg(feature = "node")]
+    #[tokio::test]
+    async fn test_runtime_arbitration_does_not_starve_ready_execution_channel() {
+        let (_time_evt_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let send_event = || {
+            exec_evt_tx
+                .send(ExecutionEvent::Order(OrderEventAny::Submitted(
+                    OrderSubmittedSpec::builder()
+                        .client_order_id(ClientOrderId::from("O-FAIR-001"))
+                        .build(),
+                )))
+                .unwrap();
+        };
+        let send_command = || {
+            exec_cmd_tx
+                .send(TradingCommandMessage::new(
+                    MessagingSwitchboard::exec_engine_execute(),
+                    TradingCommand::CancelAllOrders(CancelAllOrders::new(
+                        TraderId::from("TRADER-001"),
+                        None,
+                        StrategyId::from("S-FAIR-001"),
+                        InstrumentId::from("EUR/USD.SIM"),
+                        OrderSide::Buy,
+                        UUID4::new(),
+                        UnixNanos::default(),
+                        None,
+                        None,
+                    )),
+                ))
+                .unwrap();
+        };
+
+        send_event();
+        send_command();
+
+        let mut runner = create_test_runner(
+            time_evt_rx,
+            data_evt_rx,
+            data_cmd_rx,
+            exec_evt_rx,
+            exec_cmd_rx,
+            signal_rx,
+            signal_tx,
+        );
+        let mut saw_event = false;
+        let mut saw_command = false;
+
+        for _ in 0..128 {
+            match runner.recv().await.unwrap() {
+                PendingRunnerEvent::ExecEvent(_) => {
+                    saw_event = true;
+                    if !saw_command {
+                        send_event();
+                    }
+                }
+                PendingRunnerEvent::ExecCommand(_) => {
+                    saw_command = true;
+                    if !saw_event {
+                        send_command();
+                    }
+                }
+                _ => panic!("unexpected channel selected"),
+            }
+
+            if saw_event && saw_command {
+                break;
+            }
+        }
+
+        assert!(saw_event, "execution events were starved by commands");
+        assert!(saw_command, "execution commands were starved by events");
     }
 
     #[rstest]
@@ -1310,19 +1391,22 @@ mod tests {
             None,
         );
 
-        tx.send(ExecutionEvent::Report(ExecutionReport::Order(Box::new(
-            report,
-        ))))
+        tx.send(ExecutionEvent::report(
+            ClientId::from("SIM"),
+            ExecutionSourceId::new(),
+            ExecutionReport::Order(Box::new(report)),
+        ))
         .unwrap();
 
         let received = rx.recv().await.unwrap();
-        match received {
-            ExecutionEvent::Report(ExecutionReport::Order(r)) => {
-                assert_eq!(r.venue_order_id.as_str(), "V-001");
-                assert_eq!(r.order_status, OrderStatus::Accepted);
-            }
-            _ => panic!("Expected OrderStatusReport"),
-        }
+        let ExecutionEvent::Report(report) = received else {
+            panic!("Expected execution report");
+        };
+        let ExecutionReport::Order(report) = report.report else {
+            panic!("Expected order status report");
+        };
+        assert_eq!(report.venue_order_id.as_str(), "V-001");
+        assert_eq!(report.order_status, OrderStatus::Accepted);
     }
 
     #[tokio::test]
@@ -1346,19 +1430,22 @@ mod tests {
             None,
         );
 
-        tx.send(ExecutionEvent::Report(ExecutionReport::Fill(Box::new(
-            report,
-        ))))
+        tx.send(ExecutionEvent::report(
+            ClientId::from("SIM"),
+            ExecutionSourceId::new(),
+            ExecutionReport::Fill(Box::new(report)),
+        ))
         .unwrap();
 
         let received = rx.recv().await.unwrap();
-        match received {
-            ExecutionEvent::Report(ExecutionReport::Fill(r)) => {
-                assert_eq!(r.venue_order_id.as_str(), "V-001");
-                assert_eq!(r.trade_id.to_string(), "T-001");
-            }
-            _ => panic!("Expected FillReport"),
-        }
+        let ExecutionEvent::Report(report) = received else {
+            panic!("Expected execution report");
+        };
+        let ExecutionReport::Fill(report) = report.report else {
+            panic!("Expected fill report");
+        };
+        assert_eq!(report.venue_order_id.as_str(), "V-001");
+        assert_eq!(report.trade_id.to_string(), "T-001");
     }
 
     #[tokio::test]
@@ -1377,18 +1464,21 @@ mod tests {
             None,
         );
 
-        tx.send(ExecutionEvent::Report(ExecutionReport::Position(Box::new(
-            report,
-        ))))
+        tx.send(ExecutionEvent::report(
+            ClientId::from("SIM"),
+            ExecutionSourceId::new(),
+            ExecutionReport::Position(Box::new(report)),
+        ))
         .unwrap();
 
         let received = rx.recv().await.unwrap();
-        match received {
-            ExecutionEvent::Report(ExecutionReport::Position(r)) => {
-                assert_eq!(r.venue_position_id.unwrap().as_str(), "P-001");
-            }
-            _ => panic!("Expected PositionStatusReport"),
-        }
+        let ExecutionEvent::Report(report) = received else {
+            panic!("Expected execution report");
+        };
+        let ExecutionReport::Position(report) = report.report else {
+            panic!("Expected position status report");
+        };
+        assert_eq!(report.venue_position_id.unwrap().as_str(), "P-001");
     }
 
     #[tokio::test]
@@ -1528,9 +1618,11 @@ mod tests {
             None,
         );
         exec_evt_tx
-            .send(ExecutionEvent::Report(ExecutionReport::Order(Box::new(
-                order_status,
-            ))))
+            .send(ExecutionEvent::report(
+                ClientId::from("SIM"),
+                ExecutionSourceId::new(),
+                ExecutionReport::Order(Box::new(order_status)),
+            ))
             .unwrap();
 
         // Send execution report (Fill)
@@ -1551,9 +1643,11 @@ mod tests {
             None,
         );
         exec_evt_tx
-            .send(ExecutionEvent::Report(ExecutionReport::Fill(Box::new(
-                fill,
-            ))))
+            .send(ExecutionEvent::report(
+                ClientId::from("SIM"),
+                ExecutionSourceId::new(),
+                ExecutionReport::Fill(Box::new(fill)),
+            ))
             .unwrap();
 
         // Send execution report (Position)
@@ -1569,9 +1663,11 @@ mod tests {
             None,
         );
         exec_evt_tx
-            .send(ExecutionEvent::Report(ExecutionReport::Position(Box::new(
-                position,
-            ))))
+            .send(ExecutionEvent::report(
+                ClientId::from("SIM"),
+                ExecutionSourceId::new(),
+                ExecutionReport::Position(Box::new(position)),
+            ))
             .unwrap();
 
         // Send account event

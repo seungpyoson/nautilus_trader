@@ -1175,6 +1175,35 @@ where
     }
 }
 
+fn execution_report(event: &ExecutionEvent) -> Option<&ExecutionReport> {
+    match event {
+        ExecutionEvent::Report(authenticated) => Some(&authenticated.report),
+        _ => None,
+    }
+}
+
+fn into_execution_report(event: ExecutionEvent) -> ExecutionReport {
+    match event {
+        ExecutionEvent::Report(authenticated) => authenticated.report,
+        other => panic!("expected execution report, was {other:?}"),
+    }
+}
+
+fn is_order_report(event: &ExecutionEvent) -> bool {
+    matches!(execution_report(event), Some(ExecutionReport::Order(_)))
+}
+
+fn is_fill_report(event: &ExecutionEvent) -> bool {
+    matches!(execution_report(event), Some(ExecutionReport::Fill(_)))
+}
+
+fn is_mass_status_report(event: &ExecutionEvent) -> bool {
+    matches!(
+        execution_report(event),
+        Some(ExecutionReport::MassStatus(_))
+    )
+}
+
 fn build_limit_order(
     instrument_id: InstrumentId,
     client_order_id: ClientOrderId,
@@ -1396,22 +1425,16 @@ async fn test_exec_client_reconnect_refreshes_account_and_submits_mass_status() 
     tc.client.connect().await.expect("connect succeeds");
     let event = drain_until(
         &mut tc.rx,
-        |event| {
-            matches!(
-                event,
-                ExecutionEvent::Report(ExecutionReport::MassStatus(_))
-            )
-        },
+        is_mass_status_report,
         "post-reconnect mass status",
     )
     .await;
 
-    if let ExecutionEvent::Report(ExecutionReport::MassStatus(status)) = event {
-        assert_eq!(status.client_id, ClientId::from("DERIVE"));
-        assert_eq!(status.account_id, AccountId::from("DERIVE-001"));
-    } else {
+    let ExecutionReport::MassStatus(status) = into_execution_report(event) else {
         unreachable!();
-    }
+    };
+    assert_eq!(status.client_id, ClientId::from("DERIVE"));
+    assert_eq!(status.account_id, AccountId::from("DERIVE-001"));
     assert!(rest_state.get_subaccount_calls.lock().await.len() >= 2);
     assert!(!rest_state.open_orders_calls.lock().await.is_empty());
     assert!(!rest_state.trigger_orders_calls.lock().await.is_empty());
@@ -4324,18 +4347,12 @@ async fn test_query_order_emits_order_status_report() {
     );
     tc.client.query_order(cmd).expect("query_order Ok");
 
-    let event = drain_until(
-        &mut tc.rx,
-        |event| matches!(event, ExecutionEvent::Report(ExecutionReport::Order(_))),
-        "OrderStatusReport event",
-    )
-    .await;
+    let event = drain_until(&mut tc.rx, is_order_report, "OrderStatusReport event").await;
 
-    if let ExecutionEvent::Report(ExecutionReport::Order(report)) = event {
-        assert_eq!(report.venue_order_id.as_str(), "ord-mock-1");
-    } else {
+    let ExecutionReport::Order(report) = into_execution_report(event) else {
         unreachable!();
-    }
+    };
+    assert_eq!(report.venue_order_id.as_str(), "ord-mock-1");
 
     tc.client.disconnect().await.expect("disconnect");
 }
@@ -5464,18 +5481,12 @@ async fn test_ws_orders_notification_emits_order_status_report() {
     let frame = make_subscription_frame(&channel, &data);
     ws_state.push_notification(frame);
 
-    let event = drain_until(
-        &mut tc.rx,
-        |e| matches!(e, ExecutionEvent::Report(ExecutionReport::Order(_))),
-        "OrderStatusReport from WS",
-    )
-    .await;
+    let event = drain_until(&mut tc.rx, is_order_report, "OrderStatusReport from WS").await;
 
-    if let ExecutionEvent::Report(ExecutionReport::Order(report)) = event {
-        assert_eq!(report.venue_order_id.as_str(), "ord-mock-1");
-    } else {
+    let ExecutionReport::Order(report) = into_execution_report(event) else {
         unreachable!();
-    }
+    };
+    assert_eq!(report.venue_order_id.as_str(), "ord-mock-1");
 
     tc.client.disconnect().await.expect("disconnect");
 }
@@ -5508,19 +5519,13 @@ async fn test_ws_trades_notification_emits_fill_report() {
     let frame = make_subscription_frame(&channel, &data);
     ws_state.push_notification(frame);
 
-    let event = drain_until(
-        &mut tc.rx,
-        |e| matches!(e, ExecutionEvent::Report(ExecutionReport::Fill(_))),
-        "FillReport from WS",
-    )
-    .await;
+    let event = drain_until(&mut tc.rx, is_fill_report, "FillReport from WS").await;
 
-    if let ExecutionEvent::Report(ExecutionReport::Fill(report)) = event {
-        assert_eq!(report.trade_id.as_str(), "trade-ws-1");
-        assert_eq!(report.venue_order_id.as_str(), "ord-ws-1");
-    } else {
+    let ExecutionReport::Fill(report) = into_execution_report(event) else {
         unreachable!();
-    }
+    };
+    assert_eq!(report.trade_id.as_str(), "trade-ws-1");
+    assert_eq!(report.venue_order_id.as_str(), "ord-ws-1");
 
     tc.client.disconnect().await.expect("disconnect");
 }
@@ -5555,25 +5560,19 @@ async fn test_ws_trades_dedup_suppresses_repeated_trade_id() {
     ws_state.push_notification(make_subscription_frame(&channel, &data));
     ws_state.push_notification(make_subscription_frame(&channel, &data));
 
-    let first = drain_until(
-        &mut tc.rx,
-        |e| matches!(e, ExecutionEvent::Report(ExecutionReport::Fill(_))),
-        "first FillReport from WS",
-    )
-    .await;
+    let first = drain_until(&mut tc.rx, is_fill_report, "first FillReport from WS").await;
 
-    if let ExecutionEvent::Report(ExecutionReport::Fill(report)) = first {
-        assert_eq!(report.trade_id.as_str(), "trade-dup-1");
-    } else {
+    let ExecutionReport::Fill(report) = into_execution_report(first) else {
         unreachable!();
-    }
+    };
+    assert_eq!(report.trade_id.as_str(), "trade-dup-1");
 
     // The second frame must be suppressed. Give the dispatch loop enough
     // headroom to process it; if dedup is wired correctly nothing arrives.
     let second = tokio::time::timeout(Duration::from_millis(300), async {
         loop {
             match tc.rx.recv().await {
-                Some(ExecutionEvent::Report(ExecutionReport::Fill(_))) => return true,
+                Some(event) if is_fill_report(&event) => return true,
                 Some(_) => {}
                 None => return false,
             }
@@ -5629,18 +5628,12 @@ async fn test_cross_source_dedup_skips_ws_trade_in_generate_fill_reports() {
     let channel = format!("{TEST_SUBACCOUNT}.trades");
     let data = json!([sample_trade_json("trade-shared-1", "ord-1", "ETH-PERP")]);
     ws_state.push_notification(make_subscription_frame(&channel, &data));
-    let ws_event = drain_until(
-        &mut tc.rx,
-        |e| matches!(e, ExecutionEvent::Report(ExecutionReport::Fill(_))),
-        "WS FillReport for shared trade",
-    )
-    .await;
+    let ws_event = drain_until(&mut tc.rx, is_fill_report, "WS FillReport for shared trade").await;
 
-    if let ExecutionEvent::Report(ExecutionReport::Fill(report)) = ws_event {
-        assert_eq!(report.trade_id.as_str(), "trade-shared-1");
-    } else {
+    let ExecutionReport::Fill(report) = into_execution_report(ws_event) else {
         unreachable!();
-    }
+    };
+    assert_eq!(report.trade_id.as_str(), "trade-shared-1");
 
     // HTTP reconciliation now returns the same trade plus a fresh one; only
     // the fresh one should survive dedup.
@@ -5794,7 +5787,7 @@ async fn test_ws_dispatch_tracked_order_open_emits_order_accepted_once() {
                 Some(ExecutionEvent::Order(OrderEventAny::Accepted(_))) => {
                     return Some("duplicate Accepted");
                 }
-                Some(ExecutionEvent::Report(ExecutionReport::Order(_))) => {
+                Some(event) if is_order_report(&event) => {
                     return Some("fallback OrderStatusReport");
                 }
                 Some(_) => {}
@@ -5901,7 +5894,7 @@ async fn test_ws_dispatch_tracked_fill_emits_order_filled_and_dedupes_by_trade_i
                 Some(ExecutionEvent::Order(OrderEventAny::Filled(_))) => {
                     return Some("duplicate Filled");
                 }
-                Some(ExecutionEvent::Report(ExecutionReport::Fill(_))) => {
+                Some(event) if is_fill_report(&event) => {
                     return Some("fallback FillReport");
                 }
                 Some(_) => {}
@@ -6000,12 +5993,9 @@ async fn test_ws_dispatch_orders_filled_before_trades_still_emits_tracked_fill()
 
     let event = drain_until(
         &mut tc.rx,
-        |e| {
-            matches!(
-                e,
-                ExecutionEvent::Order(OrderEventAny::Filled(_))
-                    | ExecutionEvent::Report(ExecutionReport::Fill(_))
-            )
+        |event| {
+            matches!(event, ExecutionEvent::Order(OrderEventAny::Filled(_)))
+                || is_fill_report(event)
         },
         "fill emission",
     )
@@ -6066,20 +6056,19 @@ async fn test_ws_dispatch_external_order_falls_back_to_status_report() {
 
     let event = drain_until(
         &mut tc.rx,
-        |e| matches!(e, ExecutionEvent::Report(ExecutionReport::Order(_))),
+        is_order_report,
         "OrderStatusReport for external order",
     )
     .await;
 
-    if let ExecutionEvent::Report(ExecutionReport::Order(report)) = event {
-        assert_eq!(report.venue_order_id.as_str(), "ord-external-1");
-        assert_eq!(
-            report.client_order_id.map(|c| c.as_str().to_string()),
-            Some("EXTERNAL-LABEL".to_string()),
-        );
-    } else {
+    let ExecutionReport::Order(report) = into_execution_report(event) else {
         unreachable!();
-    }
+    };
+    assert_eq!(report.venue_order_id.as_str(), "ord-external-1");
+    assert_eq!(
+        report.client_order_id.map(|c| c.as_str().to_string()),
+        Some("EXTERNAL-LABEL".to_string()),
+    );
 
     tc.client.disconnect().await.expect("disconnect");
 }
@@ -6219,22 +6208,22 @@ async fn test_ws_dispatch_tracked_terminal_status_emits_proper_event_and_forgets
     ws_state.push_notification(make_subscription_frame(&channel, &frame));
     let event = drain_until(
         &mut tc.rx,
-        |e| {
-            matches!(
-                e,
-                ExecutionEvent::Report(ExecutionReport::Order(_))
-                    | ExecutionEvent::Order(
+        |event| {
+            is_order_report(event)
+                || matches!(
+                    event,
+                    ExecutionEvent::Order(
                         OrderEventAny::Canceled(_)
                             | OrderEventAny::Expired(_)
                             | OrderEventAny::Accepted(_),
                     )
-            )
+                )
         },
         "post-terminal replay",
     )
     .await;
     assert!(
-        matches!(event, ExecutionEvent::Report(ExecutionReport::Order(_))),
+        is_order_report(&event),
         "after terminal, replayed frame must fall back to OrderStatusReport, was {event:?}",
     );
 
@@ -6495,18 +6484,15 @@ async fn test_submit_order_jsonrpc_rejection_forgets_identity() {
 
     let event = drain_until(
         &mut tc.rx,
-        |e| {
-            matches!(
-                e,
-                ExecutionEvent::Report(ExecutionReport::Order(_))
-                    | ExecutionEvent::Order(OrderEventAny::Accepted(_))
-            )
+        |event| {
+            is_order_report(event)
+                || matches!(event, ExecutionEvent::Order(OrderEventAny::Accepted(_)))
         },
         "post-reject .orders frame outcome",
     )
     .await;
     assert!(
-        matches!(event, ExecutionEvent::Report(ExecutionReport::Order(_))),
+        is_order_report(&event),
         "identity must be forgotten after rejection; got {event:?}",
     );
 
@@ -6975,7 +6961,7 @@ async fn test_query_order_unparsable_response_does_not_emit_report() {
     let outcome = tokio::time::timeout(Duration::from_millis(200), async {
         loop {
             match tc.rx.recv().await {
-                Some(ExecutionEvent::Report(ExecutionReport::Order(_))) => {
+                Some(event) if is_order_report(&event) => {
                     return Some("unexpected OrderStatusReport");
                 }
                 Some(_) => {}

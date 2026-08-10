@@ -40,10 +40,10 @@ use nautilus_model::{
     enums::{OrderSide, OrderStatus, PositionSide, TimeInForce, TriggerType},
     events::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSubmitted, OrderTriggered, OrderUpdated, PositionChanged, PositionClosed,
-        PositionEvent, PositionOpened,
+        OrderEventAny, OrderExpired, OrderFillConfirmed, OrderFillVoided, OrderFilled,
+        OrderInitialized, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
+        OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
+        PositionChanged, PositionClosed, PositionEvent, PositionOpened,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId, StrategyId,
@@ -1386,6 +1386,7 @@ pub trait Strategy: DataActor {
             OrderEventAny::CancelRejected(e) => self.on_order_cancel_rejected(*e),
             OrderEventAny::Updated(e) => self.on_order_updated(*e),
             OrderEventAny::Filled(e) => self.on_order_filled(e),
+            OrderEventAny::FillConfirmed(e) => self.on_order_fill_confirmed(e),
             OrderEventAny::FillVoided(e) => self.on_order_fill_voided(e),
         }
         self.on_order_event(event);
@@ -1570,6 +1571,10 @@ pub trait Strategy: DataActor {
     /// Override this method to implement custom logic when an order is filled.
     #[allow(unused_variables)]
     fn on_order_filled(&mut self, event: &OrderFilled) {}
+
+    /// Called when a provisional order fill reaches venue finality.
+    #[allow(unused_variables)]
+    fn on_order_fill_confirmed(&mut self, event: &OrderFillConfirmed) {}
 
     /// Called when an applied order fill is partly or fully voided.
     #[allow(unused_variables)]

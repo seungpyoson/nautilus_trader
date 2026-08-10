@@ -445,7 +445,8 @@ pub struct LiveExecEngineConfig {
     /// The threshold (milliseconds) beyond which an in-flight order's status is checked with the venue.
     #[builder(default = 5_000)]
     pub inflight_check_threshold_ms: u32,
-    /// The number of retry attempts for verifying in-flight order status.
+    /// The maximum liveness queries for an in-flight order.
+    /// Exhaustion does not infer a terminal order state.
     #[builder(default = 5)]
     pub inflight_check_retries: u32,
     /// The interval (seconds) between checks for open orders at the venue.
@@ -574,7 +575,6 @@ impl From<&LiveExecEngineConfig> for ExecutionManagerConfig {
             reconciliation: config.reconciliation,
             lookback_mins: config.reconciliation_lookback_mins.map(u64::from),
             reconciliation_instrument_ids,
-            filter_unclaimed_external: config.filter_unclaimed_external_orders,
             filter_position_reports: config.filter_position_reports,
             filtered_client_order_ids,
             generate_missing_orders: config.generate_missing_orders,
@@ -1581,7 +1581,6 @@ mean_dispatch_ns_clear = 500
                 .reconciliation_instrument_ids
                 .contains(&InstrumentId::from("BTCUSDT.BINANCE"))
         );
-        assert!(converted.filter_unclaimed_external);
         assert!(converted.filter_position_reports);
         assert_eq!(converted.filtered_client_order_ids.len(), 2);
         assert!(

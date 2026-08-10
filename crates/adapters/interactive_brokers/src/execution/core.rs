@@ -57,11 +57,11 @@ use nautilus_common::{
     messages::{
         ExecutionEvent,
         execution::{
-            BatchCancelOrders, CancelAllOrders, CancelOrder, ExecutionReport, GenerateFillReports,
-            GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
-            GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder,
-            SubmitOrder, SubmitOrderList,
+            BatchCancelOrders, CancelAllOrders, CancelOrder, ExecutionReport, ExecutionSourceId,
+            GenerateFillReports, GenerateFillReportsBuilder, GenerateOrderStatusReport,
+            GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder,
+            GeneratePositionStatusReports, GeneratePositionStatusReportsBuilder, ModifyOrder,
+            QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
         },
     },
     msgbus::{send_account_state, switchboard::MessagingSwitchboard},
@@ -122,6 +122,8 @@ use crate::{
 pub struct InteractiveBrokersExecutionClient {
     /// Core execution client functionality.
     core: ExecutionClientCore,
+    /// Engine-issued capability authenticating reports from this client.
+    execution_source_id: ExecutionSourceId,
     /// Configuration for the client.
     config: InteractiveBrokersExecClientConfig,
     /// Instrument provider.
@@ -289,6 +291,7 @@ impl InteractiveBrokersExecutionClient {
 
         Ok(Self {
             core,
+            execution_source_id: ExecutionSourceId::new(),
             config,
             instrument_provider,
             is_connected: AtomicBool::new(false),
@@ -469,6 +472,10 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
     fn client_id(&self) -> ClientId {
         self.core.client_id
+    }
+
+    fn bind_execution_source(&mut self, source_id: ExecutionSourceId) {
+        self.execution_source_id = source_id;
     }
 
     fn account_id(&self) -> AccountId {
@@ -747,6 +754,8 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
             if let Err(e) = crate::execution::account::subscribe_positions(
                 &client_for_positions,
+                self.core.client_id,
+                self.execution_source_id,
                 self.core.account_id,
                 position_tracker_clone,
                 instrument_provider_clone,
@@ -1293,7 +1302,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             Some(UUID4::new()),
         );
 
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 
@@ -1379,6 +1388,8 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let instrument_id_map = Arc::clone(&self.instrument_id_map);
         let instrument_provider = Arc::clone(&self.instrument_provider);
         let account_id = self.core.account_id;
+        let source_client_id = self.core.client_id;
+        let source_id = self.execution_source_id;
         let exec_sender = get_exec_event_sender();
         let ts_init = get_atomic_clock_realtime().get_time_ns();
         let request_timeout_secs = self.config.request_timeout;
@@ -1457,9 +1468,11 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     };
 
                     if exec_sender
-                        .send(ExecutionEvent::Report(ExecutionReport::Order(Box::new(
-                            report,
-                        ))))
+                        .send(ExecutionEvent::report(
+                            source_client_id,
+                            source_id,
+                            ExecutionReport::Order(Box::new(report)),
+                        ))
                         .is_err()
                     {
                         tracing::error!("query_order: failed to send order status report");

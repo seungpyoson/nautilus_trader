@@ -127,10 +127,17 @@ impl BitmexExecutionClient {
         }
 
         let trader_id = core.trader_id;
+        let client_id = core.client_id;
         let account_id = core.account_id;
         let clock = get_atomic_clock_realtime();
-        let emitter =
-            ExecutionEventEmitter::new(clock, trader_id, account_id, AccountType::Margin, None);
+        let emitter = ExecutionEventEmitter::new(
+            clock,
+            trader_id,
+            client_id,
+            account_id,
+            AccountType::Margin,
+            None,
+        );
         let http_client = BitmexHttpClient::new(
             Some(config.http_base_url()),
             config.api_key.clone(),
@@ -613,6 +620,10 @@ impl ExecutionClient for BitmexExecutionClient {
         self.core.client_id
     }
 
+    fn bind_execution_source(&mut self, source_id: nautilus_common::messages::ExecutionSourceId) {
+        self.emitter.bind_execution_source(source_id);
+    }
+
     fn account_id(&self) -> AccountId {
         self.core.account_id
     }
@@ -890,7 +901,7 @@ impl ExecutionClient for BitmexExecutionClient {
             ts_now,
             None,
         );
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports)?;
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 
@@ -1429,6 +1440,7 @@ mod tests {
         let mut emitter = ExecutionEventEmitter::new(
             get_atomic_clock_realtime(),
             TraderId::from("TESTER-001"),
+            *BITMEX_CLIENT_ID,
             AccountId::from("BITMEX-001"),
             AccountType::Margin,
             None,
@@ -1645,9 +1657,12 @@ mod tests {
         dispatch_execution_fixture(&state, &emitter, account_id);
 
         match rx.try_recv().unwrap() {
-            ExecutionEvent::Report(ExecutionReport::Fill(report)) => {
-                assert_eq!(report.account_id, account_id);
-            }
+            ExecutionEvent::Report(authenticated) => match authenticated.report {
+                ExecutionReport::Fill(report) => {
+                    assert_eq!(report.account_id, account_id);
+                }
+                report => panic!("expected fill report, was {report:?}"),
+            },
             event => panic!("expected fill report, was {event:?}"),
         }
         assert!(rx.try_recv().is_err());
@@ -1749,9 +1764,11 @@ mod tests {
             &mut order_symbol_cache,
             account_id,
         );
+        let event = rx.try_recv().expect("expected order report");
         assert!(matches!(
-            rx.try_recv(),
-            Ok(ExecutionEvent::Report(ExecutionReport::Order(_)))
+            event,
+            ExecutionEvent::Report(authenticated)
+                if matches!(authenticated.report, ExecutionReport::Order(_))
         ));
 
         dispatch::dispatch_ws_message(

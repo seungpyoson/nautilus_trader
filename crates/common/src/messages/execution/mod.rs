@@ -21,7 +21,7 @@ pub mod query;
 pub mod report;
 pub mod submit;
 
-use nautilus_core::{Params, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     identifiers::{ClientId, InstrumentId, StrategyId},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -50,6 +50,62 @@ pub enum ExecutionReport {
     Position(Box<PositionStatusReport>),
     MassStatus(Box<ExecutionMassStatus>),
 }
+
+/// Unforgeable-at-runtime capability identifying one registered execution-client instance.
+///
+/// The engine creates a fresh value when it registers a client and binds that value into the
+/// client's report emitter. A report is authoritative only when this capability maps back to the
+/// same registered client as `source_client_id`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ExecutionSourceId(UUID4);
+
+impl ExecutionSourceId {
+    /// Creates a fresh execution-source capability.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(UUID4::new())
+    }
+}
+
+/// Execution evidence paired with the client that emitted it.
+///
+/// The source is assigned by the trusted execution ingress (the client's event
+/// emitter or the engine method that invoked mass-status generation) and remains
+/// separate from venue-authored fields, so reconciliation never authenticates
+/// evidence using its own claims.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedExecution<T> {
+    /// Client that emitted the evidence into the execution channel.
+    pub source_client_id: ClientId,
+    /// Capability bound to the registered client instance by the execution engine.
+    pub source_id: ExecutionSourceId,
+    /// Venue-authored reconciliation evidence.
+    pub report: T,
+}
+
+impl<T> AuthenticatedExecution<T> {
+    /// Creates an authenticated execution evidence envelope.
+    #[must_use]
+    pub const fn new(source_client_id: ClientId, source_id: ExecutionSourceId, report: T) -> Self {
+        Self {
+            source_client_id,
+            source_id,
+            report,
+        }
+    }
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for AuthenticatedExecution<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} from {}", self.report, self.source_client_id)
+    }
+}
+
+/// Authenticated runtime execution report.
+pub type AuthenticatedExecutionReport = AuthenticatedExecution<ExecutionReport>;
+
+/// Authenticated execution mass status generated for startup reconciliation.
+pub type AuthenticatedExecutionMassStatus = AuthenticatedExecution<ExecutionMassStatus>;
 
 #[expect(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq, Display)]

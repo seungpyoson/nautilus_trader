@@ -2140,7 +2140,7 @@ mod serial_tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_start_continues_when_mass_status_unavailable() {
+    async fn test_start_aborts_when_mass_status_unavailable() {
         let config = LiveNodeConfig {
             exec_engine: LiveExecEngineConfig {
                 reconciliation: true,
@@ -2157,14 +2157,16 @@ mod serial_tests {
         );
         let handle = node.handle();
 
-        let result = node.start().await;
+        let error = node.start().await.expect_err("start should fail closed");
 
-        assert!(result.is_ok(), "unexpected error: {result:#?}");
+        assert!(
+            error
+                .to_string()
+                .contains("returned no authoritative mass status")
+        );
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
-        assert_eq!(handle.state(), NodeState::Running);
-        assert!(state.connected.load(Ordering::Relaxed));
-
-        node.stop().await.unwrap();
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert!(!state.connected.load(Ordering::Relaxed));
 
         node.dispose();
 
@@ -2367,7 +2369,7 @@ mod serial_tests {
 
     #[rstest]
     #[tokio::test(flavor = "current_thread")]
-    async fn test_run_continues_when_mass_status_unavailable() {
+    async fn test_run_aborts_when_mass_status_unavailable() {
         let config = LiveNodeConfig {
             exec_engine: LiveExecEngineConfig {
                 reconciliation: true,
@@ -2383,20 +2385,13 @@ mod serial_tests {
             StartupMassStatusBehavior::Unavailable,
         );
         let handle = node.handle();
-        let stop_handle = handle.clone();
+        let error = node.run().await.expect_err("run should fail closed");
 
-        tokio::spawn(async move {
-            wait_until_async(
-                || async { stop_handle.is_running() },
-                Duration::from_secs(5),
-            )
-            .await;
-            stop_handle.stop();
-        });
-
-        let result = node.run().await;
-
-        assert!(result.is_ok(), "unexpected error: {result:#?}");
+        assert!(
+            error
+                .to_string()
+                .contains("returned no authoritative mass status")
+        );
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
@@ -3194,7 +3189,6 @@ mod serial_tests {
                 reconciliation: false,
                 inflight_check_interval_ms: 200,
                 inflight_check_threshold_ms: 0,
-                inflight_check_retries: 100,
                 open_check_interval_secs: Some(0.1),
                 open_check_lookback_mins: None,
                 open_check_threshold_ms: 0,
@@ -3268,8 +3262,6 @@ mod serial_tests {
         let handle = node.handle();
         let stop_handle = handle.clone();
         let targeted_order_report_ids = state.targeted_order_report_ids.clone();
-        let query_order_received = state.query_order_received.clone();
-        let query_order_ids = state.query_order_ids.clone();
         let position_report_requested = state.position_report_requested.clone();
 
         tokio::spawn(async move {
@@ -3278,12 +3270,9 @@ mod serial_tests {
                 Duration::from_secs(1),
             )
             .await;
-            query_order_received.store(false, Ordering::Relaxed);
-            query_order_ids.lock().unwrap().clear();
             wait_until_async(
                 || async {
-                    query_order_received.load(Ordering::Relaxed)
-                        && position_report_requested.load(Ordering::Relaxed)
+                    position_report_requested.load(Ordering::Relaxed)
                         && targeted_order_report_ids.lock().unwrap().len() >= 5
                 },
                 Duration::from_secs(2),
@@ -3297,35 +3286,48 @@ mod serial_tests {
 
         assert!(
             result.is_ok(),
-            "hung targeted report tasks should release their slot: bulk={}, targeted={observed_targeted_ids:?}, position={}, inflight={}, open={}, retries=[{}, {}, {}]",
+            "hung targeted report tasks should release their slot: bulk={}, targeted={observed_targeted_ids:?}, position={}, open={}, retries=[{}, {}, {}]",
             state.bulk_order_report_count.load(Ordering::Relaxed),
             state.position_report_count.load(Ordering::Relaxed),
-            state.query_order_received.load(Ordering::Relaxed),
             node.kernel()
                 .cache
                 .borrow()
                 .orders_open(None, None, None, None, None)
                 .len(),
-            node.exec_manager().recon_check_retry_count(&order_a),
-            node.exec_manager().recon_check_retry_count(&order_b),
-            node.exec_manager().recon_check_retry_count(&order_c),
+            node.exec_manager().missing_order_retry_count(&order_a),
+            node.exec_manager().missing_order_retry_count(&order_b),
+            node.exec_manager().missing_order_retry_count(&order_c),
         );
         assert!(result.unwrap().is_ok());
-        assert!(state.query_order_received.load(Ordering::Relaxed));
         assert!(
-            state.query_order_ids.lock().unwrap().contains(&order_a),
-            "check_inflight_orders should query the planned order after its marker times out"
+            !state.query_order_received.load(Ordering::Relaxed),
+            "accepted orders must remain under authoritative open-order reconciliation, not liveness probing"
         );
         assert!(state.position_report_requested.load(Ordering::Relaxed));
         let targeted_ids = observed_targeted_ids;
-        assert_eq!(
-            &targeted_ids[..5],
-            &[order_a, order_b, order_c, order_b, order_b],
-            "all planned markers should clear while query recency remains"
+        assert!(
+            targeted_ids.len() >= 5,
+            "targeted reconciliation should continue after hung tasks: {targeted_ids:?}"
         );
-        assert!(node.exec_manager().recon_check_retry_count(&order_a) > 0);
-        assert!(node.exec_manager().recon_check_retry_count(&order_b) > 0);
-        assert!(node.exec_manager().recon_check_retry_count(&order_c) > 0);
+        assert!(
+            [order_a, order_b, order_c]
+                .iter()
+                .all(|order_id| targeted_ids.contains(order_id)),
+            "targeted reconciliation should remain fair across open orders: {targeted_ids:?}"
+        );
+        assert!(
+            [order_a, order_b, order_c].iter().any(|order_id| {
+                targeted_ids
+                    .iter()
+                    .filter(|targeted_id| *targeted_id == order_id)
+                    .count()
+                    > 1
+            }),
+            "cleared markers should allow a later targeted cycle: {targeted_ids:?}"
+        );
+        assert!(node.exec_manager().missing_order_retry_count(&order_a) > 0);
+        assert!(node.exec_manager().missing_order_retry_count(&order_b) > 0);
+        assert!(node.exec_manager().missing_order_retry_count(&order_c) > 0);
         assert_eq!(handle.state(), NodeState::Stopped);
     }
 
