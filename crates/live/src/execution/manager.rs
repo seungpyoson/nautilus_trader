@@ -109,20 +109,47 @@ fn build_cross_zero_leg_report(
     venue_ts_last: UnixNanos,
 ) -> Option<OrderStatusReport> {
     let order_qty = Quantity::from_decimal_dp(quantity, instrument.size_precision()).ok()?;
-    let fill_price = Price::from_decimal_dp(avg_px, instrument.price_precision()).ok();
+    build_position_reconciliation_report(
+        instrument,
+        account_id,
+        instrument_id,
+        order_side,
+        order_qty,
+        avg_px,
+        None,
+        Some(tag),
+        ts_now,
+        venue_ts_last,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+fn build_position_reconciliation_report(
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    order_qty: Quantity,
+    avg_px: Decimal,
+    venue_position_id: Option<PositionId>,
+    tag: Option<&str>,
+    ts_now: UnixNanos,
+    venue_ts_last: UnixNanos,
+) -> Option<OrderStatusReport> {
+    let fill_price = Price::from_decimal_dp(avg_px, instrument.price_precision()).ok()?;
     let venue_order_id = create_position_reconciliation_venue_order_id(
         account_id,
         instrument_id,
         order_side,
         OrderType::Market,
         order_qty,
-        fill_price,
-        None,
-        Some(tag),
+        Some(fill_price),
+        venue_position_id,
+        tag,
         venue_ts_last,
     );
 
-    let report = OrderStatusReport::new(
+    let mut report = OrderStatusReport::new(
         account_id,
         instrument_id,
         None,
@@ -139,6 +166,10 @@ fn build_cross_zero_leg_report(
         None,
     )
     .with_avg_px(avg_px);
+
+    if let Some(venue_position_id) = venue_position_id {
+        report = report.with_venue_position_id(venue_position_id);
+    }
 
     Some(report)
 }
@@ -160,6 +191,25 @@ pub struct ExternalOrderMetadata {
     pub ts_init: UnixNanos,
 }
 
+struct PreparedExternalOrder {
+    initialized: OrderEventAny,
+    order: OrderAny,
+    client_order_id: ClientOrderId,
+    strategy_id: StrategyId,
+    ts_init: UnixNanos,
+}
+
+struct PreparedSyntheticPositionOrder {
+    external: PreparedExternalOrder,
+    projected_events: Vec<OrderEventAny>,
+}
+
+#[derive(Clone, Copy)]
+struct ExternalOrderAuthority {
+    client: ClientId,
+    account: AccountId,
+}
+
 /// Result of reconciliation containing events and external order metadata.
 #[derive(Debug, Default)]
 pub struct ReconciliationResult {
@@ -171,6 +221,20 @@ pub struct ReconciliationResult {
     pub rejection: Option<ReconciliationRejection>,
     /// Exactly-once accounting for position reports in the mass status.
     pub position_reports: PositionReconciliationSummary,
+    /// Non-filtered order reports not reflected in post-reconciliation cache state.
+    pub unresolved_order_reports: usize,
+    /// Unique fill reports not reflected in post-reconciliation cache state.
+    pub unresolved_fill_reports: usize,
+}
+
+impl ReconciliationResult {
+    /// Returns authoritative report evidence still absent from post-pass cache state.
+    #[must_use]
+    pub const fn unresolved_reports(&self) -> usize {
+        self.unresolved_order_reports
+            + self.unresolved_fill_reports
+            + self.position_reports.unresolved()
+    }
 }
 
 /// Exactly-once accounting for position reports consumed from one mass status.
@@ -207,7 +271,9 @@ enum PositionReportGroupDisposition {
 impl PositionReconciliationOutcome {
     fn from_events(events: Option<Vec<OrderEventAny>>) -> Self {
         match events {
-            Some(events) if events.is_empty() => Self::Unchanged,
+            Some(events) if events.is_empty() => {
+                Self::Skipped(PositionReconciliationSkip::InsufficientEvidence)
+            }
             Some(events) => Self::Applied(events),
             None => Self::Skipped(PositionReconciliationSkip::InsufficientEvidence),
         }
@@ -268,6 +334,12 @@ impl PositionReconciliationSummary {
         self.insufficient_evidence
     }
 
+    /// Returns reports whose venue discrepancy remains unresolved after the pass.
+    #[must_use]
+    pub const fn unresolved(&self) -> usize {
+        self.rejected + self.generation_disabled + self.insufficient_evidence
+    }
+
     fn record(&mut self, outcome: &PositionReconciliationOutcome) {
         match outcome {
             PositionReconciliationOutcome::Unchanged => self.unchanged += 1,
@@ -303,6 +375,90 @@ pub enum ReconciliationReportKind {
     Position,
 }
 
+#[derive(Clone, Copy)]
+struct ReconciliationOrderIdentity {
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    client_order_id: Option<ClientOrderId>,
+    venue_order_id: VenueOrderId,
+    order_side: OrderSide,
+    venue_position_id: Option<PositionId>,
+}
+
+impl From<&OrderStatusReport> for ReconciliationOrderIdentity {
+    fn from(report: &OrderStatusReport) -> Self {
+        Self {
+            account_id: report.account_id,
+            instrument_id: report.instrument_id,
+            client_order_id: report.client_order_id,
+            venue_order_id: report.venue_order_id,
+            order_side: report.order_side,
+            venue_position_id: report.venue_position_id,
+        }
+    }
+}
+
+impl From<&FillReport> for ReconciliationOrderIdentity {
+    fn from(report: &FillReport) -> Self {
+        Self {
+            account_id: report.account_id,
+            instrument_id: report.instrument_id,
+            client_order_id: report.client_order_id,
+            venue_order_id: report.venue_order_id,
+            order_side: report.order_side,
+            venue_position_id: report.venue_position_id,
+        }
+    }
+}
+
+fn reconciliation_order_identities_compatible(
+    parent: ReconciliationOrderIdentity,
+    child: ReconciliationOrderIdentity,
+) -> bool {
+    let client_ids_compatible = child
+        .client_order_id
+        .is_none_or(|child| parent.client_order_id == Some(child));
+    let position_ids_compatible = parent
+        .venue_position_id
+        .is_none_or(|parent| child.venue_position_id == Some(parent));
+
+    parent.account_id == child.account_id
+        && parent.instrument_id == child.instrument_id
+        && parent.venue_order_id == child.venue_order_id
+        && parent.order_side == child.order_side
+        && client_ids_compatible
+        && position_ids_compatible
+}
+
+fn fill_reports_have_same_execution(left: &FillReport, right: &FillReport) -> bool {
+    left.account_id == right.account_id
+        && left.instrument_id == right.instrument_id
+        && left.venue_order_id == right.venue_order_id
+        && left.trade_id == right.trade_id
+        && left.order_side == right.order_side
+        && left.last_qty == right.last_qty
+        && left.last_px == right.last_px
+        && left.commission == right.commission
+        && left.liquidity_side == right.liquidity_side
+        && left.avg_px == right.avg_px
+        && left.ts_event == right.ts_event
+        && left.client_order_id == right.client_order_id
+        && left.venue_position_id == right.venue_position_id
+}
+
+fn position_reports_have_same_state(
+    left: &PositionStatusReport,
+    right: &PositionStatusReport,
+) -> bool {
+    left.account_id == right.account_id
+        && left.instrument_id == right.instrument_id
+        && left.position_side == right.position_side
+        && left.quantity == right.quantity
+        && left.signed_decimal_qty == right.signed_decimal_qty
+        && left.venue_position_id == right.venue_position_id
+        && left.avg_px_open == right.avg_px_open
+}
+
 impl Display for ReconciliationReportKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -330,6 +486,37 @@ pub enum ReconciliationRejection {
         /// Category of the mismatched child report.
         report_kind: ReconciliationReportKind,
     },
+    /// An order or fill report conflicts with a cached order identity.
+    OrderIdentityConflict {
+        /// Category of the conflicting report.
+        report_kind: ReconciliationReportKind,
+        /// Client order ID declared by the report, when present.
+        client_order_id: Option<ClientOrderId>,
+        /// Venue order ID declared by the report.
+        venue_order_id: VenueOrderId,
+    },
+    /// A position report conflicts with a cached position identity.
+    PositionIdentityConflict {
+        /// Venue position ID declared by the report.
+        position_id: PositionId,
+    },
+    /// Reports within one snapshot contradict one another.
+    ConflictingEvidence {
+        /// Category of the contradictory reports.
+        report_kind: ReconciliationReportKind,
+    },
+    /// A report references an instrument absent from the local cache.
+    InstrumentNotCached {
+        /// Category of the unresolved report.
+        report_kind: ReconciliationReportKind,
+        /// Instrument required to represent the report.
+        instrument_id: InstrumentId,
+    },
+    /// The mass-status envelope is not authenticated by a registered execution client.
+    InvalidSource {
+        /// Client claimed by the mass-status envelope.
+        client_id: ClientId,
+    },
 }
 
 impl Display for ReconciliationRejection {
@@ -346,6 +533,31 @@ impl Display for ReconciliationRejection {
                 f,
                 "{report_kind} report account {report_account_id} does not match mass-status account {envelope_account_id}"
             ),
+            Self::OrderIdentityConflict {
+                report_kind,
+                client_order_id,
+                venue_order_id,
+            } => write!(
+                f,
+                "{report_kind} report identity conflicts with cached order: client_order_id={client_order_id:?}, venue_order_id={venue_order_id}"
+            ),
+            Self::PositionIdentityConflict { position_id } => write!(
+                f,
+                "position report identity conflicts with cached position {position_id}"
+            ),
+            Self::ConflictingEvidence { report_kind } => {
+                write!(f, "mass-status contains conflicting {report_kind} evidence")
+            }
+            Self::InstrumentNotCached {
+                report_kind,
+                instrument_id,
+            } => write!(
+                f,
+                "{report_kind} report instrument {instrument_id} is not cached"
+            ),
+            Self::InvalidSource { client_id } => {
+                write!(f, "mass-status source {client_id} is not authoritative")
+            }
         }
     }
 }
@@ -394,6 +606,7 @@ impl TargetedOrderQuery {
 #[derive(Debug)]
 pub(crate) struct TargetedOrderReportResult {
     client_order_id: ClientOrderId,
+    source_client_id: Option<ClientId>,
     report: Option<OrderStatusReport>,
     coverage_complete: bool,
 }
@@ -676,10 +889,21 @@ impl ExecutionManager {
             .unwrap_or(DEFAULT_POSITION_RECONCILIATION_TOLERANCE)
     }
 
-    fn validate_mass_status_account_scope(
+    fn validate_mass_status(
         &self,
+        source_client_id: ClientId,
         mass_status: &ExecutionMassStatus,
+        exec_engine: &ExecutionEngine,
     ) -> Result<(), ReconciliationRejection> {
+        if let Err(error) =
+            exec_engine.validate_execution_mass_status_source(source_client_id, mass_status)
+        {
+            log::error!("Invalid ExecutionMassStatus source: {error}");
+            return Err(ReconciliationRejection::InvalidSource {
+                client_id: mass_status.client_id,
+            });
+        }
+
         let envelope_account_id = mass_status.account_id;
         if self.cache.borrow().account(&envelope_account_id).is_none() {
             return Err(ReconciliationRejection::AccountNotCached {
@@ -716,6 +940,252 @@ impl ExecutionManager {
             });
         }
 
+        let cache = self.cache.borrow();
+        let uncached_instrument = order_reports
+            .values()
+            .map(|report| (ReconciliationReportKind::Order, report.instrument_id))
+            .chain(
+                fill_reports
+                    .values()
+                    .flatten()
+                    .map(|report| (ReconciliationReportKind::Fill, report.instrument_id)),
+            )
+            .chain(
+                position_reports
+                    .values()
+                    .flatten()
+                    .map(|report| (ReconciliationReportKind::Position, report.instrument_id)),
+            )
+            .find(|(_, instrument_id)| cache.instrument(instrument_id).is_none());
+        drop(cache);
+        if let Some((report_kind, instrument_id)) = uncached_instrument {
+            return Err(ReconciliationRejection::InstrumentNotCached {
+                report_kind,
+                instrument_id,
+            });
+        }
+
+        let conflicting =
+            |report_kind| ReconciliationRejection::ConflictingEvidence { report_kind };
+        let mut orders_by_client = IndexMap::new();
+        for (venue_order_id, report) in &order_reports {
+            if *venue_order_id != report.venue_order_id {
+                return Err(conflicting(ReconciliationReportKind::Order));
+            }
+            if let Some(client_order_id) = report.client_order_id
+                && orders_by_client
+                    .insert(client_order_id, ReconciliationOrderIdentity::from(report))
+                    .is_some_and(|previous| {
+                        let current = ReconciliationOrderIdentity::from(report);
+                        !reconciliation_order_identities_compatible(previous, current)
+                            && !self.reports_resolve_to_same_order(previous, current)
+                    })
+            {
+                return Err(conflicting(ReconciliationReportKind::Order));
+            }
+        }
+
+        let mut fills_by_key = IndexMap::<FillKey, &FillReport>::new();
+        for (venue_order_id, fills) in &fill_reports {
+            for fill in fills {
+                if *venue_order_id != fill.venue_order_id {
+                    return Err(conflicting(ReconciliationReportKind::Fill));
+                }
+                let fill_key = (fill.account_id, fill.instrument_id, fill.trade_id);
+                if fills_by_key
+                    .insert(fill_key, fill)
+                    .is_some_and(|previous| !fill_reports_have_same_execution(previous, fill))
+                {
+                    return Err(conflicting(ReconciliationReportKind::Fill));
+                }
+                if let Some(order_report) = order_reports.get(&fill.venue_order_id)
+                    && !reconciliation_order_identities_compatible(
+                        ReconciliationOrderIdentity::from(order_report),
+                        ReconciliationOrderIdentity::from(fill),
+                    )
+                {
+                    return Err(conflicting(ReconciliationReportKind::Fill));
+                }
+            }
+        }
+
+        let mut positions_by_id = IndexMap::<PositionId, &PositionStatusReport>::new();
+        for (instrument_id, reports) in &position_reports {
+            let has_hedge_reports = reports
+                .iter()
+                .any(|report| report.venue_position_id.is_some());
+            let has_netting_reports = reports
+                .iter()
+                .any(|report| report.venue_position_id.is_none());
+            if has_hedge_reports && has_netting_reports {
+                return Err(conflicting(ReconciliationReportKind::Position));
+            }
+
+            for report in reports {
+                if *instrument_id != report.instrument_id {
+                    return Err(conflicting(ReconciliationReportKind::Position));
+                }
+                if let Some(position_id) = report.venue_position_id
+                    && positions_by_id
+                        .insert(position_id, report)
+                        .is_some_and(|previous| !position_reports_have_same_state(previous, report))
+                {
+                    return Err(conflicting(ReconciliationReportKind::Position));
+                }
+            }
+        }
+
+        for report in order_reports.values() {
+            self.validate_cached_order_identity(
+                ReconciliationReportKind::Order,
+                report.account_id,
+                report.instrument_id,
+                report.order_side,
+                report.client_order_id,
+                report.venue_order_id,
+                report.venue_position_id,
+                Some(source_client_id),
+            )?;
+        }
+
+        for report in fill_reports.values().flatten() {
+            self.validate_cached_order_identity(
+                ReconciliationReportKind::Fill,
+                report.account_id,
+                report.instrument_id,
+                report.order_side,
+                report.client_order_id,
+                report.venue_order_id,
+                report.venue_position_id,
+                Some(source_client_id),
+            )?;
+        }
+
+        for report in position_reports.values().flatten() {
+            self.validate_cached_position_identity(report)?;
+        }
+
+        if let Err(error) =
+            exec_engine.validate_execution_mass_status(source_client_id, mass_status)
+        {
+            log::error!("Invalid ExecutionMassStatus source or evidence: {error}");
+            return Err(ReconciliationRejection::InvalidSource {
+                client_id: mass_status.client_id,
+            });
+        }
+
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn validate_cached_order_identity(
+        &self,
+        report_kind: ReconciliationReportKind,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: VenueOrderId,
+        venue_position_id: Option<PositionId>,
+        source_client_id: Option<ClientId>,
+    ) -> Result<(), ReconciliationRejection> {
+        if let Some(position_id) = venue_position_id
+            && self
+                .cache
+                .borrow()
+                .position(&position_id)
+                .is_some_and(|position| {
+                    position.account_id != account_id || position.instrument_id != instrument_id
+                })
+        {
+            return Err(ReconciliationRejection::PositionIdentityConflict { position_id });
+        }
+
+        let by_client = client_order_id.and_then(|id| self.get_order(id));
+        let by_venue = self.get_order_by_venue_order_id(venue_order_id);
+        let conflict = || ReconciliationRejection::OrderIdentityConflict {
+            report_kind,
+            client_order_id,
+            venue_order_id,
+        };
+
+        if let (Some(client_order), Some(venue_order)) = (&by_client, &by_venue)
+            && client_order.client_order_id() != venue_order.client_order_id()
+        {
+            return Err(conflict());
+        }
+
+        let Some(order) = by_client.or(by_venue) else {
+            return Ok(());
+        };
+        let position_conflicts = order
+            .position_id()
+            .zip(venue_position_id)
+            .is_some_and(|(cached, reported)| cached != reported);
+        let venue_id_matches = order.venue_order_id().is_none()
+            || order.venue_order_id() == Some(venue_order_id)
+            || order
+                .venue_order_ids()
+                .iter()
+                .any(|cached| **cached == venue_order_id);
+        let client_conflicts = source_client_id.is_some_and(|source_client_id| {
+            self.cache
+                .borrow()
+                .client_id(&order.client_order_id())
+                .is_some_and(|cached_client_id| *cached_client_id != source_client_id)
+        });
+        if order.instrument_id() != instrument_id
+            || order.order_side() != order_side
+            || order
+                .account_id()
+                .is_some_and(|cached| cached != account_id)
+            || !venue_id_matches
+            || client_order_id.is_some_and(|reported| reported != order.client_order_id())
+            || position_conflicts
+            || client_conflicts
+        {
+            return Err(conflict());
+        }
+
+        Ok(())
+    }
+
+    fn reports_resolve_to_same_order(
+        &self,
+        left: ReconciliationOrderIdentity,
+        right: ReconciliationOrderIdentity,
+    ) -> bool {
+        let resolve = |identity: ReconciliationOrderIdentity| {
+            let by_client = identity.client_order_id.and_then(|id| self.get_order(id));
+            let by_venue = self.get_order_by_venue_order_id(identity.venue_order_id);
+            match (by_client, by_venue) {
+                (Some(left), Some(right)) if left.client_order_id() != right.client_order_id() => {
+                    None
+                }
+                (Some(order), _) | (_, Some(order)) => Some(order.client_order_id()),
+                (None, None) => None,
+            }
+        };
+
+        resolve(left)
+            .zip(resolve(right))
+            .is_some_and(|(left, right)| left == right)
+    }
+
+    fn validate_cached_position_identity(
+        &self,
+        report: &PositionStatusReport,
+    ) -> Result<(), ReconciliationRejection> {
+        let Some(position_id) = report.venue_position_id else {
+            return Ok(());
+        };
+        let position = self.cache.borrow().position_owned(&position_id);
+        if position.is_some_and(|position| {
+            position.account_id != report.account_id
+                || position.instrument_id != report.instrument_id
+        }) {
+            return Err(ReconciliationRejection::PositionIdentityConflict { position_id });
+        }
         Ok(())
     }
 
@@ -807,13 +1277,16 @@ impl ExecutionManager {
     )]
     pub async fn reconcile_execution_mass_status(
         &mut self,
+        source_client_id: ClientId,
         mass_status: ExecutionMassStatus,
         exec_engine: Rc<RefCell<ExecutionEngine>>,
     ) -> ReconciliationResult {
         let mass_position_reports = mass_status.position_reports();
         let position_report_count: usize = mass_position_reports.values().map(Vec::len).sum();
 
-        if let Err(rejection) = self.validate_mass_status_account_scope(&mass_status) {
+        if let Err(rejection) =
+            self.validate_mass_status(source_client_id, &mass_status, &exec_engine.borrow())
+        {
             log::error!("Rejected ExecutionMassStatus: {rejection}");
             return ReconciliationResult::rejected(rejection, position_report_count);
         }
@@ -1033,7 +1506,10 @@ impl ExecutionManager {
                             .unwrap_or_default();
                         let (external_events, metadata) = self.handle_external_order(
                             report,
-                            mass_status.account_id,
+                            ExternalOrderAuthority {
+                                client: source_client_id,
+                                account: mass_status.account_id,
+                            },
                             &instrument,
                             &order_fills,
                             false, // Not synthetic (venue order)
@@ -1112,7 +1588,10 @@ impl ExecutionManager {
                     .unwrap_or_default();
                 let (external_events, metadata) = self.handle_external_order(
                     report,
-                    mass_status.account_id,
+                    ExternalOrderAuthority {
+                        client: source_client_id,
+                        account: mass_status.account_id,
+                    },
                     &instrument,
                     &order_fills,
                     is_synthetic,
@@ -1312,6 +1791,25 @@ impl ExecutionManager {
             }
         }
 
+        let unresolved_order_reports = order_reports
+            .values()
+            .filter(|report| !self.should_skip_order_report(report))
+            .filter(|report| {
+                self.get_order_by_report_identity(report)
+                    .is_none_or(|order| !Self::is_exact_order_match(&order, report))
+            })
+            .count();
+        let mut unique_fill_reports = IndexMap::<FillKey, &FillReport>::new();
+        for fill in fill_reports.values().flatten() {
+            unique_fill_reports
+                .entry((fill.account_id, fill.instrument_id, fill.trade_id))
+                .or_insert(fill);
+        }
+        let unresolved_fill_reports = unique_fill_reports
+            .iter()
+            .filter(|(fill_key, fill)| !self.is_fill_report_applied(fill, **fill_key))
+            .count();
+
         if orders_skipped_no_instrument > 0 {
             log::warn!("{orders_skipped_no_instrument} orders skipped (instrument not in cache)");
         }
@@ -1322,6 +1820,12 @@ impl ExecutionManager {
 
         if orders_skipped_filtered > 0 {
             log::debug!("{orders_skipped_filtered} orders skipped (filtered by config)");
+        }
+
+        if unresolved_order_reports > 0 || unresolved_fill_reports > 0 {
+            log::warn!(
+                "Execution reconciliation unresolved evidence: orders={unresolved_order_reports}, fills={unresolved_fill_reports}"
+            );
         }
 
         log::info!(
@@ -1336,6 +1840,17 @@ impl ExecutionManager {
             position_reports.insufficient_evidence(),
         );
 
+        if position_reports.skipped() > 0 {
+            log::warn!(
+                "Position reconciliation omissions: received={}, rejected={}, filtered={}, generation_disabled={}, insufficient_evidence={}",
+                position_reports.received(),
+                position_reports.rejected(),
+                position_reports.filtered(),
+                position_reports.generation_disabled(),
+                position_reports.insufficient_evidence(),
+            );
+        }
+
         debug_assert_eq!(position_reports.received(), position_report_count);
 
         ReconciliationResult {
@@ -1343,6 +1858,8 @@ impl ExecutionManager {
             external_orders,
             rejection: None,
             position_reports,
+            unresolved_order_reports,
+            unresolved_fill_reports,
         }
     }
 
@@ -1757,6 +2274,7 @@ impl ExecutionManager {
 
         let check = self.prepare_open_order_report_check(UUID4::new(), clients);
         let mut all_reports = Vec::new();
+        let mut report_sources = Vec::new();
         let mut queried_clients = IndexSet::new();
         let mut failed_clients = IndexSet::new();
 
@@ -1765,8 +2283,23 @@ impl ExecutionManager {
             queried_clients.insert(client_id);
 
             match client.generate_order_status_reports(&check.command).await {
-                Ok(reports) => {
+                Ok(reports)
+                    if reports.iter().all(|report| {
+                        report_matches_execution_client(
+                            *client,
+                            report.account_id,
+                            report.instrument_id,
+                        )
+                    }) =>
+                {
+                    report_sources.extend(std::iter::repeat_n(client_id, reports.len()));
                     all_reports.extend(reports);
+                }
+                Ok(_) => {
+                    failed_clients.insert(client_id);
+                    log::error!(
+                        "Rejected order reports with invalid source provenance from {client_id}"
+                    );
                 }
                 Err(e) => {
                     failed_clients.insert(client_id);
@@ -1781,6 +2314,7 @@ impl ExecutionManager {
         let result = self.reconcile_open_order_reports(
             &check,
             all_reports,
+            &report_sources,
             &queried_clients,
             &failed_clients,
         );
@@ -1802,9 +2336,38 @@ impl ExecutionManager {
         &mut self,
         check: &OpenOrderReportCheck,
         all_reports: Vec<OrderStatusReport>,
+        report_sources: &[ClientId],
         queried_clients: &IndexSet<ClientId>,
         failed_clients: &IndexSet<ClientId>,
     ) -> OpenOrderReconciliationResult {
+        if all_reports.len() != report_sources.len() {
+            log::error!(
+                "Rejected open-order reconciliation response: report/source cardinality mismatch"
+            );
+            return OpenOrderReconciliationResult::default();
+        }
+
+        if let Some(rejection) =
+            all_reports
+                .iter()
+                .zip(report_sources)
+                .find_map(|(report, source_client_id)| {
+                    self.validate_cached_order_identity(
+                        ReconciliationReportKind::Order,
+                        report.account_id,
+                        report.instrument_id,
+                        report.order_side,
+                        report.client_order_id,
+                        report.venue_order_id,
+                        report.venue_position_id,
+                        Some(*source_client_id),
+                    )
+                    .err()
+                })
+        {
+            log::error!("Rejected open-order reconciliation response: {rejection}");
+            return OpenOrderReconciliationResult::default();
+        }
         let mut venue_reported_ids = IndexSet::new();
 
         for report in &all_reports {
@@ -2040,6 +2603,21 @@ impl ExecutionManager {
             self.targeted_order_queries.shift_remove(&client_order_id);
 
             if let Some(report) = result.report {
+                if let Err(rejection) = self.validate_cached_order_identity(
+                    ReconciliationReportKind::Order,
+                    report.account_id,
+                    report.instrument_id,
+                    report.order_side,
+                    report.client_order_id,
+                    report.venue_order_id,
+                    report.venue_position_id,
+                    result.source_client_id,
+                ) {
+                    log::error!(
+                        "Rejected targeted order report for {client_order_id}: {rejection}"
+                    );
+                    continue;
+                }
                 self.recon_check_retries.shift_remove(&client_order_id);
                 self.missing_order_coverage_warnings
                     .shift_remove(&client_order_id);
@@ -2178,8 +2756,22 @@ impl ExecutionManager {
                 .generate_position_status_reports(&check.command)
                 .await
             {
-                Ok(client_reports) => {
+                Ok(client_reports)
+                    if client_reports.iter().all(|report| {
+                        report_matches_execution_client(
+                            *client,
+                            report.account_id,
+                            report.instrument_id,
+                        )
+                    }) =>
+                {
                     reports.extend(client_reports);
+                }
+                Ok(_) => {
+                    failed_clients.insert(client_id);
+                    log::error!(
+                        "Rejected position reports with invalid source provenance from {client_id}"
+                    );
                 }
                 Err(e) => {
                     failed_clients.insert(client_id);
@@ -2219,6 +2811,14 @@ impl ExecutionManager {
             log::warn!(
                 "Rejected periodic position reconciliation: position_reports={report_count}, uncached_accounts={uncached_accounts:?}"
             );
+            return Vec::new();
+        }
+
+        if let Some(rejection) = reports
+            .iter()
+            .find_map(|report| self.validate_cached_position_identity(report).err())
+        {
+            log::error!("Rejected periodic position reconciliation response: {rejection}");
             return Vec::new();
         }
 
@@ -2387,6 +2987,29 @@ impl ExecutionManager {
             .config
             .filtered_client_order_ids
             .contains(&client_order_id)
+        {
+            return;
+        }
+
+        // Startup replay preserves observed receipt order across the separate execution
+        // event and command channels. If an acknowledgement was observed first and advanced
+        // the order beyond an inflight state, do not let the later command recreate stale
+        // tracking. Initialized/released orders are still awaiting submit dispatch, while
+        // submitted and pending orders are awaiting a venue acknowledgement.
+        if self
+            .cache
+            .borrow()
+            .order(&client_order_id)
+            .is_some_and(|order| {
+                !matches!(
+                    order.status(),
+                    OrderStatus::Initialized
+                        | OrderStatus::Released
+                        | OrderStatus::Submitted
+                        | OrderStatus::PendingUpdate
+                        | OrderStatus::PendingCancel
+                )
+            })
         {
             return;
         }
@@ -3093,38 +3716,19 @@ impl ExecutionManager {
 
                     Quantity::from_decimal_dp(fill_qty, instrument.size_precision())
                         .ok()
-                        .map(|order_qty| {
-                            let fill_price =
-                                Price::from_decimal_dp(fill_px, instrument.price_precision()).ok();
-                            let venue_order_id = create_position_reconciliation_venue_order_id(
+                        .and_then(|order_qty| {
+                            build_position_reconciliation_report(
+                                &instrument,
                                 account_id,
                                 instrument_id,
                                 order_side,
-                                OrderType::Market,
                                 order_qty,
-                                fill_price,
+                                fill_px,
                                 venue_position_id,
                                 None,
+                                ts_now,
                                 venue_ts_last,
-                            );
-
-                            OrderStatusReport::new(
-                                account_id,
-                                instrument_id,
-                                None,
-                                venue_order_id,
-                                order_side,
-                                OrderType::Market,
-                                TimeInForce::Gtc,
-                                OrderStatus::Filled,
-                                order_qty,
-                                order_qty,
-                                ts_now,
-                                ts_now,
-                                ts_now,
-                                None,
                             )
-                            .with_avg_px(fill_px)
                         })
                         .map(|order_report| {
                             log::info!(
@@ -3132,15 +3736,12 @@ impl ExecutionManager {
                                 "Generating synthetic fill for position reconciliation {instrument_id}: side={order_side:?}, qty={}, px={fill_px}", qty_diff.abs(),
                             );
 
-                            let (events, _) = self.handle_external_order(
+                            self.handle_synthetic_position_order(
                                 &order_report,
                                 account_id,
                                 &instrument,
-                                &[],
-                                true,
-                                None,
-                            );
-                            events
+                            )
+                            .unwrap_or_default()
                         })
                 }
                 None => None,
@@ -3237,23 +3838,21 @@ impl ExecutionManager {
             return None;
         };
 
-        let open_report = match venue_avg_px {
-            Some(open_px) => Some((
-                build_cross_zero_leg_report(
-                    instrument,
-                    account_id,
-                    instrument_id,
-                    open_side,
-                    open_qty,
-                    open_px,
-                    "OPEN",
-                    ts_now,
-                    venue_ts_last,
-                )?,
-                open_px,
-            )),
-            None => None,
+        let Some(open_px) = venue_avg_px else {
+            log::warn!("Cannot open new position for {instrument_id}: no venue average price");
+            return None;
         };
+        let open_report = build_cross_zero_leg_report(
+            instrument,
+            account_id,
+            instrument_id,
+            open_side,
+            open_qty,
+            open_px,
+            "OPEN",
+            ts_now,
+            venue_ts_last,
+        )?;
 
         let close_report = build_cross_zero_leg_report(
             instrument,
@@ -3267,27 +3866,52 @@ impl ExecutionManager {
             venue_ts_last,
         )?;
 
+        let prepared_close =
+            self.prepare_synthetic_position_order(&close_report, account_id, instrument)?;
+        let prepared_open =
+            self.prepare_synthetic_position_order(&open_report, account_id, instrument)?;
+        if prepared_close.external.client_order_id == prepared_open.external.client_order_id {
+            log::error!(
+                "Cross-zero reconciliation legs for {instrument_id} resolved to the same synthetic order ID"
+            );
+            return None;
+        }
+
         log::info!(
             color = LogColor::Blue as u8;
             "Generating close fill for cross-zero {instrument_id}: side={close_side:?}, qty={close_qty}, px={close_px}",
         );
 
-        let (close_events, _) =
-            self.handle_external_order(&close_report, account_id, instrument, &[], true, None);
+        let (close_events, _) = self.commit_external_order(
+            prepared_close.external,
+            &close_report,
+            None,
+            account_id,
+            instrument,
+            &[],
+            true,
+            None,
+            Some(prepared_close.projected_events),
+        );
         let mut all_events = close_events;
 
-        if let Some((open_report, open_px)) = open_report {
-            log::info!(
-                color = LogColor::Blue as u8;
-                "Generating open fill for cross-zero {instrument_id}: side={open_side:?}, qty={open_qty}, px={open_px}",
-            );
+        log::info!(
+            color = LogColor::Blue as u8;
+            "Generating open fill for cross-zero {instrument_id}: side={open_side:?}, qty={open_qty}, px={open_px}",
+        );
 
-            let (open_events, _) =
-                self.handle_external_order(&open_report, account_id, instrument, &[], true, None);
-            all_events.extend(open_events);
-        } else {
-            log::warn!("Cannot open new position for {instrument_id}: no venue average price");
-        }
+        let (open_events, _) = self.commit_external_order(
+            prepared_open.external,
+            &open_report,
+            None,
+            account_id,
+            instrument,
+            &[],
+            true,
+            None,
+            Some(prepared_open.projected_events),
+        );
+        all_events.extend(open_events);
 
         Some(all_events)
     }
@@ -3320,50 +3944,25 @@ impl ExecutionManager {
 
         let ts_now = self.clock.borrow().timestamp_ns();
         let order_qty = Quantity::from_decimal_dp(qty_abs, instrument.size_precision()).ok()?;
-        let fill_price = Price::from_decimal_dp(venue_avg_px, instrument.price_precision()).ok();
-        let venue_order_id = create_position_reconciliation_venue_order_id(
+        let order_report = build_position_reconciliation_report(
+            instrument,
             account_id,
             instrument_id,
             order_side,
-            OrderType::Market,
             order_qty,
-            fill_price,
+            venue_avg_px,
             report.venue_position_id,
             None,
+            ts_now,
             report.ts_last,
-        );
-
-        let mut order_report = OrderStatusReport::new(
-            account_id,
-            instrument_id,
-            None,
-            venue_order_id,
-            order_side,
-            OrderType::Market,
-            TimeInForce::Gtc,
-            OrderStatus::Filled,
-            order_qty,
-            order_qty,
-            ts_now,
-            ts_now,
-            ts_now,
-            None,
-        )
-        .with_avg_px(venue_avg_px);
-
-        // Preserve venue_position_id for hedging mode
-        if let Some(venue_position_id) = report.venue_position_id {
-            order_report = order_report.with_venue_position_id(venue_position_id);
-        }
+        )?;
 
         log::info!(
             color = LogColor::Blue as u8;
             "Creating position from venue report for {instrument_id}: side={order_side:?}, qty={qty_abs}, avg_px={venue_avg_px}",
         );
 
-        let (events, _) =
-            self.handle_external_order(&order_report, account_id, instrument, &[], true, None);
-        Some(events)
+        self.handle_synthetic_position_order(&order_report, account_id, instrument)
     }
 
     fn reconcile_position_report(
@@ -3622,10 +4221,13 @@ impl ExecutionManager {
         };
 
         if diff_qty.is_zero() {
-            log::debug!(
-                "Difference quantity rounds to zero for {instrument_id}, skipping order generation"
+            log::warn!(
+                "Difference quantity for {instrument_id} exceeds reconciliation tolerance but \
+                 rounds to zero at instrument precision; insufficient evidence to generate an order"
             );
-            return PositionReconciliationOutcome::Unchanged;
+            return PositionReconciliationOutcome::Skipped(
+                PositionReconciliationSkip::InsufficientEvidence,
+            );
         }
 
         let crosses_zero = cached_signed_qty != Decimal::ZERO
@@ -3696,49 +4298,25 @@ impl ExecutionManager {
             .or(current_avg_px)?;
 
         let ts_now = self.clock.borrow().timestamp_ns();
-        let fill_price = Price::from_decimal_dp(fill_px, instrument.price_precision()).ok();
-        let venue_order_id = create_position_reconciliation_venue_order_id(
+        let order_report = build_position_reconciliation_report(
+            instrument,
             account_id,
             instrument_id,
             order_side,
-            OrderType::Market,
             diff_qty,
-            fill_price,
+            fill_px,
             report.venue_position_id,
             None,
+            ts_now,
             report.ts_last,
-        );
-
-        let mut order_report = OrderStatusReport::new(
-            account_id,
-            instrument_id,
-            None,
-            venue_order_id,
-            order_side,
-            OrderType::Market,
-            TimeInForce::Gtc,
-            OrderStatus::Filled,
-            diff_qty,
-            diff_qty,
-            ts_now,
-            ts_now,
-            ts_now,
-            None,
-        )
-        .with_avg_px(fill_px);
-
-        if let Some(venue_position_id) = report.venue_position_id {
-            order_report = order_report.with_venue_position_id(venue_position_id);
-        }
+        )?;
 
         log::info!(
             color = LogColor::Blue as u8;
             "Generating reconciliation order for {instrument_id}: side={order_side:?}, qty={diff_qty}, px={fill_px}",
         );
 
-        let (events, _) =
-            self.handle_external_order(&order_report, account_id, instrument, &[], true, None);
-        Some(events)
+        self.handle_synthetic_position_order(&order_report, account_id, instrument)
     }
 
     fn reconcile_order_report(
@@ -3845,12 +4423,94 @@ impl ExecutionManager {
     fn handle_external_order(
         &self,
         report: &OrderStatusReport,
-        account_id: AccountId,
+        authority: ExternalOrderAuthority,
         instrument: &InstrumentAny,
         fills: &[&FillReport],
         is_synthetic: bool,
-        mut fill_queue: Option<&mut ReconciliationFillQueue>,
+        fill_queue: Option<&mut ReconciliationFillQueue>,
     ) -> (Vec<OrderEventAny>, Option<ExternalOrderMetadata>) {
+        let Some(prepared) = self.prepare_external_order(report, is_synthetic) else {
+            return (Vec::new(), None);
+        };
+        self.commit_external_order(
+            prepared,
+            report,
+            Some(authority.client),
+            authority.account,
+            instrument,
+            fills,
+            is_synthetic,
+            fill_queue,
+            None,
+        )
+    }
+
+    fn prepare_synthetic_position_order(
+        &self,
+        report: &OrderStatusReport,
+        account_id: AccountId,
+        instrument: &InstrumentAny,
+    ) -> Option<PreparedSyntheticPositionOrder> {
+        let external = self.prepare_external_order(report, true)?;
+        let projected_events = generate_external_order_status_events(
+            &external.order,
+            report,
+            &account_id,
+            instrument,
+            self.clock.borrow().timestamp_ns(),
+        );
+        let projects_complete_fill = projected_events.iter().any(|event| {
+            matches!(
+                event,
+                OrderEventAny::Filled(fill)
+                    if fill.client_order_id == external.client_order_id
+                        && fill.account_id == account_id
+                        && fill.instrument_id == report.instrument_id
+                        && fill.order_side == report.order_side
+                        && fill.last_qty == report.quantity
+            )
+        });
+        if !projects_complete_fill {
+            log::warn!(
+                "Synthetic position reconciliation order {} for {} does not project a complete fill",
+                external.client_order_id,
+                report.instrument_id,
+            );
+            return None;
+        }
+
+        Some(PreparedSyntheticPositionOrder {
+            external,
+            projected_events,
+        })
+    }
+
+    fn handle_synthetic_position_order(
+        &self,
+        report: &OrderStatusReport,
+        account_id: AccountId,
+        instrument: &InstrumentAny,
+    ) -> Option<Vec<OrderEventAny>> {
+        let prepared = self.prepare_synthetic_position_order(report, account_id, instrument)?;
+        let (events, _) = self.commit_external_order(
+            prepared.external,
+            report,
+            None,
+            account_id,
+            instrument,
+            &[],
+            true,
+            None,
+            Some(prepared.projected_events),
+        );
+        (!events.is_empty()).then_some(events)
+    }
+
+    fn prepare_external_order(
+        &self,
+        report: &OrderStatusReport,
+        is_synthetic: bool,
+    ) -> Option<PreparedExternalOrder> {
         let (strategy_id, tags) =
             if let Some(claimed_strategy) = self.external_order_claims.get(&report.instrument_id) {
                 let order_id = report
@@ -3876,7 +4536,7 @@ impl ExecutionManager {
 
         // Filter unclaimed venue orders (but not synthetic reconciliation orders)
         if self.config.filter_unclaimed_external && !is_synthetic {
-            return (Vec::new(), None);
+            return None;
         }
 
         let client_order_id = report
@@ -3891,10 +4551,53 @@ impl ExecutionManager {
                 report.instrument_id,
                 report,
             );
-            return (Vec::new(), None);
+            return None;
         }
 
-        let ts_now = self.clock.borrow().timestamp_ns();
+        {
+            let cache = self.cache.borrow();
+            if let Some(existing) = cache.order(&client_order_id) {
+                if is_synthetic {
+                    log::warn!(
+                        "Synthetic reconciliation order {client_order_id} for {} already exists in cache with status {:?}; report remains unresolved",
+                        report.instrument_id,
+                        existing.status(),
+                    );
+                } else {
+                    log::error!(
+                        "External order {client_order_id} for {} already exists in cache",
+                        report.instrument_id,
+                    );
+                }
+                return None;
+            }
+
+            if let Some(existing_client_order_id) = cache.client_order_id(&report.venue_order_id) {
+                let evidence = if is_synthetic {
+                    "synthetic reconciliation"
+                } else {
+                    "external"
+                };
+                log::warn!(
+                    "Cannot create {evidence} order {client_order_id} for {}: venue order ID {} is already owned by {existing_client_order_id}; report remains unresolved",
+                    report.instrument_id,
+                    report.venue_order_id,
+                );
+                return None;
+            }
+
+            if let Some(existing_venue_order_id) = cache.venue_order_id(&client_order_id)
+                && *existing_venue_order_id != report.venue_order_id
+            {
+                log::warn!(
+                    "Cannot create external order {client_order_id} for {}: client order ID is already indexed to {existing_venue_order_id}; report remains unresolved",
+                    report.instrument_id,
+                );
+                return None;
+            }
+        }
+
+        let ts_init = self.clock.borrow().timestamp_ns();
 
         let initialized = match OrderInitialized::new_checked(
             self.config.trader_id,
@@ -3910,8 +4613,8 @@ impl ExecutionManager {
             false, // quote_quantity
             true,  // reconciliation
             UUID4::new(),
-            ts_now,
-            ts_now,
+            ts_init,
+            ts_init,
             report.price,
             report.activation_price,
             report.trigger_price,
@@ -3935,7 +4638,7 @@ impl ExecutionManager {
             Ok(initialized) => initialized,
             Err(e) => {
                 log::error!("Failed to create order from report: {e}");
-                return (Vec::new(), None);
+                return None;
             }
         };
 
@@ -3944,13 +4647,44 @@ impl ExecutionManager {
             Ok(order) => order,
             Err(e) => {
                 log::error!("Failed to create order from report: {e}");
-                return (Vec::new(), None);
+                return None;
             }
         };
 
+        Some(PreparedExternalOrder {
+            initialized,
+            order,
+            client_order_id,
+            strategy_id,
+            ts_init,
+        })
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn commit_external_order(
+        &self,
+        prepared: PreparedExternalOrder,
+        report: &OrderStatusReport,
+        source_client_id: Option<ClientId>,
+        account_id: AccountId,
+        instrument: &InstrumentAny,
+        fills: &[&FillReport],
+        is_synthetic: bool,
+        mut fill_queue: Option<&mut ReconciliationFillQueue>,
+        projected_order_events: Option<Vec<OrderEventAny>>,
+    ) -> (Vec<OrderEventAny>, Option<ExternalOrderMetadata>) {
+        let PreparedExternalOrder {
+            initialized,
+            order,
+            client_order_id,
+            strategy_id,
+            ts_init,
+        } = prepared;
+
         {
             let mut cache = self.cache.borrow_mut();
-            if let Err(e) = cache.add_order(order.clone(), None, None, false) {
+
+            if let Err(e) = cache.add_order(order.clone(), None, source_client_id, false) {
                 // Deterministic synthetic reconciliation IDs hash the same logical event
                 // to the same client_order_id, so a restart replay can legitimately collide
                 // with a cached order. Differentiate expected dedup from stuck state.
@@ -4000,8 +4734,9 @@ impl ExecutionManager {
 
         // Generate events for external order: Accepted first, then fills (for terminal statuses),
         // then terminal status. This matches Python's behavior.
-        let mut order_events =
-            generate_external_order_status_events(&order, report, &account_id, instrument, ts_now);
+        let mut order_events = projected_order_events.unwrap_or_else(|| {
+            generate_external_order_status_events(&order, report, &account_id, instrument, ts_now)
+        });
 
         if !fills.is_empty() {
             let cached_order = self.get_order(client_order_id).unwrap();
@@ -4082,7 +4817,7 @@ impl ExecutionManager {
             venue_order_id: report.venue_order_id,
             instrument_id: report.instrument_id,
             strategy_id,
-            ts_init: ts_now,
+            ts_init,
         };
 
         (order_events, Some(metadata))
@@ -4259,6 +4994,24 @@ impl ExecutionManager {
             && !should_reconciliation_update(order, report)
     }
 
+    fn get_order_by_report_identity(&self, report: &OrderStatusReport) -> Option<OrderAny> {
+        report
+            .client_order_id
+            .and_then(|client_order_id| self.get_order(client_order_id))
+            .or_else(|| self.get_order_by_venue_order_id(report.venue_order_id))
+    }
+
+    fn is_fill_report_applied(&self, fill: &FillReport, fill_key: FillKey) -> bool {
+        fill.client_order_id
+            .and_then(|client_order_id| self.get_order(client_order_id))
+            .or_else(|| self.get_order_by_venue_order_id(fill.venue_order_id))
+            .is_some_and(|order| {
+                order.account_id() == Some(fill_key.0)
+                    && order.instrument_id() == fill_key.1
+                    && order.trade_ids().contains(&&fill_key.2)
+            })
+    }
+
     fn is_fill_applied(&self, fill: &OrderFilled, fill_key: FillKey) -> bool {
         self.get_order(fill.client_order_id)
             .or_else(|| self.get_order_by_venue_order_id(fill.venue_order_id))
@@ -4308,6 +5061,14 @@ impl ExecutionManager {
     }
 }
 
+pub(crate) fn report_matches_execution_client(
+    client: &dyn ExecutionClient,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+) -> bool {
+    client.account_id() == account_id && client.handles_order_venue(instrument_id.venue)
+}
+
 pub(crate) async fn request_targeted_order_reports(
     clients: &[&dyn ExecutionClient],
     queries: Vec<TargetedOrderQuery>,
@@ -4318,6 +5079,7 @@ pub(crate) async fn request_targeted_order_reports(
 
     for query in queries {
         let mut report = None;
+        let mut source_client_id = None;
         let mut coverage_complete = true;
 
         for client_id in &query.responsible_clients {
@@ -4340,8 +5102,15 @@ pub(crate) async fn request_targeted_order_reports(
             request_count += 1;
 
             match client.generate_order_status_report(&query.command).await {
-                Ok(Some(candidate)) if targeted_report_matches(&query, &candidate) => {
+                Ok(Some(candidate))
+                    if report_matches_execution_client(
+                        *client,
+                        candidate.account_id,
+                        candidate.instrument_id,
+                    ) && targeted_report_matches(&query, &candidate) =>
+                {
                     report = Some(candidate);
+                    source_client_id = Some(client_id);
                     break;
                 }
                 Ok(Some(candidate)) => {
@@ -4367,6 +5136,7 @@ pub(crate) async fn request_targeted_order_reports(
 
         results.push(TargetedOrderReportResult {
             client_order_id: query.client_order_id,
+            source_client_id,
             report,
             coverage_complete,
         });
@@ -4480,6 +5250,56 @@ mod tests {
                 ..Default::default()
             },
         );
+
+        manager.register_inflight(client_order_id);
+
+        assert!(!manager.inflight_checks.contains_key(&client_order_id));
+        assert!(!manager.recon_check_retries.contains_key(&client_order_id));
+    }
+
+    #[rstest]
+    fn test_register_inflight_skips_order_already_closed_by_earlier_event() {
+        let client_order_id = ClientOrderId::from("O-CLOSED-BEFORE-COMMAND");
+        let venue_order_id = VenueOrderId::from("V-CLOSED-BEFORE-COMMAND");
+        let instrument_id = InstrumentId::from("ETHUSDT.BINANCE");
+        let client_id = ClientId::from("BINANCE");
+        let account_id = AccountId::from("TEST-001");
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        insert_accepted_limit_order(
+            &cache,
+            client_order_id,
+            venue_order_id,
+            instrument_id,
+            client_id,
+        );
+        let order = cache.borrow().order_owned(&client_order_id).unwrap();
+        let canceled = TestOrderEventStubs::canceled(&order, account_id, Some(venue_order_id));
+        cache.borrow_mut().update_order(&canceled).unwrap();
+        let mut manager = ExecutionManager::new(clock, cache, ExecutionManagerConfig::default());
+
+        manager.register_inflight(client_order_id);
+
+        assert!(!manager.inflight_checks.contains_key(&client_order_id));
+        assert!(!manager.recon_check_retries.contains_key(&client_order_id));
+    }
+
+    #[rstest]
+    fn test_register_inflight_skips_order_already_accepted_by_earlier_event() {
+        let client_order_id = ClientOrderId::from("O-ACCEPTED-BEFORE-COMMAND");
+        let venue_order_id = VenueOrderId::from("V-ACCEPTED-BEFORE-COMMAND");
+        let instrument_id = InstrumentId::from("ETHUSDT.BINANCE");
+        let client_id = ClientId::from("BINANCE");
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        insert_accepted_limit_order(
+            &cache,
+            client_order_id,
+            venue_order_id,
+            instrument_id,
+            client_id,
+        );
+        let mut manager = ExecutionManager::new(clock, cache, ExecutionManagerConfig::default());
 
         manager.register_inflight(client_order_id);
 

@@ -379,7 +379,7 @@ impl Harness {
             .expect("mass status was None");
         self.exec_engine
             .borrow_mut()
-            .reconcile_execution_mass_status(&mass_status);
+            .reconcile_execution_mass_status(client_id, &mass_status);
         mass_status
     }
 }

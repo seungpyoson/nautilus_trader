@@ -13,7 +13,7 @@
           "size": 10.0
         },
         "bspLiability": 0.0,
-        "side": "BACK",
+        "side": "LAY",
         "status": "EXECUTABLE",
         "persistenceType": "PERSIST",
         "orderType": "LIMIT",

@@ -61,7 +61,15 @@
 //!   thread. `bind_senders` overwrites any existing TLS contents on the
 //!   thread, so the last caller wins.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    collections::VecDeque,
+    fmt::Debug,
+    sync::{Arc, Mutex},
+    task::{Context, Poll, Wake, Waker},
+};
+
+#[cfg(feature = "node")]
+use std::future::poll_fn;
 
 use nautilus_common::{
     live::runner::{replace_data_event_sender, replace_exec_event_sender},
@@ -148,6 +156,9 @@ pub trait Runner {
 ///
 /// These can be extracted from `AsyncRunner` via `take_channels()` to drive
 /// the event loop directly on the same thread as the msgbus endpoints.
+/// Construction arms every receiver with a channel-specific waker. Those
+/// wakers record cross-channel readiness in one queue so startup snapshots
+/// replay the order observed by the runner instead of a fixed channel order.
 #[derive(Debug)]
 pub struct AsyncRunnerChannels {
     pub time_evt_rx: tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
@@ -155,9 +166,23 @@ pub struct AsyncRunnerChannels {
     pub exec_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
     pub data_evt_rx: tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
     pub data_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+    arrivals: RunnerArrivalQueue,
+    prefetched: [VecDeque<PendingRunnerEvent>; RunnerChannel::COUNT],
+    deferred: VecDeque<PendingRunnerEvent>,
+    closed: [bool; RunnerChannel::COUNT],
 }
 
 #[cfg(feature = "node")]
+#[derive(Debug)]
+pub(crate) struct AsyncRunnerReceivers {
+    pub(crate) time_evt: tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
+    pub(crate) exec_evt: tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    pub(crate) exec_cmd: tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
+    pub(crate) data_evt: tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    pub(crate) data_cmd: tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+}
+
+#[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
     reason = "runner events are consumed immediately; boxing would add routing allocations"
@@ -168,6 +193,309 @@ pub(crate) enum PendingRunnerEvent {
     ExecCommand(TradingCommandMessage),
     DataEvent(DataEvent),
     DataCommand(DataCommand),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunnerChannel {
+    Time,
+    ExecEvent,
+    ExecCommand,
+    DataEvent,
+    DataCommand,
+}
+
+impl RunnerChannel {
+    const COUNT: usize = 5;
+    const ALL: [Self; Self::COUNT] = [
+        Self::Time,
+        Self::ExecEvent,
+        Self::ExecCommand,
+        Self::DataEvent,
+        Self::DataCommand,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Time => 0,
+            Self::ExecEvent => 1,
+            Self::ExecCommand => 2,
+            Self::DataEvent => 3,
+            Self::DataCommand => 4,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RunnerArrivalState {
+    ready: VecDeque<RunnerChannel>,
+    queued: [bool; RunnerChannel::COUNT],
+    parent_waker: Option<Waker>,
+}
+
+#[derive(Debug)]
+struct RunnerChannelWake {
+    channel: RunnerChannel,
+    state: Arc<Mutex<RunnerArrivalState>>,
+}
+
+impl Wake for RunnerChannelWake {
+    fn wake(self: Arc<Self>) {
+        Self::record(&self);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        Self::record(self);
+    }
+}
+
+impl RunnerChannelWake {
+    fn record(&self) {
+        let parent_waker = {
+            let mut state = self.state.lock().unwrap();
+            let index = self.channel.index();
+
+            if !state.queued[index] {
+                state.queued[index] = true;
+                state.ready.push_back(self.channel);
+            }
+            state.parent_waker.clone()
+        };
+
+        if let Some(waker) = parent_waker {
+            waker.wake();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RunnerArrivalQueue {
+    state: Arc<Mutex<RunnerArrivalState>>,
+    wakers: [Waker; RunnerChannel::COUNT],
+}
+
+impl RunnerArrivalQueue {
+    fn new() -> Self {
+        let state = Arc::new(Mutex::new(RunnerArrivalState::default()));
+        let wakers = RunnerChannel::ALL.map(|channel| {
+            Waker::from(Arc::new(RunnerChannelWake {
+                channel,
+                state: state.clone(),
+            }))
+        });
+        Self { state, wakers }
+    }
+
+    fn set_parent_waker(&self, waker: &Waker) {
+        self.state.lock().unwrap().parent_waker = Some(waker.clone());
+    }
+
+    fn mark_ready(&self, channel: RunnerChannel) {
+        self.wakers[channel.index()].wake_by_ref();
+    }
+
+    fn pop_ready(&self) -> Option<RunnerChannel> {
+        let mut state = self.state.lock().unwrap();
+        let channel = state.ready.pop_front()?;
+        state.queued[channel.index()] = false;
+        Some(channel)
+    }
+
+    fn has_ready(&self) -> bool {
+        !self.state.lock().unwrap().ready.is_empty()
+    }
+
+    fn waker(&self, channel: RunnerChannel) -> &Waker {
+        &self.wakers[channel.index()]
+    }
+}
+
+impl AsyncRunnerChannels {
+    pub(crate) fn new(
+        time_evt_rx: tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
+        exec_evt_rx: tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+        exec_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
+        data_evt_rx: tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+        data_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+    ) -> Self {
+        let mut channels = Self {
+            time_evt_rx,
+            exec_evt_rx,
+            exec_cmd_rx,
+            data_evt_rx,
+            data_cmd_rx,
+            arrivals: RunnerArrivalQueue::new(),
+            prefetched: std::array::from_fn(|_| VecDeque::new()),
+            deferred: VecDeque::new(),
+            closed: [false; RunnerChannel::COUNT],
+        };
+        channels.prime();
+        channels
+    }
+
+    fn prime(&mut self) {
+        for channel in RunnerChannel::ALL {
+            self.arm(channel);
+        }
+    }
+
+    fn arm(&mut self, channel: RunnerChannel) {
+        let index = channel.index();
+
+        if self.closed[index] {
+            return;
+        }
+
+        if !self.prefetched[index].is_empty() {
+            self.arrivals.mark_ready(channel);
+            return;
+        }
+
+        let waker = self.arrivals.waker(channel).clone();
+        let mut cx = Context::from_waker(&waker);
+        let next = match channel {
+            RunnerChannel::Time => self
+                .time_evt_rx
+                .poll_recv(&mut cx)
+                .map(|item| item.map(PendingRunnerEvent::Time)),
+            RunnerChannel::ExecEvent => self
+                .exec_evt_rx
+                .poll_recv(&mut cx)
+                .map(|item| item.map(PendingRunnerEvent::ExecEvent)),
+            RunnerChannel::ExecCommand => self
+                .exec_cmd_rx
+                .poll_recv(&mut cx)
+                .map(|item| item.map(PendingRunnerEvent::ExecCommand)),
+            RunnerChannel::DataEvent => self
+                .data_evt_rx
+                .poll_recv(&mut cx)
+                .map(|item| item.map(PendingRunnerEvent::DataEvent)),
+            RunnerChannel::DataCommand => self
+                .data_cmd_rx
+                .poll_recv(&mut cx)
+                .map(|item| item.map(PendingRunnerEvent::DataCommand)),
+        };
+
+        match next {
+            Poll::Ready(Some(event)) => {
+                self.prefetched[index].push_back(event);
+                self.arrivals.mark_ready(channel);
+            }
+            Poll::Ready(None) => self.closed[index] = true,
+            Poll::Pending => {}
+        }
+    }
+
+    fn take_ready(&mut self, channel: RunnerChannel) -> Option<PendingRunnerEvent> {
+        let index = channel.index();
+
+        if let Some(event) = self.prefetched[index].pop_front() {
+            return Some(event);
+        }
+
+        match channel {
+            RunnerChannel::Time => self
+                .time_evt_rx
+                .try_recv()
+                .ok()
+                .map(PendingRunnerEvent::Time),
+            RunnerChannel::ExecEvent => self
+                .exec_evt_rx
+                .try_recv()
+                .ok()
+                .map(PendingRunnerEvent::ExecEvent),
+            RunnerChannel::ExecCommand => self
+                .exec_cmd_rx
+                .try_recv()
+                .ok()
+                .map(PendingRunnerEvent::ExecCommand),
+            RunnerChannel::DataEvent => self
+                .data_evt_rx
+                .try_recv()
+                .ok()
+                .map(PendingRunnerEvent::DataEvent),
+            RunnerChannel::DataCommand => self
+                .data_cmd_rx
+                .try_recv()
+                .ok()
+                .map(PendingRunnerEvent::DataCommand),
+        }
+    }
+
+    fn poll_next(&mut self, cx: &Context<'_>) -> Poll<Option<PendingRunnerEvent>> {
+        if let Some(event) = self.deferred.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+
+        self.arrivals.set_parent_waker(cx.waker());
+
+        loop {
+            if let Some(channel) = self.arrivals.pop_ready() {
+                if let Some(event) = self.take_ready(channel) {
+                    self.arm(channel);
+                    return Poll::Ready(Some(event));
+                }
+                self.arm(channel);
+                continue;
+            }
+
+            self.prime();
+
+            if self.arrivals.has_ready() {
+                continue;
+            }
+
+            if self.closed.iter().all(|closed| *closed) {
+                return Poll::Ready(None);
+            }
+
+            return Poll::Pending;
+        }
+    }
+
+    #[cfg(feature = "node")]
+    pub(crate) async fn recv(&mut self) -> Option<PendingRunnerEvent> {
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    pub(crate) fn drain_pending_snapshot(&mut self) -> Vec<PendingRunnerEvent> {
+        let pending = self.pending_count();
+        let mut events = Vec::with_capacity(pending);
+        let cx = Context::from_waker(Waker::noop());
+
+        for _ in 0..pending {
+            match self.poll_next(&cx) {
+                Poll::Ready(Some(event)) => events.push(event),
+                Poll::Ready(None) | Poll::Pending => break,
+            }
+        }
+
+        events
+    }
+
+    pub(crate) fn defer(&mut self, events: impl IntoIterator<Item = PendingRunnerEvent>) {
+        self.deferred.extend(events);
+    }
+
+    #[cfg(feature = "node")]
+    pub(crate) fn into_receivers(self) -> AsyncRunnerReceivers {
+        AsyncRunnerReceivers {
+            time_evt: self.time_evt_rx,
+            exec_evt: self.exec_evt_rx,
+            exec_cmd: self.exec_cmd_rx,
+            data_evt: self.data_evt_rx,
+            data_cmd: self.data_cmd_rx,
+        }
+    }
+
+    fn pending_count(&self) -> usize {
+        self.time_evt_rx.len()
+            + self.exec_evt_rx.len()
+            + self.exec_cmd_rx.len()
+            + self.data_evt_rx.len()
+            + self.data_cmd_rx.len()
+            + self.prefetched.iter().map(VecDeque::len).sum::<usize>()
+            + self.deferred.len()
+    }
 }
 
 pub struct AsyncRunner {
@@ -226,13 +554,13 @@ impl AsyncRunner {
         let (data_evt_tx, data_evt_rx) = unbounded_channel::<DataEvent>();
 
         Self {
-            channels: AsyncRunnerChannels {
+            channels: AsyncRunnerChannels::new(
                 time_evt_rx,
                 exec_evt_rx,
                 exec_cmd_rx,
                 data_evt_rx,
                 data_cmd_rx,
-            },
+            ),
             time_evt_tx,
             signal_rx,
             signal_tx,
@@ -296,24 +624,24 @@ impl AsyncRunner {
 
         loop {
             let mut progressed = false;
+            let mut deferred = Vec::new();
 
-            // Events drain before commands here even though the runtime select
-            // prefers the opposite for everything-else: `LiveNode::start()`
-            // calls this after `connect_data_clients()` to push queued
-            // `DataEvent::Instrument` items into the cache. A pending
-            // subscription command (e.g. `SubscribeBars`) processed before the
-            // matching instrument lands would be rejected by the data engine.
-            while let Ok(evt) = self.channels.data_evt_rx.try_recv() {
-                Self::handle_data_event(evt);
-                progressed = true;
-                total += 1;
+            for event in self.channels.drain_pending_snapshot() {
+                match event {
+                    PendingRunnerEvent::DataEvent(event) => {
+                        Self::handle_data_event(event);
+                        progressed = true;
+                        total += 1;
+                    }
+                    PendingRunnerEvent::DataCommand(command) => {
+                        Self::handle_data_command(command);
+                        progressed = true;
+                        total += 1;
+                    }
+                    event => deferred.push(event),
+                }
             }
-
-            while let Ok(cmd) = self.channels.data_cmd_rx.try_recv() {
-                Self::handle_data_command(cmd);
-                progressed = true;
-                total += 1;
-            }
+            self.channels.defer(deferred);
 
             if !progressed {
                 break;
@@ -474,93 +802,18 @@ impl AsyncRunner {
 
 #[cfg(feature = "node")]
 impl AsyncRunner {
-    pub(crate) fn poll_pending(&mut self, mut process: impl FnMut(PendingRunnerEvent)) -> usize {
+    pub(crate) fn poll_pending(&mut self, process: impl FnMut(PendingRunnerEvent)) -> usize {
         self.bind_senders();
 
-        let pending = (
-            self.channels.time_evt_rx.len(),
-            self.channels.exec_evt_rx.len(),
-            self.channels.exec_cmd_rx.len(),
-            self.channels.data_evt_rx.len(),
-            self.channels.data_cmd_rx.len(),
-        );
-        let mut processed = 0;
-        processed += poll_channel(
-            &mut self.channels.time_evt_rx,
-            pending.0,
-            PendingRunnerEvent::Time,
-            &mut process,
-        );
-        processed += poll_channel(
-            &mut self.channels.exec_evt_rx,
-            pending.1,
-            PendingRunnerEvent::ExecEvent,
-            &mut process,
-        );
-        processed += poll_channel(
-            &mut self.channels.exec_cmd_rx,
-            pending.2,
-            PendingRunnerEvent::ExecCommand,
-            &mut process,
-        );
-        processed += poll_channel(
-            &mut self.channels.data_evt_rx,
-            pending.3,
-            PendingRunnerEvent::DataEvent,
-            &mut process,
-        );
-        processed += poll_channel(
-            &mut self.channels.data_cmd_rx,
-            pending.4,
-            PendingRunnerEvent::DataCommand,
-            &mut process,
-        );
+        let events = self.channels.drain_pending_snapshot();
+        let processed = events.len();
+        events.into_iter().for_each(process);
         processed
     }
 
     pub(crate) async fn recv(&mut self) -> Option<PendingRunnerEvent> {
-        tokio::select! {
-            biased;
-
-            Some(message) = self.channels.time_evt_rx.recv() => {
-                Some(PendingRunnerEvent::Time(message))
-            }
-            Some(event) = self.channels.exec_evt_rx.recv() => {
-                Some(PendingRunnerEvent::ExecEvent(event))
-            }
-            Some(command) = self.channels.exec_cmd_rx.recv() => {
-                Some(PendingRunnerEvent::ExecCommand(command))
-            }
-            Some(event) = self.channels.data_evt_rx.recv() => {
-                Some(PendingRunnerEvent::DataEvent(event))
-            }
-            Some(command) = self.channels.data_cmd_rx.recv() => {
-                Some(PendingRunnerEvent::DataCommand(command))
-            }
-            else => None,
-        }
+        self.channels.recv().await
     }
-}
-
-#[cfg(feature = "node")]
-fn poll_channel<T>(
-    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
-    pending: usize,
-    event: impl Fn(T) -> PendingRunnerEvent,
-    process: &mut impl FnMut(PendingRunnerEvent),
-) -> usize {
-    let mut processed = 0;
-
-    for _ in 0..pending {
-        let Ok(message) = receiver.try_recv() else {
-            break;
-        };
-
-        process(event(message));
-        processed += 1;
-    }
-
-    processed
 }
 
 #[cfg(test)]
@@ -640,13 +893,13 @@ mod tests {
         let (exec_evt_tx, _) = tokio::sync::mpsc::unbounded_channel();
 
         AsyncRunner {
-            channels: AsyncRunnerChannels {
+            channels: AsyncRunnerChannels::new(
                 time_evt_rx,
                 exec_evt_rx,
                 exec_cmd_rx,
                 data_evt_rx,
                 data_cmd_rx,
-            },
+            ),
             time_evt_tx,
             exec_cmd_tx,
             exec_evt_tx,
@@ -750,6 +1003,62 @@ mod tests {
         assert_eq!(first, 5);
         assert_eq!(second, 1);
         assert_eq!(processed_by_channel, [1, 1, 1, 2, 1]);
+    }
+
+    #[cfg(feature = "node")]
+    #[rstest]
+    fn test_poll_pending_preserves_command_before_event_arrival() {
+        let (_time_evt_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut runner = create_test_runner(
+            time_evt_rx,
+            data_evt_rx,
+            data_cmd_rx,
+            exec_evt_rx,
+            exec_cmd_rx,
+            signal_rx,
+            signal_tx,
+        );
+
+        exec_cmd_tx
+            .send(TradingCommandMessage::new(
+                MessagingSwitchboard::exec_engine_execute(),
+                TradingCommand::CancelAllOrders(CancelAllOrders::new(
+                    TraderId::from("TRADER-001"),
+                    None,
+                    StrategyId::from("S-POLL-ORDER"),
+                    InstrumentId::from("EUR/USD.SIM"),
+                    OrderSide::Buy,
+                    UUID4::new(),
+                    UnixNanos::from(1),
+                    None,
+                    None,
+                )),
+            ))
+            .unwrap();
+        exec_evt_tx
+            .send(ExecutionEvent::Order(OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder()
+                    .client_order_id(ClientOrderId::from("O-POLL-ORDER"))
+                    .build(),
+            )))
+            .unwrap();
+
+        let mut observed = Vec::new();
+        let processed = runner.poll_pending(|event| {
+            observed.push(match event {
+                PendingRunnerEvent::ExecCommand(_) => "command",
+                PendingRunnerEvent::ExecEvent(_) => "event",
+                _ => panic!("Unexpected runner event"),
+            });
+        });
+
+        assert_eq!(processed, 2);
+        assert_eq!(observed, ["command", "event"]);
     }
 
     #[rstest]

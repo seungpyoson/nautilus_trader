@@ -59,7 +59,8 @@ use nautilus_live::{
 };
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
+    enums::{OmsType, OrderSide, OrderStatus, OrderType, PositionSideSpecified, TimeInForce},
+    events::{OrderEventAny, OrderPendingCancel},
     identifiers::{
         AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, StrategyId, TraderId,
         Venue, VenueOrderId,
@@ -331,6 +332,7 @@ mod serial_tests {
     #[derive(Clone, Copy, Debug)]
     enum StartupMassStatusBehavior {
         Unavailable,
+        InsufficientPositionEvidence,
         Error,
         Pending,
     }
@@ -783,6 +785,29 @@ mod serial_tests {
 
             match self.behavior {
                 StartupMassStatusBehavior::Unavailable => Ok(None),
+                StartupMassStatusBehavior::InsufficientPositionEvidence => {
+                    let ts_last = UnixNanos::from(1_000_000);
+                    let instrument_id = crypto_perpetual_ethusdt().id();
+                    let mut mass_status = ExecutionMassStatus::new(
+                        self.client_id(),
+                        self.account_id(),
+                        self.venue(),
+                        ts_last,
+                        Some(UUID4::new()),
+                    );
+                    mass_status.add_position_reports(vec![PositionStatusReport::new(
+                        self.account_id(),
+                        instrument_id,
+                        PositionSideSpecified::Long,
+                        Quantity::from("5.000"),
+                        ts_last,
+                        ts_last,
+                        None,
+                        None,
+                        None,
+                    )]);
+                    Ok(Some(mass_status))
+                }
                 StartupMassStatusBehavior::Error => Err(anyhow::anyhow!("mass status failed")),
                 StartupMassStatusBehavior::Pending => {
                     std::future::pending::<anyhow::Result<Option<ExecutionMassStatus>>>().await
@@ -2164,7 +2189,7 @@ mod serial_tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_start_continues_when_mass_status_unavailable() {
+    async fn test_start_aborts_when_mass_status_unavailable() {
         let config = LiveNodeConfig {
             exec_engine: LiveExecEngineConfig {
                 reconciliation: true,
@@ -2181,12 +2206,17 @@ mod serial_tests {
         );
         let handle = node.handle();
 
-        let result = node.start().await;
+        let err = node.start().await.expect_err("start should fail");
+        let err = format!("{err:#}");
 
-        assert!(result.is_ok(), "unexpected error: {result:#?}");
+        assert!(
+            err.contains("No mass status available from")
+                && err.contains("startup reconciliation lacks sufficient evidence"),
+            "unexpected error: {err}"
+        );
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
-        assert_eq!(handle.state(), NodeState::Running);
-        assert!(state.connected.load(Ordering::Relaxed));
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert!(!state.connected.load(Ordering::Relaxed));
         assert!(
             node.kernel()
                 .cache
@@ -2195,15 +2225,41 @@ mod serial_tests {
                 .is_some(),
             "start must route the account event required to complete client connection",
         );
+    }
 
-        node.stop().await.unwrap();
+    #[rstest]
+    #[tokio::test]
+    async fn test_start_aborts_when_mass_status_has_insufficient_position_evidence() {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecEngineConfig {
+                reconciliation: true,
+                ..Default::default()
+            },
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupInsufficientPositionEvidenceNode",
+            config,
+            StartupMassStatusBehavior::InsufficientPositionEvidence,
+        );
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()))
+            .unwrap();
+        let handle = node.handle();
 
-        node.dispose();
+        let err = node.start().await.expect_err("start should fail");
+        let err = format!("{err:#}");
 
+        assert!(
+            err.contains("left unresolved reports") && err.contains("positions=1"),
+            "unexpected error: {err}"
+        );
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
-        assert!(node.kernel().trader().borrow().is_disposed());
-        assert_eq!(node.kernel().trader().borrow().component_count(), 0);
     }
 
     #[rstest]
@@ -2399,7 +2455,7 @@ mod serial_tests {
 
     #[rstest]
     #[tokio::test(flavor = "current_thread")]
-    async fn test_run_continues_when_mass_status_unavailable() {
+    async fn test_run_aborts_when_mass_status_unavailable() {
         let config = LiveNodeConfig {
             exec_engine: LiveExecEngineConfig {
                 reconciliation: true,
@@ -2415,20 +2471,14 @@ mod serial_tests {
             StartupMassStatusBehavior::Unavailable,
         );
         let handle = node.handle();
-        let stop_handle = handle.clone();
+        let err = node.run().await.expect_err("run should fail");
+        let err = format!("{err:#}");
 
-        tokio::spawn(async move {
-            wait_until_async(
-                || async { stop_handle.is_running() },
-                Duration::from_secs(5),
-            )
-            .await;
-            stop_handle.stop();
-        });
-
-        let result = node.run().await;
-
-        assert!(result.is_ok(), "unexpected error: {result:#?}");
+        assert!(
+            err.contains("No mass status available from")
+                && err.contains("startup reconciliation lacks sufficient evidence"),
+            "unexpected error: {err}"
+        );
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
@@ -3288,6 +3338,29 @@ mod serial_tests {
             VenueOrderId::from("V-TARGETED-C"),
             client_id,
         );
+
+        // Keep order A in a legitimate inflight state while it remains eligible for open checks
+        let pending_cancel = {
+            let cache = node.kernel().cache.borrow();
+            let order = cache.order(&order_a).unwrap();
+            OrderEventAny::PendingCancel(OrderPendingCancel::new(
+                order.trader_id(),
+                order.strategy_id(),
+                order.instrument_id(),
+                order.client_order_id(),
+                order.account_id(),
+                UUID4::new(),
+                UnixNanos::default(),
+                UnixNanos::default(),
+                false,
+                order.venue_order_id(),
+            ))
+        };
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .update_order(&pending_cancel)
+            .unwrap();
         node.exec_manager_mut().register_inflight(order_a);
         assert_eq!(
             node.kernel()
@@ -3351,9 +3424,17 @@ mod serial_tests {
         assert!(state.position_report_requested.load(Ordering::Relaxed));
         let targeted_ids = observed_targeted_ids;
         assert_eq!(
-            &targeted_ids[..5],
-            &[order_a, order_b, order_c, order_b, order_b],
-            "all planned markers should clear while query recency remains"
+            &targeted_ids[..3],
+            &[order_a, order_b, order_c],
+            "deferred targeted checks should resume after the timed-out batch"
+        );
+        assert!(
+            targeted_ids[3..].contains(&order_b),
+            "all timed-out planned markers should clear while query recency remains: targeted={targeted_ids:?}, queried={:?}, retries=[{}, {}, {}]",
+            state.query_order_ids.lock().unwrap().clone(),
+            node.exec_manager().recon_check_retry_count(&order_a),
+            node.exec_manager().recon_check_retry_count(&order_b),
+            node.exec_manager().recon_check_retry_count(&order_c),
         );
         assert!(node.exec_manager().recon_check_retry_count(&order_a) > 0);
         assert!(node.exec_manager().recon_check_retry_count(&order_b) > 0);

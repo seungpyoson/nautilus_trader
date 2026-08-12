@@ -77,7 +77,13 @@
 //! maintenance below 100ms (defaults are seconds to minutes). Cadence drifts
 //! by at most one body duration per fire.
 
-use std::{collections::HashSet, fmt::Debug, future::Future, pin::Pin, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    fmt::Debug,
+    future::Future,
+    pin::Pin,
+    time::Duration,
+};
 
 use anyhow::Context;
 use indexmap::IndexSet;
@@ -123,10 +129,11 @@ use crate::{
         client::LiveExecutionClient,
         manager::{
             ExecutionManager, ExecutionManagerConfig, OpenOrderReportCheck, PositionReportCheck,
-            TargetedOrderQuery, TargetedOrderReportResult, request_targeted_order_reports,
+            TargetedOrderQuery, TargetedOrderReportResult, report_matches_execution_client,
+            request_targeted_order_reports,
         },
     },
-    runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent},
+    runner::{AsyncRunner, AsyncRunnerChannels, AsyncRunnerReceivers, PendingRunnerEvent},
 };
 
 pub mod builder;
@@ -394,7 +401,7 @@ impl LiveNode {
 
         if let Err(e) = data_connect_result {
             self.runner = Some(runner);
-            pending.drain();
+            pending.drain_after_failure_with(|event| self.process_runner_event(event));
             return self
                 .abort_startup_with_error("Data client connection timed out", e)
                 .await;
@@ -408,12 +415,12 @@ impl LiveNode {
             &mut pending,
         )
         .await;
-        pending.drain();
 
         let engine_connection_status = match engine_connection_result {
             Ok(status) => status,
             Err(e) => {
                 self.runner = Some(runner);
+                pending.drain_after_failure_with(|event| self.process_runner_event(event));
                 return self
                     .abort_startup_with_error("Execution client connection timed out", e)
                     .await;
@@ -422,6 +429,7 @@ impl LiveNode {
 
         if engine_connection_status == EngineConnectionStatus::TimedOut {
             self.runner = Some(runner);
+            pending.drain_after_failure_with(|event| self.process_runner_event(event));
             return self
                 .abort_startup_with_error(
                     "Engine readiness timed out",
@@ -435,11 +443,13 @@ impl LiveNode {
             .or_else(|| self.startup_abort_reason())
         {
             self.runner = Some(runner);
+            pending.drain_after_failure_with(|event| self.process_runner_event(event));
             self.abort_startup(reason).await?;
             return Ok(());
         }
 
         debug_assert_eq!(engine_connection_status, EngineConnectionStatus::Connected);
+        pending.drain_with(|event| self.process_runner_event(event));
 
         let reconciliation_result = drive_with_runner_event_buffering(
             self.perform_startup_reconciliation(),
@@ -448,9 +458,9 @@ impl LiveNode {
         )
         .await;
         self.runner = Some(runner);
-        pending.drain();
 
         if let Err(e) = reconciliation_result {
+            pending.drain_after_failure_with(|event| self.process_runner_event(event));
             if let Err(finalize_err) = self.abort_startup("Startup reconciliation failed").await {
                 anyhow::bail!(
                     "startup reconciliation failed: {e}; failed to finalize startup abort: {finalize_err}"
@@ -459,6 +469,8 @@ impl LiveNode {
 
             return Err(e);
         }
+
+        pending.drain_with(|event| self.process_runner_event(event));
 
         if let Some(reason) = self.startup_abort_reason() {
             self.abort_startup(reason).await?;
@@ -794,12 +806,39 @@ impl LiveNode {
 
                     let result = self
                         .exec_manager
-                        .reconcile_execution_mass_status(mass_status, exec_engine_rc)
+                        .reconcile_execution_mass_status(client_id, mass_status, exec_engine_rc)
                         .await;
 
                     if let Some(rejection) = &result.rejection {
                         anyhow::bail!(
                             "ExecutionMassStatus from {client_id} was rejected: {rejection}"
+                        );
+                    }
+
+                    // Reconciliation creates external orders before position outcomes are known.
+                    // Register them with the authenticated source client even when a later
+                    // unresolved position makes startup fail closed, so a retry cannot strand
+                    // already-cached orders outside client tracking.
+                    if !result.external_orders.is_empty() {
+                        let exec_engine = self.kernel.exec_engine.borrow();
+                        for external in &result.external_orders {
+                            exec_engine.register_external_order_for_client(
+                                client_id,
+                                external.client_order_id,
+                                external.venue_order_id,
+                                external.instrument_id,
+                                external.strategy_id,
+                                external.ts_init,
+                            )?;
+                        }
+                    }
+
+                    if result.unresolved_reports() > 0 {
+                        anyhow::bail!(
+                            "ExecutionMassStatus from {client_id} left unresolved reports: orders={}, fills={}, positions={}",
+                            result.unresolved_order_reports,
+                            result.unresolved_fill_reports,
+                            result.position_reports.unresolved(),
                         );
                     }
 
@@ -817,25 +856,11 @@ impl LiveNode {
                             result.events.len()
                         );
                     }
-
-                    // Register external orders with execution clients for tracking
-                    if !result.external_orders.is_empty() {
-                        let exec_engine = self.kernel.exec_engine.borrow();
-                        for external in result.external_orders {
-                            exec_engine.register_external_order(
-                                external.client_order_id,
-                                external.venue_order_id,
-                                external.instrument_id,
-                                external.strategy_id,
-                                external.ts_init,
-                            );
-                        }
-                    }
                 }
                 Ok(None) => {
-                    log::warn!(
-                        "No mass status available from {client_id} \
-                         (likely adapter error when generating reports)"
+                    anyhow::bail!(
+                        "No mass status available from {client_id}; startup reconciliation lacks \
+                         sufficient evidence"
                     );
                 }
                 Err(e) => {
@@ -894,13 +919,7 @@ impl LiveNode {
         };
         runner.bind_senders();
 
-        let AsyncRunnerChannels {
-            mut time_evt_rx,
-            mut exec_evt_rx,
-            mut exec_cmd_rx,
-            mut data_evt_rx,
-            mut data_cmd_rx,
-        } = runner.take_channels();
+        let mut channels = runner.take_channels();
 
         log::info!("Event loop starting");
 
@@ -931,13 +950,7 @@ impl LiveNode {
                 let result = self
                     .abort_startup("External message bus ingress failed to start")
                     .await;
-                Self::drain_channels(
-                    &mut time_evt_rx,
-                    &mut data_evt_rx,
-                    &mut data_cmd_rx,
-                    &mut exec_evt_rx,
-                    &mut exec_cmd_rx,
-                );
+                Self::drain_ordered_channels(&mut channels);
                 log::info!("Event loop stopped");
 
                 if let Err(finalize_err) = result {
@@ -959,33 +972,17 @@ impl LiveNode {
         let data_connect_result = drive_with_event_buffering(
             self.connect_data_phase(connection_deadline),
             &mut pending,
-            &mut time_evt_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
+            &mut channels,
         )
         .await;
 
         if let Err(e) = data_connect_result {
-            flush_all_pending(
-                &mut pending,
-                &mut time_evt_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-            );
+            flush_all_pending(&mut pending, &mut channels);
+            pending.drain_after_failure_with(|event| self.process_runner_event(event));
             let result = self
                 .abort_startup_with_error("Data client connection timed out", e)
                 .await;
-            Self::drain_channels(
-                &mut time_evt_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-            );
+            Self::drain_ordered_channels(&mut channels);
             log::info!("Event loop stopped");
             return result;
         }
@@ -993,9 +990,12 @@ impl LiveNode {
         // Flush any data events still queued in the channel receivers that the
         // select loop did not capture before the connect future resolved, then
         // drain everything into cache.
-        flush_pending_data(&mut pending, &mut data_evt_rx, &mut data_cmd_rx);
+        flush_pending_data(&mut pending, &mut channels);
         debug_assert!(
-            pending.data_evts.is_empty() && pending.data_cmds.is_empty(),
+            pending.events.iter().all(|event| !matches!(
+                event,
+                PendingRunnerEvent::DataEvent(_) | PendingRunnerEvent::DataCommand(_)
+            )),
             "data must be drained into cache before exec clients connect",
         );
 
@@ -1003,60 +1003,34 @@ impl LiveNode {
         let engine_connection_result = drive_with_event_buffering(
             self.connect_exec_phase(connection_deadline),
             &mut pending,
-            &mut time_evt_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
+            &mut channels,
         )
         .await;
 
         // Flush channel receivers and drain all remaining pending events
-        flush_all_pending(
-            &mut pending,
-            &mut time_evt_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-        );
-        debug_assert!(
-            pending.is_empty(),
-            "all startup events must be processed before reconciliation",
-        );
-
+        flush_all_pending(&mut pending, &mut channels);
         let engine_connection_status = match engine_connection_result {
             Ok(status) => status,
             Err(e) => {
+                pending.drain_after_failure_with(|event| self.process_runner_event(event));
                 let result = self
                     .abort_startup_with_error("Execution client connection timed out", e)
                     .await;
-                Self::drain_channels(
-                    &mut time_evt_rx,
-                    &mut data_evt_rx,
-                    &mut data_cmd_rx,
-                    &mut exec_evt_rx,
-                    &mut exec_cmd_rx,
-                );
+                Self::drain_ordered_channels(&mut channels);
                 log::info!("Event loop stopped");
                 return result;
             }
         };
 
         if engine_connection_status == EngineConnectionStatus::TimedOut {
+            pending.drain_after_failure_with(|event| self.process_runner_event(event));
             let result = self
                 .abort_startup_with_error(
                     "Engine readiness timed out",
                     anyhow::anyhow!("readiness timeout while waiting for engine connections"),
                 )
                 .await;
-            Self::drain_channels(
-                &mut time_evt_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-            );
+            Self::drain_ordered_channels(&mut channels);
             log::info!("Event loop stopped");
             return result;
         }
@@ -1065,49 +1039,33 @@ impl LiveNode {
             .abort_reason()
             .or_else(|| self.startup_abort_reason())
         {
+            pending.drain_after_failure_with(|event| self.process_runner_event(event));
             self.abort_startup(reason).await?;
-            Self::drain_channels(
-                &mut time_evt_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-            );
+            Self::drain_ordered_channels(&mut channels);
             log::info!("Event loop stopped");
             return Ok(());
         }
 
         debug_assert_eq!(engine_connection_status, EngineConnectionStatus::Connected);
+        pending.drain_with(|event| self.process_runner_event(event));
+        debug_assert!(
+            pending.is_empty(),
+            "all startup events must be processed before reconciliation",
+        );
 
         // Run reconciliation now that instruments are in cache and start trader
         let reconciliation_result = drive_with_event_buffering(
             self.perform_startup_reconciliation(),
             &mut pending,
-            &mut time_evt_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
+            &mut channels,
         )
         .await;
-        flush_all_pending(
-            &mut pending,
-            &mut time_evt_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-        );
+        flush_all_pending(&mut pending, &mut channels);
 
         if let Err(e) = reconciliation_result {
+            pending.drain_after_failure_with(|event| self.process_runner_event(event));
             let result = self.abort_startup("Startup reconciliation failed").await;
-            Self::drain_channels(
-                &mut time_evt_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-            );
+            Self::drain_ordered_channels(&mut channels);
             log::info!("Event loop stopped");
 
             if let Err(finalize_err) = result {
@@ -1119,18 +1077,22 @@ impl LiveNode {
             return Err(e);
         }
 
+        pending.drain_with(|event| self.process_runner_event(event));
+
         if let Some(reason) = self.startup_abort_reason() {
             let result = self.abort_startup(reason).await;
-            Self::drain_channels(
-                &mut time_evt_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-            );
+            Self::drain_ordered_channels(&mut channels);
             log::info!("Event loop stopped");
             return result;
         }
+
+        let AsyncRunnerReceivers {
+            time_evt: mut time_evt_rx,
+            exec_evt: mut exec_evt_rx,
+            exec_cmd: mut exec_cmd_rx,
+            data_evt: mut data_evt_rx,
+            data_cmd: mut data_cmd_rx,
+        } = channels.into_receivers();
 
         if let Err(e) = self.kernel.start_trader() {
             let result = self.abort_after_trader_start_failure(e).await;
@@ -1372,6 +1334,7 @@ impl LiveNode {
                             let reconciliation = self.exec_manager.reconcile_open_order_reports(
                                 &result.check,
                                 result.reports,
+                                &result.report_sources,
                                 &result.queried_clients,
                                 &result.failed_clients,
                             );
@@ -2150,6 +2113,31 @@ impl LiveNode {
         }
     }
 
+    fn drain_ordered_channels(channels: &mut AsyncRunnerChannels) {
+        let events = channels.drain_pending_snapshot();
+        let drained = events.len();
+
+        for event in events {
+            match event {
+                PendingRunnerEvent::Time(message) => {
+                    let _ = AsyncRunner::handle_time_event(message);
+                }
+                PendingRunnerEvent::ExecEvent(event) => AsyncRunner::handle_exec_event(event),
+                PendingRunnerEvent::ExecCommand(command) => {
+                    AsyncRunner::handle_trading_command(command);
+                }
+                PendingRunnerEvent::DataEvent(event) => AsyncRunner::handle_data_event(event),
+                PendingRunnerEvent::DataCommand(command) => {
+                    AsyncRunner::handle_data_command(command);
+                }
+            }
+        }
+
+        if drained > 0 {
+            log::info!("Drained {drained} remaining events during shutdown");
+        }
+    }
+
     fn drain_channels(
         time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
         data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
@@ -2719,6 +2707,7 @@ impl LiveNode {
                     Ok(result) => ReportTaskOutcome::Completed(OpenOrderReportResult {
                         check,
                         reports: result.reports,
+                        report_sources: result.report_sources,
                         queried_clients: result.queried_clients,
                         failed_clients: result.failed_clients,
                     }),
@@ -2881,6 +2870,7 @@ async fn request_open_order_reports(
     command: GenerateOrderStatusReports,
 ) -> OpenOrderReportQueryResult {
     let mut all_reports = Vec::new();
+    let mut report_sources = Vec::new();
     let mut queried_clients = IndexSet::new();
     let mut failed_clients = IndexSet::new();
 
@@ -2889,8 +2879,23 @@ async fn request_open_order_reports(
         queried_clients.insert(client_id);
 
         match client.generate_order_status_reports(&command).await {
-            Ok(reports) => {
+            Ok(reports)
+                if reports.iter().all(|report| {
+                    report_matches_execution_client(
+                        &client,
+                        report.account_id,
+                        report.instrument_id,
+                    )
+                }) =>
+            {
+                report_sources.extend(std::iter::repeat_n(client_id, reports.len()));
                 all_reports.extend(reports);
+            }
+            Ok(_) => {
+                failed_clients.insert(client_id);
+                log::error!(
+                    "Rejected order reports with invalid source provenance from {client_id}"
+                );
             }
             Err(e) => {
                 failed_clients.insert(client_id);
@@ -2904,6 +2909,7 @@ async fn request_open_order_reports(
 
     OpenOrderReportQueryResult {
         reports: all_reports,
+        report_sources,
         queried_clients,
         failed_clients,
     }
@@ -2922,8 +2928,22 @@ async fn request_position_reports(
         queried_clients.insert(client_id);
 
         match client.generate_position_status_reports(&command).await {
-            Ok(reports) => {
+            Ok(reports)
+                if reports.iter().all(|report| {
+                    report_matches_execution_client(
+                        &client,
+                        report.account_id,
+                        report.instrument_id,
+                    )
+                }) =>
+            {
                 all_reports.extend(reports);
+            }
+            Ok(_) => {
+                failed_clients.insert(client_id);
+                log::error!(
+                    "Rejected position reports with invalid source provenance from {client_id}"
+                );
             }
             Err(e) => {
                 failed_clients.insert(client_id);
@@ -2984,6 +3004,7 @@ struct OpenOrderReportTask {
 struct OpenOrderReportResult {
     check: OpenOrderReportCheck,
     reports: Vec<OrderStatusReport>,
+    report_sources: Vec<ClientId>,
     queried_clients: IndexSet<ClientId>,
     failed_clients: IndexSet<ClientId>,
 }
@@ -2998,6 +3019,7 @@ struct TargetedOrderReportTask {
 
 struct OpenOrderReportQueryResult {
     reports: Vec<OrderStatusReport>,
+    report_sources: Vec<ClientId>,
     queried_clients: IndexSet<ClientId>,
     failed_clients: IndexSet<ClientId>,
 }
@@ -3035,79 +3057,39 @@ struct RunnerReceivers<'a> {
 /// This closes the gap where `drive_with_event_buffering` exits as soon as its
 /// driven future resolves (biased select), leaving items in the channel receivers
 /// that were not captured into `pending`.
-fn flush_pending_data(
-    pending: &mut PendingEvents,
-    data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
-) {
+fn flush_pending_data(pending: &mut PendingEvents, channels: &mut AsyncRunnerChannels) {
     loop {
-        let mut progressed = pending.drain_data();
-
-        while let Ok(evt) = data_evt_rx.try_recv() {
-            AsyncRunner::handle_data_event(evt);
-            progressed = true;
+        let captured = channels.drain_pending_snapshot();
+        let captured_any = !captured.is_empty();
+        for event in captured {
+            pending.capture_runner_event(event);
         }
+        let progressed = pending.drain_data();
 
-        while let Ok(cmd) = data_cmd_rx.try_recv() {
-            AsyncRunner::handle_data_command(cmd);
-            progressed = true;
-        }
-
-        if !progressed {
+        if !captured_any && !progressed {
             break;
         }
     }
 }
 
-/// Flushes all channel receivers into `pending`, then drains everything.
+/// Flushes all channel receivers into the ordered pending queue.
 ///
 /// Unlike [`flush_pending_data`] this is a single pass, not a drain-until-quiet
 /// loop. Sufficient for phase 2 where the goal is to capture items the biased
 /// select did not poll before the connect future resolved.
-fn flush_all_pending(
-    pending: &mut PendingEvents,
-    time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-    data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
-    exec_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
-) {
-    // Flush channel receivers into pending
-    while let Ok(handler) = time_evt_rx.try_recv() {
-        let _ = AsyncRunner::handle_time_event(handler);
+fn flush_all_pending(pending: &mut PendingEvents, channels: &mut AsyncRunnerChannels) {
+    for event in channels.drain_pending_snapshot() {
+        pending.capture_runner_event(event);
     }
-
-    while let Ok(evt) = data_evt_rx.try_recv() {
-        pending.data_evts.push(evt);
-    }
-
-    while let Ok(cmd) = data_cmd_rx.try_recv() {
-        pending.data_cmds.push(cmd);
-    }
-
-    while let Ok(evt) = exec_evt_rx.try_recv() {
-        pending.capture_execution_event(evt);
-    }
-
-    while let Ok(cmd) = exec_cmd_rx.try_recv() {
-        pending.exec_cmds.push(cmd);
-    }
-
-    pending.drain();
 }
 
 /// Drives a future to completion while buffering channel events.
 ///
-/// Time events are handled immediately. Account events are forwarded directly.
-/// All other events are buffered in `pending` for later processing.
+/// Every event is buffered in receipt order for later canonical processing.
 async fn drive_with_event_buffering<F: std::future::Future>(
     future: F,
     pending: &mut PendingEvents,
-    time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-    data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
-    exec_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
+    channels: &mut AsyncRunnerChannels,
 ) -> F::Output {
     tokio::pin!(future);
 
@@ -3115,24 +3097,13 @@ async fn drive_with_event_buffering<F: std::future::Future>(
         tokio::select! {
             biased;
 
-            result = &mut future => {
-                break result;
+            event = channels.recv() => {
+                let Some(event) = event else {
+                    break future.await;
+                };
+                pending.capture_runner_event(event);
             }
-            Some(handler) = time_evt_rx.recv() => {
-                let _ = AsyncRunner::handle_time_event(handler);
-            }
-            Some(evt) = exec_evt_rx.recv() => {
-                pending.capture_execution_event(evt);
-            }
-            Some(cmd) = exec_cmd_rx.recv() => {
-                pending.exec_cmds.push(cmd);
-            }
-            Some(evt) = data_evt_rx.recv() => {
-                pending.data_evts.push(evt);
-            }
-            Some(cmd) = data_cmd_rx.recv() => {
-                pending.data_cmds.push(cmd);
-            }
+            result = &mut future => break result,
         }
     }
 }
@@ -3149,13 +3120,13 @@ async fn drive_with_runner_event_buffering<F: std::future::Future>(
         tokio::select! {
             biased;
 
-            result = &mut future => break result,
             event = runner.recv() => {
                 let Some(event) = event else {
                     break future.await;
                 };
                 pending.capture_runner_event(event);
             }
+            result = &mut future => break result,
         }
     };
 
@@ -3165,48 +3136,25 @@ async fn drive_with_runner_event_buffering<F: std::future::Future>(
 
 #[derive(Default)]
 struct PendingEvents {
-    data_cmds: Vec<DataCommand>,
-    data_evts: Vec<DataEvent>,
-    exec_cmds: Vec<TradingCommandMessage>,
-    exec_reports: Vec<ExecutionReport>,
-    order_evts: Vec<OrderEventAny>,
+    events: VecDeque<PendingRunnerEvent>,
 }
 
 impl PendingEvents {
     fn is_empty(&self) -> bool {
-        self.data_evts.is_empty()
-            && self.data_cmds.is_empty()
-            && self.exec_cmds.is_empty()
-            && self.exec_reports.is_empty()
-            && self.order_evts.is_empty()
+        self.events.is_empty()
     }
 
     fn capture_execution_event(&mut self, event: ExecutionEvent) {
         match event {
             ExecutionEvent::Account(_) => AsyncRunner::handle_exec_event(event),
-            ExecutionEvent::Report(report) => self.exec_reports.push(report),
-            ExecutionEvent::Order(order_event) => self.order_evts.push(order_event),
-            ExecutionEvent::OrderSubmittedBatch(batch) => self
-                .order_evts
-                .extend(batch.into_iter().map(OrderEventAny::Submitted)),
-            ExecutionEvent::OrderAcceptedBatch(batch) => self
-                .order_evts
-                .extend(batch.into_iter().map(OrderEventAny::Accepted)),
-            ExecutionEvent::OrderCanceledBatch(batch) => self
-                .order_evts
-                .extend(batch.into_iter().map(OrderEventAny::Canceled)),
+            event => self.events.push_back(PendingRunnerEvent::ExecEvent(event)),
         }
     }
 
     fn capture_runner_event(&mut self, event: PendingRunnerEvent) {
         match event {
-            PendingRunnerEvent::Time(message) => {
-                let _ = AsyncRunner::handle_time_event(message);
-            }
             PendingRunnerEvent::ExecEvent(event) => self.capture_execution_event(event),
-            PendingRunnerEvent::ExecCommand(command) => self.exec_cmds.push(command),
-            PendingRunnerEvent::DataEvent(event) => self.data_evts.push(event),
-            PendingRunnerEvent::DataCommand(command) => self.data_cmds.push(command),
+            event => self.events.push_back(event),
         }
     }
 
@@ -3214,66 +3162,65 @@ impl PendingEvents {
     ///
     /// Returns `true` if any events or commands were drained.
     fn drain_data(&mut self) -> bool {
-        let total = self.data_evts.len() + self.data_cmds.len();
+        let total = self
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    PendingRunnerEvent::DataEvent(_) | PendingRunnerEvent::DataCommand(_)
+                )
+            })
+            .count();
 
         if total > 0 {
-            log::debug!(
-                "Draining {total} data events/commands into cache \
-                 (data_evts={}, data_cmds={})",
-                self.data_evts.len(),
-                self.data_cmds.len(),
-            );
+            log::debug!("Draining {total} data events/commands into cache");
         }
 
-        for evt in self.data_evts.drain(..) {
-            AsyncRunner::handle_data_event(evt);
+        let mut retained = VecDeque::with_capacity(self.events.len() - total);
+        while let Some(event) = self.events.pop_front() {
+            match event {
+                PendingRunnerEvent::DataEvent(event) => AsyncRunner::handle_data_event(event),
+                PendingRunnerEvent::DataCommand(command) => {
+                    AsyncRunner::handle_data_command(command);
+                }
+                event => retained.push_back(event),
+            }
         }
-
-        for cmd in self.data_cmds.drain(..) {
-            AsyncRunner::handle_data_command(cmd);
-        }
+        self.events = retained;
 
         total > 0
     }
 
-    /// Drains all remaining pending events.
-    fn drain(&mut self) {
-        let total = self.data_evts.len()
-            + self.data_cmds.len()
-            + self.exec_cmds.len()
-            + self.exec_reports.len()
-            + self.order_evts.len();
+    /// Drains all remaining pending events through the node's canonical router.
+    fn drain_with(&mut self, mut process: impl FnMut(PendingRunnerEvent)) {
+        let total = self.events.len();
 
         if total > 0 {
-            log::debug!(
-                "Processing {total} events/commands queued during startup \
-                 (data_evts={}, data_cmds={}, exec_cmds={}, exec_reports={}, order_evts={})",
-                self.data_evts.len(),
-                self.data_cmds.len(),
-                self.exec_cmds.len(),
-                self.exec_reports.len(),
-                self.order_evts.len()
+            log::debug!("Processing {total} events/commands queued during startup");
+        }
+
+        while let Some(event) = self.events.pop_front() {
+            process(event);
+        }
+    }
+
+    /// Drains venue and data truth after a failed startup phase while rejecting
+    /// queued execution commands that are no longer authorized to leave the node.
+    fn drain_after_failure_with(&mut self, mut process: impl FnMut(PendingRunnerEvent)) {
+        let mut rejected_commands = 0;
+        while let Some(event) = self.events.pop_front() {
+            if matches!(event, PendingRunnerEvent::ExecCommand(_)) {
+                rejected_commands += 1;
+            } else {
+                process(event);
+            }
+        }
+
+        if rejected_commands > 0 {
+            log::warn!(
+                "Rejected {rejected_commands} execution command(s) queued during failed startup"
             );
-        }
-
-        for evt in self.data_evts.drain(..) {
-            AsyncRunner::handle_data_event(evt);
-        }
-
-        for cmd in self.data_cmds.drain(..) {
-            AsyncRunner::handle_data_command(cmd);
-        }
-
-        for report in self.exec_reports.drain(..) {
-            AsyncRunner::handle_exec_event(ExecutionEvent::Report(report));
-        }
-
-        for cmd in self.exec_cmds.drain(..) {
-            AsyncRunner::handle_trading_command(cmd);
-        }
-
-        for evt in self.order_evts.drain(..) {
-            AsyncRunner::handle_exec_event(ExecutionEvent::Order(evt));
         }
     }
 }
@@ -5356,6 +5303,108 @@ mod tests {
     }
 
     #[rstest]
+    #[tokio::test]
+    async fn test_startup_backlog_replays_event_before_command_through_lifecycle_bookkeeping() {
+        use nautilus_common::{messages::execution::CancelOrder, runner::get_trading_cmd_sender};
+
+        let config = LiveNodeConfig {
+            exec_engine: crate::config::LiveExecEngineConfig {
+                reconciliation: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut node = LiveNode::build("OrderedBacklogNode".to_string(), Some(config)).unwrap();
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        let account_id = AccountId::from("ORDERED-BACKLOG-001");
+        let client_id = ClientId::from("ORDERED-BACKLOG");
+        let client_order_id = ClientOrderId::from("O-ORDERED-BACKLOG");
+        let venue_order_id = VenueOrderId::from("V-ORDERED-BACKLOG");
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(node.trader_id())
+            .strategy_id(StrategyId::from("S-ORDERED-BACKLOG"))
+            .client_order_id(client_order_id)
+            .instrument_id(instrument_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("100.00"))
+            .build();
+        let submitted = TestOrderEventStubs::submitted(&order, account_id);
+
+        {
+            let mut cache = node.kernel.cache.borrow_mut();
+            cache
+                .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+                .unwrap();
+            cache
+                .add_order(order.clone(), None, Some(client_id), false)
+                .unwrap();
+            cache.update_order(&submitted).unwrap();
+        }
+
+        node.exec_manager.register_inflight(client_order_id);
+        let mut runner = AsyncRunner::new();
+        runner.bind_senders();
+
+        let status_at_command_dispatch = Rc::new(RefCell::new(None));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_execute(),
+            TypedIntoHandler::from({
+                let cache = node.kernel.cache.clone();
+                let status_at_command_dispatch = status_at_command_dispatch.clone();
+                move |_: TradingCommand| {
+                    *status_at_command_dispatch.borrow_mut() = cache
+                        .borrow()
+                        .order(&client_order_id)
+                        .map(|order| order.status());
+                }
+            }),
+        );
+
+        let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
+        let exec_event_sender = get_exec_event_sender();
+        let exec_command_sender = get_trading_cmd_sender();
+        let mut pending = PendingEvents::default();
+
+        drive_with_runner_event_buffering(
+            async move {
+                exec_event_sender
+                    .send(ExecutionEvent::Order(accepted))
+                    .unwrap();
+                exec_command_sender.execute(TradingCommandMessage::new(
+                    MessagingSwitchboard::exec_engine_execute(),
+                    TradingCommand::CancelOrder(CancelOrder::new(
+                        order.trader_id(),
+                        None,
+                        order.strategy_id(),
+                        instrument_id,
+                        client_order_id,
+                        Some(venue_order_id),
+                        UUID4::new(),
+                        UnixNanos::default(),
+                        None,
+                        None,
+                    )),
+                ));
+                tokio::task::yield_now().await;
+            },
+            &mut runner,
+            &mut pending,
+        )
+        .await;
+        pending.drain_with(|event| node.process_runner_event(event));
+
+        assert_eq!(
+            *status_at_command_dispatch.borrow(),
+            Some(OrderStatus::Accepted)
+        );
+        assert!(node.exec_manager.check_open_order_queries().is_empty());
+
+        node.dispose();
+    }
+
+    #[rstest]
     #[tokio::test(start_paused = true)]
     async fn test_stop_processes_residual_exec_event_during_grace_period() {
         let config = LiveNodeConfig {
@@ -6398,14 +6447,12 @@ mod tests {
         use nautilus_model::instruments::{InstrumentAny, stubs::crypto_perpetual_ethusdt};
 
         let mut pending = PendingEvents::default();
-        pending
-            .data_evts
-            .push(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
-                crypto_perpetual_ethusdt(),
-            )));
+        pending.capture_runner_event(PendingRunnerEvent::DataEvent(DataEvent::Instrument(
+            InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()),
+        )));
 
         assert!(pending.drain_data());
-        assert!(pending.data_evts.is_empty());
+        assert!(pending.is_empty());
     }
 
     fn stub_data_event() -> DataEvent {
@@ -6431,36 +6478,47 @@ mod tests {
 
     #[rstest]
     fn test_flush_pending_data_drains_events_and_commands() {
-        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (_exec_cmd_tx, exec_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let mut channels =
+            AsyncRunnerChannels::new(time_rx, exec_evt_rx, exec_cmd_rx, evt_rx, cmd_rx);
 
         let mut pending = PendingEvents::default();
 
         // Pre-load pending (items captured by the select loop)
-        pending.data_evts.push(stub_data_event());
-        pending.data_cmds.push(stub_data_command());
+        pending.capture_runner_event(PendingRunnerEvent::DataEvent(stub_data_event()));
+        pending.capture_runner_event(PendingRunnerEvent::DataCommand(stub_data_command()));
 
         // Pre-load channels (items missed by the select loop)
         evt_tx.send(stub_data_event()).unwrap();
         cmd_tx.send(stub_data_command()).unwrap();
 
-        flush_pending_data(&mut pending, &mut evt_rx, &mut cmd_rx);
+        flush_pending_data(&mut pending, &mut channels);
 
-        assert!(pending.data_evts.is_empty());
-        assert!(pending.data_cmds.is_empty());
-        assert!(evt_rx.try_recv().is_err());
-        assert!(cmd_rx.try_recv().is_err());
+        assert!(pending.is_empty());
+        assert!(channels.data_evt_rx.try_recv().is_err());
+        assert!(channels.data_cmd_rx.try_recv().is_err());
     }
 
     #[rstest]
     fn test_flush_pending_data_drains_mixed_sources() {
-        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (_exec_cmd_tx, exec_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let mut channels =
+            AsyncRunnerChannels::new(time_rx, exec_evt_rx, exec_cmd_rx, evt_rx, cmd_rx);
 
         let mut pending = PendingEvents::default();
 
         // First pass: pending has an event, channel has a command
-        pending.data_evts.push(stub_data_event());
+        pending.capture_runner_event(PendingRunnerEvent::DataEvent(stub_data_event()));
         cmd_tx.send(stub_data_command()).unwrap();
 
         // Second pass: channel has items that simulate arrival during first drain
@@ -6468,12 +6526,11 @@ mod tests {
         evt_tx.send(stub_data_event()).unwrap();
         cmd_tx.send(stub_data_command()).unwrap();
 
-        flush_pending_data(&mut pending, &mut evt_rx, &mut cmd_rx);
+        flush_pending_data(&mut pending, &mut channels);
 
-        assert!(pending.data_evts.is_empty());
-        assert!(pending.data_cmds.is_empty());
-        assert!(evt_rx.try_recv().is_err());
-        assert!(cmd_rx.try_recv().is_err());
+        assert!(pending.is_empty());
+        assert!(channels.data_evt_rx.try_recv().is_err());
+        assert!(channels.data_cmd_rx.try_recv().is_err());
     }
 
     fn stub_time_event_handler() -> TimeEventMessage {
@@ -6543,20 +6600,21 @@ mod tests {
     }
 
     #[rstest]
-    fn test_flush_all_pending_drains_buffered_channels() {
-        let (time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (exec_evt_tx, mut exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-        let (exec_cmd_tx, mut exec_cmd_rx) =
+    fn test_flush_all_pending_captures_buffered_channels_in_one_queue() {
+        let (time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (exec_cmd_tx, exec_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let mut channels =
+            AsyncRunnerChannels::new(time_rx, exec_evt_rx, exec_cmd_rx, data_evt_rx, data_cmd_rx);
 
         let mut pending = PendingEvents::default();
 
         // Pre-load pending with data items
-        pending.data_evts.push(stub_data_event());
-        pending.data_cmds.push(stub_data_command());
+        pending.capture_runner_event(PendingRunnerEvent::DataEvent(stub_data_event()));
+        pending.capture_runner_event(PendingRunnerEvent::DataCommand(stub_data_command()));
 
         // Pre-load all channel types
         time_tx.send(stub_time_event_handler()).unwrap();
@@ -6565,25 +6623,37 @@ mod tests {
         exec_evt_tx.send(stub_exec_event()).unwrap();
         exec_cmd_tx.send(stub_trading_command_message()).unwrap();
 
-        flush_all_pending(
-            &mut pending,
-            &mut time_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-        );
+        flush_all_pending(&mut pending, &mut channels);
 
-        assert!(pending.data_evts.is_empty());
-        assert!(pending.data_cmds.is_empty());
-        assert!(pending.exec_reports.is_empty());
-        assert!(pending.exec_cmds.is_empty());
-        assert!(pending.order_evts.is_empty());
-        assert!(time_rx.try_recv().is_err());
-        assert!(data_evt_rx.try_recv().is_err());
-        assert!(data_cmd_rx.try_recv().is_err());
-        assert!(exec_evt_rx.try_recv().is_err());
-        assert!(exec_cmd_rx.try_recv().is_err());
+        assert_eq!(pending.events.len(), 7);
+        let queued = pending
+            .events
+            .iter()
+            .map(|event| match event {
+                PendingRunnerEvent::Time(_) => "time",
+                PendingRunnerEvent::ExecEvent(_) => "exec_event",
+                PendingRunnerEvent::ExecCommand(_) => "exec_command",
+                PendingRunnerEvent::DataEvent(_) => "data_event",
+                PendingRunnerEvent::DataCommand(_) => "data_command",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queued,
+            [
+                "data_event",
+                "data_command",
+                "time",
+                "data_event",
+                "data_command",
+                "exec_event",
+                "exec_command",
+            ]
+        );
+        assert!(channels.time_evt_rx.try_recv().is_err());
+        assert!(channels.data_evt_rx.try_recv().is_err());
+        assert!(channels.data_cmd_rx.try_recv().is_err());
+        assert!(channels.exec_evt_rx.try_recv().is_err());
+        assert!(channels.exec_cmd_rx.try_recv().is_err());
     }
 
     fn stub_order_event() -> ExecutionEvent {
@@ -6615,62 +6685,54 @@ mod tests {
 
     #[rstest]
     fn test_flush_all_pending_routes_order_event_to_order_evts() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (exec_evt_tx, mut exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-        let (_exec_cmd_tx, mut exec_cmd_rx) =
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (_exec_cmd_tx, exec_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let mut channels =
+            AsyncRunnerChannels::new(time_rx, exec_evt_rx, exec_cmd_rx, data_evt_rx, data_cmd_rx);
 
         let mut pending = PendingEvents::default();
 
         exec_evt_tx.send(stub_order_event()).unwrap();
         exec_evt_tx.send(stub_exec_event()).unwrap();
 
-        flush_all_pending(
-            &mut pending,
-            &mut time_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-        );
+        flush_all_pending(&mut pending, &mut channels);
 
-        // Both order and report events are drained by pending.drain()
-        assert!(pending.order_evts.is_empty());
-        assert!(pending.exec_reports.is_empty());
-        assert!(exec_evt_rx.try_recv().is_err());
+        assert_eq!(pending.events.len(), 2);
+        assert!(matches!(
+            &pending.events[0],
+            PendingRunnerEvent::ExecEvent(ExecutionEvent::Order(_))
+        ));
+        assert!(matches!(
+            &pending.events[1],
+            PendingRunnerEvent::ExecEvent(ExecutionEvent::Report(_))
+        ));
+        assert!(channels.exec_evt_rx.try_recv().is_err());
     }
 
     #[rstest]
     fn test_flush_all_pending_routes_account_event_immediately() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (exec_evt_tx, mut exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-        let (_exec_cmd_tx, mut exec_cmd_rx) =
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (_exec_cmd_tx, exec_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let mut channels =
+            AsyncRunnerChannels::new(time_rx, exec_evt_rx, exec_cmd_rx, data_evt_rx, data_cmd_rx);
 
         let mut pending = PendingEvents::default();
 
         exec_evt_tx.send(stub_account_event()).unwrap();
 
-        flush_all_pending(
-            &mut pending,
-            &mut time_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-        );
+        flush_all_pending(&mut pending, &mut channels);
 
         // Account events are forwarded immediately, never buffered in pending
-        assert!(pending.exec_reports.is_empty());
-        assert!(pending.order_evts.is_empty());
-        assert!(pending.exec_cmds.is_empty());
-        assert!(exec_evt_rx.try_recv().is_err());
+        assert!(pending.is_empty());
+        assert!(channels.exec_evt_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -6691,9 +6753,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(pending.order_evts.len(), 1);
-        assert!(pending.exec_reports.is_empty());
-        assert!(pending.exec_cmds.is_empty());
+        assert_eq!(pending.events.len(), 1);
+        assert!(matches!(
+            &pending.events[0],
+            PendingRunnerEvent::ExecEvent(ExecutionEvent::Order(_))
+        ));
     }
 
     #[rstest]
@@ -6706,7 +6770,7 @@ mod tests {
     #[rstest]
     fn test_pending_is_empty_false_with_data_evt() {
         let mut pending = PendingEvents::default();
-        pending.data_evts.push(stub_data_event());
+        pending.capture_runner_event(PendingRunnerEvent::DataEvent(stub_data_event()));
 
         assert!(!pending.is_empty());
     }
@@ -6714,7 +6778,7 @@ mod tests {
     #[rstest]
     fn test_pending_is_empty_false_with_data_cmd() {
         let mut pending = PendingEvents::default();
-        pending.data_cmds.push(stub_data_command());
+        pending.capture_runner_event(PendingRunnerEvent::DataCommand(stub_data_command()));
 
         assert!(!pending.is_empty());
     }
@@ -6722,7 +6786,9 @@ mod tests {
     #[rstest]
     fn test_pending_is_empty_false_with_exec_cmd() {
         let mut pending = PendingEvents::default();
-        pending.exec_cmds.push(stub_trading_command_message());
+        pending.capture_runner_event(PendingRunnerEvent::ExecCommand(
+            stub_trading_command_message(),
+        ));
 
         assert!(!pending.is_empty());
     }
@@ -6750,20 +6816,27 @@ mod tests {
             );
 
             let mut pending = PendingEvents::default();
-            pending.exec_cmds.push(TradingCommandMessage::new(
-                MessagingSwitchboard::risk_engine_execute(),
-                TradingCommand::QueryAccount(QueryAccount::new(
-                    TraderId::from("TESTER-001"),
-                    None,
-                    AccountId::from("TEST-001"),
-                    UUID4::new(),
-                    UnixNanos::default(),
-                    None,
-                    None,
-                )),
+            pending.capture_runner_event(PendingRunnerEvent::ExecCommand(
+                TradingCommandMessage::new(
+                    MessagingSwitchboard::risk_engine_execute(),
+                    TradingCommand::QueryAccount(QueryAccount::new(
+                        TraderId::from("TESTER-001"),
+                        None,
+                        AccountId::from("TEST-001"),
+                        UUID4::new(),
+                        UnixNanos::default(),
+                        None,
+                        None,
+                    )),
+                ),
             ));
 
-            pending.drain();
+            pending.drain_with(|event| match event {
+                PendingRunnerEvent::ExecCommand(command) => {
+                    AsyncRunner::handle_trading_command(command);
+                }
+                _ => panic!("Unexpected pending event"),
+            });
 
             assert!(pending.is_empty());
             assert_eq!(risk_commands.borrow().len(), 1);
@@ -6778,12 +6851,32 @@ mod tests {
     }
 
     #[rstest]
+    fn test_pending_drain_preserves_observed_order_across_execution_channels() {
+        let mut pending = PendingEvents::default();
+        pending.capture_execution_event(stub_order_event());
+        pending.capture_runner_event(PendingRunnerEvent::ExecCommand(
+            stub_trading_command_message(),
+        ));
+        pending.capture_execution_event(stub_exec_event());
+        let mut observed = Vec::new();
+
+        pending.drain_with(|event| {
+            observed.push(match event {
+                PendingRunnerEvent::ExecEvent(ExecutionEvent::Order(_)) => "order",
+                PendingRunnerEvent::ExecCommand(_) => "command",
+                PendingRunnerEvent::ExecEvent(ExecutionEvent::Report(_)) => "report",
+                _ => panic!("Unexpected pending event"),
+            });
+        });
+
+        assert_eq!(observed, ["order", "command", "report"]);
+        assert!(pending.is_empty());
+    }
+
+    #[rstest]
     fn test_pending_is_empty_false_with_exec_report() {
         let mut pending = PendingEvents::default();
-
-        if let ExecutionEvent::Report(report) = stub_exec_event() {
-            pending.exec_reports.push(report);
-        }
+        pending.capture_execution_event(stub_exec_event());
 
         assert!(!pending.is_empty());
     }
@@ -6791,10 +6884,7 @@ mod tests {
     #[rstest]
     fn test_pending_is_empty_false_with_order_evt() {
         let mut pending = PendingEvents::default();
-
-        if let ExecutionEvent::Order(order_evt) = stub_order_event() {
-            pending.order_evts.push(order_evt);
-        }
+        pending.capture_execution_event(stub_order_event());
 
         assert!(!pending.is_empty());
     }
@@ -6836,65 +6926,55 @@ mod tests {
     }
 
     #[rstest]
-    fn test_flush_all_pending_buffers_submitted_batch_as_individual_events() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (exec_evt_tx, mut exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-        let (_exec_cmd_tx, mut exec_cmd_rx) =
+    fn test_flush_all_pending_preserves_submitted_batch_for_canonical_processing() {
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (_exec_cmd_tx, exec_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let mut channels =
+            AsyncRunnerChannels::new(time_rx, exec_evt_rx, exec_cmd_rx, data_evt_rx, data_cmd_rx);
 
         let mut pending = PendingEvents::default();
 
         exec_evt_tx.send(stub_submitted_batch_event()).unwrap();
 
-        flush_all_pending(
-            &mut pending,
-            &mut time_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-        );
+        flush_all_pending(&mut pending, &mut channels);
 
-        // Batch should be unpacked into individual Submitted events then drained
-        assert!(pending.order_evts.is_empty());
-        assert!(exec_evt_rx.try_recv().is_err());
+        assert!(matches!(
+            &pending.events[0],
+            PendingRunnerEvent::ExecEvent(ExecutionEvent::OrderSubmittedBatch(_))
+        ));
+        assert!(channels.exec_evt_rx.try_recv().is_err());
     }
 
     #[rstest]
-    fn test_flush_all_pending_buffers_canceled_batch_as_individual_events() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (exec_evt_tx, mut exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-        let (_exec_cmd_tx, mut exec_cmd_rx) =
+    fn test_flush_all_pending_preserves_canceled_batch_for_canonical_processing() {
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (_exec_cmd_tx, exec_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let mut channels =
+            AsyncRunnerChannels::new(time_rx, exec_evt_rx, exec_cmd_rx, data_evt_rx, data_cmd_rx);
 
         let mut pending = PendingEvents::default();
 
         exec_evt_tx.send(stub_canceled_batch_event()).unwrap();
 
-        flush_all_pending(
-            &mut pending,
-            &mut time_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-        );
+        flush_all_pending(&mut pending, &mut channels);
 
-        // Batch should be unpacked into individual Canceled events then drained
-        assert!(pending.order_evts.is_empty());
-        assert!(exec_evt_rx.try_recv().is_err());
+        assert!(matches!(
+            &pending.events[0],
+            PendingRunnerEvent::ExecEvent(ExecutionEvent::OrderCanceledBatch(_))
+        ));
+        assert!(channels.exec_evt_rx.try_recv().is_err());
     }
 
     #[rstest]
-    fn test_flush_all_pending_expands_batch_into_order_evts_before_drain() {
-        use nautilus_model::identifiers::ClientOrderId;
-
+    fn test_flush_all_pending_preserves_batch_as_single_ordered_event() {
         let (exec_evt_tx, mut exec_evt_rx) =
             tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
 
@@ -6902,43 +6982,16 @@ mod tests {
 
         let mut pending = PendingEvents::default();
 
-        // Manually replicate what flush_all_pending does before drain
         while let Ok(evt) = exec_evt_rx.try_recv() {
-            match evt {
-                ExecutionEvent::Account(_) => {
-                    AsyncRunner::handle_exec_event(evt);
-                }
-                ExecutionEvent::Report(report) => {
-                    pending.exec_reports.push(report);
-                }
-                ExecutionEvent::Order(order_evt) => {
-                    pending.order_evts.push(order_evt);
-                }
-                ExecutionEvent::OrderSubmittedBatch(batch) => {
-                    for submitted in batch {
-                        pending.order_evts.push(OrderEventAny::Submitted(submitted));
-                    }
-                }
-                ExecutionEvent::OrderAcceptedBatch(batch) => {
-                    for accepted in batch {
-                        pending.order_evts.push(OrderEventAny::Accepted(accepted));
-                    }
-                }
-                ExecutionEvent::OrderCanceledBatch(batch) => {
-                    for canceled in batch {
-                        pending.order_evts.push(OrderEventAny::Canceled(canceled));
-                    }
-                }
-            }
+            pending.capture_execution_event(evt);
         }
 
-        assert_eq!(pending.order_evts.len(), 2);
-        assert!(
-            matches!(&pending.order_evts[0], OrderEventAny::Canceled(c) if c.client_order_id == ClientOrderId::from("O-001"))
-        );
-        assert!(
-            matches!(&pending.order_evts[1], OrderEventAny::Canceled(c) if c.client_order_id == ClientOrderId::from("O-002"))
-        );
+        assert_eq!(pending.events.len(), 1);
+        assert!(matches!(
+            &pending.events[0],
+            PendingRunnerEvent::ExecEvent(ExecutionEvent::OrderCanceledBatch(batch))
+                if batch.len() == 2
+        ));
     }
 
     #[derive(Debug)]

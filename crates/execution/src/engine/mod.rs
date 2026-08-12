@@ -105,6 +105,132 @@ const TIMER_PURGE_CLOSED_ORDERS: &str = "ExecEngine_PURGE_CLOSED_ORDERS";
 const TIMER_PURGE_CLOSED_POSITIONS: &str = "ExecEngine_PURGE_CLOSED_POSITIONS";
 const TIMER_PURGE_ACCOUNT_EVENTS: &str = "ExecEngine_PURGE_ACCOUNT_EVENTS";
 
+#[derive(Clone, Copy)]
+struct ReconciliationReportIdentity {
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    client_order_id: Option<ClientOrderId>,
+    venue_order_id: VenueOrderId,
+    order_side: OrderSide,
+    venue_position_id: Option<PositionId>,
+}
+
+impl From<&OrderStatusReport> for ReconciliationReportIdentity {
+    fn from(report: &OrderStatusReport) -> Self {
+        Self {
+            account_id: report.account_id,
+            instrument_id: report.instrument_id,
+            client_order_id: report.client_order_id,
+            venue_order_id: report.venue_order_id,
+            order_side: report.order_side,
+            venue_position_id: report.venue_position_id,
+        }
+    }
+}
+
+impl From<&FillReport> for ReconciliationReportIdentity {
+    fn from(report: &FillReport) -> Self {
+        Self {
+            account_id: report.account_id,
+            instrument_id: report.instrument_id,
+            client_order_id: report.client_order_id,
+            venue_order_id: report.venue_order_id,
+            order_side: report.order_side,
+            venue_position_id: report.venue_position_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReportOrderResolution {
+    Matched(ClientOrderId),
+    External,
+    Conflict,
+}
+
+fn report_identity_matches_order(
+    order: &OrderAny,
+    report: ReconciliationReportIdentity,
+    originating_account_id: Option<AccountId>,
+) -> bool {
+    let venue_id_matches = order.venue_order_id().is_none()
+        || order.venue_order_id() == Some(report.venue_order_id)
+        || order
+            .venue_order_ids()
+            .iter()
+            .any(|venue_order_id| **venue_order_id == report.venue_order_id);
+    let client_id_matches = report
+        .client_order_id
+        .is_none_or(|client_order_id| client_order_id == order.client_order_id());
+    let order_account_matches = order
+        .account_id()
+        .is_none_or(|account_id| account_id == report.account_id);
+    let client_account_matches =
+        originating_account_id.is_none_or(|account_id| account_id == report.account_id);
+
+    // Netting reports can omit a venue position ID, only explicit IDs can conflict
+    let position_matches = order
+        .position_id()
+        .zip(report.venue_position_id)
+        .is_none_or(|(cached, reported)| cached == reported);
+
+    order.instrument_id() == report.instrument_id
+        && order.order_side() == report.order_side
+        && client_id_matches
+        && venue_id_matches
+        && order_account_matches
+        && client_account_matches
+        && position_matches
+}
+
+fn reconciliation_identities_compatible(
+    parent: ReconciliationReportIdentity,
+    child: ReconciliationReportIdentity,
+) -> bool {
+    let client_ids_compatible = child
+        .client_order_id
+        .is_none_or(|child| parent.client_order_id == Some(child));
+    let position_ids_compatible = parent
+        .venue_position_id
+        .is_none_or(|parent| child.venue_position_id == Some(parent));
+
+    parent.account_id == child.account_id
+        && parent.instrument_id == child.instrument_id
+        && parent.venue_order_id == child.venue_order_id
+        && parent.order_side == child.order_side
+        && client_ids_compatible
+        && position_ids_compatible
+}
+
+fn fill_reports_have_same_execution(left: &FillReport, right: &FillReport) -> bool {
+    left.account_id == right.account_id
+        && left.instrument_id == right.instrument_id
+        && left.venue_order_id == right.venue_order_id
+        && left.trade_id == right.trade_id
+        && left.order_side == right.order_side
+        && left.last_qty == right.last_qty
+        && left.last_px == right.last_px
+        && left.commission == right.commission
+        && left.liquidity_side == right.liquidity_side
+        && left.avg_px == right.avg_px
+        && left.ts_event == right.ts_event
+        && left.client_order_id == right.client_order_id
+        && left.venue_position_id == right.venue_position_id
+}
+
+fn position_reports_have_same_state(
+    left: &PositionStatusReport,
+    right: &PositionStatusReport,
+) -> bool {
+    left.account_id == right.account_id
+        && left.instrument_id == right.instrument_id
+        && left.position_side == right.position_side
+        && left.quantity == right.quantity
+        && left.signed_decimal_qty == right.signed_decimal_qty
+        && left.venue_position_id == right.venue_position_id
+        && left.avg_px_open == right.avg_px_open
+}
+
 /// Central execution engine responsible for orchestrating order routing and execution.
 ///
 /// The execution engine manages the entire order lifecycle from submission to completion,
@@ -138,6 +264,23 @@ impl Debug for ExecutionEngine {
 }
 
 impl ExecutionEngine {
+    fn reports_resolve_to_same_order(
+        &self,
+        left: ReconciliationReportIdentity,
+        right: ReconciliationReportIdentity,
+    ) -> bool {
+        matches!(
+            (
+                self.resolve_report_order(left),
+                self.resolve_report_order(right),
+            ),
+            (
+                ReportOrderResolution::Matched(left_id),
+                ReportOrderResolution::Matched(right_id),
+            ) if left_id == right_id
+        )
+    }
+
     /// Creates a new [`ExecutionEngine`] instance.
     pub fn new(
         clock: Rc<RefCell<dyn Clock>>,
@@ -477,6 +620,35 @@ impl ExecutionEngine {
                 ts_init,
             );
         }
+    }
+
+    /// Registers an external order with the execution client that supplied its
+    /// reconciliation evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the identified execution client is not registered.
+    pub fn register_external_order_for_client(
+        &self,
+        client_id: ClientId,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<()> {
+        let client = self
+            .clients
+            .get(&client_id)
+            .ok_or_else(|| anyhow::anyhow!("No execution client registered with ID {client_id}"))?;
+        client.register_external_order(
+            client_order_id,
+            venue_order_id,
+            instrument_id,
+            strategy_id,
+            ts_init,
+        );
+        Ok(())
     }
 
     #[must_use]
@@ -1038,9 +1210,74 @@ impl ExecutionEngine {
             ExecutionReport::Position(position_report) => {
                 self.reconcile_position_report(position_report);
             }
-            ExecutionReport::MassStatus(mass_status) => {
-                self.reconcile_execution_mass_status(mass_status);
+            ExecutionReport::MassStatus(_) => {
+                self.report_count += 1;
+                log::error!(
+                    "Rejecting execution mass status received without authenticated client provenance"
+                );
             }
+        }
+    }
+
+    fn resolve_report_order(&self, report: ReconciliationReportIdentity) -> ReportOrderResolution {
+        let cache = self.cache.borrow();
+        if report.venue_position_id.is_some_and(|position_id| {
+            cache.position(&position_id).is_some_and(|position| {
+                position.account_id != report.account_id
+                    || position.instrument_id != report.instrument_id
+            })
+        }) {
+            return ReportOrderResolution::Conflict;
+        }
+        let by_client = report
+            .client_order_id
+            .and_then(|id| cache.order(&id).map(|order| order.clone()));
+        let by_venue = cache
+            .client_order_id(&report.venue_order_id)
+            .and_then(|id| cache.order(id).map(|order| order.clone()));
+
+        let order = match (by_client, by_venue) {
+            (Some(client_order), Some(venue_order))
+                if client_order.client_order_id() != venue_order.client_order_id() =>
+            {
+                return ReportOrderResolution::Conflict;
+            }
+            (Some(order), _) | (None, Some(order)) => order,
+            (None, None) => return ReportOrderResolution::External,
+        };
+        let originating_account_id = cache
+            .client_id(&order.client_order_id())
+            .and_then(|client_id| self.clients.get(client_id))
+            .map(|client| client.account_id);
+
+        if report_identity_matches_order(&order, report, originating_account_id) {
+            ReportOrderResolution::Matched(order.client_order_id())
+        } else {
+            ReportOrderResolution::Conflict
+        }
+    }
+
+    fn cached_order_client_account_id(&self, client_order_id: ClientOrderId) -> Option<AccountId> {
+        self.cache
+            .borrow()
+            .client_id(&client_order_id)
+            .and_then(|client_id| self.clients.get(client_id))
+            .map(|client| client.account_id)
+    }
+
+    fn report_order_matches_source(
+        &self,
+        resolution: ReportOrderResolution,
+        source_client_id: ClientId,
+    ) -> bool {
+        match resolution {
+            ReportOrderResolution::Matched(client_order_id) => self
+                .cache
+                .borrow()
+                .client_id(&client_order_id)
+                .is_none_or(|cached_client_id| *cached_client_id == source_client_id),
+            ReportOrderResolution::External => true,
+            ReportOrderResolution::Conflict => false,
         }
     }
 
@@ -1059,31 +1296,55 @@ impl ExecutionEngine {
             report,
         );
 
-        let cache = self.cache.borrow();
+        let order = self.resolve_report_order(ReconciliationReportIdentity {
+            account_id: report.account_id,
+            instrument_id: report.instrument_id,
+            client_order_id: report.client_order_id,
+            venue_order_id: report.venue_order_id,
+            order_side: report.order_side,
+            venue_position_id: report.venue_position_id,
+        });
 
-        let order = report
-            .client_order_id
-            .and_then(|id| cache.order(&id).map(|o| o.clone()))
-            .or_else(|| {
-                cache
-                    .client_order_id(&report.venue_order_id)
-                    .and_then(|cid| cache.order(cid).map(|o| o.clone()))
-            });
+        let instrument = self
+            .cache
+            .borrow()
+            .instrument(&report.instrument_id)
+            .cloned();
 
-        let instrument = cache.instrument(&report.instrument_id).cloned();
+        match order {
+            ReportOrderResolution::Matched(client_order_id) => {
+                let Some(order) = self
+                    .cache
+                    .borrow()
+                    .order(&client_order_id)
+                    .map(|order| order.clone())
+                else {
+                    log::error!(
+                        "Resolved reconciliation order {client_order_id} disappeared from cache"
+                    );
+                    return;
+                };
+                let ts_now = self.clock.borrow().timestamp_ns();
+                let events = generate_reconciliation_order_events(
+                    &order,
+                    report,
+                    instrument.as_ref(),
+                    ts_now,
+                );
 
-        drop(cache);
-
-        if let Some(order) = order {
-            let ts_now = self.clock.borrow().timestamp_ns();
-            let events =
-                generate_reconciliation_order_events(&order, report, instrument.as_ref(), ts_now);
-
-            for event in &events {
-                self.handle_event(event);
+                for event in &events {
+                    self.handle_event(event);
+                }
             }
-        } else {
-            self.create_external_order(report, instrument.as_ref());
+            ReportOrderResolution::External => {
+                self.create_external_order(report, instrument.as_ref());
+            }
+            ReportOrderResolution::Conflict => {
+                log::error!(
+                    "Rejecting order status report for venue_order_id={}: report identity conflicts with cached order",
+                    report.venue_order_id,
+                );
+            }
         }
     }
 
@@ -1397,20 +1658,20 @@ impl ExecutionEngine {
             report,
         );
 
-        let cache = self.cache.borrow();
+        let order = self.resolve_report_order(ReconciliationReportIdentity {
+            account_id: report.account_id,
+            instrument_id: report.instrument_id,
+            client_order_id: report.client_order_id,
+            venue_order_id: report.venue_order_id,
+            order_side: report.order_side,
+            venue_position_id: report.venue_position_id,
+        });
 
-        let order = report
-            .client_order_id
-            .and_then(|id| cache.order(&id).map(|o| o.clone()))
-            .or_else(|| {
-                cache
-                    .client_order_id(&report.venue_order_id)
-                    .and_then(|cid| cache.order(cid).map(|o| o.clone()))
-            });
-
-        let instrument = cache.instrument(&report.instrument_id).cloned();
-
-        drop(cache);
+        let instrument = self
+            .cache
+            .borrow()
+            .instrument(&report.instrument_id)
+            .cloned();
 
         let Some(instrument) = instrument else {
             log::debug!(
@@ -1422,8 +1683,21 @@ impl ExecutionEngine {
         };
 
         let order = match order {
-            Some(order) => order,
-            None => {
+            ReportOrderResolution::Matched(client_order_id) => {
+                let Some(order) = self
+                    .cache
+                    .borrow()
+                    .order(&client_order_id)
+                    .map(|order| order.clone())
+                else {
+                    log::error!(
+                        "Resolved reconciliation order {client_order_id} disappeared from cache"
+                    );
+                    return;
+                };
+                order
+            }
+            ReportOrderResolution::External => {
                 let Some(order) = self.materialize_external_order_from_fill(report) else {
                     return;
                 };
@@ -1446,6 +1720,13 @@ impl ExecutionEngine {
                     .order(&order.client_order_id())
                     .map(|o| o.clone())
                     .unwrap_or(order)
+            }
+            ReportOrderResolution::Conflict => {
+                log::error!(
+                    "Rejecting fill report for venue_order_id={}: report identity conflicts with cached order",
+                    report.venue_order_id,
+                );
+                return;
             }
         };
 
@@ -1481,17 +1762,54 @@ impl ExecutionEngine {
             msgbus::publish_any(fill_report_topic, fill);
         }
 
-        let cache = self.cache.borrow();
-        let order = report
-            .client_order_id
-            .and_then(|id| cache.order(&id).map(|o| o.clone()))
-            .or_else(|| {
-                cache
-                    .client_order_id(&report.venue_order_id)
-                    .and_then(|cid| cache.order(cid).map(|o| o.clone()))
-            });
-        let instrument = cache.instrument(&report.instrument_id).cloned();
-        drop(cache);
+        let report_identity = ReconciliationReportIdentity::from(report);
+        let mut seen_fills = IndexMap::<(AccountId, InstrumentId, TradeId), &FillReport>::new();
+        for fill in fills {
+            let fill_identity = ReconciliationReportIdentity::from(fill);
+            let fill_key = (fill.account_id, fill.instrument_id, fill.trade_id);
+            let conflicting_duplicate = seen_fills
+                .insert(fill_key, fill)
+                .is_some_and(|previous| previous != fill);
+            if !reconciliation_identities_compatible(report_identity, fill_identity)
+                || conflicting_duplicate
+            {
+                log::error!(
+                    "Rejecting bundled report for venue_order_id={}: companion fill evidence conflicts",
+                    report.venue_order_id,
+                );
+                return;
+            }
+        }
+
+        let order = self.resolve_report_order(report_identity);
+        if let ReportOrderResolution::Matched(client_order_id) = order {
+            let cached_order = self
+                .cache
+                .borrow()
+                .order(&client_order_id)
+                .map(|order| order.clone());
+            let originating_account_id = self.cached_order_client_account_id(client_order_id);
+            if cached_order.is_none_or(|order| {
+                fills.iter().any(|fill| {
+                    !report_identity_matches_order(
+                        &order,
+                        ReconciliationReportIdentity::from(fill),
+                        originating_account_id,
+                    )
+                })
+            }) {
+                log::error!(
+                    "Rejecting bundled report for venue_order_id={}: companion fill identity conflicts with cached order",
+                    report.venue_order_id,
+                );
+                return;
+            }
+        }
+        let instrument = self
+            .cache
+            .borrow()
+            .instrument(&report.instrument_id)
+            .cloned();
 
         let Some(instrument) = instrument else {
             log::debug!(
@@ -1501,14 +1819,21 @@ impl ExecutionEngine {
             );
 
             if fills.is_empty()
-                && let Some(order) = order
+                && let ReportOrderResolution::Matched(client_order_id) = order
             {
-                let ts_now = self.clock.borrow().timestamp_ns();
-                let events =
-                    generate_reconciliation_order_snapshot_events(&order, report, None, ts_now);
+                let order = self
+                    .cache
+                    .borrow()
+                    .order(&client_order_id)
+                    .map(|order| order.clone());
+                if let Some(order) = order {
+                    let ts_now = self.clock.borrow().timestamp_ns();
+                    let events =
+                        generate_reconciliation_order_snapshot_events(&order, report, None, ts_now);
 
-                for event in &events {
-                    self.handle_event(event);
+                    for event in &events {
+                        self.handle_event(event);
+                    }
                 }
             }
             return;
@@ -1517,7 +1842,18 @@ impl ExecutionEngine {
         // Bootstrap the external order with only OrderAccepted; defer fill events to
         // the per-fill loop so real fill metadata is preserved.
         let mut order = match order {
-            Some(order) => {
+            ReportOrderResolution::Matched(client_order_id) => {
+                let Some(order) = self
+                    .cache
+                    .borrow()
+                    .order(&client_order_id)
+                    .map(|order| order.clone())
+                else {
+                    log::error!(
+                        "Resolved reconciliation order {client_order_id} disappeared from cache"
+                    );
+                    return;
+                };
                 let ts_now = self.clock.borrow().timestamp_ns();
                 let events = generate_reconciliation_order_pre_fill_events(&order, report, ts_now);
                 for event in &events {
@@ -1529,7 +1865,7 @@ impl ExecutionEngine {
                     .map(|o| o.clone())
                     .unwrap_or(order)
             }
-            None => {
+            ReportOrderResolution::External => {
                 let Some(order) = self.materialize_external_order_from_status(report) else {
                     return;
                 };
@@ -1552,6 +1888,13 @@ impl ExecutionEngine {
                     .order(&order.client_order_id())
                     .map(|o| o.clone())
                     .unwrap_or(order)
+            }
+            ReportOrderResolution::Conflict => {
+                log::error!(
+                    "Rejecting bundled report for venue_order_id={}: report identity conflicts with cached order",
+                    report.venue_order_id,
+                );
+                return;
             }
         };
 
@@ -1725,13 +2068,198 @@ impl ExecutionEngine {
         ))
     }
 
+    /// Validates that a mass-status envelope came from the registered execution client
+    /// identified by the trusted caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source client is unknown or the envelope identity does
+    /// not match the registered client.
+    pub fn validate_execution_mass_status_source(
+        &self,
+        source_client_id: ClientId,
+        mass_status: &ExecutionMassStatus,
+    ) -> anyhow::Result<()> {
+        let client = self
+            .clients
+            .get(&source_client_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown mass-status client {source_client_id}"))?;
+        anyhow::ensure!(
+            mass_status.client_id == source_client_id
+                && client.account_id == mass_status.account_id
+                && client.venue == mass_status.venue,
+            "Mass-status source does not match authenticated client {source_client_id}",
+        );
+        Ok(())
+    }
+
     /// Reconciles an execution mass status report.
     ///
     /// Processes all order reports, fill reports, and position reports contained
     /// in the mass status. Order reports are paired with their companion fills so
     /// real trade IDs and commissions are applied before any residual inferred fill.
-    pub fn reconcile_execution_mass_status(&mut self, mass_status: &ExecutionMassStatus) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when source provenance or any child/cross-child identity is
+    /// inconsistent. Validation completes before reconciliation mutates engine state.
+    pub fn validate_execution_mass_status(
+        &self,
+        source_client_id: ClientId,
+        mass_status: &ExecutionMassStatus,
+    ) -> anyhow::Result<()> {
+        self.validate_execution_mass_status_source(source_client_id, mass_status)?;
+        let client = self
+            .clients
+            .get(&source_client_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown mass-status client {source_client_id}"))?;
+
+        let orders = mass_status.order_reports();
+        let fills = mass_status.fill_reports();
+        let positions = mass_status.position_reports();
+        let reports_match_source = orders.values().all(|report| {
+            report.account_id == mass_status.account_id
+                && client.handles_order_venue(report.instrument_id.venue)
+        }) && fills.values().flatten().all(|report| {
+            report.account_id == mass_status.account_id
+                && client.handles_order_venue(report.instrument_id.venue)
+        }) && positions.values().flatten().all(|report| {
+            report.account_id == mass_status.account_id
+                && client.handles_order_venue(report.instrument_id.venue)
+        });
+        anyhow::ensure!(
+            reports_match_source,
+            "Mass-status child report source mismatch"
+        );
+
+        let cache = self.cache.borrow();
+        let all_instruments_cached = orders
+            .values()
+            .map(|report| report.instrument_id)
+            .chain(fills.values().flatten().map(|report| report.instrument_id))
+            .chain(
+                positions
+                    .values()
+                    .flatten()
+                    .map(|report| report.instrument_id),
+            )
+            .all(|instrument_id| cache.instrument(&instrument_id).is_some());
+        drop(cache);
+        anyhow::ensure!(
+            all_instruments_cached,
+            "Mass-status instrument is not cached"
+        );
+
+        let mut orders_by_client = IndexMap::new();
+        for (venue_order_id, report) in &orders {
+            anyhow::ensure!(
+                *venue_order_id == report.venue_order_id,
+                "Mass-status order map key conflicts with report identity"
+            );
+            let resolution = self.resolve_report_order(ReconciliationReportIdentity::from(report));
+            anyhow::ensure!(
+                self.report_order_matches_source(resolution, source_client_id),
+                "Mass-status order identity or source conflicts with cached order"
+            );
+            if let Some(client_order_id) = report.client_order_id
+                && orders_by_client
+                    .insert(client_order_id, ReconciliationReportIdentity::from(report))
+                    .is_some_and(|previous| {
+                        let current = ReconciliationReportIdentity::from(report);
+                        !reconciliation_identities_compatible(previous, current)
+                            && !self.reports_resolve_to_same_order(previous, current)
+                    })
+            {
+                anyhow::bail!("Mass-status order reports conflict");
+            }
+        }
+
+        let mut fills_by_key = IndexMap::<(AccountId, InstrumentId, TradeId), &FillReport>::new();
+        for (venue_order_id, reports) in &fills {
+            for fill in reports {
+                anyhow::ensure!(
+                    *venue_order_id == fill.venue_order_id,
+                    "Mass-status fill map key conflicts with report identity"
+                );
+                let resolution =
+                    self.resolve_report_order(ReconciliationReportIdentity::from(fill));
+                anyhow::ensure!(
+                    self.report_order_matches_source(resolution, source_client_id),
+                    "Mass-status fill identity or source conflicts with cached order"
+                );
+                let fill_key = (fill.account_id, fill.instrument_id, fill.trade_id);
+                if fills_by_key
+                    .insert(fill_key, fill)
+                    .is_some_and(|previous| !fill_reports_have_same_execution(previous, fill))
+                {
+                    anyhow::bail!("Mass-status duplicate fill evidence conflicts");
+                }
+                if let Some(order) = orders.get(&fill.venue_order_id) {
+                    anyhow::ensure!(
+                        reconciliation_identities_compatible(
+                            ReconciliationReportIdentity::from(order),
+                            ReconciliationReportIdentity::from(fill),
+                        ),
+                        "Mass-status order and companion fill identities conflict"
+                    );
+                }
+            }
+        }
+
+        let mut positions_by_id = IndexMap::<PositionId, &PositionStatusReport>::new();
+        for (instrument_id, reports) in &positions {
+            let has_hedge = reports
+                .iter()
+                .any(|report| report.venue_position_id.is_some());
+            let has_netting = reports
+                .iter()
+                .any(|report| report.venue_position_id.is_none());
+            anyhow::ensure!(
+                !(has_hedge && has_netting),
+                "Mass-status mixes hedging and netting position evidence"
+            );
+            for report in reports {
+                anyhow::ensure!(
+                    *instrument_id == report.instrument_id,
+                    "Mass-status position map key conflicts with report identity"
+                );
+                if let Some(position_id) = report.venue_position_id {
+                    let cached_conflict =
+                        self.cache
+                            .borrow()
+                            .position(&position_id)
+                            .is_some_and(|position| {
+                                position.account_id != report.account_id
+                                    || position.instrument_id != report.instrument_id
+                            });
+                    anyhow::ensure!(
+                        !cached_conflict,
+                        "Mass-status position identity conflicts with cached position"
+                    );
+                    if positions_by_id
+                        .insert(position_id, report)
+                        .is_some_and(|previous| !position_reports_have_same_state(previous, report))
+                    {
+                        anyhow::bail!("Mass-status duplicate position evidence conflicts");
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn reconcile_execution_mass_status(
+        &mut self,
+        source_client_id: ClientId,
+        mass_status: &ExecutionMassStatus,
+    ) {
         self.report_count += 1;
+
+        if let Err(error) = self.validate_execution_mass_status(source_client_id, mass_status) {
+            log::error!("Rejecting execution mass status: {error}");
+            return;
+        }
 
         log::info!(
             "Reconciling mass status for client={}, account={}, venue={}",

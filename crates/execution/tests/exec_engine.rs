@@ -166,6 +166,18 @@ fn stub_client() -> StubExecutionClient {
     )
 }
 
+fn register_sim_mass_status_client(execution_engine: &mut ExecutionEngine) {
+    execution_engine
+        .register_client(Box::new(StubExecutionClient::new(
+            ClientId::from("SIM"),
+            AccountId::test_default(),
+            Venue::from("SIM"),
+            OmsType::Netting,
+            None,
+        )))
+        .unwrap();
+}
+
 #[expect(clippy::too_many_arguments)]
 fn build_order_filled(
     trader_id: TraderId,
@@ -12417,6 +12429,142 @@ fn test_reconcile_order_status_report_finds_order_by_venue_order_id(
     assert_eq!(order.status(), OrderStatus::Canceled);
 }
 
+#[rstest]
+fn test_reconcile_order_status_report_rejects_cached_order_side_conflict(
+    mut execution_engine: ExecutionEngine,
+) {
+    let (instrument, order) = prepare_accepted_order(&mut execution_engine);
+    let mut report = create_order_status_report(
+        Some(order.client_order_id()),
+        order.venue_order_id().unwrap(),
+        instrument.id(),
+        OrderStatus::Canceled,
+        order.quantity(),
+        order.filled_qty(),
+    );
+    report.order_side = OrderSide::Sell;
+
+    execution_engine.reconcile_order_status_report(&report);
+
+    assert_eq!(
+        execution_engine
+            .cache()
+            .borrow()
+            .order(&order.client_order_id())
+            .unwrap()
+            .status(),
+        OrderStatus::Accepted,
+    );
+}
+
+#[rstest]
+fn test_reconcile_order_status_report_rejects_cached_order_instrument_conflict(
+    mut execution_engine: ExecutionEngine,
+) {
+    let (_, order) = prepare_accepted_order(&mut execution_engine);
+    let conflicting_instrument = InstrumentAny::from(gbpusd_sim());
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(conflicting_instrument.clone())
+        .unwrap();
+    let report = create_order_status_report(
+        Some(order.client_order_id()),
+        order.venue_order_id().unwrap(),
+        conflicting_instrument.id(),
+        OrderStatus::Canceled,
+        order.quantity(),
+        order.filled_qty(),
+    );
+
+    execution_engine.reconcile_order_status_report(&report);
+
+    assert_eq!(
+        execution_engine
+            .cache()
+            .borrow()
+            .order(&order.client_order_id())
+            .unwrap()
+            .status(),
+        OrderStatus::Accepted,
+    );
+}
+
+#[rstest]
+fn test_reconcile_order_status_report_rejects_split_client_and_venue_indexes(
+    mut execution_engine: ExecutionEngine,
+) {
+    let (instrument, first) = prepare_accepted_order(&mut execution_engine);
+    let second = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("O-SECOND"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_order(second.clone(), None, Some(ClientId::from("STUB")), true)
+        .unwrap();
+    execution_engine.process(&TestOrderEventStubs::submitted(
+        &second,
+        AccountId::test_default(),
+    ));
+    execution_engine.process(&TestOrderEventStubs::accepted(
+        &second,
+        AccountId::test_default(),
+        VenueOrderId::from("V-SECOND"),
+    ));
+
+    let report = create_order_status_report(
+        Some(first.client_order_id()),
+        VenueOrderId::from("V-SECOND"),
+        instrument.id(),
+        OrderStatus::Canceled,
+        first.quantity(),
+        first.filled_qty(),
+    );
+
+    execution_engine.reconcile_order_status_report(&report);
+
+    let cache = execution_engine.cache().borrow();
+    assert_eq!(
+        cache.order(&first.client_order_id()).unwrap().status(),
+        OrderStatus::Accepted,
+    );
+    assert_eq!(
+        cache.order(&second.client_order_id()).unwrap().status(),
+        OrderStatus::Accepted,
+    );
+}
+
+#[rstest]
+fn test_reconcile_order_status_report_allows_first_venue_id_assignment(
+    mut execution_engine: ExecutionEngine,
+) {
+    let (instrument, order) = prepare_submitted_limit_order_with_account(
+        &mut execution_engine,
+        CashAccount::default().into(),
+    );
+    assert!(order.venue_order_id().is_none());
+    let venue_order_id = VenueOrderId::from("V-FIRST");
+    let report = create_order_status_report(
+        Some(order.client_order_id()),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::Accepted,
+        order.quantity(),
+        order.filled_qty(),
+    );
+
+    execution_engine.reconcile_order_status_report(&report);
+
+    let cache = execution_engine.cache().borrow();
+    let cached = cache.order(&order.client_order_id()).unwrap();
+    assert_eq!(cached.status(), OrderStatus::Accepted);
+    assert_eq!(cached.venue_order_id(), Some(venue_order_id));
+}
+
 fn create_fill_report(
     instrument_id: InstrumentId,
     client_order_id: Option<ClientOrderId>,
@@ -12633,6 +12781,100 @@ fn test_reconcile_fill_report_applies_fill_event(mut execution_engine: Execution
 }
 
 #[rstest]
+fn test_reconcile_fill_report_rejects_cached_order_instrument_conflict(
+    mut execution_engine: ExecutionEngine,
+) {
+    let (_, order) = prepare_accepted_order(&mut execution_engine);
+    let conflicting_instrument = InstrumentAny::from(gbpusd_sim());
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(conflicting_instrument.clone())
+        .unwrap();
+
+    let report = create_fill_report(
+        conflicting_instrument.id(),
+        Some(order.client_order_id()),
+        order.venue_order_id().unwrap(),
+        TradeId::from("T-WRONG-INSTRUMENT"),
+        Quantity::from(50_000),
+        Price::from("1.00000"),
+    );
+
+    execution_engine.reconcile_fill_report(&report);
+
+    let cache = execution_engine.cache().borrow();
+    let cached = cache.order(&order.client_order_id()).unwrap();
+    assert!(cached.filled_qty().is_zero());
+    assert!(cached.trade_ids().is_empty());
+}
+
+#[rstest]
+fn test_reconcile_fill_report_rejects_cached_position_instrument_conflict(
+    mut execution_engine: ExecutionEngine,
+) {
+    let (instrument, order) = prepare_accepted_order(&mut execution_engine);
+    let conflicting_instrument = InstrumentAny::from(gbpusd_sim());
+    let conflicting_position = stub_position_long(gbpusd_sim());
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(conflicting_instrument)
+        .unwrap();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_position(&conflicting_position, OmsType::Netting)
+        .unwrap();
+    let mut report = create_fill_report(
+        instrument.id(),
+        Some(order.client_order_id()),
+        order.venue_order_id().unwrap(),
+        TradeId::from("T-WRONG-POSITION-INSTRUMENT"),
+        Quantity::from(50_000),
+        Price::from("1.00000"),
+    );
+    report.venue_position_id = Some(conflicting_position.id);
+
+    execution_engine.reconcile_fill_report(&report);
+
+    let cache = execution_engine.cache().borrow();
+    let cached = cache.order(&order.client_order_id()).unwrap();
+    assert!(cached.filled_qty().is_zero());
+    assert!(cached.trade_ids().is_empty());
+    assert_eq!(
+        cache
+            .position(&conflicting_position.id)
+            .unwrap()
+            .instrument_id,
+        conflicting_position.instrument_id
+    );
+}
+
+#[rstest]
+fn test_reconcile_fill_report_rejects_cached_order_side_conflict(
+    mut execution_engine: ExecutionEngine,
+) {
+    let (instrument, order) = prepare_accepted_order(&mut execution_engine);
+    let mut report = create_fill_report(
+        instrument.id(),
+        Some(order.client_order_id()),
+        order.venue_order_id().unwrap(),
+        TradeId::from("T-WRONG-SIDE"),
+        Quantity::from(50_000),
+        Price::from("1.00000"),
+    );
+    report.order_side = OrderSide::Sell;
+
+    execution_engine.reconcile_fill_report(&report);
+
+    let cache = execution_engine.cache().borrow();
+    let cached = cache.order(&order.client_order_id()).unwrap();
+    assert!(cached.filled_qty().is_zero());
+    assert!(cached.trade_ids().is_empty());
+}
+
+#[rstest]
 fn test_reconcile_fill_report_finds_order_by_venue_order_id(mut execution_engine: ExecutionEngine) {
     let instrument = audusd_sim();
     let client_order_id = ClientOrderId::from("O-001");
@@ -12682,7 +12924,7 @@ fn test_reconcile_fill_report_finds_order_by_venue_order_id(mut execution_engine
 }
 
 #[rstest]
-fn test_reconcile_fill_report_uses_report_account_for_position(
+fn test_reconcile_fill_report_rejects_cached_order_account_conflict(
     mut execution_engine: ExecutionEngine,
 ) {
     let instrument = audusd_sim();
@@ -12740,6 +12982,7 @@ fn test_reconcile_fill_report_uses_report_account_for_position(
     execution_engine.reconcile_fill_report(&report);
 
     let cache = execution_engine.cache().borrow();
+    let cached_order = cache.order(&client_order_id).unwrap();
     let report_account_positions = cache.positions(
         None,
         Some(&instrument.id()),
@@ -12755,9 +12998,10 @@ fn test_reconcile_fill_report_uses_report_account_for_position(
         None,
     );
 
-    assert_eq!(report_account_positions.len(), 1);
-    assert_eq!(report_account_positions[0].account_id, report_account_id);
-    assert_eq!(report_account_positions[0].instrument_id, instrument.id());
+    assert_eq!(cached_order.status(), OrderStatus::Accepted);
+    assert!(cached_order.filled_qty().is_zero());
+    assert!(cached_order.trade_ids().is_empty());
+    assert!(report_account_positions.is_empty());
     assert!(order_account_positions.is_empty());
 }
 
@@ -12937,6 +13181,7 @@ fn test_reconcile_position_report_hedging_mode_position_not_found(
 
 #[rstest]
 fn test_reconcile_execution_mass_status_empty(mut execution_engine: ExecutionEngine) {
+    register_sim_mass_status_client(&mut execution_engine);
     let mass_status = ExecutionMassStatus::new(
         ClientId::from("SIM"),
         AccountId::test_default(),
@@ -12945,7 +13190,7 @@ fn test_reconcile_execution_mass_status_empty(mut execution_engine: ExecutionEng
         None,
     );
 
-    execution_engine.reconcile_execution_mass_status(&mass_status);
+    execution_engine.reconcile_execution_mass_status(ClientId::from("SIM"), &mass_status);
 
     assert_eq!(execution_engine.report_count(), 1);
 
@@ -12957,7 +13202,89 @@ fn test_reconcile_execution_mass_status_empty(mut execution_engine: ExecutionEng
 }
 
 #[rstest]
+fn test_reconcile_execution_mass_status_rejects_cached_order_owned_by_other_client(
+    mut execution_engine: ExecutionEngine,
+) {
+    let source_client_id = ClientId::from("SIM-B");
+    let owning_client_id = ClientId::from("SIM-A");
+    execution_engine.register_default_client(Box::new(StubExecutionClient::new(
+        owning_client_id,
+        AccountId::test_default(),
+        Venue::from("SIM"),
+        OmsType::Netting,
+        None,
+    )));
+    execution_engine
+        .register_client(Box::new(StubExecutionClient::new(
+            source_client_id,
+            AccountId::test_default(),
+            Venue::from("SIM"),
+            OmsType::Netting,
+            None,
+        )))
+        .unwrap();
+    let instrument = audusd_sim();
+    let client_order_id = ClientOrderId::from("O-CLIENT-PROVENANCE");
+    let venue_order_id = VenueOrderId::from("V-CLIENT-PROVENANCE");
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
+        .unwrap();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .price(Price::from("1.00000"))
+        .build();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(owning_client_id), true)
+        .unwrap();
+    execution_engine.process(&TestOrderEventStubs::submitted(
+        &order,
+        AccountId::test_default(),
+    ));
+    execution_engine.process(&TestOrderEventStubs::accepted(
+        &order,
+        AccountId::test_default(),
+        venue_order_id,
+    ));
+    let report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::Canceled,
+        order.quantity(),
+        order.filled_qty(),
+    );
+    let mut mass_status = ExecutionMassStatus::new(
+        source_client_id,
+        AccountId::test_default(),
+        Venue::from("SIM"),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    mass_status.add_order_reports(vec![report]);
+
+    execution_engine.reconcile_execution_mass_status(source_client_id, &mass_status);
+
+    assert_eq!(
+        execution_engine
+            .cache()
+            .borrow()
+            .order(&client_order_id)
+            .unwrap()
+            .status(),
+        OrderStatus::Accepted
+    );
+}
+
+#[rstest]
 fn test_reconcile_execution_mass_status_with_order_reports(mut execution_engine: ExecutionEngine) {
+    register_sim_mass_status_client(&mut execution_engine);
     let instrument = audusd_sim();
     let client_order_id = ClientOrderId::from("O-001");
     let venue_order_id = VenueOrderId::from("V-001");
@@ -12979,7 +13306,7 @@ fn test_reconcile_execution_mass_status_with_order_reports(mut execution_engine:
     execution_engine
         .cache()
         .borrow_mut()
-        .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+        .add_order(order.clone(), None, Some(ClientId::from("SIM")), true)
         .unwrap();
 
     let submitted = TestOrderEventStubs::submitted(&order, AccountId::test_default());
@@ -13006,7 +13333,7 @@ fn test_reconcile_execution_mass_status_with_order_reports(mut execution_engine:
     );
     mass_status.add_order_reports(vec![order_report]);
 
-    execution_engine.reconcile_execution_mass_status(&mass_status);
+    execution_engine.reconcile_execution_mass_status(ClientId::from("SIM"), &mass_status);
 
     let cache = execution_engine.cache().borrow();
     let order = cache.order(&client_order_id).unwrap();
@@ -13020,6 +13347,7 @@ fn test_reconcile_execution_mass_status_applies_real_fill_before_terminal_order_
     mut execution_engine: ExecutionEngine,
     #[case] terminal_status: OrderStatus,
 ) {
+    register_sim_mass_status_client(&mut execution_engine);
     let instrument = audusd_sim();
     let client_order_id = ClientOrderId::from("O-MASS-FILL");
     let venue_order_id = VenueOrderId::from("V-MASS-FILL");
@@ -13041,7 +13369,7 @@ fn test_reconcile_execution_mass_status_applies_real_fill_before_terminal_order_
     execution_engine
         .cache()
         .borrow_mut()
-        .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+        .add_order(order.clone(), None, Some(ClientId::from("SIM")), true)
         .unwrap();
     execution_engine.process(&TestOrderEventStubs::submitted(
         &order,
@@ -13079,7 +13407,7 @@ fn test_reconcile_execution_mass_status_applies_real_fill_before_terminal_order_
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
 
-    execution_engine.reconcile_execution_mass_status(&mass_status);
+    execution_engine.reconcile_execution_mass_status(ClientId::from("SIM"), &mass_status);
 
     let cache = execution_engine.cache().borrow();
     let order = cache.order(&client_order_id).unwrap();
@@ -13093,6 +13421,7 @@ fn test_reconcile_execution_mass_status_applies_real_fill_before_terminal_order_
 fn test_reconcile_execution_mass_status_accepts_submitted_order_before_real_fill(
     mut execution_engine: ExecutionEngine,
 ) {
+    register_sim_mass_status_client(&mut execution_engine);
     let instrument = audusd_sim();
     let client_order_id = ClientOrderId::from("O-MASS-SUBMITTED");
     let venue_order_id = VenueOrderId::from("V-MASS-SUBMITTED");
@@ -13112,7 +13441,7 @@ fn test_reconcile_execution_mass_status_accepts_submitted_order_before_real_fill
     execution_engine
         .cache()
         .borrow_mut()
-        .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+        .add_order(order.clone(), None, Some(ClientId::from("SIM")), true)
         .unwrap();
     execution_engine.process(&TestOrderEventStubs::submitted(
         &order,
@@ -13144,7 +13473,7 @@ fn test_reconcile_execution_mass_status_accepts_submitted_order_before_real_fill
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
 
-    execution_engine.reconcile_execution_mass_status(&mass_status);
+    execution_engine.reconcile_execution_mass_status(ClientId::from("SIM"), &mass_status);
 
     let cache = execution_engine.cache().borrow();
     let order = cache.order(&client_order_id).unwrap();
@@ -13159,6 +13488,7 @@ fn test_reconcile_execution_mass_status_accepts_submitted_order_before_real_fill
 fn test_reconcile_execution_mass_status_publishes_skipped_external_fill(
     mut execution_engine: ExecutionEngine,
 ) {
+    register_sim_mass_status_client(&mut execution_engine);
     // External-order fills are skipped by the per-report reconciliation path
     // (covered by an inferred fill), but they still arrived from the venue and
     // must be captured for forensic replay on the raw FillReport topic.
@@ -13210,7 +13540,7 @@ fn test_reconcile_execution_mass_status_publishes_skipped_external_fill(
     let (handler, saver) = get_any_saving_handler::<FillReport>(None);
     msgbus::subscribe_any(pattern, handler.clone(), None);
 
-    execution_engine.reconcile_execution_mass_status(&mass_status);
+    execution_engine.reconcile_execution_mass_status(ClientId::from("SIM"), &mass_status);
 
     msgbus::unsubscribe_any(pattern, &handler);
 
@@ -14725,6 +15055,7 @@ fn test_reconcile_execution_report_filters_unclaimed_external_order(
 #[rstest]
 fn test_reconcile_execution_mass_status_filters_unclaimed_external_order() {
     let mut execution_engine = execution_engine_with_unclaimed_external_order_filter(true);
+    register_sim_mass_status_client(&mut execution_engine);
     let instrument = audusd_sim();
     let client_order_id = ClientOrderId::from("O-UNCLAIMED-MASS");
     let venue_order_id = VenueOrderId::from("V-UNCLAIMED-MASS");
@@ -14772,7 +15103,7 @@ fn test_reconcile_execution_mass_status_filters_unclaimed_external_order() {
     let (raw_fill_handler, raw_fill_saver) = get_any_saving_handler::<FillReport>(None);
     msgbus::subscribe_any(raw_fill_pattern, raw_fill_handler.clone(), None);
 
-    execution_engine.reconcile_execution_mass_status(&mass_status);
+    execution_engine.reconcile_execution_mass_status(ClientId::from("SIM"), &mass_status);
 
     msgbus::unsubscribe_any(raw_order_pattern, &raw_order_handler);
     msgbus::unsubscribe_any(raw_fill_pattern, &raw_fill_handler);
@@ -15306,6 +15637,46 @@ fn test_reconcile_order_with_fills_applies_to_cached_order(mut execution_engine:
     assert_eq!(order.filled_qty(), Quantity::from(100_000));
     assert_eq!(order.trade_ids().len(), 1);
     assert_eq!(*order.trade_ids()[0], TradeId::from("T-LOCAL-001"));
+}
+
+#[rstest]
+fn test_reconcile_order_with_fills_rejects_companion_fill_identity_conflict(
+    mut execution_engine: ExecutionEngine,
+) {
+    let (instrument, order) = prepare_accepted_order(&mut execution_engine);
+    let conflicting_instrument = InstrumentAny::from(gbpusd_sim());
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(conflicting_instrument.clone())
+        .unwrap();
+    let client_order_id = order.client_order_id();
+    let venue_order_id = order.venue_order_id().unwrap();
+    let conflicting_trade_id = TradeId::from("T-BUNDLED-WRONG-INSTRUMENT");
+    let order_report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::Filled,
+        order.quantity(),
+        order.quantity(),
+    );
+    let conflicting_fill = create_fill_report(
+        conflicting_instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        conflicting_trade_id,
+        order.quantity(),
+        Price::from("1.00000"),
+    );
+
+    execution_engine.reconcile_order_with_fills(&order_report, &[conflicting_fill]);
+
+    let cache = execution_engine.cache().borrow();
+    let reconciled = cache.order(&client_order_id).unwrap();
+    assert_eq!(reconciled.status(), OrderStatus::Accepted);
+    assert!(reconciled.filled_qty().is_zero());
+    assert!(reconciled.trade_ids().is_empty());
 }
 
 #[rstest]
