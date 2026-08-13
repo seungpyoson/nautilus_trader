@@ -98,19 +98,22 @@ use nautilus_common::{
     messages::{
         DataEvent, ExecutionEvent, ExecutionReport,
         data::DataCommand,
-        execution::{GenerateOrderStatusReports, GeneratePositionStatusReports, TradingCommand},
+        execution::{
+            CancelOrder, GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder,
+            TradingCommand,
+        },
         system::QueueStateChanged,
     },
     msgbus::{self, BusMessage, MessagingSwitchboard},
     runner::{SystemChannel, TimeEventMessage, TradingCommandMessage},
 };
 use nautilus_core::{
-    UUID4,
+    UUID4, UnixNanos,
     datetime::{NANOSECONDS_IN_MILLISECOND, mins_to_secs, secs_to_nanos_unchecked},
 };
 use nautilus_execution::engine::ExecutionEngine;
 use nautilus_model::{
-    events::OrderEventAny,
+    events::{OrderCancelRejected, OrderDenied, OrderEventAny, OrderModifyRejected},
     identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     orders::Order,
     reports::{OrderStatusReport, PositionStatusReport},
@@ -154,6 +157,22 @@ use metrics::{RunnerChannelQueueDepths, RunnerMetrics};
 use queue::{QueueMonitor, QueueStateTransition};
 use state::{EngineConnectionStatus, RunningTransition};
 pub use state::{LiveNodeHandle, NodeState};
+
+/// Reason carried by the event that answers a command startup failed to dispatch.
+const REFUSED_COMMAND_REASON: &str = "Startup failed before command dispatch";
+
+/// What a drain does with a trading command still buffered inside the node.
+///
+/// Every drain site states which it is, so a command's fate follows from why the
+/// node is draining rather than from which buffer the command landed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandDisposition {
+    /// Send the command to its endpoint. The node ran, so the request stands.
+    Dispatch,
+    /// Answer the command with a denial or rejection. Startup failed, so the
+    /// node is no longer authorized to send it.
+    Refuse,
+}
 
 /// High-level abstraction for a live Nautilus system node.
 ///
@@ -401,7 +420,7 @@ impl LiveNode {
 
         if let Err(e) = data_connect_result {
             self.runner = Some(runner);
-            pending.drain_after_failure_with(|event| self.process_runner_event(event));
+            pending.drain_with(|event| self.refuse_runner_event(event));
             return self
                 .abort_startup_with_error("Data client connection timed out", e)
                 .await;
@@ -420,7 +439,7 @@ impl LiveNode {
             Ok(status) => status,
             Err(e) => {
                 self.runner = Some(runner);
-                pending.drain_after_failure_with(|event| self.process_runner_event(event));
+                pending.drain_with(|event| self.refuse_runner_event(event));
                 return self
                     .abort_startup_with_error("Execution client connection timed out", e)
                     .await;
@@ -429,7 +448,7 @@ impl LiveNode {
 
         if engine_connection_status == EngineConnectionStatus::TimedOut {
             self.runner = Some(runner);
-            pending.drain_after_failure_with(|event| self.process_runner_event(event));
+            pending.drain_with(|event| self.refuse_runner_event(event));
             return self
                 .abort_startup_with_error(
                     "Engine readiness timed out",
@@ -443,7 +462,7 @@ impl LiveNode {
             .or_else(|| self.startup_abort_reason())
         {
             self.runner = Some(runner);
-            pending.drain_after_failure_with(|event| self.process_runner_event(event));
+            pending.drain_with(|event| self.refuse_runner_event(event));
             self.abort_startup(reason).await?;
             return Ok(());
         }
@@ -460,7 +479,7 @@ impl LiveNode {
         self.runner = Some(runner);
 
         if let Err(e) = reconciliation_result {
-            pending.drain_after_failure_with(|event| self.process_runner_event(event));
+            pending.drain_with(|event| self.refuse_runner_event(event));
             if let Err(finalize_err) = self.abort_startup("Startup reconciliation failed").await {
                 anyhow::bail!(
                     "startup reconciliation failed: {e}; failed to finalize startup abort: {finalize_err}"
@@ -478,11 +497,11 @@ impl LiveNode {
         }
 
         if let Err(e) = self.kernel.start_trader() {
-            return self.abort_after_trader_start_failure(e).await;
+            return self.abort_after_trader_start_failure(e, None).await;
         }
         #[cfg(feature = "plugin")]
         if let Err(e) = self.plugins.start_controllers() {
-            return self.abort_after_trader_start_failure(e).await;
+            return self.abort_after_trader_start_failure(e, None).await;
         }
 
         if !self.finish_startup_trader(None).await? {
@@ -569,6 +588,12 @@ impl LiveNode {
         self.handle.set_stopped();
     }
 
+    /// Processes traffic for the post-stop grace period.
+    ///
+    /// Always dispatches commands: every caller runs this after the decision
+    /// point, where [`refuse_queued_commands`](Self::refuse_queued_commands) has
+    /// already answered the backlog, so what arrives here is the shutdown
+    /// sequence's own work and has to leave the node.
     async fn process_runner_for(&mut self, duration: Duration) -> usize {
         let Some(mut runner) = self.runner.take() else {
             dst::time::sleep(duration).await;
@@ -600,6 +625,11 @@ impl LiveNode {
         processed
     }
 
+    /// Drains the runner's queue, dispatching commands.
+    ///
+    /// Same reasoning as [`process_runner_for`](Self::process_runner_for): the
+    /// backlog was answered at the decision point, so anything left belongs to a
+    /// node that ran or to the shutdown sequence.
     fn drain_runner_pending(&mut self) -> usize {
         let Some(mut runner) = self.runner.take() else {
             return 0;
@@ -950,7 +980,7 @@ impl LiveNode {
                 let result = self
                     .abort_startup("External message bus ingress failed to start")
                     .await;
-                Self::drain_ordered_channels(&mut channels);
+                self.drain_ordered_channels_after_failure(&mut channels);
                 log::info!("Event loop stopped");
 
                 if let Err(finalize_err) = result {
@@ -978,11 +1008,11 @@ impl LiveNode {
 
         if let Err(e) = data_connect_result {
             flush_all_pending(&mut pending, &mut channels);
-            pending.drain_after_failure_with(|event| self.process_runner_event(event));
+            pending.drain_with(|event| self.refuse_runner_event(event));
             let result = self
                 .abort_startup_with_error("Data client connection timed out", e)
                 .await;
-            Self::drain_ordered_channels(&mut channels);
+            self.drain_ordered_channels_after_failure(&mut channels);
             log::info!("Event loop stopped");
             return result;
         }
@@ -1012,25 +1042,25 @@ impl LiveNode {
         let engine_connection_status = match engine_connection_result {
             Ok(status) => status,
             Err(e) => {
-                pending.drain_after_failure_with(|event| self.process_runner_event(event));
+                pending.drain_with(|event| self.refuse_runner_event(event));
                 let result = self
                     .abort_startup_with_error("Execution client connection timed out", e)
                     .await;
-                Self::drain_ordered_channels(&mut channels);
+                self.drain_ordered_channels_after_failure(&mut channels);
                 log::info!("Event loop stopped");
                 return result;
             }
         };
 
         if engine_connection_status == EngineConnectionStatus::TimedOut {
-            pending.drain_after_failure_with(|event| self.process_runner_event(event));
+            pending.drain_with(|event| self.refuse_runner_event(event));
             let result = self
                 .abort_startup_with_error(
                     "Engine readiness timed out",
                     anyhow::anyhow!("readiness timeout while waiting for engine connections"),
                 )
                 .await;
-            Self::drain_ordered_channels(&mut channels);
+            self.drain_ordered_channels_after_failure(&mut channels);
             log::info!("Event loop stopped");
             return result;
         }
@@ -1039,9 +1069,9 @@ impl LiveNode {
             .abort_reason()
             .or_else(|| self.startup_abort_reason())
         {
-            pending.drain_after_failure_with(|event| self.process_runner_event(event));
+            pending.drain_with(|event| self.refuse_runner_event(event));
             self.abort_startup(reason).await?;
-            Self::drain_ordered_channels(&mut channels);
+            self.drain_ordered_channels_after_failure(&mut channels);
             log::info!("Event loop stopped");
             return Ok(());
         }
@@ -1063,9 +1093,9 @@ impl LiveNode {
         flush_all_pending(&mut pending, &mut channels);
 
         if let Err(e) = reconciliation_result {
-            pending.drain_after_failure_with(|event| self.process_runner_event(event));
+            pending.drain_with(|event| self.refuse_runner_event(event));
             let result = self.abort_startup("Startup reconciliation failed").await;
-            Self::drain_ordered_channels(&mut channels);
+            self.drain_ordered_channels_after_failure(&mut channels);
             log::info!("Event loop stopped");
 
             if let Err(finalize_err) = result {
@@ -1079,43 +1109,57 @@ impl LiveNode {
 
         pending.drain_with(|event| self.process_runner_event(event));
 
-        if let Some(reason) = self.startup_abort_reason() {
-            let result = self.abort_startup(reason).await;
-            Self::drain_ordered_channels(&mut channels);
-            log::info!("Event loop stopped");
-            return result;
-        }
-
+        // Hand the receivers to the event loop before deciding whether to abort:
+        // the handoff drains messages the runner already took out of them, and
+        // those carry venue truth the abort decision must see.
         let AsyncRunnerReceivers {
             time_evt: mut time_evt_rx,
             exec_evt: mut exec_evt_rx,
             exec_cmd: mut exec_cmd_rx,
             data_evt: mut data_evt_rx,
             data_cmd: mut data_cmd_rx,
-        } = channels.into_receivers();
+        } = channels.into_receivers(|event| self.process_runner_event(event));
 
-        if let Err(e) = self.kernel.start_trader() {
-            let result = self.abort_after_trader_start_failure(e).await;
-            Self::drain_channels(
+        if let Some(reason) = self.startup_abort_reason() {
+            let result = self.abort_startup(reason).await;
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut data_evt_rx,
                 &mut data_cmd_rx,
                 &mut exec_evt_rx,
                 &mut exec_cmd_rx,
+                CommandDisposition::Refuse,
             );
+            log::info!("Event loop stopped");
+            return result;
+        }
+
+        if let Err(e) = self.kernel.start_trader() {
+            let mut receivers = RunnerReceivers {
+                time_evt: &mut time_evt_rx,
+                data_evt: &mut data_evt_rx,
+                data_cmd: &mut data_cmd_rx,
+                exec_evt: &mut exec_evt_rx,
+                exec_cmd: &mut exec_cmd_rx,
+            };
+            let result = self
+                .abort_after_trader_start_failure(e, Some(&mut receivers))
+                .await;
             log::info!("Event loop stopped");
             return result;
         }
         #[cfg(feature = "plugin")]
         if let Err(e) = self.plugins.start_controllers() {
-            let result = self.abort_after_trader_start_failure(e).await;
-            Self::drain_channels(
-                &mut time_evt_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-            );
+            let mut receivers = RunnerReceivers {
+                time_evt: &mut time_evt_rx,
+                data_evt: &mut data_evt_rx,
+                data_cmd: &mut data_cmd_rx,
+                exec_evt: &mut exec_evt_rx,
+                exec_cmd: &mut exec_cmd_rx,
+            };
+            let result = self
+                .abort_after_trader_start_failure(e, Some(&mut receivers))
+                .await;
             log::info!("Event loop stopped");
             return result;
         }
@@ -1619,13 +1663,15 @@ impl LiveNode {
 
         let stop_result = self.finalize_stop().await;
 
-        // Handle events that arrived during finalize_stop
-        Self::drain_channels(
+        // Handle events that arrived during finalize_stop. The node ran, so a
+        // late command still belongs to a live request and is dispatched.
+        self.drain_channels(
             &mut time_evt_rx,
             &mut data_evt_rx,
             &mut data_cmd_rx,
             &mut exec_evt_rx,
             &mut exec_cmd_rx,
+            CommandDisposition::Dispatch,
         );
 
         log::info!("Event loop stopped");
@@ -1796,6 +1842,212 @@ impl LiveNode {
         }
     }
 
+    /// Routes a buffered runner event after startup failed.
+    ///
+    /// Venue and data truth is still applied, because the node's own state must
+    /// reflect what the venue did. A trading command is answered instead of
+    /// dispatched: startup failed, so the node is no longer authorized to send it.
+    fn refuse_runner_event(&mut self, event: PendingRunnerEvent) {
+        match event {
+            PendingRunnerEvent::ExecCommand(message) => {
+                self.refuse_exec_command(message.command());
+            }
+            event => self.process_runner_event(event),
+        }
+    }
+
+    /// Answers every trading command queued before the node decided to stop.
+    ///
+    /// Call this at the decision point, ahead of any stop sequence. Stopping the
+    /// trader runs its `on_stop` handlers, which queue the shutdown's own
+    /// commands - a `CancelAllOrders` that must reach the venue so nothing is
+    /// left resting - into the same channel. Draining the backlog first is what
+    /// separates the two: what is here now is the caller's, what arrives after
+    /// is the shutdown's.
+    ///
+    /// Events are left alone. They are venue truth, and the drains that follow
+    /// process them in order.
+    fn refuse_queued_commands(
+        &self,
+        exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
+    ) {
+        let mut refused = 0;
+
+        while let Ok(message) = exec_cmd_rx.try_recv() {
+            self.refuse_exec_command(message.command());
+            refused += 1;
+        }
+
+        if refused > 0 {
+            log::warn!("Refused {refused} trading command(s) queued before startup was abandoned");
+        }
+    }
+
+    /// [`refuse_queued_commands`](Self::refuse_queued_commands) for the paths
+    /// where the node still owns the runner instead of the bare receivers.
+    ///
+    /// Non-command events are returned to the runner so the drains that follow
+    /// still see them in arrival order.
+    fn refuse_queued_runner_commands(&mut self) {
+        let Some(mut runner) = self.runner.take() else {
+            return;
+        };
+
+        let mut refused = 0;
+        let mut deferred = Vec::new();
+        runner.poll_pending(|event| match event {
+            PendingRunnerEvent::ExecCommand(message) => {
+                self.refuse_exec_command(message.command());
+                refused += 1;
+            }
+            event => deferred.push(event),
+        });
+        runner.defer_pending(deferred);
+        self.runner = Some(runner);
+
+        if refused > 0 {
+            log::warn!("Refused {refused} trading command(s) queued before startup was abandoned");
+        }
+    }
+
+    /// Answers a trading command the node refused to dispatch.
+    ///
+    /// A command that never reaches its endpoint still has a caller waiting on
+    /// it. The strategy already marked its order pending-cancel or
+    /// pending-update locally, or left a new order initialized awaiting
+    /// submission, so discarding the command silently strands that order in a
+    /// state no venue event will ever resolve. Each command is answered with the
+    /// event that terminates the request it made.
+    ///
+    /// Commands carrying no per-order request (`CancelAllOrders`, queries) have
+    /// no such event; those are logged.
+    fn refuse_exec_command(&self, command: &TradingCommand) {
+        let ts = self.kernel.clock().borrow().timestamp_ns();
+        let answers = match command {
+            TradingCommand::SubmitOrder(cmd) => vec![Self::order_denied(
+                cmd.trader_id,
+                cmd.strategy_id,
+                cmd.instrument_id,
+                cmd.client_order_id,
+                ts,
+            )],
+            TradingCommand::SubmitOrderList(cmd) => cmd
+                .order_inits
+                .iter()
+                .map(|init| {
+                    Self::order_denied(
+                        cmd.trader_id,
+                        cmd.strategy_id,
+                        cmd.instrument_id,
+                        init.client_order_id,
+                        ts,
+                    )
+                })
+                .collect(),
+            TradingCommand::ModifyOrder(cmd) => vec![Self::modify_rejected(cmd, ts)],
+            TradingCommand::ModifyOrders(cmd) => cmd
+                .modifies
+                .iter()
+                .map(|modify| Self::modify_rejected(modify, ts))
+                .collect(),
+            TradingCommand::CancelOrder(cmd) => vec![Self::cancel_rejected(cmd, ts)],
+            TradingCommand::CancelOrders(cmd) => cmd
+                .cancels
+                .iter()
+                .map(|cancel| Self::cancel_rejected(cancel, ts))
+                .collect(),
+            TradingCommand::CancelAllOrders(_)
+            | TradingCommand::QueryOrder(_)
+            | TradingCommand::QueryAccount(_) => Vec::new(),
+        };
+
+        if answers.is_empty() {
+            log::warn!("Refused {command} queued during failed startup, no order answer to emit");
+            return;
+        }
+
+        for event in answers {
+            let client_order_id = event.client_order_id();
+
+            if !self.refusal_applies(&event) {
+                log::warn!(
+                    "Refused {command} queued during failed startup, cannot answer {client_order_id}: order missing from cache or not awaiting this command",
+                );
+                continue;
+            }
+
+            log::warn!(
+                "Refused {command} queued during failed startup, answering {client_order_id} with {event}",
+            );
+            AsyncRunner::handle_exec_event(ExecutionEvent::Order(event));
+        }
+    }
+
+    /// Returns whether the cached order can accept this refusal.
+    ///
+    /// Uses the order state machine rather than restating it, so an answer is
+    /// only emitted where the engine would apply it.
+    fn refusal_applies(&self, event: &OrderEventAny) -> bool {
+        let cache = self.kernel.cache();
+        let cache = cache.borrow();
+        let Some(order) = cache.order(&event.client_order_id()) else {
+            return false;
+        };
+
+        order.status().transition(event).is_ok()
+    }
+
+    fn order_denied(
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        ts: UnixNanos,
+    ) -> OrderEventAny {
+        OrderEventAny::Denied(OrderDenied::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            REFUSED_COMMAND_REASON.into(),
+            UUID4::new(),
+            ts,
+            ts,
+        ))
+    }
+
+    fn modify_rejected(command: &ModifyOrder, ts: UnixNanos) -> OrderEventAny {
+        OrderEventAny::ModifyRejected(OrderModifyRejected::new(
+            command.trader_id,
+            command.strategy_id,
+            command.instrument_id,
+            command.client_order_id,
+            REFUSED_COMMAND_REASON.into(),
+            UUID4::new(),
+            ts,
+            ts,
+            false,
+            command.venue_order_id,
+            None,
+        ))
+    }
+
+    fn cancel_rejected(command: &CancelOrder, ts: UnixNanos) -> OrderEventAny {
+        OrderEventAny::CancelRejected(OrderCancelRejected::new(
+            command.trader_id,
+            command.strategy_id,
+            command.instrument_id,
+            command.client_order_id,
+            REFUSED_COMMAND_REASON.into(),
+            UUID4::new(),
+            ts,
+            ts,
+            false,
+            command.venue_order_id,
+            None,
+        ))
+    }
+
     /// Dispatches a normal-ingress execution event, then commits a direct
     /// `OrderFilled` to the recent-fills dedup cache only once it is present on
     /// its canonical order.
@@ -1937,6 +2189,40 @@ impl LiveNode {
         log::info!("{reason}, aborting startup");
         self.handle.set_shutting_down();
 
+        // Answer what was queued before the node gave up, while the command
+        // channel still holds only pre-decision traffic. Stopping the trader
+        // below runs its `on_stop` handlers, which queue the shutdown's own
+        // commands into the same channel; those must reach the venue.
+        match receivers.as_deref_mut() {
+            Some(receivers) => self.refuse_queued_commands(receivers.exec_cmd),
+            None => self.refuse_queued_runner_commands(),
+        }
+
+        let errors = self.stop_started_trader_and_drain(receivers).await;
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("{}", errors.join("; "))
+        }
+    }
+
+    /// Stops a trader that has started, lets its stop sequence reach the venue,
+    /// then finalizes and drains what is left.
+    ///
+    /// Shared by both abort paths so a started trader is always torn down the
+    /// same way. Stopping the trader runs its `on_stop` handlers, which queue
+    /// commands - typically `CancelAllOrders` so nothing is left resting at the
+    /// venue - and the grace period is what lets those leave the node before the
+    /// clients disconnect. Every drain here dispatches: whichever caller answered
+    /// its backlog did so before calling in.
+    ///
+    /// Returns the teardown errors in order, so each caller can fold in whatever
+    /// brought it here.
+    async fn stop_started_trader_and_drain(
+        &mut self,
+        mut receivers: Option<&mut RunnerReceivers<'_>>,
+    ) -> Vec<String> {
         #[cfg(feature = "plugin")]
         let controller_stop_result = self.plugins.stop_controllers();
         #[cfg(not(feature = "plugin"))]
@@ -1946,7 +2232,7 @@ impl LiveNode {
         let delay = self.kernel.delay_post_stop();
         log::info!("Awaiting residual events ({delay:?})...");
 
-        let residual_events = match receivers.as_mut() {
+        let residual_events = match receivers.as_deref_mut() {
             Some(receivers) => self.process_receivers_for(delay, receivers).await,
             None => self.process_runner_for(delay).await,
         };
@@ -1958,12 +2244,13 @@ impl LiveNode {
         let finalize_result = self.finalize_stop().await;
 
         if let Some(receivers) = receivers {
-            Self::drain_channels(
+            self.drain_channels(
                 receivers.time_evt,
                 receivers.data_evt,
                 receivers.data_cmd,
                 receivers.exec_evt,
                 receivers.exec_cmd,
+                CommandDisposition::Dispatch,
             );
         } else {
             let drained_events = self.drain_runner_pending();
@@ -1986,13 +2273,11 @@ impl LiveNode {
             errors.push(format!("Failed to finalize startup abort: {e}"));
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            anyhow::bail!("{}", errors.join("; "))
-        }
+        errors
     }
 
+    /// [`process_runner_for`](Self::process_runner_for) for the paths that hold
+    /// the bare receivers. Dispatches commands for the same reason.
     async fn process_receivers_for(
         &mut self,
         duration: Duration,
@@ -2035,26 +2320,26 @@ impl LiveNode {
     async fn abort_after_trader_start_failure(
         &mut self,
         start_err: anyhow::Error,
+        receivers: Option<&mut RunnerReceivers<'_>>,
     ) -> anyhow::Result<()> {
         log::info!("Trader startup failed, aborting startup");
         self.handle.set_shutting_down();
-        let stop_result = self.kernel.stop_trader_after_start_failure();
-        let finalize_result = self.finalize_stop().await;
 
-        match (stop_result, finalize_result) {
-            (Ok(()), Ok(())) => Err(start_err),
-            (Err(stop_err), Ok(())) => anyhow::bail!(
-                "Failed during trader startup: {start_err}; failed to stop partial trader start: \
-                 {stop_err}"
-            ),
-            (Ok(()), Err(finalize_err)) => anyhow::bail!(
-                "Failed during trader startup: {start_err}; failed to finalize startup abort: \
-                 {finalize_err}"
-            ),
-            (Err(stop_err), Err(finalize_err)) => anyhow::bail!(
-                "Failed during trader startup: {start_err}; failed to stop partial trader start: \
-                 {stop_err}; failed to finalize startup abort: {finalize_err}"
-            ),
+        // No backlog refusal here, unlike `abort_started_trader`. `start_trader`
+        // stops the trader itself when a component fails to start, so by the time
+        // it returns an error the queue can already hold that stop's `on_stop`
+        // output. Nothing at this point distinguishes it from a caller's request,
+        // and leaving orders resting at the venue is the worse mistake, so the
+        // teardown below sends everything.
+        let errors = self.stop_started_trader_and_drain(receivers).await;
+
+        if errors.is_empty() {
+            Err(start_err)
+        } else {
+            anyhow::bail!(
+                "Failed during trader startup: {start_err}; {}",
+                errors.join("; ")
+            )
         }
     }
 
@@ -2113,24 +2398,17 @@ impl LiveNode {
         }
     }
 
-    fn drain_ordered_channels(channels: &mut AsyncRunnerChannels) {
+    /// Drains the runner's ordered queue after startup failed.
+    ///
+    /// Only reached from an abort path, so a queued trading command is answered
+    /// on the same terms as one buffered in [`PendingEvents`]. Where a command
+    /// happened to be buffered must not decide whether it is sent.
+    fn drain_ordered_channels_after_failure(&mut self, channels: &mut AsyncRunnerChannels) {
         let events = channels.drain_pending_snapshot();
         let drained = events.len();
 
         for event in events {
-            match event {
-                PendingRunnerEvent::Time(message) => {
-                    let _ = AsyncRunner::handle_time_event(message);
-                }
-                PendingRunnerEvent::ExecEvent(event) => AsyncRunner::handle_exec_event(event),
-                PendingRunnerEvent::ExecCommand(command) => {
-                    AsyncRunner::handle_trading_command(command);
-                }
-                PendingRunnerEvent::DataEvent(event) => AsyncRunner::handle_data_event(event),
-                PendingRunnerEvent::DataCommand(command) => {
-                    AsyncRunner::handle_data_command(command);
-                }
-            }
+            self.refuse_runner_event(event);
         }
 
         if drained > 0 {
@@ -2139,11 +2417,13 @@ impl LiveNode {
     }
 
     fn drain_channels(
+        &self,
         time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
         data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
         data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
         exec_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
         exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
+        disposition: CommandDisposition,
     ) {
         let mut drained = 0;
 
@@ -2163,7 +2443,10 @@ impl LiveNode {
         }
 
         while let Ok(cmd) = exec_cmd_rx.try_recv() {
-            AsyncRunner::handle_trading_command(cmd);
+            match disposition {
+                CommandDisposition::Dispatch => AsyncRunner::handle_trading_command(cmd),
+                CommandDisposition::Refuse => self.refuse_exec_command(cmd.command()),
+            }
             drained += 1;
         }
 
@@ -3202,25 +3485,6 @@ impl PendingEvents {
 
         while let Some(event) = self.events.pop_front() {
             process(event);
-        }
-    }
-
-    /// Drains venue and data truth after a failed startup phase while rejecting
-    /// queued execution commands that are no longer authorized to leave the node.
-    fn drain_after_failure_with(&mut self, mut process: impl FnMut(PendingRunnerEvent)) {
-        let mut rejected_commands = 0;
-        while let Some(event) = self.events.pop_front() {
-            if matches!(event, PendingRunnerEvent::ExecCommand(_)) {
-                rejected_commands += 1;
-            } else {
-                process(event);
-            }
-        }
-
-        if rejected_commands > 0 {
-            log::warn!(
-                "Rejected {rejected_commands} execution command(s) queued during failed startup"
-            );
         }
     }
 }
@@ -6845,6 +7109,266 @@ mod tests {
                 TradingCommand::QueryAccount(_)
             ));
             assert_eq!(exec_commands.borrow().as_slice(), &[]);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Builds a node holding one order the venue accepted and the strategy then
+    /// marked pending-cancel locally, the state a queued `CancelOrder` implies.
+    fn node_with_pending_cancel_order(
+        name: &str,
+        client_order_id: ClientOrderId,
+    ) -> (LiveNode, TraderId, StrategyId, InstrumentId) {
+        use nautilus_model::events::OrderPendingCancel;
+
+        let node = LiveNode::build(name.to_string(), None).unwrap();
+        let trader_id = TraderId::from("TESTER-001");
+        let strategy_id = StrategyId::from("S-REFUSE");
+        let account_id = AccountId::from("TEST-001");
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        let venue_order_id = VenueOrderId::from("V-REFUSE");
+
+        node.kernel
+            .cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+            .unwrap();
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(trader_id)
+            .strategy_id(strategy_id)
+            .client_order_id(client_order_id)
+            .instrument_id(instrument_id)
+            .quantity(Quantity::from("10.0"))
+            .price(Price::from("100.0"))
+            .build();
+        let submitted = TestOrderEventStubs::submitted(&order, account_id);
+        let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
+        let pending_cancel = OrderEventAny::PendingCancel(OrderPendingCancel::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            Some(account_id),
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            false,
+            Some(venue_order_id),
+        ));
+
+        {
+            let mut cache = node.kernel.cache.borrow_mut();
+            cache.add_order(order, None, None, false).unwrap();
+            cache.update_order(&submitted).unwrap();
+            cache.update_order(&accepted).unwrap();
+            cache.update_order(&pending_cancel).unwrap();
+        }
+
+        (node, trader_id, strategy_id, instrument_id)
+    }
+
+    fn cancel_order_command(
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+    ) -> TradingCommand {
+        use nautilus_common::messages::execution::CancelOrder;
+
+        TradingCommand::CancelOrder(CancelOrder::new(
+            trader_id,
+            None,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+    }
+
+    #[rstest]
+    fn test_refuse_exec_command_answers_queued_cancel() {
+        use nautilus_common::msgbus::stubs::get_typed_into_message_saving_handler;
+
+        std::thread::spawn(|| {
+            msgbus::get_message_bus().borrow_mut().dispose();
+
+            let client_order_id = ClientOrderId::from("O-REFUSE-CANCEL");
+            let (node, trader_id, strategy_id, instrument_id) =
+                node_with_pending_cancel_order("RefuseCancelNode", client_order_id);
+
+            let (handler, order_events) = get_typed_into_message_saving_handler::<OrderEventAny>(
+                Some(Ustr::from("ExecEngine.process")),
+            );
+            msgbus::register_order_event_endpoint(
+                MessagingSwitchboard::exec_engine_process(),
+                handler,
+            );
+
+            node.refuse_exec_command(&cancel_order_command(
+                trader_id,
+                strategy_id,
+                instrument_id,
+                client_order_id,
+            ));
+
+            let answers = order_events.get_messages();
+            assert_eq!(
+                answers.len(),
+                1,
+                "a queued cancel must be answered exactly once"
+            );
+            let OrderEventAny::CancelRejected(rejected) = &answers[0] else {
+                panic!("Expected a cancel rejection, got {:?}", answers[0]);
+            };
+            assert_eq!(rejected.client_order_id, client_order_id);
+            assert_eq!(rejected.reason.as_str(), REFUSED_COMMAND_REASON);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[rstest]
+    fn test_refuse_exec_command_skips_order_missing_from_cache() {
+        use nautilus_common::msgbus::stubs::get_typed_into_message_saving_handler;
+
+        std::thread::spawn(|| {
+            msgbus::get_message_bus().borrow_mut().dispose();
+
+            let (node, trader_id, strategy_id, instrument_id) = node_with_pending_cancel_order(
+                "RefuseUnknownNode",
+                ClientOrderId::from("O-REFUSE-KNOWN"),
+            );
+
+            let (handler, order_events) = get_typed_into_message_saving_handler::<OrderEventAny>(
+                Some(Ustr::from("ExecEngine.process")),
+            );
+            msgbus::register_order_event_endpoint(
+                MessagingSwitchboard::exec_engine_process(),
+                handler,
+            );
+
+            node.refuse_exec_command(&cancel_order_command(
+                trader_id,
+                strategy_id,
+                instrument_id,
+                ClientOrderId::from("O-REFUSE-UNKNOWN"),
+            ));
+
+            assert!(
+                order_events.get_messages().is_empty(),
+                "an order the cache never saw must not receive an inapplicable event",
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[rstest]
+    fn test_refuse_queued_commands_answers_backlog_and_leaves_channel_empty() {
+        use nautilus_common::msgbus::stubs::get_typed_into_message_saving_handler;
+
+        std::thread::spawn(|| {
+            msgbus::get_message_bus().borrow_mut().dispose();
+
+            let client_order_id = ClientOrderId::from("O-REFUSE-BACKLOG");
+            let (node, trader_id, strategy_id, instrument_id) =
+                node_with_pending_cancel_order("RefuseBacklogNode", client_order_id);
+
+            let (handler, order_events) = get_typed_into_message_saving_handler::<OrderEventAny>(
+                Some(Ustr::from("ExecEngine.process")),
+            );
+            msgbus::register_order_event_endpoint(
+                MessagingSwitchboard::exec_engine_process(),
+                handler,
+            );
+
+            let (exec_cmd_tx, mut exec_cmd_rx) =
+                tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            exec_cmd_tx
+                .send(TradingCommandMessage::new(
+                    MessagingSwitchboard::exec_engine_execute(),
+                    cancel_order_command(trader_id, strategy_id, instrument_id, client_order_id),
+                ))
+                .unwrap();
+
+            node.refuse_queued_commands(&mut exec_cmd_rx);
+
+            let answers = order_events.get_messages();
+            assert_eq!(answers.len(), 1);
+            assert!(matches!(&answers[0], OrderEventAny::CancelRejected(_)));
+            // The backlog must be gone, so a command the stop sequence queues
+            // next is the only thing the following drains can see.
+            assert!(exec_cmd_rx.try_recv().is_err());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[rstest]
+    fn test_drain_ordered_channels_after_failure_answers_queued_command() {
+        use nautilus_common::msgbus::stubs::get_typed_into_message_saving_handler;
+
+        std::thread::spawn(|| {
+            msgbus::get_message_bus().borrow_mut().dispose();
+
+            let client_order_id = ClientOrderId::from("O-REFUSE-CHANNEL");
+            let (mut node, trader_id, strategy_id, instrument_id) =
+                node_with_pending_cancel_order("RefuseChannelNode", client_order_id);
+
+            let dispatched = Rc::new(RefCell::new(Vec::new()));
+            let dispatched_handler = dispatched.clone();
+            msgbus::register_trading_command_endpoint(
+                MessagingSwitchboard::exec_engine_execute(),
+                TypedIntoHandler::from(move |command: TradingCommand| {
+                    dispatched_handler.borrow_mut().push(command);
+                }),
+            );
+            let (handler, order_events) = get_typed_into_message_saving_handler::<OrderEventAny>(
+                Some(Ustr::from("ExecEngine.process")),
+            );
+            msgbus::register_order_event_endpoint(
+                MessagingSwitchboard::exec_engine_process(),
+                handler,
+            );
+
+            let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+            let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+            let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+            let (_exec_evt_tx, exec_evt_rx) =
+                tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+            let (exec_cmd_tx, exec_cmd_rx) =
+                tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            let mut channels = AsyncRunnerChannels::new(
+                time_rx,
+                exec_evt_rx,
+                exec_cmd_rx,
+                data_evt_rx,
+                data_cmd_rx,
+            );
+
+            exec_cmd_tx
+                .send(TradingCommandMessage::new(
+                    MessagingSwitchboard::exec_engine_execute(),
+                    cancel_order_command(trader_id, strategy_id, instrument_id, client_order_id),
+                ))
+                .unwrap();
+
+            node.drain_ordered_channels_after_failure(&mut channels);
+
+            assert!(
+                dispatched.borrow().is_empty(),
+                "a channel-resident command must not leave the node after startup failed",
+            );
+            let answers = order_events.get_messages();
+            assert_eq!(answers.len(), 1);
+            assert!(matches!(&answers[0], OrderEventAny::CancelRejected(_)));
         })
         .join()
         .unwrap();

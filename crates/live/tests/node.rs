@@ -170,6 +170,68 @@ impl DataActor for StopOnStartStrategy {
 
 nautilus_strategy!(StopOnStartStrategy);
 
+/// Queues a cancel-all before requesting stop, then queues another while stopping.
+///
+/// The first belongs to the strategy and the node cannot honour it once it gives
+/// up on startup; the second is the shutdown's own and has to reach the venue.
+#[derive(Debug)]
+struct CancelAllThenStopOnStartStrategy {
+    core: StrategyCore,
+    handle: LiveNodeHandle,
+    instrument_id: InstrumentId,
+}
+
+impl CancelAllThenStopOnStartStrategy {
+    fn new(config: StrategyConfig, handle: LiveNodeHandle, instrument_id: InstrumentId) -> Self {
+        Self {
+            core: StrategyCore::new(config),
+            handle,
+            instrument_id,
+        }
+    }
+}
+
+impl DataActor for CancelAllThenStopOnStartStrategy {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.cancel_all_orders(self.instrument_id, None, None, None)?;
+        self.handle.stop();
+        Ok(())
+    }
+
+    fn on_stop(&mut self) -> anyhow::Result<()> {
+        self.cancel_all_orders(self.instrument_id, None, None, None)
+    }
+}
+
+nautilus_strategy!(CancelAllThenStopOnStartStrategy);
+
+/// Starts cleanly and cancels its orders when stopped.
+///
+/// Paired with [`FailingStartStrategy`] to exercise the teardown that runs when a
+/// later component fails to start.
+#[derive(Debug)]
+struct CancelOnStopStrategy {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+}
+
+impl CancelOnStopStrategy {
+    fn new(config: StrategyConfig, instrument_id: InstrumentId) -> Self {
+        Self {
+            core: StrategyCore::new(config),
+            instrument_id,
+        }
+    }
+}
+
+impl DataActor for CancelOnStopStrategy {
+    fn on_stop(&mut self) -> anyhow::Result<()> {
+        self.cancel_all_orders(self.instrument_id, None, None, None)
+    }
+}
+
+nautilus_strategy!(CancelOnStopStrategy);
+
 #[derive(Debug)]
 struct ClaimingTestStrategy {
     core: StrategyCore,
@@ -2270,6 +2332,9 @@ mod serial_tests {
                 reconciliation: false,
                 ..Default::default()
             },
+            // Bounds the post-stop grace period this teardown now runs; the
+            // default is 10s of real time.
+            delay_post_stop: Duration::from_millis(10),
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
@@ -2402,6 +2467,207 @@ mod serial_tests {
 
         assert!(node.kernel().trader().borrow().is_disposed());
         assert_eq!(node.kernel().trader().borrow().component_count(), 0);
+    }
+
+    /// A cancel-all the strategy queued before the stop request must be answered
+    /// inside the node, while the one its `on_stop` queues must reach the venue.
+    ///
+    /// Both commands are the same variant on the same channel, so only when each
+    /// was queued separates them. Deleting the backlog refusal in
+    /// `abort_started_trader` sends both and this fails on the count.
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_stop_during_start_answers_queued_cancel_and_sends_shutdown_cancel(
+        #[case] run: bool,
+    ) {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::from_millis(10),
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StopDuringStartQueuedCancelNode",
+            config,
+            StartupMassStatusBehavior::Unavailable,
+        );
+        let handle = node.handle();
+        let strategy_id = StrategyId::from("CANCEL-THEN-STOP-001");
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        let account_id = AccountAny::default().id();
+        let client_id = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+            .unwrap();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .quantity(Quantity::from("1.0"))
+            .price(Price::from("100.0"))
+            .build();
+        let submitted = TestOrderEventStubs::submitted(&order, account_id);
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .add_order(order, None, Some(client_id), false)
+            .unwrap();
+        let order = node
+            .kernel()
+            .cache
+            .borrow_mut()
+            .update_order(&submitted)
+            .unwrap();
+        let accepted =
+            TestOrderEventStubs::accepted(&order, account_id, VenueOrderId::from("V-STOP-002"));
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .update_order(&accepted)
+            .unwrap();
+
+        node.add_strategy(CancelAllThenStopOnStartStrategy::new(
+            StrategyConfig {
+                strategy_id: Some(strategy_id),
+                ..Default::default()
+            },
+            handle.clone(),
+            instrument_id,
+        ))
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        assert!(result.is_ok(), "unexpected error: {result:#?}");
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert_eq!(
+            state.cancel_all_orders_received.load(Ordering::Relaxed),
+            1,
+            "only the shutdown's own cancel-all may reach the venue",
+        );
+        assert!(
+            state
+                .cancel_all_orders_while_connected
+                .load(Ordering::Relaxed)
+        );
+
+        node.dispose();
+    }
+
+    /// A component failing to start still has to leave the venue clean.
+    ///
+    /// `start_trader` stops the partially started trader itself, so the surviving
+    /// strategy's `on_stop` cancel-all is already queued when the abort runs. Only
+    /// the post-stop grace period gets it out before the clients disconnect;
+    /// without one it is drained after disconnect and never reaches the venue.
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_trader_start_failure_sends_shutdown_cancel_while_connected(#[case] run: bool) {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::from_millis(10),
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "TraderStartFailureCancelNode",
+            config,
+            StartupMassStatusBehavior::Unavailable,
+        );
+        let handle = node.handle();
+        let strategy_id = StrategyId::from("CANCEL-ON-STOP-001");
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        let account_id = AccountAny::default().id();
+        let client_id = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+            .unwrap();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .quantity(Quantity::from("1.0"))
+            .price(Price::from("100.0"))
+            .build();
+        let submitted = TestOrderEventStubs::submitted(&order, account_id);
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .add_order(order, None, Some(client_id), false)
+            .unwrap();
+        let order = node
+            .kernel()
+            .cache
+            .borrow_mut()
+            .update_order(&submitted)
+            .unwrap();
+        let accepted =
+            TestOrderEventStubs::accepted(&order, account_id, VenueOrderId::from("V-STOP-003"));
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .update_order(&accepted)
+            .unwrap();
+
+        // Insertion order is start order, so this one is running when the next
+        // fails and the trader rolls back.
+        node.add_strategy(CancelOnStopStrategy::new(
+            StrategyConfig {
+                strategy_id: Some(strategy_id),
+                ..Default::default()
+            },
+            instrument_id,
+        ))
+        .unwrap();
+        node.add_strategy(FailingStartStrategy::new(StrategyConfig {
+            strategy_id: Some(StrategyId::from("FAILING-START-002")),
+            order_id_tag: Some("002".to_string()),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+        let err = result.expect_err("trader start should fail");
+
+        assert!(
+            err.to_string()
+                .contains("simulated live node strategy start failure"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert_eq!(state.cancel_all_orders_received.load(Ordering::Relaxed), 1);
+        assert!(
+            state
+                .cancel_all_orders_while_connected
+                .load(Ordering::Relaxed),
+            "the shutdown cancel-all must leave the node before the clients disconnect",
+        );
+
+        node.dispose();
     }
 
     #[rstest]

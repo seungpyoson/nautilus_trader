@@ -156,9 +156,27 @@ pub trait Runner {
 ///
 /// These can be extracted from `AsyncRunner` via `take_channels()` to drive
 /// the event loop directly on the same thread as the msgbus endpoints.
-/// Construction arms every receiver with a channel-specific waker. Those
-/// wakers record cross-channel readiness in one queue so startup snapshots
-/// replay the order observed by the runner instead of a fixed channel order.
+///
+/// Construction arms every receiver with a channel-specific waker and holds one
+/// buffer of messages already taken from the receivers. A waker records its
+/// channel in the readiness queue; draining a recorded channel moves every
+/// message that channel currently holds into the buffer. The buffer is the only
+/// place a taken message can live, so there is exactly one replay order and
+/// re-arming a channel cannot move a message relative to any other.
+///
+/// That order is:
+///
+/// - each channel's own messages in FIFO order, and
+/// - across channels, the order in which the runner first observed each channel
+///   become ready.
+///
+/// It is **not** global message arrival order. The five receivers are
+/// independent tokio channels with no shared sequence, and a receiver signals
+/// readiness only on its empty-to-non-empty transition, so a message arriving on
+/// an already-ready channel is invisible until that channel is drained. Relative
+/// order across channels between two observations is unobservable here and
+/// nothing downstream may assume it. Recovering it would require stamping a
+/// sequence at every send site.
 #[derive(Debug)]
 pub struct AsyncRunnerChannels {
     pub time_evt_rx: tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
@@ -167,8 +185,7 @@ pub struct AsyncRunnerChannels {
     pub data_evt_rx: tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
     pub data_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
     arrivals: RunnerArrivalQueue,
-    prefetched: [VecDeque<PendingRunnerEvent>; RunnerChannel::COUNT],
-    deferred: VecDeque<PendingRunnerEvent>,
+    buffered: VecDeque<PendingRunnerEvent>,
     closed: [bool; RunnerChannel::COUNT],
 }
 
@@ -225,6 +242,11 @@ impl RunnerChannel {
     }
 }
 
+/// Channels waiting to be drained, in the order their wakers fired.
+///
+/// One entry per channel is sufficient because popping a channel drains every
+/// message it holds into the single message buffer. A channel recorded twice
+/// would only produce an empty second drain.
 #[derive(Debug, Default)]
 struct RunnerArrivalState {
     ready: VecDeque<RunnerChannel>,
@@ -289,19 +311,11 @@ impl RunnerArrivalQueue {
         self.state.lock().unwrap().parent_waker = Some(waker.clone());
     }
 
-    fn mark_ready(&self, channel: RunnerChannel) {
-        self.wakers[channel.index()].wake_by_ref();
-    }
-
     fn pop_ready(&self) -> Option<RunnerChannel> {
         let mut state = self.state.lock().unwrap();
         let channel = state.ready.pop_front()?;
         state.queued[channel.index()] = false;
         Some(channel)
-    }
-
-    fn has_ready(&self) -> bool {
-        !self.state.lock().unwrap().ready.is_empty()
     }
 
     fn waker(&self, channel: RunnerChannel) -> &Waker {
@@ -324,8 +338,7 @@ impl AsyncRunnerChannels {
             data_evt_rx,
             data_cmd_rx,
             arrivals: RunnerArrivalQueue::new(),
-            prefetched: std::array::from_fn(|_| VecDeque::new()),
-            deferred: VecDeque::new(),
+            buffered: VecDeque::new(),
             closed: [false; RunnerChannel::COUNT],
         };
         channels.prime();
@@ -334,95 +347,65 @@ impl AsyncRunnerChannels {
 
     fn prime(&mut self) {
         for channel in RunnerChannel::ALL {
-            self.arm(channel);
+            self.drain_channel(channel);
         }
     }
 
-    fn arm(&mut self, channel: RunnerChannel) {
+    /// Moves every message the channel currently holds into the shared buffer,
+    /// then re-arms its waker.
+    ///
+    /// Taking the whole channel is what makes the buffer the single ordering
+    /// authority: a message is either still in its receiver or in the buffer,
+    /// never split across a per-channel prefetch that a later re-arm could
+    /// reorder. The final `poll_recv` returning `Pending` is what re-registers
+    /// the channel waker, so arming and draining cannot come apart.
+    fn drain_channel(&mut self, channel: RunnerChannel) {
         let index = channel.index();
 
         if self.closed[index] {
             return;
         }
 
-        if !self.prefetched[index].is_empty() {
-            self.arrivals.mark_ready(channel);
-            return;
-        }
-
         let waker = self.arrivals.waker(channel).clone();
         let mut cx = Context::from_waker(&waker);
-        let next = match channel {
-            RunnerChannel::Time => self
-                .time_evt_rx
-                .poll_recv(&mut cx)
-                .map(|item| item.map(PendingRunnerEvent::Time)),
-            RunnerChannel::ExecEvent => self
-                .exec_evt_rx
-                .poll_recv(&mut cx)
-                .map(|item| item.map(PendingRunnerEvent::ExecEvent)),
-            RunnerChannel::ExecCommand => self
-                .exec_cmd_rx
-                .poll_recv(&mut cx)
-                .map(|item| item.map(PendingRunnerEvent::ExecCommand)),
-            RunnerChannel::DataEvent => self
-                .data_evt_rx
-                .poll_recv(&mut cx)
-                .map(|item| item.map(PendingRunnerEvent::DataEvent)),
-            RunnerChannel::DataCommand => self
-                .data_cmd_rx
-                .poll_recv(&mut cx)
-                .map(|item| item.map(PendingRunnerEvent::DataCommand)),
-        };
 
-        match next {
-            Poll::Ready(Some(event)) => {
-                self.prefetched[index].push_back(event);
-                self.arrivals.mark_ready(channel);
+        loop {
+            let next = match channel {
+                RunnerChannel::Time => self
+                    .time_evt_rx
+                    .poll_recv(&mut cx)
+                    .map(|item| item.map(PendingRunnerEvent::Time)),
+                RunnerChannel::ExecEvent => self
+                    .exec_evt_rx
+                    .poll_recv(&mut cx)
+                    .map(|item| item.map(PendingRunnerEvent::ExecEvent)),
+                RunnerChannel::ExecCommand => self
+                    .exec_cmd_rx
+                    .poll_recv(&mut cx)
+                    .map(|item| item.map(PendingRunnerEvent::ExecCommand)),
+                RunnerChannel::DataEvent => self
+                    .data_evt_rx
+                    .poll_recv(&mut cx)
+                    .map(|item| item.map(PendingRunnerEvent::DataEvent)),
+                RunnerChannel::DataCommand => self
+                    .data_cmd_rx
+                    .poll_recv(&mut cx)
+                    .map(|item| item.map(PendingRunnerEvent::DataCommand)),
+            };
+
+            match next {
+                Poll::Ready(Some(event)) => self.buffered.push_back(event),
+                Poll::Ready(None) => {
+                    self.closed[index] = true;
+                    return;
+                }
+                Poll::Pending => return,
             }
-            Poll::Ready(None) => self.closed[index] = true,
-            Poll::Pending => {}
-        }
-    }
-
-    fn take_ready(&mut self, channel: RunnerChannel) -> Option<PendingRunnerEvent> {
-        let index = channel.index();
-
-        if let Some(event) = self.prefetched[index].pop_front() {
-            return Some(event);
-        }
-
-        match channel {
-            RunnerChannel::Time => self
-                .time_evt_rx
-                .try_recv()
-                .ok()
-                .map(PendingRunnerEvent::Time),
-            RunnerChannel::ExecEvent => self
-                .exec_evt_rx
-                .try_recv()
-                .ok()
-                .map(PendingRunnerEvent::ExecEvent),
-            RunnerChannel::ExecCommand => self
-                .exec_cmd_rx
-                .try_recv()
-                .ok()
-                .map(PendingRunnerEvent::ExecCommand),
-            RunnerChannel::DataEvent => self
-                .data_evt_rx
-                .try_recv()
-                .ok()
-                .map(PendingRunnerEvent::DataEvent),
-            RunnerChannel::DataCommand => self
-                .data_cmd_rx
-                .try_recv()
-                .ok()
-                .map(PendingRunnerEvent::DataCommand),
         }
     }
 
     fn poll_next(&mut self, cx: &Context<'_>) -> Poll<Option<PendingRunnerEvent>> {
-        if let Some(event) = self.deferred.pop_front() {
+        if let Some(event) = self.buffered.pop_front() {
             return Poll::Ready(Some(event));
         }
 
@@ -430,18 +413,21 @@ impl AsyncRunnerChannels {
 
         loop {
             if let Some(channel) = self.arrivals.pop_ready() {
-                if let Some(event) = self.take_ready(channel) {
-                    self.arm(channel);
+                self.drain_channel(channel);
+
+                if let Some(event) = self.buffered.pop_front() {
                     return Poll::Ready(Some(event));
                 }
-                self.arm(channel);
+
                 continue;
             }
 
+            // Re-poll every channel so a waker stolen by another select loop
+            // over the same receivers cannot strand buffered messages.
             self.prime();
 
-            if self.arrivals.has_ready() {
-                continue;
+            if let Some(event) = self.buffered.pop_front() {
+                return Poll::Ready(Some(event));
             }
 
             if self.closed.iter().all(|closed| *closed) {
@@ -457,6 +443,11 @@ impl AsyncRunnerChannels {
         poll_fn(|cx| self.poll_next(cx)).await
     }
 
+    /// Returns the messages available when the snapshot was taken.
+    ///
+    /// The bound is sampled up front so a handler that re-sends cannot keep the
+    /// drain running. Anything that arrives during the drain stays buffered for
+    /// the next caller rather than being taken and dropped.
     pub(crate) fn drain_pending_snapshot(&mut self) -> Vec<PendingRunnerEvent> {
         let pending = self.pending_count();
         let mut events = Vec::with_capacity(pending);
@@ -472,12 +463,41 @@ impl AsyncRunnerChannels {
         events
     }
 
+    /// Returns events to the front of the buffer, ahead of anything taken since.
+    ///
+    /// Callers defer what they took but could not handle yet, so those events
+    /// still precede every message still sitting in a receiver.
     pub(crate) fn defer(&mut self, events: impl IntoIterator<Item = PendingRunnerEvent>) {
-        self.deferred.extend(events);
+        let mut restored: VecDeque<PendingRunnerEvent> = events.into_iter().collect();
+        restored.append(&mut self.buffered);
+        self.buffered = restored;
     }
 
+    /// Hands the receivers to a caller that will poll them directly, draining
+    /// every buffered message through `process` first.
+    ///
+    /// The buffer holds messages already taken out of the receivers, so they
+    /// cannot be recovered by whoever polls the receivers next. Requiring a sink
+    /// makes losing them impossible without writing a call site that visibly
+    /// discards them.
     #[cfg(feature = "node")]
-    pub(crate) fn into_receivers(self) -> AsyncRunnerReceivers {
+    pub(crate) fn into_receivers(
+        mut self,
+        mut process: impl FnMut(PendingRunnerEvent),
+    ) -> AsyncRunnerReceivers {
+        // A message can land in the buffer after the last drain: `prime` takes
+        // whatever a receiver holds, and adapter tasks send from other threads.
+        self.prime();
+
+        let handed_off = self.buffered.len();
+        if handed_off > 0 {
+            log::debug!("Handing off {handed_off} buffered events before the event loop");
+        }
+
+        while let Some(event) = self.buffered.pop_front() {
+            process(event);
+        }
+
         AsyncRunnerReceivers {
             time_evt: self.time_evt_rx,
             exec_evt: self.exec_evt_rx,
@@ -493,8 +513,7 @@ impl AsyncRunnerChannels {
             + self.exec_cmd_rx.len()
             + self.data_evt_rx.len()
             + self.data_cmd_rx.len()
-            + self.prefetched.iter().map(VecDeque::len).sum::<usize>()
-            + self.deferred.len()
+            + self.buffered.len()
     }
 }
 
@@ -811,6 +830,12 @@ impl AsyncRunner {
         processed
     }
 
+    /// Returns events a caller took but chose not to handle, ahead of anything
+    /// taken since, so the next drain still sees them in arrival order.
+    pub(crate) fn defer_pending(&mut self, events: impl IntoIterator<Item = PendingRunnerEvent>) {
+        self.channels.defer(events);
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<PendingRunnerEvent> {
         self.channels.recv().await
     }
@@ -1059,6 +1084,143 @@ mod tests {
 
         assert_eq!(processed, 2);
         assert_eq!(observed, ["command", "event"]);
+    }
+
+    fn arrival_order_exec_event(client_order_id: &str) -> ExecutionEvent {
+        ExecutionEvent::Order(OrderEventAny::Submitted(
+            OrderSubmittedSpec::builder()
+                .client_order_id(ClientOrderId::from(client_order_id))
+                .build(),
+        ))
+    }
+
+    fn arrival_order_exec_command(strategy_id: &str) -> TradingCommandMessage {
+        TradingCommandMessage::new(
+            MessagingSwitchboard::exec_engine_execute(),
+            TradingCommand::CancelAllOrders(CancelAllOrders::new(
+                TraderId::from("TRADER-001"),
+                None,
+                StrategyId::from(strategy_id),
+                InstrumentId::from("EUR/USD.SIM"),
+                OrderSide::Buy,
+                UUID4::new(),
+                UnixNanos::from(1),
+                None,
+                None,
+            )),
+        )
+    }
+
+    fn arrival_order_label(event: PendingRunnerEvent) -> String {
+        match event {
+            PendingRunnerEvent::ExecEvent(ExecutionEvent::Order(order_event)) => {
+                order_event.client_order_id().to_string()
+            }
+            PendingRunnerEvent::ExecCommand(message) => match message.command() {
+                TradingCommand::CancelAllOrders(command) => command.strategy_id.to_string(),
+                command => panic!("Unexpected trading command {command}"),
+            },
+            event => panic!("Unexpected runner event {event:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_drain_snapshot_keeps_second_event_ahead_of_later_channel() {
+        let (_time_evt_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut channels = AsyncRunnerChannels::new(
+            time_evt_rx,
+            exec_evt_rx,
+            exec_cmd_rx,
+            data_evt_rx,
+            data_cmd_rx,
+        );
+
+        // Two events on one channel, then one command on another. A receiver
+        // signals readiness only on its empty-to-non-empty transition, so the
+        // second event never gets a readiness signal of its own and only the
+        // channel drain can keep it in front of the later command.
+        exec_evt_tx.send(arrival_order_exec_event("O-1")).unwrap();
+        exec_evt_tx.send(arrival_order_exec_event("O-2")).unwrap();
+        exec_cmd_tx.send(arrival_order_exec_command("S-1")).unwrap();
+
+        let observed = channels
+            .drain_pending_snapshot()
+            .into_iter()
+            .map(arrival_order_label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(observed, ["O-1", "O-2", "S-1"]);
+    }
+
+    #[rstest]
+    fn test_drain_snapshot_keeps_channels_in_readiness_order() {
+        let (_time_evt_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut channels = AsyncRunnerChannels::new(
+            time_evt_rx,
+            exec_evt_rx,
+            exec_cmd_rx,
+            data_evt_rx,
+            data_cmd_rx,
+        );
+
+        // Command channel becomes ready first, so its batch leads even though the
+        // event channel sorts earlier in the fixed channel order.
+        exec_cmd_tx.send(arrival_order_exec_command("S-1")).unwrap();
+        exec_cmd_tx.send(arrival_order_exec_command("S-2")).unwrap();
+        exec_evt_tx.send(arrival_order_exec_event("O-1")).unwrap();
+
+        let observed = channels
+            .drain_pending_snapshot()
+            .into_iter()
+            .map(arrival_order_label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(observed, ["S-1", "S-2", "O-1"]);
+    }
+
+    #[cfg(feature = "node")]
+    #[rstest]
+    fn test_into_receivers_hands_off_buffered_events() {
+        let (_time_evt_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut channels = AsyncRunnerChannels::new(
+            time_evt_rx,
+            exec_evt_rx,
+            exec_cmd_rx,
+            data_evt_rx,
+            data_cmd_rx,
+        );
+
+        // Already taken out of its receiver: whoever polls the receivers next
+        // cannot see it.
+        channels.defer(vec![PendingRunnerEvent::ExecEvent(
+            arrival_order_exec_event("O-BUFFERED"),
+        )]);
+        // Arrived after the last drain, still sitting in its receiver.
+        exec_evt_tx
+            .send(arrival_order_exec_event("O-LATE"))
+            .unwrap();
+
+        let mut handed_off = Vec::new();
+        let mut receivers =
+            channels.into_receivers(|event| handed_off.push(arrival_order_label(event)));
+
+        assert_eq!(handed_off, ["O-BUFFERED", "O-LATE"]);
+        assert!(receivers.exec_evt.try_recv().is_err());
     }
 
     #[rstest]
