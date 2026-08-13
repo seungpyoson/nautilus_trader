@@ -47,7 +47,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use uuid::Uuid;
 
-use super::{ids::*, orders::*, positions::*, types::*};
+use super::{identity::*, ids::*, orders::*, positions::*, types::*};
 
 #[fixture]
 fn instrument() -> InstrumentAny {
@@ -6438,4 +6438,26 @@ fn test_continuous_reconciliation_converges_quantity_on_working_order(instrument
         UnixNanos::default(),
     );
     assert!(pass2.is_empty(), "second pass must be a no-op");
+}
+
+/// Absence of a venue-supplied identity is not a contradiction: only two explicit and
+/// differing values conflict. This is the rule every reconciliation evidence check shares.
+#[rstest]
+#[case(None, None)]
+#[case(None, Some(PositionId::from("P-001")))]
+#[case(Some(PositionId::from("P-001")), None)]
+#[case(Some(PositionId::from("P-001")), Some(PositionId::from("P-001")))]
+fn test_optional_identities_compatible_treats_omission_as_absence_of_evidence(
+    #[case] left: Option<PositionId>,
+    #[case] right: Option<PositionId>,
+) {
+    assert!(optional_identities_compatible(left, right));
+}
+
+#[rstest]
+fn test_optional_identities_compatible_rejects_two_explicit_differing_values() {
+    assert!(!optional_identities_compatible(
+        Some(PositionId::from("P-001")),
+        Some(PositionId::from("P-002")),
+    ));
 }

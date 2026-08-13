@@ -36,6 +36,7 @@
 //!
 //! See `docs/concepts/reconciliation.md` for the operator-facing description.
 
+mod identity;
 mod ids;
 mod orders;
 mod positions;
@@ -46,6 +47,7 @@ mod proptests;
 #[cfg(test)]
 mod tests;
 
+pub use identity::optional_identities_compatible;
 pub use ids::{
     create_inferred_reconciliation_trade_id, create_position_reconciliation_venue_order_id,
 };

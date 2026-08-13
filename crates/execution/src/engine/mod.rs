@@ -96,7 +96,8 @@ use crate::{
     reconciliation::{
         check_position_reconciliation, generate_external_order_status_events,
         generate_reconciliation_order_events, generate_reconciliation_order_pre_fill_events,
-        generate_reconciliation_order_snapshot_events, reconcile_fill_report as reconcile_fill,
+        generate_reconciliation_order_snapshot_events, optional_identities_compatible,
+        reconcile_fill_report as reconcile_fill,
     },
 };
 
@@ -159,20 +160,16 @@ fn report_identity_matches_order(
             .venue_order_ids()
             .iter()
             .any(|venue_order_id| **venue_order_id == report.venue_order_id);
-    let client_id_matches = report
-        .client_order_id
-        .is_none_or(|client_order_id| client_order_id == order.client_order_id());
+    let client_id_matches =
+        optional_identities_compatible(report.client_order_id, Some(order.client_order_id()));
     let order_account_matches = order
         .account_id()
         .is_none_or(|account_id| account_id == report.account_id);
     let client_account_matches =
         originating_account_id.is_none_or(|account_id| account_id == report.account_id);
 
-    // Netting reports can omit a venue position ID, only explicit IDs can conflict
-    let position_matches = order
-        .position_id()
-        .zip(report.venue_position_id)
-        .is_none_or(|(cached, reported)| cached == reported);
+    let position_matches =
+        optional_identities_compatible(order.position_id(), report.venue_position_id);
 
     order.instrument_id() == report.instrument_id
         && order.order_side() == report.order_side
@@ -187,12 +184,10 @@ fn reconciliation_identities_compatible(
     parent: ReconciliationReportIdentity,
     child: ReconciliationReportIdentity,
 ) -> bool {
-    let client_ids_compatible = child
-        .client_order_id
-        .is_none_or(|child| parent.client_order_id == Some(child));
-    let position_ids_compatible = parent
-        .venue_position_id
-        .is_none_or(|parent| child.venue_position_id == Some(parent));
+    let client_ids_compatible =
+        optional_identities_compatible(parent.client_order_id, child.client_order_id);
+    let position_ids_compatible =
+        optional_identities_compatible(parent.venue_position_id, child.venue_position_id);
 
     parent.account_id == child.account_id
         && parent.instrument_id == child.instrument_id

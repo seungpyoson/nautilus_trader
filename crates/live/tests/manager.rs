@@ -1152,6 +1152,98 @@ async fn test_reconcile_mass_status_creates_external_order_accepted() {
     assert!(order.is_some());
 }
 
+/// Builds a mass status holding one order report and one companion fill report for the
+/// same venue order, so the order/fill identity compatibility rule is the only gate the
+/// caller is exercising.
+fn mass_status_with_companion_fill(
+    order_client_order_id: Option<ClientOrderId>,
+    order_venue_position_id: Option<PositionId>,
+    fill_client_order_id: Option<ClientOrderId>,
+    fill_venue_position_id: Option<PositionId>,
+) -> ExecutionMassStatus {
+    let instrument_id = test_instrument_id();
+    let venue_order_id = VenueOrderId::from("V-COMPANION");
+    let mut order_report = create_order_status_report(
+        order_client_order_id,
+        venue_order_id,
+        instrument_id,
+        OrderStatus::Filled,
+        Quantity::from("1.0"),
+        Quantity::from("1.0"),
+    );
+
+    if let Some(venue_position_id) = order_venue_position_id {
+        order_report = order_report.with_venue_position_id(venue_position_id);
+    }
+
+    let mut fill_report = create_fill_report(
+        ClientOrderId::from("O-COMPANION-PLACEHOLDER"),
+        venue_order_id,
+        instrument_id,
+        TradeId::from("T-COMPANION"),
+        "1.0",
+    );
+    fill_report.client_order_id = fill_client_order_id;
+    fill_report.venue_position_id = fill_venue_position_id;
+
+    create_mass_status(vec![order_report], vec![fill_report])
+}
+
+/// A hedging venue reports the position ID on order status but omits it on execution
+/// data (Bybit's fill payload carries no `position_idx`). The omission is absence of
+/// evidence, not a contradiction, so the pair must reconcile.
+#[tokio::test]
+async fn test_reconcile_mass_status_accepts_companion_fill_omitting_position_id() {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-COMPANION");
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(
+            test_client_id(),
+            mass_status_with_companion_fill(
+                Some(client_order_id),
+                Some(PositionId::from("P-HEDGE-LONG")),
+                Some(client_order_id),
+                None,
+            ),
+            ctx.exec_engine.clone(),
+        )
+        .await;
+
+    assert!(result.rejection.is_none());
+}
+
+#[tokio::test]
+async fn test_reconcile_mass_status_rejects_explicit_position_id_mismatch() {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-COMPANION");
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(
+            test_client_id(),
+            mass_status_with_companion_fill(
+                Some(client_order_id),
+                Some(PositionId::from("P-HEDGE-LONG")),
+                Some(client_order_id),
+                Some(PositionId::from("P-HEDGE-SHORT")),
+            ),
+            ctx.exec_engine.clone(),
+        )
+        .await;
+
+    assert_eq!(
+        result.rejection,
+        Some(ReconciliationRejection::ConflictingEvidence {
+            report_kind: ReconciliationReportKind::Fill,
+        })
+    );
+    assert!(result.events.is_empty());
+}
+
 #[tokio::test]
 async fn test_reconcile_mass_status_rejects_cross_client_external_order_claim() {
     let mut ctx = TestContext::new();

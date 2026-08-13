@@ -60,8 +60,9 @@ use nautilus_execution::{
         create_position_reconciliation_venue_order_id, create_reconciliation_rejected,
         create_reconciliation_triggered, generate_external_order_status_events,
         generate_reconciliation_order_pre_fill_events,
-        generate_reconciliation_order_snapshot_events, process_mass_status_for_reconciliation,
-        reconcile_order_report, should_reconciliation_update,
+        generate_reconciliation_order_snapshot_events, optional_identities_compatible,
+        process_mass_status_for_reconciliation, reconcile_order_report,
+        should_reconciliation_update,
     },
 };
 use nautilus_model::{
@@ -415,12 +416,10 @@ fn reconciliation_order_identities_compatible(
     parent: ReconciliationOrderIdentity,
     child: ReconciliationOrderIdentity,
 ) -> bool {
-    let client_ids_compatible = child
-        .client_order_id
-        .is_none_or(|child| parent.client_order_id == Some(child));
-    let position_ids_compatible = parent
-        .venue_position_id
-        .is_none_or(|parent| child.venue_position_id == Some(parent));
+    let client_ids_compatible =
+        optional_identities_compatible(parent.client_order_id, child.client_order_id);
+    let position_ids_compatible =
+        optional_identities_compatible(parent.venue_position_id, child.venue_position_id);
 
     parent.account_id == child.account_id
         && parent.instrument_id == child.instrument_id
@@ -1118,10 +1117,8 @@ impl ExecutionManager {
         let Some(order) = by_client.or(by_venue) else {
             return Ok(());
         };
-        let position_conflicts = order
-            .position_id()
-            .zip(venue_position_id)
-            .is_some_and(|(cached, reported)| cached != reported);
+        let position_conflicts =
+            !optional_identities_compatible(order.position_id(), venue_position_id);
         let venue_id_matches = order.venue_order_id().is_none()
             || order.venue_order_id() == Some(venue_order_id)
             || order
@@ -1140,7 +1137,7 @@ impl ExecutionManager {
                 .account_id()
                 .is_some_and(|cached| cached != account_id)
             || !venue_id_matches
-            || client_order_id.is_some_and(|reported| reported != order.client_order_id())
+            || !optional_identities_compatible(client_order_id, Some(order.client_order_id()))
             || position_conflicts
             || client_conflicts
         {

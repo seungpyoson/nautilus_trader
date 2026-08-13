@@ -13282,6 +13282,143 @@ fn test_reconcile_execution_mass_status_rejects_cached_order_owned_by_other_clie
     );
 }
 
+/// Builds a mass status holding one order report and one companion fill report for the
+/// same venue order, so the order/fill identity compatibility rule is the only gate the
+/// caller is exercising.
+fn mass_status_with_companion_fill(
+    execution_engine: &mut ExecutionEngine,
+    order_client_order_id: Option<ClientOrderId>,
+    order_venue_position_id: Option<PositionId>,
+    fill_client_order_id: Option<ClientOrderId>,
+    fill_venue_position_id: Option<PositionId>,
+) -> ExecutionMassStatus {
+    register_sim_mass_status_client(execution_engine);
+    let instrument = audusd_sim();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
+        .unwrap();
+
+    let venue_order_id = VenueOrderId::from("V-COMPANION");
+    let mut order_report = create_order_status_report(
+        order_client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::Filled,
+        Quantity::from(100_000),
+        Quantity::from(100_000),
+    );
+
+    if let Some(venue_position_id) = order_venue_position_id {
+        order_report = order_report.with_venue_position_id(venue_position_id);
+    }
+
+    let mut fill_report = create_fill_report(
+        instrument.id(),
+        fill_client_order_id,
+        venue_order_id,
+        TradeId::from("T-COMPANION"),
+        Quantity::from(100_000),
+        Price::from("1.00000"),
+    );
+    fill_report.venue_position_id = fill_venue_position_id;
+
+    let mut mass_status = ExecutionMassStatus::new(
+        ClientId::from("SIM"),
+        AccountId::test_default(),
+        Venue::from("SIM"),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    mass_status.add_order_reports(vec![order_report]);
+    mass_status.add_fill_reports(vec![fill_report]);
+    mass_status
+}
+
+/// A hedging venue reports the position ID on order status but omits it on execution
+/// data (Bybit's fill payload carries no `position_idx`). The omission is absence of
+/// evidence, not a contradiction, so the pair must reconcile.
+#[rstest]
+fn test_validate_execution_mass_status_accepts_companion_fill_omitting_position_id(
+    mut execution_engine: ExecutionEngine,
+) {
+    let client_order_id = ClientOrderId::from("O-COMPANION");
+    let mass_status = mass_status_with_companion_fill(
+        &mut execution_engine,
+        Some(client_order_id),
+        Some(PositionId::from("P-HEDGE-LONG")),
+        Some(client_order_id),
+        None,
+    );
+
+    assert!(
+        execution_engine
+            .validate_execution_mass_status(ClientId::from("SIM"), &mass_status)
+            .is_ok()
+    );
+}
+
+/// The mirror shape: the venue echoes the client order ID on the fill but omits it on
+/// the order snapshot. Absence on the parent is not a contradiction either.
+#[rstest]
+fn test_validate_execution_mass_status_accepts_companion_fill_supplying_client_order_id(
+    mut execution_engine: ExecutionEngine,
+) {
+    let mass_status = mass_status_with_companion_fill(
+        &mut execution_engine,
+        None,
+        None,
+        Some(ClientOrderId::from("O-COMPANION")),
+        None,
+    );
+
+    assert!(
+        execution_engine
+            .validate_execution_mass_status(ClientId::from("SIM"), &mass_status)
+            .is_ok()
+    );
+}
+
+#[rstest]
+fn test_validate_execution_mass_status_rejects_explicit_position_id_mismatch(
+    mut execution_engine: ExecutionEngine,
+) {
+    let client_order_id = ClientOrderId::from("O-COMPANION");
+    let mass_status = mass_status_with_companion_fill(
+        &mut execution_engine,
+        Some(client_order_id),
+        Some(PositionId::from("P-HEDGE-LONG")),
+        Some(client_order_id),
+        Some(PositionId::from("P-HEDGE-SHORT")),
+    );
+
+    assert!(
+        execution_engine
+            .validate_execution_mass_status(ClientId::from("SIM"), &mass_status)
+            .is_err()
+    );
+}
+
+#[rstest]
+fn test_validate_execution_mass_status_rejects_explicit_client_order_id_mismatch(
+    mut execution_engine: ExecutionEngine,
+) {
+    let mass_status = mass_status_with_companion_fill(
+        &mut execution_engine,
+        Some(ClientOrderId::from("O-COMPANION-A")),
+        None,
+        Some(ClientOrderId::from("O-COMPANION-B")),
+        None,
+    );
+
+    assert!(
+        execution_engine
+            .validate_execution_mass_status(ClientId::from("SIM"), &mass_status)
+            .is_err()
+    );
+}
+
 #[rstest]
 fn test_reconcile_execution_mass_status_with_order_reports(mut execution_engine: ExecutionEngine) {
     register_sim_mass_status_client(&mut execution_engine);
