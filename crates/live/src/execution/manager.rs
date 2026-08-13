@@ -1210,57 +1210,6 @@ impl ExecutionManager {
         PositionReportGroupDisposition::Skipped(PositionReconciliationSkip::InsufficientEvidence)
     }
 
-    fn hedge_position_baseline(
-        &self,
-        reports: &IndexMap<InstrumentId, Vec<PositionStatusReport>>,
-    ) -> IndexMap<PositionId, Position> {
-        let cache = self.cache.borrow();
-
-        reports
-            .values()
-            .flatten()
-            .filter_map(|report| report.venue_position_id)
-            .filter_map(|position_id| {
-                cache
-                    .position_owned(&position_id)
-                    .map(|position| (position_id, position))
-            })
-            .collect()
-    }
-
-    fn project_attributed_hedge_fills(
-        &self,
-        baseline: &IndexMap<PositionId, Position>,
-        fills: &[OrderFilled],
-    ) -> IndexMap<PositionId, Position> {
-        let mut projected: IndexMap<PositionId, Position> = IndexMap::new();
-
-        for fill in fills {
-            let Some(position_id) = fill.position_id else {
-                continue;
-            };
-
-            if let Some(position) = projected.get_mut(&position_id) {
-                position.apply(fill);
-                continue;
-            }
-
-            let position = if let Some(position) = baseline.get(&position_id) {
-                let mut position = position.clone();
-                position.apply(fill);
-                position
-            } else {
-                let Some(instrument) = self.get_instrument(&fill.instrument_id) else {
-                    continue;
-                };
-                Position::new(&instrument, fill.clone())
-            };
-            projected.insert(position_id, position);
-        }
-
-        projected
-    }
-
     /// Reconciles orders and fills from a mass status report.
     ///
     /// Order events are collected, sorted globally by `ts_event`, then processed through
@@ -1287,7 +1236,6 @@ impl ExecutionManager {
             log::error!("Rejected ExecutionMassStatus: {rejection}");
             return ReconciliationResult::rejected(rejection, position_report_count);
         }
-        let hedge_position_baseline = self.hedge_position_baseline(&mass_position_reports);
 
         // Publish raw reports before any state mutation (including fill adjustment
         // below, which can synthesise replacement order/fill reports). The
@@ -1693,7 +1641,6 @@ impl ExecutionManager {
         }
 
         events.sort_by_key(|e| e.ts_event());
-        let mut applied_position_fills = Vec::new();
 
         for event in &events {
             let project_fill = matches!(
@@ -1733,15 +1680,8 @@ impl ExecutionManager {
                 && self.is_fill_applied(fill, fill_key)
             {
                 self.processed_fills.mark(fill_key);
-
-                if !project_fill {
-                    applied_position_fills.push(fill.clone());
-                }
             }
         }
-
-        let projected_hedge_positions =
-            self.project_attributed_hedge_fills(&hedge_position_baseline, &applied_position_fills);
 
         let instruments_with_unattributed_fills: IndexSet<InstrumentId> = adjusted_fill_reports
             .values()
@@ -1768,11 +1708,9 @@ impl ExecutionManager {
 
             for report in reports {
                 let outcome = match disposition {
-                    PositionReportGroupDisposition::Reconcile => self.reconcile_position_report(
-                        &report,
-                        mass_status.account_id,
-                        &projected_hedge_positions,
-                    ),
+                    PositionReportGroupDisposition::Reconcile => {
+                        self.reconcile_position_report(&report, mass_status.account_id)
+                    }
                     PositionReportGroupDisposition::Skipped(reason) => {
                         PositionReconciliationOutcome::Skipped(reason)
                     }
@@ -3966,20 +3904,25 @@ impl ExecutionManager {
         &self,
         report: &PositionStatusReport,
         account_id: AccountId,
-        projected_hedge_positions: &IndexMap<PositionId, Position>,
     ) -> PositionReconciliationOutcome {
         if report.venue_position_id.is_some() {
-            self.reconcile_position_report_hedging(report, account_id, projected_hedge_positions)
+            self.reconcile_position_report_hedging(report, account_id)
         } else {
             self.reconcile_position_report_netting(report, account_id)
         }
     }
 
+    /// Reconciles one hedge position report against the cached position.
+    ///
+    /// The cache is the single authority for what the reconciled fills actually applied to.
+    /// It is read here, after every order event has been through the execution engine, so a
+    /// fill the engine declined to apply to the position (for example a reduce-only fill with
+    /// no reducible position) cannot contribute quantity to this comparison, and a fill the
+    /// manager did not itself queue (an inferred residual) cannot be missed by it.
     fn reconcile_position_report_hedging(
         &self,
         report: &PositionStatusReport,
         account_id: AccountId,
-        projected_hedge_positions: &IndexMap<PositionId, Position>,
     ) -> PositionReconciliationOutcome {
         let Some(venue_position_id) = report.venue_position_id else {
             return PositionReconciliationOutcome::Skipped(
@@ -3993,29 +3936,6 @@ impl ExecutionManager {
             venue_position_id
         );
 
-        if let Some(projected_position) = projected_hedge_positions.get(&venue_position_id) {
-            let projected_qty = projected_position.signed_decimal_qty();
-            let tolerance = self.position_reconciliation_tolerance(account_id);
-            if (projected_qty - report.signed_decimal_qty).abs() <= tolerance {
-                return PositionReconciliationOutcome::Unchanged;
-            }
-
-            if !self.config.generate_missing_orders {
-                return PositionReconciliationOutcome::Skipped(
-                    PositionReconciliationSkip::GenerationDisabled,
-                );
-            }
-
-            return PositionReconciliationOutcome::from_events(
-                self.reconcile_hedge_position_discrepancy(
-                    report,
-                    account_id,
-                    projected_position,
-                    projected_qty,
-                ),
-            );
-        }
-
         let position = {
             let cache = self.cache.borrow();
             cache.position_owned(&venue_position_id)
@@ -4025,8 +3945,9 @@ impl ExecutionManager {
             Some(position) => {
                 let cached_signed_qty = position.signed_decimal_qty();
                 let venue_signed_qty = report.signed_decimal_qty;
+                let tolerance = self.position_reconciliation_tolerance(account_id);
 
-                if cached_signed_qty == venue_signed_qty {
+                if (cached_signed_qty - venue_signed_qty).abs() <= tolerance {
                     log::debug!(
                         "Hedge position {venue_position_id} matches venue: qty={cached_signed_qty}"
                     );

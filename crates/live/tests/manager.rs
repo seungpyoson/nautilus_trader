@@ -61,7 +61,7 @@ use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     enums::{
         AccountType, ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
-        PositionSideSpecified, TimeInForce, TriggerType,
+        PositionSide, PositionSideSpecified, TimeInForce, TriggerType,
     },
     events::{
         OrderEventAny, OrderFilled,
@@ -6371,6 +6371,295 @@ async fn test_reconcile_mass_status_projects_attributed_hedge_fill_before_positi
     assert_eq!(result.position_reports.applied(), expected_applied);
     assert_eq!(result.position_reports.unchanged(), expected_unchanged);
     assert_eq!(result.position_reports.skipped(), 0);
+}
+
+#[tokio::test]
+async fn test_reconcile_mass_status_counts_external_residual_fill_against_hedge_position() {
+    // An external order report whose filled quantity exceeds the sum of its fill reports
+    // produces a residual inferred fill. That fill reaches the position through the normal
+    // event path, so the venue report must reconcile against the position the fills actually
+    // built, without synthesising any corrective quantity.
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    let venue_order_id = VenueOrderId::from("V-RESIDUAL-001");
+    let venue_position_id = PositionId::from("P-HEDGE-RESIDUAL");
+
+    ctx.add_instrument(test_instrument());
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+
+    // Venue reports 5.0 filled but only accounts for 3.0 of it with fill reports.
+    let order_report = create_order_status_report(
+        None,
+        venue_order_id,
+        instrument_id,
+        OrderStatus::Filled,
+        Quantity::from("5.0"),
+        Quantity::from("5.0"),
+    )
+    .with_avg_px(dec!(3000.0))
+    .with_venue_position_id(venue_position_id);
+    mass_status.add_order_reports(vec![order_report]);
+
+    let fill = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        TradeId::from("T-RESIDUAL-001"),
+        OrderSide::Buy,
+        Quantity::from("3.0"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        None,
+        Some(venue_position_id),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    mass_status.add_fill_reports(vec![fill]);
+
+    let position_report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSideSpecified::Long,
+        Quantity::from("5.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        Some(venue_position_id),
+        Some(dec!(3000.00)),
+    );
+    mass_status.add_position_reports(vec![position_report]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(test_client_id(), mass_status, ctx.exec_engine.clone())
+        .await;
+
+    // The real fill plus the residual inferred fill, and nothing else.
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+            .count(),
+        2,
+    );
+    assert_eq!(result.position_reports.received(), 1);
+    assert_eq!(result.position_reports.applied(), 0);
+    assert_eq!(result.position_reports.unchanged(), 1);
+    assert_eq!(result.position_reports.skipped(), 0);
+
+    let cache = ctx.cache.borrow();
+    let position = cache.position(&venue_position_id).unwrap();
+    assert_eq!(position.quantity, Quantity::from("5.0"));
+    // Only the external order itself; no synthetic position reconciliation order.
+    assert_eq!(cache.orders(None, None, None, None, None).len(), 1);
+}
+
+#[tokio::test]
+async fn test_reconcile_mass_status_counts_incremental_residual_fill_against_hedge_position() {
+    // Same defect through the cached-order path: a canceled report whose filled quantity
+    // exceeds the projected order state produces an incremental inferred fill outside the
+    // manager's fill queue. It still mutates the position, so the venue report must not see
+    // a shortfall.
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    let client_order_id = ClientOrderId::from("O-INCREMENTAL-001");
+    let venue_order_id = VenueOrderId::from("V-INCREMENTAL-001");
+    let venue_position_id = PositionId::from("P-HEDGE-INCREMENTAL");
+
+    ctx.add_instrument(test_instrument());
+    let order = create_accepted_order(
+        "O-INCREMENTAL-001",
+        instrument_id,
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+        venue_order_id,
+    );
+    let strategy_id = order.strategy_id();
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(strategy_id, OmsType::Hedging);
+    ctx.add_order(order);
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+
+    let order_report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument_id,
+        OrderStatus::Canceled,
+        Quantity::from("5.0"),
+        Quantity::from("5.0"),
+    )
+    .with_avg_px(dec!(3000.0))
+    .with_venue_position_id(venue_position_id);
+    mass_status.add_order_reports(vec![order_report]);
+
+    let fill = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        TradeId::from("T-INCREMENTAL-001"),
+        OrderSide::Buy,
+        Quantity::from("3.0"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        Some(client_order_id),
+        Some(venue_position_id),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    mass_status.add_fill_reports(vec![fill]);
+
+    let position_report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSideSpecified::Long,
+        Quantity::from("5.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        Some(venue_position_id),
+        Some(dec!(3000.00)),
+    );
+    mass_status.add_position_reports(vec![position_report]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(test_client_id(), mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+            .count(),
+        2,
+    );
+    assert_eq!(result.position_reports.received(), 1);
+    assert_eq!(result.position_reports.applied(), 0);
+    assert_eq!(result.position_reports.unchanged(), 1);
+    assert_eq!(result.position_reports.skipped(), 0);
+
+    let cache = ctx.cache.borrow();
+    let position = cache.position(&venue_position_id).unwrap();
+    assert_eq!(position.quantity, Quantity::from("5.0"));
+    assert_eq!(cache.orders(None, None, None, None, None).len(), 1);
+}
+
+#[tokio::test]
+async fn test_reconcile_mass_status_treats_position_rejected_fill_as_missing_hedge_position() {
+    // The execution engine refuses to open a position from a reduce-only fill with nothing to
+    // reduce, but the order still records the fill. Order acceptance must not be read as
+    // position acceptance: the venue position is genuinely missing from the cache and has to
+    // be reconciled, not reported as already in sync.
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    let client_order_id = ClientOrderId::from("O-REDUCE-ONLY-001");
+    let venue_order_id = VenueOrderId::from("V-REDUCE-ONLY-001");
+    let venue_position_id = PositionId::from("P-HEDGE-REDUCE-ONLY");
+
+    ctx.add_instrument(test_instrument());
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .client_order_id(client_order_id)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("5.0"))
+        .price(Price::from("3000.00"))
+        .reduce_only(true)
+        .build();
+    apply_submitted_and_accepted(&mut order, venue_order_id);
+    let strategy_id = order.strategy_id();
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(strategy_id, OmsType::Hedging);
+    ctx.add_order(order);
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+
+    let order_report = create_order_status_report_for_side(
+        Some(client_order_id),
+        venue_order_id,
+        instrument_id,
+        OrderSide::Sell,
+        OrderStatus::Filled,
+        Quantity::from("5.0"),
+        Quantity::from("5.0"),
+    )
+    .with_avg_px(dec!(3000.0))
+    .with_venue_position_id(venue_position_id);
+    mass_status.add_order_reports(vec![order_report]);
+
+    let fill = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        TradeId::from("T-REDUCE-ONLY-001"),
+        OrderSide::Sell,
+        Quantity::from("5.0"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        Some(client_order_id),
+        Some(venue_position_id),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    mass_status.add_fill_reports(vec![fill]);
+
+    let position_report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSideSpecified::Short,
+        Quantity::from("5.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        Some(venue_position_id),
+        Some(dec!(3000.00)),
+    );
+    mass_status.add_position_reports(vec![position_report]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(test_client_id(), mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert_eq!(result.position_reports.received(), 1);
+    assert_eq!(result.position_reports.unchanged(), 0);
+    assert_eq!(result.position_reports.applied(), 1);
+    assert_eq!(result.position_reports.skipped(), 0);
+
+    let cache = ctx.cache.borrow();
+    let position = cache.position(&venue_position_id).unwrap();
+    assert_eq!(position.quantity, Quantity::from("5.0"));
+    assert_eq!(position.side, PositionSide::Short);
 }
 
 #[tokio::test]
