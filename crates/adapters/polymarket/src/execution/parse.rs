@@ -55,6 +55,8 @@ pub enum ReportParseError {
     Timestamp,
     #[error("conflicting duplicate fill evidence")]
     ConflictingFill,
+    #[error("conflicting duplicate order evidence")]
+    ConflictingOrder,
 }
 
 /// Converts a [`PolymarketLiquiditySide`] to a Nautilus [`LiquiditySide`].

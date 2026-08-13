@@ -15,7 +15,7 @@
 
 //! Reconciliation report generation for the Polymarket execution client.
 
-use std::fmt::Display;
+use std::{fmt::Display, hash::Hash};
 
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
@@ -108,6 +108,7 @@ pub(crate) enum PositionOmission {
     UnmappedInstrument,
     InvalidSize,
     InvalidAveragePrice,
+    Conflicting,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -119,12 +120,26 @@ pub(crate) enum ReconciliationOmission {
     UnmappedFill,
     InvalidFill(ReportParseError),
     UnownedMakerTrade,
+    /// A trade naming a requested order while naming another asset.
+    ContradictoryFill,
     Position(PositionOmission),
     LookbackOrder,
     LookbackFill,
+    /// An order row outside the instrument, status, or time range asked about.
+    OutOfScopeOrder,
+    /// A trade row outside the orders, instrument, or time range asked about.
+    OutOfScopeFill,
+    /// A position row outside the instrument asked about.
+    OutOfScopePosition,
 }
 
 impl ReconciliationOmission {
+    /// Returns whether the omission leaves what it concerns unstatable.
+    ///
+    /// A row the caller did not ask about is evidence about something else, so leaving it out is
+    /// the narrowing the caller requested rather than evidence this client failed to account for.
+    /// A row that was asked about and could not be used is the opposite: the answer would be
+    /// missing part of what it claims to cover.
     const fn invalidates_snapshot(self) -> bool {
         match self {
             Self::PendingTrade
@@ -133,15 +148,20 @@ impl ReconciliationOmission {
             | Self::UnmappedFill
             | Self::InvalidFill(_)
             | Self::UnownedMakerTrade
+            | Self::ContradictoryFill
             | Self::Position(
                 PositionOmission::UnmappedInstrument
                 | PositionOmission::InvalidSize
-                | PositionOmission::InvalidAveragePrice,
+                | PositionOmission::InvalidAveragePrice
+                | PositionOmission::Conflicting,
             ) => true,
             Self::FailedTrade
             | Self::Position(PositionOmission::Dust | PositionOmission::Zero)
             | Self::LookbackOrder
-            | Self::LookbackFill => false,
+            | Self::LookbackFill
+            | Self::OutOfScopeOrder
+            | Self::OutOfScopeFill
+            | Self::OutOfScopePosition => false,
         }
     }
 }
@@ -177,6 +197,7 @@ impl ReconciliationOmissions {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.counts.is_empty()
     }
@@ -185,6 +206,14 @@ impl ReconciliationOmissions {
         for ((scope, reason), count) in other.counts {
             self.record_n(scope, reason, count);
         }
+    }
+
+    /// Returns whether any omission leaves what it concerns unstatable.
+    #[must_use]
+    pub(crate) fn has_invalidating(&self) -> bool {
+        self.counts
+            .keys()
+            .any(|(_, reason)| reason.invalidates_snapshot())
     }
 
     /// Returns the instruments whose evidence is unusable, so no report about them can be stated.
@@ -261,6 +290,22 @@ impl<T> ReportSet<T> {
     fn omit(&mut self, scope: OmissionScope, reason: ReconciliationOmission) {
         self.omissions.record(scope, reason);
     }
+}
+
+/// Returns what a venue row is evidence about, which bounds the authority its omission can destroy.
+///
+/// An asset outside the execution lookup belongs to another user of the same funder wallet, so a
+/// row naming it is [`OmissionScope::Foreign`] rather than evidence this client left out.
+pub(crate) fn evidence_scope(
+    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    asset: Ustr,
+) -> OmissionScope {
+    instruments
+        .load()
+        .get(&asset)
+        .map_or(OmissionScope::Foreign, |instrument| {
+            OmissionScope::Instrument(instrument.id())
+        })
 }
 
 /// Fails when the client holds no execution lookup while the venue reports evidence for the wallet.
@@ -372,6 +417,10 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
                 if let Some(filter_id) = instrument_filter
                     && instrument_id != filter_id
                 {
+                    output.omit(
+                        OmissionScope::Instrument(instrument_id),
+                        ReconciliationOmission::OutOfScopeFill,
+                    );
                     continue;
                 }
 
@@ -437,6 +486,10 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
             if let Some(filter_id) = instrument_filter
                 && instrument_id != filter_id
             {
+                output.omit(
+                    OmissionScope::Instrument(instrument_id),
+                    ReconciliationOmission::OutOfScopeFill,
+                );
                 continue;
             }
 
@@ -473,17 +526,13 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
         }
     }
 
-    let (unique, conflicting) = dedupe_fill_evidence(&output.reports);
-    let mut reports = unique.into_iter().cloned().collect::<Vec<_>>();
-    reports.retain(|report| !conflicting.contains(&report.instrument_id));
-    output.reports = reports;
-
-    for instrument_id in conflicting {
-        output.omit(
-            OmissionScope::Instrument(instrument_id),
-            ReconciliationOmission::InvalidFill(ReportParseError::ConflictingFill),
-        );
-    }
+    collapse_repeated_evidence(
+        &mut output,
+        fill_evidence_key,
+        |fill| fill.instrument_id,
+        same_fill_evidence,
+        ReconciliationOmission::InvalidFill(ReportParseError::ConflictingFill),
+    );
 
     output
 }
@@ -515,6 +564,10 @@ pub(crate) fn build_order_reports_from_orders<'a>(
         if let Some(filter_id) = instrument_filter
             && instrument_id != filter_id
         {
+            output.omit(
+                OmissionScope::Instrument(instrument_id),
+                ReconciliationOmission::OutOfScopeOrder,
+            );
             continue;
         }
 
@@ -539,6 +592,16 @@ pub(crate) fn build_order_reports_from_orders<'a>(
         output.reports.push(report);
     }
 
+    // A consumer keys order reports by venue order id, so two rows for one id there overwrite
+    // each other. The disagreement has to be caught before it reaches that keyed insert.
+    collapse_repeated_evidence(
+        &mut output,
+        |report| report.venue_order_id,
+        |report| report.instrument_id,
+        same_order_evidence,
+        ReconciliationOmission::InvalidOrder(ReportParseError::ConflictingOrder),
+    );
+
     output
 }
 
@@ -548,17 +611,22 @@ pub(crate) fn apply_fill_filters(
     venue_order_id: Option<VenueOrderId>,
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
+    omissions: &mut ReconciliationOmissions,
 ) -> Vec<FillReport> {
-    if let Some(vid) = venue_order_id {
-        reports.retain(|r| r.venue_order_id == vid);
-    }
+    reports.retain(|report| {
+        let in_scope = venue_order_id.is_none_or(|id| report.venue_order_id == id)
+            && start.is_none_or(|start| report.ts_event >= start)
+            && end.is_none_or(|end| report.ts_event <= end);
 
-    match (start, end) {
-        (Some(s), Some(e)) => reports.retain(|r| r.ts_event >= s && r.ts_event <= e),
-        (Some(s), None) => reports.retain(|r| r.ts_event >= s),
-        (None, Some(e)) => reports.retain(|r| r.ts_event <= e),
-        (None, None) => {}
-    }
+        if !in_scope {
+            omissions.record(
+                OmissionScope::Instrument(report.instrument_id),
+                ReconciliationOmission::OutOfScopeFill,
+            );
+        }
+
+        in_scope
+    });
 
     reports
 }
@@ -576,9 +644,31 @@ pub(crate) fn build_position_reports<'a>(
     ts: UnixNanos,
 ) -> ReportSet<PositionStatusReport> {
     let mut output = ReportSet::new();
+    // The venue states one balance per asset, so repeated rows for one asset are the venue
+    // disagreeing with itself. A consumer keeps every position report an instrument gets and
+    // applies them in order, so both rows would be applied as though both were true.
+    let rows = positions.into_iter().collect::<Vec<_>>();
+    let (unique, conflicting) = dedupe_evidence(
+        &rows,
+        |position| Ustr::from(position.asset.as_str()),
+        |left, right| left == right,
+    );
 
-    for position in positions {
-        let instrument = instruments.get_cloned(&Ustr::from(position.asset.as_str()));
+    for asset in &conflicting {
+        output.omit(
+            evidence_scope(instruments, *asset),
+            ReconciliationOmission::Position(PositionOmission::Conflicting),
+        );
+    }
+
+    for position in unique {
+        let asset = Ustr::from(position.asset.as_str());
+
+        if conflicting.contains(&asset) {
+            continue;
+        }
+
+        let instrument = instruments.get_cloned(&asset);
 
         if position.size >= Decimal::ZERO && position.size < DUST_POSITION_THRESHOLD {
             // Without an instrument mapping there is no position for a report to be about, so a
@@ -730,6 +820,13 @@ fn build_reconciliation_snapshot(
         UnixNanos::from(ts_init.as_u64().saturating_sub(lookback_ns))
     });
     let (scoped_orders, old_orders) = scope_by_lookback(orders, cutoff, |order| {
+        // An order still resting at the venue is evidence about the present, whatever its age:
+        // reconciliation exists to see it. Only an order the venue has already finished with is
+        // history the window can leave out.
+        if OrderStatus::from(order.status).is_open() {
+            return None;
+        }
+
         order
             .created_at
             .checked_mul(NANOSECONDS_IN_SECOND)
@@ -795,6 +892,10 @@ fn build_reconciliation_snapshot(
     })
 }
 
+/// Narrows rows to the lookback window, returning how many the window left out.
+///
+/// `timestamp` returns `None` for a row the window cannot exclude, either because the row is not
+/// history or because it carries no time the window could be compared against.
 fn scope_by_lookback<T>(
     rows: &[T],
     cutoff: Option<UnixNanos>,
@@ -828,7 +929,9 @@ pub(crate) fn log_reconciliation_summary(
         "Polymarket {route}: reports(order={order_reports}, fill={fill_reports}, position={position_reports}); withheld={withheld_reports}; omissions={omissions}"
     );
 
-    if omissions.is_empty() && withheld_reports == 0 {
+    // Narrowing the evidence to what was asked about is ordinary, so the summary is only raised
+    // to a warning when something the response claims to cover could not be stated.
+    if withheld_reports == 0 && !omissions.has_invalidating() {
         log::debug!("{message}");
     } else {
         log::warn!("{message}");
@@ -890,41 +993,92 @@ fn unique_fill_evidence(fill_reports: &[FillReport]) -> Result<Vec<&FillReport>,
     Err(ReportParseError::ConflictingFill)
 }
 
-/// Collapses repeated venue rows, naming the instruments whose repeated rows disagree.
-fn dedupe_fill_evidence(fill_reports: &[FillReport]) -> (Vec<&FillReport>, AHashSet<InstrumentId>) {
-    let mut unique = Vec::with_capacity(fill_reports.len());
-    let mut seen = AHashMap::<(AccountId, InstrumentId, TradeId), &FillReport>::new();
+fn dedupe_fill_evidence(fill_reports: &[FillReport]) -> (Vec<&FillReport>, AHashSet<FillKey>) {
+    dedupe_evidence(fill_reports, fill_evidence_key, same_fill_evidence)
+}
+
+/// The venue's identity for a fill: one trade, on one instrument, for one account.
+type FillKey = (AccountId, InstrumentId, TradeId);
+
+fn fill_evidence_key(fill: &FillReport) -> FillKey {
+    (fill.account_id, fill.instrument_id, fill.trade_id)
+}
+
+/// Collapses repeated venue rows in a set, recording the instruments whose repeated rows disagree.
+///
+/// Rows that disagree about one venue key leave no way to tell which of them the venue meant, so
+/// the instrument they name is withheld rather than answered from whichever row happened to be
+/// consumed last.
+fn collapse_repeated_evidence<T: Clone, K: Copy + Eq + Hash>(
+    output: &mut ReportSet<T>,
+    key: impl Fn(&T) -> K,
+    instrument_of: impl Fn(&T) -> InstrumentId,
+    same: impl Fn(&T, &T) -> bool,
+    conflict: ReconciliationOmission,
+) {
+    let (unique, conflicting) = dedupe_evidence(&output.reports, &key, same);
+    let blocked = unique
+        .iter()
+        .filter(|report| conflicting.contains(&key(report)))
+        .map(|report| instrument_of(report))
+        .collect::<AHashSet<_>>();
+    output.reports = unique
+        .into_iter()
+        .filter(|report| !blocked.contains(&instrument_of(report)))
+        .cloned()
+        .collect();
+
+    for instrument_id in blocked {
+        output.omit(OmissionScope::Instrument(instrument_id), conflict);
+    }
+}
+
+/// Collapses repeated venue rows, naming the keys whose repeated rows disagree.
+///
+/// `key` must be the venue's own identity for the row, so that two answers to one question are
+/// what gets compared. Rows the venue keeps apart are not made to answer for each other.
+fn dedupe_evidence<T, K: Copy + Eq + Hash>(
+    rows: &[T],
+    key: impl Fn(&T) -> K,
+    same: impl Fn(&T, &T) -> bool,
+) -> (Vec<&T>, AHashSet<K>) {
+    let mut unique = Vec::with_capacity(rows.len());
+    let mut seen = AHashMap::<K, &T>::new();
     let mut conflicting = AHashSet::new();
 
-    for fill in fill_reports {
-        let fill_key = (fill.account_id, fill.instrument_id, fill.trade_id);
-
-        if let Some(previous) = seen.insert(fill_key, fill) {
-            if !same_fill_evidence(previous, fill) {
-                conflicting.insert(fill.instrument_id);
+    for row in rows {
+        if let Some(previous) = seen.insert(key(row), row) {
+            if !same(previous, row) {
+                conflicting.insert(key(row));
             }
         } else {
-            unique.push(fill);
+            unique.push(row);
         }
     }
 
     (unique, conflicting)
 }
 
+/// Returns whether two rows for one venue key carry the same evidence.
+///
+/// `report_id` and `ts_init` identify the report this client built rather than what the venue
+/// stated, so they are normalized away and every remaining field is compared. Comparing whole
+/// reports keeps a field added later inside the check instead of silently outside it.
 fn same_fill_evidence(left: &FillReport, right: &FillReport) -> bool {
-    left.account_id == right.account_id
-        && left.instrument_id == right.instrument_id
-        && left.venue_order_id == right.venue_order_id
-        && left.trade_id == right.trade_id
-        && left.order_side == right.order_side
-        && left.last_qty == right.last_qty
-        && left.last_px == right.last_px
-        && left.commission == right.commission
-        && left.liquidity_side == right.liquidity_side
-        && left.avg_px == right.avg_px
-        && left.ts_event == right.ts_event
-        && left.client_order_id == right.client_order_id
-        && left.venue_position_id == right.venue_position_id
+    let mut right = right.clone();
+    right.report_id = left.report_id;
+    right.ts_init = left.ts_init;
+    *left == right
+}
+
+/// Returns whether two rows for one venue order carry the same evidence.
+///
+/// See [`same_fill_evidence`] for why the report's own identifiers are normalized away.
+fn same_order_evidence(left: &OrderStatusReport, right: &OrderStatusReport) -> bool {
+    let mut right = right.clone();
+    right.report_id = left.report_id;
+    right.ts_init = left.ts_init;
+    *left == right
 }
 
 pub(crate) fn cap_order_report_filled_qty(
@@ -1236,6 +1390,163 @@ mod tests {
             ),
             1,
         );
+    }
+
+    #[rstest]
+    fn order_builder_collapses_repeated_rest_rows() {
+        let (instruments, _, _) = traded_instruments();
+        let order = order_on(TRADED_TOKEN, "V-REPEATED");
+
+        let output = build_order_reports_from_orders(
+            &[order.clone(), order],
+            &instruments,
+            AccountId::from("POLY-001"),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(output.reports.len(), 1);
+        assert!(output.omissions.is_empty());
+    }
+
+    #[rstest]
+    fn order_builder_rejects_conflicting_repeated_rest_rows() {
+        let (instruments, traded_id, _) = traded_instruments();
+        let order = order_on(TRADED_TOKEN, "V-REPEATED");
+        let mut conflicting = order.clone();
+        conflicting.size_matched += Decimal::ONE;
+
+        let output = build_order_reports_from_orders(
+            &[order, conflicting],
+            &instruments,
+            AccountId::from("POLY-001"),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(output.reports.is_empty());
+        assert_eq!(
+            output.omissions.count(
+                OmissionScope::Instrument(traded_id),
+                ReconciliationOmission::InvalidOrder(ReportParseError::ConflictingOrder),
+            ),
+            1,
+        );
+    }
+
+    #[rstest]
+    fn reconciliation_snapshot_withholds_conflicting_repeated_order_rows() {
+        let (instruments, _, other_id) = traded_instruments();
+        let order = order_on(TRADED_TOKEN, "V-REPEATED");
+        let mut conflicting = order.clone();
+        conflicting.size_matched += Decimal::ONE;
+
+        let snapshot = build_reconciliation_snapshot(
+            &[order, conflicting, order_on(OTHER_TRADED_TOKEN, "V-LIVE")],
+            &[],
+            &[],
+            &instruments,
+            &OrderFillTrackerMap::new(),
+            &test_fill_context(),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("an unusable order withholds its instrument rather than failing the snapshot");
+
+        // A consumer keys order reports by venue order id, so these two rows would collapse into
+        // whichever was consumed last. Neither can be stated, and the other order is untouched.
+        assert_eq!(snapshot.orders.len(), 1);
+        assert_eq!(snapshot.orders[0].instrument_id, other_id);
+    }
+
+    #[rstest]
+    fn position_builder_collapses_repeated_rows() {
+        let (instruments, _, _) = traded_instruments();
+        let position = position_on(TRADED_TOKEN, Decimal::TEN);
+
+        let output = build_position_reports(
+            &[position.clone(), position],
+            &instruments,
+            AccountId::from("POLY-001"),
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(output.reports.len(), 1);
+        assert!(output.omissions.is_empty());
+    }
+
+    #[rstest]
+    fn position_builder_rejects_conflicting_repeated_rows() {
+        let (instruments, traded_id, _) = traded_instruments();
+        let position = position_on(TRADED_TOKEN, Decimal::TEN);
+        let mut conflicting = position.clone();
+        conflicting.size += Decimal::ONE;
+
+        let output = build_position_reports(
+            &[position, conflicting],
+            &instruments,
+            AccountId::from("POLY-001"),
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        // A consumer keeps every position row for an instrument and applies them in order, so
+        // two rows that disagree would both be applied as though both were true.
+        assert!(output.reports.is_empty());
+        assert_eq!(
+            output.omissions.count(
+                OmissionScope::Instrument(traded_id),
+                ReconciliationOmission::Position(PositionOmission::Conflicting),
+            ),
+            1,
+        );
+    }
+
+    #[rstest]
+    fn reconciliation_snapshot_keeps_open_order_older_than_the_lookback() {
+        let (instruments, traded_id, _) = traded_instruments();
+        let mut resting = order_on(TRADED_TOKEN, "V-OLD");
+        resting.created_at = 1;
+
+        let snapshot = build_reconciliation_snapshot(
+            &[resting],
+            &[],
+            &[],
+            &instruments,
+            &OrderFillTrackerMap::new(),
+            &test_fill_context(),
+            Some(1),
+            UnixNanos::from(121_000_000_000u64),
+        )
+        .expect("a resting order is evidence about the present");
+
+        // Reconciliation exists to see orders still resting at the venue. When one was placed
+        // is not evidence that it is no longer there, so the window must not hide it.
+        assert_eq!(snapshot.orders.len(), 1);
+        assert_eq!(snapshot.orders[0].instrument_id, traded_id);
+    }
+
+    #[rstest]
+    fn reconciliation_snapshot_scopes_terminal_order_older_than_the_lookback() {
+        let (instruments, _, _) = traded_instruments();
+        let mut finished = order_on(TRADED_TOKEN, "V-OLD");
+        finished.created_at = 1;
+        finished.status = crate::common::enums::PolymarketOrderStatus::Canceled;
+
+        let snapshot = build_reconciliation_snapshot(
+            &[finished],
+            &[],
+            &[],
+            &instruments,
+            &OrderFillTrackerMap::new(),
+            &test_fill_context(),
+            Some(1),
+            UnixNanos::from(121_000_000_000u64),
+        )
+        .expect("out-of-window history must not invalidate the selected snapshot");
+
+        // Negative control: an order the venue has finished with is history, which is what the
+        // window bounds, so it is still left out.
+        assert!(snapshot.orders.is_empty());
     }
 
     #[rstest]

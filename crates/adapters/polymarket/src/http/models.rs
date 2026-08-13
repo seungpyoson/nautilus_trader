@@ -375,7 +375,7 @@ pub struct ClobMarketResponse {
 }
 
 /// A position from the Polymarket Data API `GET /positions` endpoint.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct DataApiPosition {
     pub asset: String,
     #[serde(alias = "conditionId", alias = "condition_id")]

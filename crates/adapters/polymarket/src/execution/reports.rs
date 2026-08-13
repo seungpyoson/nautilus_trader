@@ -18,7 +18,9 @@ use nautilus_common::messages::execution::{
     GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
     GeneratePositionStatusReports, QueryAccount, QueryOrder,
 };
-use nautilus_core::{UnixNanos, collections::AtomicMap, time::AtomicTime};
+use nautilus_core::{
+    UnixNanos, collections::AtomicMap, datetime::NANOSECONDS_IN_SECOND, time::AtomicTime,
+};
 use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
     enums::{OrderStatus, OrderType, TimeInForce},
@@ -38,10 +40,11 @@ use super::{
         sum_filled_quantity, weighted_average_price,
     },
     reconciliation::{
-        FillContext, OmissionScope, ReconciliationOmission, ReportSet, apply_fill_filters,
-        build_fill_reports_from_trades, build_position_reports, cap_order_report_filled_qty,
-        confirmed_filled_quantities, ensure_execution_lookup_loaded, log_reconciliation_summary,
-        normalize_terminal_order_report_quantity, withhold_non_authoritative,
+        FillContext, OmissionScope, ReconciliationOmission, ReconciliationOmissions, ReportSet,
+        apply_fill_filters, build_fill_reports_from_trades, build_position_reports,
+        cap_order_report_filled_qty, confirmed_filled_quantities, ensure_execution_lookup_loaded,
+        evidence_scope, log_reconciliation_summary, normalize_terminal_order_report_quantity,
+        withhold_non_authoritative,
     },
 };
 use crate::{
@@ -84,6 +87,8 @@ impl PolymarketExecutionClient {
             .get_trades(GetTradesParams::default())
             .await
             .context("failed to fetch trades for order recovery")?;
+        let authority_context = format!("Order recovery for {venue_order_id}");
+        let mut scope_omissions = ReconciliationOmissions::default();
         let order_trades = scope_fill_trades(
             &trades,
             &self.shared_token_instruments,
@@ -91,7 +96,11 @@ impl PolymarketExecutionClient {
             std::slice::from_ref(&venue_order_id),
             None,
             None,
+            &mut scope_omissions,
         )?;
+        // An empty set is read below as the venue holding nothing for this order, so evidence
+        // that scoping could not account for has to fail here rather than be recovered from.
+        scope_omissions.ensure_authoritative(&authority_context, Some(instrument_id))?;
 
         let resolved_client_order_id =
             client_order_id.or_else(|| self.core.cache().client_order_id(&venue_order_id).copied());
@@ -144,17 +153,17 @@ impl PolymarketExecutionClient {
             return Ok(Some(report));
         }
 
-        let output = build_fill_reports_from_trades(
+        let mut output = build_fill_reports_from_trades(
             &order_trades,
             &ctx,
             &self.shared_token_instruments,
             Some(instrument_id),
             ts_init,
         );
-        output.omissions.ensure_authoritative(
-            &format!("Order recovery for {venue_order_id}"),
-            Some(instrument_id),
-        )?;
+        output.omissions.merge(scope_omissions);
+        output
+            .omissions
+            .ensure_authoritative(&authority_context, Some(instrument_id))?;
         let mut order_fills = output.reports;
         self.fill_tracker.snap_fill_reports(&mut order_fills);
 
@@ -488,6 +497,7 @@ impl PolymarketExecutionClient {
             orders.len(),
         )?;
 
+        let mut scope_omissions = ReconciliationOmissions::default();
         let scoped_orders = scope_order_rows(
             &orders,
             &self.shared_token_instruments,
@@ -495,6 +505,7 @@ impl PolymarketExecutionClient {
             cmd.open_only,
             cmd.start,
             cmd.end,
+            &mut scope_omissions,
         )?;
         let mut output = super::reconciliation::build_order_reports_from_orders(
             scoped_orders,
@@ -503,6 +514,7 @@ impl PolymarketExecutionClient {
             cmd.instrument_id,
             self.clock.get_time_ns(),
         );
+        output.omissions.merge(scope_omissions);
 
         let needs_confirmed_fills = output.reports.iter().any(|report| {
             let cached_filled = report
@@ -580,15 +592,10 @@ impl PolymarketExecutionClient {
             report.instrument_id
         });
 
-        let reports = if cmd.open_only {
-            output
-                .reports
-                .into_iter()
-                .filter(|r| r.order_status.is_open())
-                .collect()
-        } else {
-            output.reports
-        };
+        // `scope_order_rows` owns the open-only contract: it decides on the venue status the
+        // report status is parsed from, so a second filter here could only drop rows it kept
+        // without recording why.
+        let reports = output.reports;
 
         log_reconciliation_summary(
             "order reports",
@@ -619,6 +626,7 @@ impl PolymarketExecutionClient {
             trades.len(),
         )?;
 
+        let mut scope_omissions = ReconciliationOmissions::default();
         let scoped_trades = scope_fill_trades(
             &trades,
             &self.shared_token_instruments,
@@ -626,6 +634,7 @@ impl PolymarketExecutionClient {
             cmd.venue_order_id.as_slice(),
             cmd.start,
             cmd.end,
+            &mut scope_omissions,
         )?;
         let ctx = self.fill_context();
         let mut output = build_fill_reports_from_trades(
@@ -635,6 +644,7 @@ impl PolymarketExecutionClient {
             cmd.instrument_id,
             self.clock.get_time_ns(),
         );
+        output.omissions.merge(scope_omissions);
 
         self.fill_tracker.snap_fill_reports(&mut output.reports);
 
@@ -642,7 +652,13 @@ impl PolymarketExecutionClient {
         let withheld = withhold_non_authoritative(&mut output.reports, &blocked, |report| {
             report.instrument_id
         });
-        let reports = apply_fill_filters(output.reports, cmd.venue_order_id, cmd.start, cmd.end);
+        let reports = apply_fill_filters(
+            std::mem::take(&mut output.reports),
+            cmd.venue_order_id,
+            cmd.start,
+            cmd.end,
+            &mut output.omissions,
+        );
 
         log_reconciliation_summary(
             "fill reports",
@@ -675,10 +691,12 @@ impl PolymarketExecutionClient {
         )?;
 
         let ts_now = self.clock.get_time_ns();
+        let mut scope_omissions = ReconciliationOmissions::default();
         let scoped_positions = scope_position_rows(
             &positions,
             &self.shared_token_instruments,
             cmd.instrument_id,
+            &mut scope_omissions,
         )?;
         let mut output = build_position_reports(
             scoped_positions,
@@ -686,6 +704,7 @@ impl PolymarketExecutionClient {
             self.core.account_id,
             ts_now,
         );
+        output.omissions.merge(scope_omissions);
 
         let blocked = output.omissions.non_authoritative_instruments();
         let withheld = withhold_non_authoritative(&mut output.reports, &blocked, |report| {
@@ -725,6 +744,12 @@ impl PolymarketExecutionClient {
     }
 }
 
+/// Narrows trades to the orders, instrument, and time range the caller asked about.
+///
+/// A trade that names one of the requested orders while naming another asset is not a trade about
+/// something else: it contradicts the instrument the caller asked about. Scoping it away would
+/// leave the caller reading an empty result as "the venue holds nothing for this order", so it is
+/// recorded as evidence that destroys authority over that instrument instead.
 fn scope_fill_trades(
     trades: &[PolymarketTradeReport],
     instruments: &AtomicMap<Ustr, InstrumentAny>,
@@ -732,54 +757,117 @@ fn scope_fill_trades(
     venue_order_ids: &[VenueOrderId],
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
+    omissions: &mut ReconciliationOmissions,
 ) -> anyhow::Result<Vec<PolymarketTradeReport>> {
     let asset_filter = resolve_asset_filter(instruments, instrument_filter, "fill")?;
+    // Only a request naming both an order and an instrument can be contradicted.
+    let contradiction_scope = instrument_filter.map(OmissionScope::Instrument);
+    let mut scoped_trades = Vec::with_capacity(trades.len());
 
-    Ok(trades
-        .iter()
-        .filter_map(|trade| {
-            let in_time_range = parse_timestamp(&trade.match_time).is_none_or(|timestamp| {
-                start.is_none_or(|start| timestamp >= start)
-                    && end.is_none_or(|end| timestamp <= end)
-            });
+    for trade in trades {
+        let scope = evidence_scope(instruments, trade.asset_id);
+        let in_time_range = parse_timestamp(&trade.match_time).is_none_or(|timestamp| {
+            start.is_none_or(|start| timestamp >= start) && end.is_none_or(|end| timestamp <= end)
+        });
 
-            if !in_time_range {
-                return None;
+        if !in_time_range {
+            omissions.record(scope, ReconciliationOmission::OutOfScopeFill);
+            continue;
+        }
+
+        if trade.trader_side == crate::common::enums::PolymarketLiquiditySide::Maker {
+            let mut maker_orders = Vec::with_capacity(trade.maker_orders.len());
+            let mut contradicted = 0;
+
+            for maker_order in &trade.maker_orders {
+                let names_requested = names_requested_order(venue_order_ids, &maker_order.order_id);
+                let asset_matches =
+                    asset_filter.is_none_or(|asset| maker_order.asset_id == asset.as_str());
+
+                if names_requested && !asset_matches {
+                    contradicted += 1;
+                } else if asset_matches && (venue_order_ids.is_empty() || names_requested) {
+                    maker_orders.push(maker_order.clone());
+                }
+            }
+
+            if contradicted > 0
+                && let Some(contradiction_scope) = contradiction_scope
+            {
+                omissions.record_n(
+                    contradiction_scope,
+                    ReconciliationOmission::ContradictoryFill,
+                    contradicted,
+                );
+            }
+
+            if maker_orders.is_empty() {
+                if contradicted == 0 {
+                    omissions.record(scope, ReconciliationOmission::OutOfScopeFill);
+                }
+                continue;
             }
 
             let mut scoped = trade.clone();
-            if trade.trader_side == crate::common::enums::PolymarketLiquiditySide::Maker {
-                scoped.maker_orders.retain(|order| {
-                    (venue_order_ids.is_empty()
-                        || venue_order_ids
-                            .iter()
-                            .any(|venue_order_id| order.order_id == venue_order_id.as_str()))
-                        && asset_filter.is_none_or(|asset| order.asset_id == asset.as_str())
-                });
-                (!scoped.maker_orders.is_empty()).then_some(scoped)
-            } else {
-                let order_matches = venue_order_ids.is_empty()
-                    || venue_order_ids
-                        .iter()
-                        .any(|venue_order_id| trade.taker_order_id == venue_order_id.as_str());
-                let asset_matches =
-                    asset_filter.is_none_or(|asset| trade.asset_id == asset.as_str());
-                (order_matches && asset_matches).then_some(scoped)
+            scoped.maker_orders = maker_orders;
+            scoped_trades.push(scoped);
+        } else {
+            let names_requested = names_requested_order(venue_order_ids, &trade.taker_order_id);
+            let asset_matches = asset_filter.is_none_or(|asset| trade.asset_id == asset.as_str());
+
+            if names_requested && !asset_matches {
+                if let Some(contradiction_scope) = contradiction_scope {
+                    omissions.record(
+                        contradiction_scope,
+                        ReconciliationOmission::ContradictoryFill,
+                    );
+                }
+                continue;
             }
-        })
-        .collect())
+
+            let in_scope = asset_matches && (venue_order_ids.is_empty() || names_requested);
+
+            if !in_scope {
+                omissions.record(scope, ReconciliationOmission::OutOfScopeFill);
+                continue;
+            }
+
+            scoped_trades.push(trade.clone());
+        }
+    }
+
+    Ok(scoped_trades)
+}
+
+/// Returns whether a venue row names one of the orders the caller asked about.
+fn names_requested_order(venue_order_ids: &[VenueOrderId], order_id: &str) -> bool {
+    venue_order_ids
+        .iter()
+        .any(|venue_order_id| order_id == venue_order_id.as_str())
 }
 
 fn scope_position_rows<'a>(
     positions: &'a [DataApiPosition],
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     instrument_filter: Option<InstrumentId>,
+    omissions: &mut ReconciliationOmissions,
 ) -> anyhow::Result<Vec<&'a DataApiPosition>> {
     let asset = resolve_asset_filter(instruments, instrument_filter, "position")?;
-    Ok(positions
-        .iter()
-        .filter(|position| asset.is_none_or(|asset| position.asset == asset.as_str()))
-        .collect())
+    let mut scoped = Vec::with_capacity(positions.len());
+
+    for position in positions {
+        if asset.is_some_and(|asset| position.asset != asset.as_str()) {
+            omissions.record(
+                evidence_scope(instruments, Ustr::from(position.asset.as_str())),
+                ReconciliationOmission::OutOfScopePosition,
+            );
+            continue;
+        }
+
+        scoped.push(position);
+    }
+
+    Ok(scoped)
 }
 
 fn resolve_asset_filter(
@@ -807,23 +895,46 @@ fn scope_order_rows<'a>(
     open_only: bool,
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
+    omissions: &mut ReconciliationOmissions,
 ) -> anyhow::Result<Vec<&'a crate::http::models::PolymarketOpenOrder>> {
     let asset = resolve_asset_filter(instruments, instrument_filter, "order")?;
-    Ok(orders
-        .iter()
-        .filter(|order| asset.is_none_or(|asset| order.asset_id == asset))
-        .filter(|order| !open_only || OrderStatus::from(order.status).is_open())
-        .filter(|order| {
-            order
-                .created_at
-                .checked_mul(1_000_000_000)
-                .map(UnixNanos::from)
-                .is_none_or(|timestamp| {
-                    start.is_none_or(|start| timestamp >= start)
-                        && end.is_none_or(|end| timestamp <= end)
-                })
-        })
-        .collect())
+    let mut scoped = Vec::with_capacity(orders.len());
+
+    for order in orders {
+        let scope = evidence_scope(instruments, order.asset_id);
+
+        if asset.is_some_and(|asset| order.asset_id != asset)
+            || (open_only && !OrderStatus::from(order.status).is_open())
+        {
+            omissions.record(scope, ReconciliationOmission::OutOfScopeOrder);
+            continue;
+        }
+
+        // A `created_at` no timestamp can represent leaves the window undecidable. Keeping the
+        // row would let it bypass the window the caller asked for, and dropping it would hide a
+        // row the caller did ask about, so it is unusable evidence about its instrument.
+        let Some(created_at) = order
+            .created_at
+            .checked_mul(NANOSECONDS_IN_SECOND)
+            .map(UnixNanos::from)
+        else {
+            omissions.record(
+                scope,
+                ReconciliationOmission::InvalidOrder(ReportParseError::Timestamp),
+            );
+            continue;
+        };
+
+        if start.is_some_and(|start| created_at < start) || end.is_some_and(|end| created_at > end)
+        {
+            omissions.record(scope, ReconciliationOmission::OutOfScopeOrder);
+            continue;
+        }
+
+        scoped.push(order);
+    }
+
+    Ok(scoped)
 }
 
 fn recovered_terminal_order_status(
@@ -856,6 +967,7 @@ async fn fetch_confirmed_fill_reports(
         .get_trades(GetTradesParams::default())
         .await
         .context("failed to fetch confirmed trades")?;
+    let mut scope_omissions = ReconciliationOmissions::default();
     let relevant_trades = scope_fill_trades(
         &trades,
         token_instruments,
@@ -863,6 +975,7 @@ async fn fetch_confirmed_fill_reports(
         venue_order_ids,
         None,
         None,
+        &mut scope_omissions,
     )?;
     let mut output = build_fill_reports_from_trades(
         &relevant_trades,
@@ -871,6 +984,7 @@ async fn fetch_confirmed_fill_reports(
         instrument_id,
         ts_init,
     );
+    output.omissions.merge(scope_omissions);
     output
         .omissions
         .ensure_authoritative(authority_context, instrument_id)?;
@@ -944,10 +1058,37 @@ mod tests {
 
     use super::*;
 
+    const REQUESTED_ORDER: &str = "V-REQUESTED";
+    const REQUESTED_TOKEN: &str = "TARGET";
+    const OTHER_TOKEN: &str = "UNMAPPED";
+
     fn test_open_order() -> crate::http::models::PolymarketOpenOrder {
         let content = std::fs::read_to_string("test_data/http_open_order.json")
             .expect("failed to read open-order fixture");
         serde_json::from_str(&content).expect("failed to parse open-order fixture")
+    }
+
+    fn test_trade_report() -> PolymarketTradeReport {
+        let content = std::fs::read_to_string("test_data/http_trade_report.json")
+            .expect("failed to read trade-report fixture");
+        serde_json::from_str(&content).expect("failed to parse trade-report fixture")
+    }
+
+    /// An execution lookup holding the single instrument the caller asks about.
+    fn requested_instrument() -> (AtomicMap<Ustr, InstrumentAny>, InstrumentId) {
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let instrument_id = instrument.id();
+        let instruments = AtomicMap::new();
+        instruments.insert(Ustr::from(REQUESTED_TOKEN), instrument);
+        (instruments, instrument_id)
+    }
+
+    /// A taker trade naming the requested order while naming another asset.
+    fn contradictory_taker_trade() -> PolymarketTradeReport {
+        let mut trade = test_trade_report();
+        trade.taker_order_id = REQUESTED_ORDER.to_string();
+        trade.asset_id = Ustr::from(OTHER_TOKEN);
+        trade
     }
 
     #[rstest]
@@ -973,29 +1114,47 @@ mod tests {
 
     #[rstest]
     fn test_scope_position_rows_isolates_requested_instrument_authority() {
-        let instrument = InstrumentAny::BinaryOption(binary_option());
-        let instrument_id = instrument.id();
-        let instruments = AtomicMap::new();
-        instruments.insert(Ustr::from("TARGET"), instrument);
+        let (instruments, instrument_id) = requested_instrument();
         let positions = vec![
             DataApiPosition {
-                asset: "TARGET".to_string(),
+                asset: REQUESTED_TOKEN.to_string(),
                 condition_id: "0xtarget".to_string(),
                 size: Decimal::ONE,
                 avg_price: Some(Decimal::new(5, 1)),
             },
             DataApiPosition {
-                asset: "UNMAPPED".to_string(),
+                asset: OTHER_TOKEN.to_string(),
                 condition_id: "0xunrelated".to_string(),
                 size: Decimal::ONE,
                 avg_price: None,
             },
         ];
+        let mut omissions = ReconciliationOmissions::default();
 
-        let scoped = scope_position_rows(&positions, &instruments, Some(instrument_id)).unwrap();
+        let scoped = scope_position_rows(
+            &positions,
+            &instruments,
+            Some(instrument_id),
+            &mut omissions,
+        )
+        .unwrap();
 
+        // Negative control: a row about another asset was never part of the answer, so it is
+        // dropped, is visible in the ledger, and leaves the requested instrument statable.
         assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].asset, "TARGET");
+        assert_eq!(scoped[0].asset, REQUESTED_TOKEN);
+        assert_eq!(
+            omissions.count(
+                OmissionScope::Foreign,
+                ReconciliationOmission::OutOfScopePosition,
+            ),
+            1,
+        );
+        assert!(
+            omissions
+                .ensure_authoritative("Position reports", Some(instrument_id))
+                .is_ok()
+        );
     }
 
     #[rstest]
@@ -1007,6 +1166,7 @@ mod tests {
             &positions,
             &instruments,
             Some(InstrumentId::from("UNKNOWN.POLYMARKET")),
+            &mut ReconciliationOmissions::default(),
         );
 
         assert!(result.is_err());
@@ -1014,16 +1174,14 @@ mod tests {
 
     #[rstest]
     fn test_scope_order_rows_isolates_requested_instrument_before_validation() {
-        let instrument = InstrumentAny::BinaryOption(binary_option());
-        let instrument_id = instrument.id();
-        let instruments = AtomicMap::new();
+        let (instruments, instrument_id) = requested_instrument();
         let mut target = test_open_order();
-        target.asset_id = Ustr::from("TARGET");
+        target.asset_id = Ustr::from(REQUESTED_TOKEN);
         let mut unrelated = target.clone();
-        unrelated.asset_id = Ustr::from("UNMAPPED");
+        unrelated.asset_id = Ustr::from(OTHER_TOKEN);
         unrelated.price = Decimal::ZERO;
-        instruments.insert(target.asset_id, instrument);
         let orders = vec![target, unrelated];
+        let mut omissions = ReconciliationOmissions::default();
 
         let scoped = scope_order_rows(
             &orders,
@@ -1032,27 +1190,38 @@ mod tests {
             false,
             None,
             None,
+            &mut omissions,
         )
         .unwrap();
 
         assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].asset_id, Ustr::from("TARGET"));
+        assert_eq!(scoped[0].asset_id, Ustr::from(REQUESTED_TOKEN));
+        assert_eq!(
+            omissions.count(
+                OmissionScope::Foreign,
+                ReconciliationOmission::OutOfScopeOrder,
+            ),
+            1,
+        );
+        assert!(
+            omissions
+                .ensure_authoritative("Order reports", Some(instrument_id))
+                .is_ok()
+        );
     }
 
     #[rstest]
     fn test_scope_order_rows_applies_time_and_open_contract_before_validation() {
-        let instrument = InstrumentAny::BinaryOption(binary_option());
-        let instrument_id = instrument.id();
-        let instruments = AtomicMap::new();
+        let (instruments, instrument_id) = requested_instrument();
         let mut old = test_open_order();
-        old.asset_id = Ustr::from("TARGET");
+        old.asset_id = Ustr::from(REQUESTED_TOKEN);
         old.created_at = 1;
         old.price = Decimal::ZERO;
         let mut terminal = old.clone();
         terminal.created_at = 3;
         terminal.status = crate::common::enums::PolymarketOrderStatus::Matched;
-        instruments.insert(old.asset_id, instrument);
         let orders = vec![old, terminal];
+        let mut omissions = ReconciliationOmissions::default();
 
         let scoped = scope_order_rows(
             &orders,
@@ -1061,9 +1230,209 @@ mod tests {
             true,
             Some(UnixNanos::from(2_000_000_000u64)),
             None,
+            &mut omissions,
+        )
+        .unwrap();
+
+        // Negative control: an out-of-window row and a terminal row under `open_only` are both
+        // narrowing the caller asked for, so both stay out while the answer stays statable.
+        assert!(scoped.is_empty());
+        assert_eq!(
+            omissions.count(
+                OmissionScope::Instrument(instrument_id),
+                ReconciliationOmission::OutOfScopeOrder,
+            ),
+            2,
+        );
+        assert!(
+            omissions
+                .ensure_authoritative("Order reports", Some(instrument_id))
+                .is_ok()
+        );
+    }
+
+    #[rstest]
+    fn test_scope_order_rows_rejects_unrepresentable_created_at() {
+        let (instruments, instrument_id) = requested_instrument();
+        let mut order = test_open_order();
+        order.asset_id = Ustr::from(REQUESTED_TOKEN);
+        order.created_at = u64::MAX;
+        let orders = vec![order];
+        let mut omissions = ReconciliationOmissions::default();
+
+        let scoped = scope_order_rows(
+            &orders,
+            &instruments,
+            Some(instrument_id),
+            false,
+            Some(UnixNanos::from(2_000_000_000u64)),
+            Some(UnixNanos::from(3_000_000_000u64)),
+            &mut omissions,
+        )
+        .unwrap();
+
+        // A `created_at` no timestamp can represent cannot be compared against the window, so it
+        // must not pass through the window as though it had been checked.
+        assert!(scoped.is_empty());
+        assert_eq!(
+            omissions.count(
+                OmissionScope::Instrument(instrument_id),
+                ReconciliationOmission::InvalidOrder(ReportParseError::Timestamp),
+            ),
+            1,
+        );
+        assert!(
+            omissions
+                .ensure_authoritative("Order reports", Some(instrument_id))
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    fn test_scope_fill_trades_rejects_taker_trade_naming_requested_order_on_another_asset() {
+        let (instruments, instrument_id) = requested_instrument();
+        let trades = vec![contradictory_taker_trade()];
+        let mut omissions = ReconciliationOmissions::default();
+
+        let scoped = scope_fill_trades(
+            &trades,
+            &instruments,
+            Some(instrument_id),
+            &[VenueOrderId::from(REQUESTED_ORDER)],
+            None,
+            None,
+            &mut omissions,
+        )
+        .unwrap();
+
+        // The venue says this trade belongs to the requested order while naming another asset.
+        // Scoping it away silently would leave the empty result reading as "the venue holds
+        // nothing for this order", which the caller recovers from as a cancellation.
+        assert!(scoped.is_empty());
+        assert_eq!(
+            omissions.count(
+                OmissionScope::Instrument(instrument_id),
+                ReconciliationOmission::ContradictoryFill,
+            ),
+            1,
+        );
+        assert!(
+            omissions
+                .ensure_authoritative("Order recovery", Some(instrument_id))
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    fn test_scope_fill_trades_rejects_maker_trade_naming_requested_order_on_another_asset() {
+        let (instruments, instrument_id) = requested_instrument();
+        let mut trade = test_trade_report();
+        trade.trader_side = crate::common::enums::PolymarketLiquiditySide::Maker;
+        trade.asset_id = Ustr::from(REQUESTED_TOKEN);
+        trade.maker_orders.truncate(1);
+        trade.maker_orders[0].order_id = REQUESTED_ORDER.to_string();
+        trade.maker_orders[0].asset_id = Ustr::from(OTHER_TOKEN);
+        let trades = vec![trade];
+        let mut omissions = ReconciliationOmissions::default();
+
+        let scoped = scope_fill_trades(
+            &trades,
+            &instruments,
+            Some(instrument_id),
+            &[VenueOrderId::from(REQUESTED_ORDER)],
+            None,
+            None,
+            &mut omissions,
         )
         .unwrap();
 
         assert!(scoped.is_empty());
+        assert_eq!(
+            omissions.count(
+                OmissionScope::Instrument(instrument_id),
+                ReconciliationOmission::ContradictoryFill,
+            ),
+            1,
+        );
+        assert!(
+            omissions
+                .ensure_authoritative("Order recovery", Some(instrument_id))
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    fn test_scope_fill_trades_scopes_unrelated_trades_benignly() {
+        let (instruments, instrument_id) = requested_instrument();
+        let mut other_order = test_trade_report();
+        other_order.asset_id = Ustr::from(REQUESTED_TOKEN);
+        other_order.taker_order_id = "V-OTHER".to_string();
+        let mut other_asset = test_trade_report();
+        other_asset.asset_id = Ustr::from(OTHER_TOKEN);
+        other_asset.taker_order_id = "V-OTHER".to_string();
+        let trades = vec![other_order, other_asset];
+        let mut omissions = ReconciliationOmissions::default();
+
+        let scoped = scope_fill_trades(
+            &trades,
+            &instruments,
+            Some(instrument_id),
+            &[VenueOrderId::from(REQUESTED_ORDER)],
+            None,
+            None,
+            &mut omissions,
+        )
+        .unwrap();
+
+        // Negative control: neither trade names the requested order, so neither contradicts it.
+        // Both stay out of the answer and the requested instrument stays statable.
+        assert!(scoped.is_empty());
+        assert_eq!(
+            omissions.count(
+                OmissionScope::Instrument(instrument_id),
+                ReconciliationOmission::OutOfScopeFill,
+            ),
+            1,
+        );
+        assert_eq!(
+            omissions.count(
+                OmissionScope::Foreign,
+                ReconciliationOmission::OutOfScopeFill,
+            ),
+            1,
+        );
+        assert!(
+            omissions
+                .ensure_authoritative("Fill reports", Some(instrument_id))
+                .is_ok()
+        );
+    }
+
+    #[rstest]
+    fn test_scope_fill_trades_keeps_requested_order_on_the_requested_asset() {
+        let (instruments, instrument_id) = requested_instrument();
+        let mut trade = contradictory_taker_trade();
+        trade.asset_id = Ustr::from(REQUESTED_TOKEN);
+        let trades = vec![trade];
+        let mut omissions = ReconciliationOmissions::default();
+
+        let scoped = scope_fill_trades(
+            &trades,
+            &instruments,
+            Some(instrument_id),
+            &[VenueOrderId::from(REQUESTED_ORDER)],
+            None,
+            None,
+            &mut omissions,
+        )
+        .unwrap();
+
+        // Negative control: the same trade on the requested asset is ordinary evidence.
+        assert_eq!(scoped.len(), 1);
+        assert!(
+            omissions
+                .ensure_authoritative("Fill reports", Some(instrument_id))
+                .is_ok()
+        );
     }
 }
