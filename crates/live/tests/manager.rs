@@ -10067,6 +10067,217 @@ async fn test_reconciliation_instrument_ids_filters_position_reports() {
     );
 }
 
+#[tokio::test]
+async fn test_reconciliation_instrument_ids_filtered_fills_are_not_unresolved() {
+    // Fills excluded by reconciliation_instrument_ids are never applied, so they must
+    // not read as evidence the pass failed to resolve.
+    let included_instrument_id = test_instrument_id();
+    let excluded_instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+    let excluded_instrument_id = excluded_instrument.id();
+    let config = ExecutionManagerConfig {
+        reconciliation_instrument_ids: IndexSet::from([included_instrument_id]),
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    ctx.add_instrument(test_instrument());
+    ctx.add_instrument(excluded_instrument);
+
+    let carried_client_order_id = ClientOrderId::from("O-EXCLUDED-CARRIED");
+    let carried_venue_order_id = VenueOrderId::from("V-EXCLUDED-CARRIED");
+    let excluded_report = create_order_status_report(
+        Some(carried_client_order_id),
+        carried_venue_order_id,
+        excluded_instrument_id,
+        OrderStatus::Filled,
+        Quantity::from("1.0"),
+        Quantity::from("1.0"),
+    );
+    let carried_fill = create_fill_report(
+        carried_client_order_id,
+        carried_venue_order_id,
+        excluded_instrument_id,
+        TradeId::from("T-EXCLUDED-CARRIED"),
+        "1.0",
+    );
+
+    // Orphan fill: no order report in the mass status covers this venue order
+    let orphan_fill = create_fill_report(
+        ClientOrderId::from("O-EXCLUDED-ORPHAN"),
+        VenueOrderId::from("V-EXCLUDED-ORPHAN"),
+        excluded_instrument_id,
+        TradeId::from("T-EXCLUDED-ORPHAN"),
+        "1.0",
+    );
+
+    let mass_status = create_mass_status(vec![excluded_report], vec![carried_fill, orphan_fill]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(test_client_id(), mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert!(result.rejection.is_none());
+    assert!(
+        result.events.is_empty(),
+        "excluded instrument evidence must not be applied"
+    );
+    assert!(
+        ctx.get_order(&carried_client_order_id).is_none(),
+        "excluded instrument must not be reconciled"
+    );
+    assert_eq!(
+        result.unresolved_reports(),
+        0,
+        "evidence excluded by reconciliation_instrument_ids must not read as unresolved"
+    );
+}
+
+#[tokio::test]
+async fn test_filter_unclaimed_external_reports_are_not_unresolved() {
+    // An account holding an order this node never placed must not block startup when
+    // the operator asked for those orders to be filtered out.
+    let config = ExecutionManagerConfig {
+        filter_unclaimed_external: true,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    let instrument_id = test_instrument_id();
+    ctx.add_instrument(test_instrument());
+
+    let client_order_id = ClientOrderId::from("O-UNCLAIMED-001");
+    let venue_order_id = VenueOrderId::from("V-UNCLAIMED-001");
+    let report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument_id,
+        OrderStatus::Filled,
+        Quantity::from("1.0"),
+        Quantity::from("1.0"),
+    );
+    let fill = create_fill_report(
+        client_order_id,
+        venue_order_id,
+        instrument_id,
+        TradeId::from("T-UNCLAIMED-001"),
+        "1.0",
+    );
+
+    let mass_status = create_mass_status(vec![report], vec![fill]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(test_client_id(), mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert!(result.rejection.is_none());
+    assert!(
+        result.events.is_empty(),
+        "unclaimed external evidence must not be applied"
+    );
+    assert!(
+        ctx.get_order(&client_order_id).is_none(),
+        "unclaimed external order must not be created"
+    );
+    assert_eq!(
+        result.unresolved_reports(),
+        0,
+        "evidence excluded by filter_unclaimed_external must not read as unresolved"
+    );
+}
+
+#[tokio::test]
+async fn test_uncached_instrument_for_filtered_reports_does_not_reject_mass_status() {
+    // An instrument the node deliberately excludes need not be loaded, so its reports
+    // must not invalidate the evidence the node does reconcile.
+    let included_instrument_id = test_instrument_id();
+    let excluded_instrument_id = InstrumentId::from("SOLUSDT.BINANCE");
+    let config = ExecutionManagerConfig {
+        reconciliation_instrument_ids: IndexSet::from([included_instrument_id]),
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    ctx.add_instrument(test_instrument());
+
+    let included_client_order_id = ClientOrderId::from("O-INCLUDED-001");
+    let included_venue_order_id = VenueOrderId::from("V-INCLUDED-001");
+    ctx.add_order(create_accepted_order(
+        included_client_order_id.as_str(),
+        included_instrument_id,
+        OrderSide::Buy,
+        "1.000",
+        "3000.00",
+        included_venue_order_id,
+    ));
+
+    let included_report = create_order_status_report(
+        Some(included_client_order_id),
+        included_venue_order_id,
+        included_instrument_id,
+        OrderStatus::Accepted,
+        Quantity::from("1.000"),
+        Quantity::from("0"),
+    );
+    let excluded_client_order_id = ClientOrderId::from("O-UNCACHED-001");
+    let excluded_venue_order_id = VenueOrderId::from("V-UNCACHED-001");
+    let excluded_report = create_order_status_report(
+        Some(excluded_client_order_id),
+        excluded_venue_order_id,
+        excluded_instrument_id,
+        OrderStatus::Filled,
+        Quantity::from("1.0"),
+        Quantity::from("1.0"),
+    );
+    let excluded_fill = create_fill_report(
+        excluded_client_order_id,
+        excluded_venue_order_id,
+        excluded_instrument_id,
+        TradeId::from("T-UNCACHED-001"),
+        "1.0",
+    );
+
+    let mut mass_status =
+        create_mass_status(vec![included_report, excluded_report], vec![excluded_fill]);
+    mass_status.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        excluded_instrument_id,
+        PositionSideSpecified::Long,
+        Quantity::from("1.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        Some(dec!(100.00)),
+    )]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(test_client_id(), mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert_eq!(
+        result.rejection, None,
+        "an uncached instrument carrying only filtered reports must not reject the batch"
+    );
+    assert_eq!(
+        result.position_reports.filtered(),
+        1,
+        "the uncached instrument's position report must be accounted as filtered"
+    );
+    assert_eq!(
+        result.unresolved_reports(),
+        0,
+        "reports for an excluded instrument must not read as unresolved"
+    );
+    assert!(
+        ctx.get_order(&excluded_client_order_id).is_none(),
+        "excluded instrument must not be reconciled"
+    );
+    assert!(
+        ctx.get_order(&included_client_order_id).is_some(),
+        "included evidence must survive an uncached excluded instrument"
+    );
+}
+
 struct MockExecutionClient {
     client_id: ClientId,
     account_id: AccountId,

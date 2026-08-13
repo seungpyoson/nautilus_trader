@@ -224,17 +224,48 @@ pub struct ReconciliationResult {
     pub position_reports: PositionReconciliationSummary,
     /// Non-filtered order reports not reflected in post-reconciliation cache state.
     pub unresolved_order_reports: usize,
-    /// Unique fill reports not reflected in post-reconciliation cache state.
+    /// Non-filtered unique fill reports not reflected in post-reconciliation cache state.
     pub unresolved_fill_reports: usize,
 }
 
 impl ReconciliationResult {
     /// Returns authoritative report evidence still absent from post-pass cache state.
+    ///
+    /// Reports the configuration excluded from the pass are not counted: evidence the
+    /// node deliberately declined to process is not evidence the node failed to resolve.
     #[must_use]
     pub const fn unresolved_reports(&self) -> usize {
         self.unresolved_order_reports
             + self.unresolved_fill_reports
             + self.position_reports.unresolved()
+    }
+}
+
+/// Reconciliation configuration that deliberately excludes a report from a pass.
+///
+/// A report excluded here is never applied to cache state, so it must never count
+/// towards the unresolved totals that fail startup, and it must never make an
+/// uncached instrument reject the mass status it arrived in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconciliationFilter {
+    /// The report's client order ID is in `filtered_client_order_ids`.
+    ClientOrderId,
+    /// The report's instrument is outside `reconciliation_instrument_ids`.
+    Instrument,
+    /// `filter_unclaimed_external` excludes a venue order with no cached counterpart.
+    UnclaimedExternal,
+    /// `filter_position_reports` excludes every position report.
+    PositionReports,
+}
+
+impl Display for ReconciliationFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientOrderId => write!(f, "in filtered_client_order_ids"),
+            Self::Instrument => write!(f, "not in reconciliation_instrument_ids"),
+            Self::UnclaimedExternal => write!(f, "unclaimed external order"),
+            Self::PositionReports => write!(f, "position reports filtered"),
+        }
     }
 }
 
@@ -939,24 +970,32 @@ impl ExecutionManager {
             });
         }
 
-        let cache = self.cache.borrow();
-        let uncached_instrument = order_reports
+        // Reports the configuration excludes are never applied, so an instrument the cache
+        // does not carry for them cannot invalidate the surrounding evidence. Instrument
+        // coverage is therefore checked against the evidence the pass will process.
+        let retained_mass_status = self.processable_mass_status(mass_status);
+        let processable = retained_mass_status.as_ref().unwrap_or(mass_status);
+        let processable_orders = processable.order_reports();
+        let processable_fills = processable.fill_reports();
+        let processable_positions = processable.position_reports();
+
+        let uncached_instrument = processable_orders
             .values()
             .map(|report| (ReconciliationReportKind::Order, report.instrument_id))
             .chain(
-                fill_reports
+                processable_fills
                     .values()
                     .flatten()
                     .map(|report| (ReconciliationReportKind::Fill, report.instrument_id)),
             )
             .chain(
-                position_reports
+                processable_positions
                     .values()
                     .flatten()
                     .map(|report| (ReconciliationReportKind::Position, report.instrument_id)),
             )
-            .find(|(_, instrument_id)| cache.instrument(instrument_id).is_none());
-        drop(cache);
+            .find(|(_, instrument_id)| self.cache.borrow().instrument(instrument_id).is_none());
+
         if let Some((report_kind, instrument_id)) = uncached_instrument {
             return Err(ReconciliationRejection::InstrumentNotCached {
                 report_kind,
@@ -1064,8 +1103,10 @@ impl ExecutionManager {
             self.validate_cached_position_identity(report)?;
         }
 
+        // The engine validates whatever evidence it is handed and does not know the
+        // reconciliation filters, so it must only see what this pass will process.
         if let Err(error) =
-            exec_engine.validate_execution_mass_status(source_client_id, mass_status)
+            exec_engine.validate_execution_mass_status(source_client_id, processable)
         {
             log::error!("Invalid ExecutionMassStatus source or evidence: {error}");
             return Err(ReconciliationRejection::InvalidSource {
@@ -1074,6 +1115,62 @@ impl ExecutionManager {
         }
 
         Ok(())
+    }
+
+    /// Returns `mass_status` restricted to the evidence this pass will process.
+    ///
+    /// Returns `None` when the configuration excludes nothing, so the common path keeps
+    /// validating the original snapshot without copying it.
+    fn processable_mass_status(
+        &self,
+        mass_status: &ExecutionMassStatus,
+    ) -> Option<ExecutionMassStatus> {
+        let order_reports = mass_status.order_reports();
+        let fill_reports = mass_status.fill_reports();
+        let position_reports = mass_status.position_reports();
+
+        let retained_orders: Vec<OrderStatusReport> = order_reports
+            .values()
+            .filter(|report| self.order_report_filter(report).is_none())
+            .cloned()
+            .collect();
+        let retained_fills: Vec<FillReport> = fill_reports
+            .iter()
+            .flat_map(|(venue_order_id, fills)| {
+                fills.iter().map(move |fill| (venue_order_id, fill))
+            })
+            .filter(|(venue_order_id, fill)| {
+                self.fill_report_filter(fill, order_reports.get(*venue_order_id))
+                    .is_none()
+            })
+            .map(|(_, fill)| fill.clone())
+            .collect();
+        let retained_positions: Vec<PositionStatusReport> = position_reports
+            .iter()
+            .filter(|(instrument_id, _)| self.position_report_filter(instrument_id).is_none())
+            .flat_map(|(_, reports)| reports.iter().cloned())
+            .collect();
+
+        let excludes_nothing = retained_orders.len() == order_reports.len()
+            && retained_fills.len() == fill_reports.values().map(Vec::len).sum::<usize>()
+            && retained_positions.len() == position_reports.values().map(Vec::len).sum::<usize>();
+
+        if excludes_nothing {
+            return None;
+        }
+
+        let mut retained = ExecutionMassStatus::new(
+            mass_status.client_id,
+            mass_status.account_id,
+            mass_status.venue,
+            mass_status.ts_init,
+            Some(mass_status.report_id),
+        );
+        retained.add_order_reports(retained_orders);
+        retained.add_fill_reports(retained_fills);
+        retained.add_position_reports(retained_positions);
+
+        Some(retained)
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1192,11 +1289,8 @@ impl ExecutionManager {
         reports: &[PositionStatusReport],
         instruments_with_unattributed_fills: &IndexSet<InstrumentId>,
     ) -> PositionReportGroupDisposition {
-        if self.config.filter_position_reports {
-            return PositionReportGroupDisposition::Skipped(PositionReconciliationSkip::Filtered);
-        }
-
-        if !self.should_reconcile_instrument(&instrument_id) {
+        if let Some(filter) = self.position_report_filter(&instrument_id) {
+            log::debug!("Skipping position reports for {instrument_id}: {filter}");
             return PositionReportGroupDisposition::Skipped(PositionReconciliationSkip::Filtered);
         }
 
@@ -1317,11 +1411,14 @@ impl ExecutionManager {
 
         // Deduplicate reports by venue_order_id, keeping the most advanced state
         let order_reports = Self::deduplicate_order_reports(adjusted_order_reports.values());
-        let mut orders_skipped_filtered = 0usize;
 
         for report in order_reports.values() {
-            if self.should_skip_order_report(report) {
-                orders_skipped_filtered += 1;
+            if let Some(filter) = self.order_report_filter(report) {
+                log::debug!(
+                    "Skipping order report {} for {}: {filter}",
+                    report.venue_order_id,
+                    report.instrument_id,
+                );
                 continue;
             }
 
@@ -1443,44 +1540,44 @@ impl ExecutionManager {
                     ) {
                         log::warn!("Failed to add venue order ID index: {e}");
                     }
-                } else if !self.config.filter_unclaimed_external {
-                    if let Some(instrument) = self.get_instrument(&report.instrument_id) {
-                        let order_fills: Vec<&FillReport> = fill_reports
-                            .get(&report.venue_order_id)
-                            .map(|f| f.iter().collect())
-                            .unwrap_or_default();
-                        let (external_events, metadata) = self.handle_external_order(
-                            report,
-                            ExternalOrderAuthority {
-                                client: source_client_id,
-                                account: mass_status.account_id,
-                            },
-                            &instrument,
-                            &order_fills,
-                            false, // Not synthetic (venue order)
-                            Some(&mut fill_queue),
-                        );
+                } else if let Some(instrument) = self.get_instrument(&report.instrument_id) {
+                    // `order_report_filter` already excluded unclaimed venue orders
+                    let is_synthetic = Self::is_synthetic_order_report(report);
+                    let order_fills: Vec<&FillReport> = fill_reports
+                        .get(&report.venue_order_id)
+                        .map(|f| f.iter().collect())
+                        .unwrap_or_default();
+                    let (external_events, metadata) = self.handle_external_order(
+                        report,
+                        ExternalOrderAuthority {
+                            client: source_client_id,
+                            account: mass_status.account_id,
+                        },
+                        &instrument,
+                        &order_fills,
+                        is_synthetic,
+                        Some(&mut fill_queue),
+                    );
 
-                        if !external_events.is_empty() {
-                            external_orders_created += 1;
-                            fills_applied += external_events
-                                .iter()
-                                .filter(|e| matches!(e, OrderEventAny::Filled(_)))
-                                .count();
+                    if !external_events.is_empty() {
+                        external_orders_created += 1;
+                        fills_applied += external_events
+                            .iter()
+                            .filter(|e| matches!(e, OrderEventAny::Filled(_)))
+                            .count();
 
-                            if report.order_status.is_open() {
-                                open_orders_initialized += 1;
-                            }
-
-                            events.extend(external_events);
-
-                            if let Some(m) = metadata {
-                                external_orders.push(m);
-                            }
+                        if report.order_status.is_open() {
+                            open_orders_initialized += 1;
                         }
-                    } else {
-                        orders_skipped_no_instrument += 1;
+
+                        events.extend(external_events);
+
+                        if let Some(m) = metadata {
+                            external_orders.push(m);
+                        }
                     }
+                } else {
+                    orders_skipped_no_instrument += 1;
                 }
             } else if let Some(order) = self.get_order_by_venue_order_id(report.venue_order_id) {
                 // Fallback: match by venue_order_id
@@ -1525,7 +1622,7 @@ impl ExecutionManager {
                 }
             } else if let Some(instrument) = self.get_instrument(&report.instrument_id) {
                 // Synthetic orders (S- prefix) are generated by reconciliation logic
-                let is_synthetic = report.venue_order_id.as_str().starts_with("S-");
+                let is_synthetic = Self::is_synthetic_order_report(report);
 
                 let order_fills: Vec<&FillReport> = fill_reports
                     .get(&report.venue_order_id)
@@ -1578,24 +1675,8 @@ impl ExecutionManager {
                 continue;
             };
 
-            if !self.should_reconcile_instrument(&first_fill.instrument_id) {
-                log::debug!(
-                    "Skipping orphan fills for {}: not in reconciliation_instrument_ids",
-                    first_fill.instrument_id
-                );
-                continue;
-            }
-
-            // Skip if fill's client_order_id is in filtered list
-            if let Some(client_order_id) = &first_fill.client_order_id
-                && self
-                    .config
-                    .filtered_client_order_ids
-                    .contains(client_order_id)
-            {
-                log::debug!(
-                    "Skipping orphan fills for {client_order_id}: in filtered_client_order_ids"
-                );
+            if let Some(filter) = self.fill_report_filter(first_fill, None) {
+                log::debug!("Skipping orphan fills for {venue_order_id}: {filter}");
                 continue;
             }
 
@@ -1604,20 +1685,6 @@ impl ExecutionManager {
                 .as_ref()
                 .and_then(|id| self.get_order(*id))
                 .or_else(|| self.get_order_by_venue_order_id(*venue_order_id));
-
-            // Skip if resolved order's client_order_id is filtered (venue_order_id lookup path)
-            if let Some(ref order) = order
-                && self
-                    .config
-                    .filtered_client_order_ids
-                    .contains(&order.client_order_id())
-            {
-                log::debug!(
-                    "Skipping orphan fills for {}: in filtered_client_order_ids",
-                    order.client_order_id()
-                );
-                continue;
-            }
 
             if let Some(order) = order {
                 let instrument_id = order.instrument_id();
@@ -1726,24 +1793,42 @@ impl ExecutionManager {
             }
         }
 
-        let unresolved_order_reports = order_reports
-            .values()
-            .filter(|report| !self.should_skip_order_report(report))
-            .filter(|report| {
-                self.get_order_by_report_identity(report)
-                    .is_none_or(|order| !Self::is_exact_order_match(&order, report))
-            })
-            .count();
+        // Evidence excluded by configuration is not evidence left unresolved, so each
+        // report is accounted to exactly one of the two totals.
+        let mut filtered_order_reports = 0usize;
+        let mut unresolved_order_reports = 0usize;
+
+        for report in order_reports.values() {
+            if self.order_report_filter(report).is_some() {
+                filtered_order_reports += 1;
+            } else if self
+                .get_order_by_report_identity(report)
+                .is_none_or(|order| !Self::is_exact_order_match(&order, report))
+            {
+                unresolved_order_reports += 1;
+            }
+        }
+
         let mut unique_fill_reports = IndexMap::<FillKey, &FillReport>::new();
         for fill in fill_reports.values().flatten() {
             unique_fill_reports
                 .entry((fill.account_id, fill.instrument_id, fill.trade_id))
                 .or_insert(fill);
         }
-        let unresolved_fill_reports = unique_fill_reports
-            .iter()
-            .filter(|(fill_key, fill)| !self.is_fill_report_applied(fill, **fill_key))
-            .count();
+
+        let mut filtered_fill_reports = 0usize;
+        let mut unresolved_fill_reports = 0usize;
+
+        for (fill_key, fill) in &unique_fill_reports {
+            if self
+                .fill_report_filter(fill, order_reports.get(&fill.venue_order_id).copied())
+                .is_some()
+            {
+                filtered_fill_reports += 1;
+            } else if !self.is_fill_report_applied(fill, *fill_key) {
+                unresolved_fill_reports += 1;
+            }
+        }
 
         if orders_skipped_no_instrument > 0 {
             log::warn!("{orders_skipped_no_instrument} orders skipped (instrument not in cache)");
@@ -1753,8 +1838,10 @@ impl ExecutionManager {
             log::debug!("{orders_skipped_duplicate} orders skipped (already in sync)");
         }
 
-        if orders_skipped_filtered > 0 {
-            log::debug!("{orders_skipped_filtered} orders skipped (filtered by config)");
+        if filtered_order_reports > 0 || filtered_fill_reports > 0 {
+            log::debug!(
+                "Reports excluded by configuration: orders={filtered_order_reports}, fills={filtered_fill_reports}"
+            );
         }
 
         if unresolved_order_reports > 0 || unresolved_fill_reports > 0 {
@@ -1765,7 +1852,7 @@ impl ExecutionManager {
 
         log::info!(
             color = LogColor::Blue as u8;
-            "Reconciliation complete for {venue}: reconciled={orders_reconciled}, external={external_orders_created}, open={open_orders_initialized}, fills={fills_applied}, position_reports={}, positions_applied={}, positions_unchanged={}, positions_skipped={} (filtered={}, generation_disabled={}, insufficient_evidence={}), skipped={orders_skipped_duplicate}, filtered={orders_skipped_filtered}",
+            "Reconciliation complete for {venue}: reconciled={orders_reconciled}, external={external_orders_created}, open={open_orders_initialized}, fills={fills_applied}, position_reports={}, positions_applied={}, positions_unchanged={}, positions_skipped={} (filtered={}, generation_disabled={}, insufficient_evidence={}), skipped={orders_skipped_duplicate}, filtered={filtered_order_reports}",
             position_reports.received(),
             position_reports.applied(),
             position_reports.unchanged(),
@@ -3337,28 +3424,100 @@ impl ExecutionManager {
         self.cache.borrow().instrument(instrument_id).cloned()
     }
 
-    fn should_skip_order_report(&self, report: &OrderStatusReport) -> bool {
+    /// Returns the configuration filter excluding `report` from a pass, if any.
+    ///
+    /// This is the only place an order report is excluded by configuration. The
+    /// reconciliation pass, the unresolved-report accounting, and mass-status
+    /// validation all read their answer from here, so a filter added here takes
+    /// effect everywhere, and a filter added anywhere else has no effect at all.
+    fn order_report_filter(&self, report: &OrderStatusReport) -> Option<ReconciliationFilter> {
         if let Some(client_order_id) = &report.client_order_id
             && self
                 .config
                 .filtered_client_order_ids
                 .contains(client_order_id)
         {
-            log::debug!(
-                "Skipping order report {client_order_id}: in filtered_client_order_ids list"
-            );
-            return true;
+            return Some(ReconciliationFilter::ClientOrderId);
         }
 
         if !self.should_reconcile_instrument(&report.instrument_id) {
-            log::debug!(
-                "Skipping order report for {}: not in reconciliation_instrument_ids",
-                report.instrument_id
-            );
-            return true;
+            return Some(ReconciliationFilter::Instrument);
         }
 
-        false
+        // Unclaimed external filtering only excludes venue orders that resolve to no
+        // cached order; synthetic reconciliation orders are never venue-unclaimed.
+        if self.config.filter_unclaimed_external
+            && !Self::is_synthetic_order_report(report)
+            && self.get_order_by_report_identity(report).is_none()
+        {
+            return Some(ReconciliationFilter::UnclaimedExternal);
+        }
+
+        None
+    }
+
+    /// Returns the configuration filter excluding `fill` from a pass, if any.
+    ///
+    /// A fill carried by an order report shares that report's fate: the pass applies
+    /// the fill only while processing the report. Orphan fills, which no report in the
+    /// mass status covers, are excluded on their own identity.
+    fn fill_report_filter(
+        &self,
+        fill: &FillReport,
+        owning_report: Option<&OrderStatusReport>,
+    ) -> Option<ReconciliationFilter> {
+        if let Some(report) = owning_report {
+            return self.order_report_filter(report);
+        }
+
+        if !self.should_reconcile_instrument(&fill.instrument_id) {
+            return Some(ReconciliationFilter::Instrument);
+        }
+
+        if let Some(client_order_id) = &fill.client_order_id
+            && self
+                .config
+                .filtered_client_order_ids
+                .contains(client_order_id)
+        {
+            return Some(ReconciliationFilter::ClientOrderId);
+        }
+
+        // The venue_order_id lookup path can still resolve to a filtered order.
+        if let Some(order) = fill
+            .client_order_id
+            .and_then(|client_order_id| self.get_order(client_order_id))
+            .or_else(|| self.get_order_by_venue_order_id(fill.venue_order_id))
+            && self
+                .config
+                .filtered_client_order_ids
+                .contains(&order.client_order_id())
+        {
+            return Some(ReconciliationFilter::ClientOrderId);
+        }
+
+        None
+    }
+
+    /// Returns the configuration filter excluding position reports for `instrument_id`.
+    fn position_report_filter(&self, instrument_id: &InstrumentId) -> Option<ReconciliationFilter> {
+        if self.config.filter_position_reports {
+            return Some(ReconciliationFilter::PositionReports);
+        }
+
+        if !self.should_reconcile_instrument(instrument_id) {
+            return Some(ReconciliationFilter::Instrument);
+        }
+
+        None
+    }
+
+    /// Returns whether `report` was synthesised by position reconciliation.
+    ///
+    /// Synthetic reports carry a generated venue order ID and no client order ID,
+    /// so they are never unclaimed venue orders.
+    fn is_synthetic_order_report(report: &OrderStatusReport) -> bool {
+        report.client_order_id.is_none() && report.venue_order_id.as_str().starts_with("S-")
     }
 
     fn should_reconcile_instrument(&self, instrument_id: &InstrumentId) -> bool {
@@ -4452,10 +4611,8 @@ impl ExecutionManager {
                 (StrategyId::from("EXTERNAL"), Some(vec![tag]))
             };
 
-        // Filter unclaimed venue orders (but not synthetic reconciliation orders)
-        if self.config.filter_unclaimed_external && !is_synthetic {
-            return None;
-        }
+        // `filter_unclaimed_external` is owned by `order_report_filter`, which excludes
+        // the report before the pass reaches this point.
 
         let client_order_id = report
             .client_order_id
