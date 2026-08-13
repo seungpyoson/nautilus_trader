@@ -14,25 +14,40 @@
 // -------------------------------------------------------------------------------------------------
 
 //! Per-order fill tracking with terminal quantity normalization for the Polymarket adapter.
+//!
+//! The trade evidence ledger lives here, under the same lock as the per-order quantities, because
+//! the two always change together: a leg the venue failed has to give its quantity back in the same
+//! critical section that decides the leg is void, and a fill queued for an order that is not yet
+//! registered has to be admitted or refused against that same decision. Two locks, or two places
+//! holding trade state, is what let a fill be applied and voided out of order.
 
 use std::sync::Mutex;
 
 use indexmap::IndexMap;
-use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
+use nautilus_common::cache::fifo::FifoCacheMap;
 use nautilus_core::MUTEX_POISONED;
 #[cfg(test)]
 use nautilus_model::identifiers::InstrumentId;
 use nautilus_model::{
     enums::OrderSide,
-    events::OrderFilled,
-    identifiers::{ClientOrderId, VenueOrderId},
+    events::{OrderFillVoided, OrderFilled},
+    identifiers::{ClientOrderId, TradeId, VenueOrderId},
     reports::{FillReport, OrderStatusReport},
     types::Quantity,
 };
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
-use crate::common::consts::DUST_SNAP_THRESHOLD_DEC;
+#[cfg(test)]
+use crate::execution::trade_evidence::EvidenceState;
+use crate::{
+    common::consts::DUST_SNAP_THRESHOLD_DEC,
+    execution::{
+        evidence_ledger::{EvidenceOutcome, TradeEvidenceLedger, VoidedLeg},
+        parse::make_composite_trade_id,
+        trade_evidence::{FillDelivery, Settlement, TradeEvidence},
+    },
+};
 
 /// Cumulative fill state for a single order.
 #[derive(Debug, Clone, Copy)]
@@ -42,17 +57,29 @@ struct OrderFillState {
     order_side: OrderSide,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct FillCorrectionMetadata {
-    pub correction_key: String,
-    pub info: Option<IndexMap<Ustr, Ustr>>,
-    pub is_confirmed: bool,
+/// What the caller must emit for one venue statement about a trade leg.
+#[derive(Debug)]
+pub(crate) enum TradeAdmission {
+    /// The leg was applied against a registered order: emit this fill.
+    Emit(Box<FillReport>),
+    /// The leg was applied, and its fill is queued until the order it fills is registered.
+    Queued,
+    /// The statement changes nothing that leaves this adapter.
+    Ignored,
+    /// The leg was applied and the venue has now failed it: reverse it.
+    Voided(Box<VoidedLeg>),
 }
 
+/// A fill accepted from the venue while the order it fills was not yet registered.
+///
+/// The evidence behind it is already in the ledger, so a failure that lands before this reaches
+/// the engine still refuses it, and a re-delivery of the same trade never queues it twice.
 #[derive(Clone, Debug)]
 pub(crate) struct BufferedFill {
     pub report: FillReport,
-    pub correction: Option<FillCorrectionMetadata>,
+    /// The venue trade fields carried into `OrderFilled.info`, for a fill that came from a trade
+    /// payload rather than the order path.
+    pub info: Option<IndexMap<Ustr, Ustr>>,
 }
 
 /// Registration map plus the fill and order-report buffers, all under one mutex.
@@ -66,9 +93,7 @@ struct TrackerInner {
     orders: FifoCacheMap<VenueOrderId, OrderFillState, 10_000>,
     pending_fills: FifoCacheMap<VenueOrderId, Vec<BufferedFill>, 1_000>,
     pending_reports: FifoCacheMap<VenueOrderId, Vec<OrderStatusReport>, 1_000>,
-    voided_trades: FifoCache<String, 10_000>,
-    confirmed_trades: FifoCache<String, 10_000>,
-    applied_buffered_fills: FifoCacheMap<String, Vec<OrderFilled>, 10_000>,
+    evidence: TradeEvidenceLedger,
 }
 
 /// Tracks per-order fill accumulation, detects dust residuals, and buffers WS messages that arrive
@@ -149,31 +174,64 @@ impl OrderFillTrackerMap {
             .is_some_and(|s| s.cumulative_filled >= s.submitted_qty)
     }
 
-    /// Records a tracked fill, or buffers it until the order is registered, atomically.
+    /// Records what the venue has stated about one trade leg and applies it to the fill state.
     ///
-    /// The accepted-check and the buffer insert run under one lock, so the submit path's register
-    /// and drain (the same lock) cannot interleave between them. Returns the report to emit when the
-    /// order is registered, or `None` when it was buffered.
-    pub(crate) fn accept_or_buffer_fill(
+    /// The ledger decision, the dust snap, the quantity the order accumulates, and the queueing of
+    /// a fill for an order that is not yet registered all happen under one lock, so a re-delivered
+    /// trade cannot be applied twice and a failure cannot cross a fill that is mid-flight.
+    ///
+    /// `candidate` is the evidence the statement supports, and is `None` only when the payload
+    /// could not produce complete evidence, which only a failure acts on.
+    pub(crate) fn observe_trade_leg(
         &self,
-        venue_order_id: VenueOrderId,
-        report: FillReport,
-        correction: FillCorrectionMetadata,
-    ) -> Option<FillReport> {
+        trade_id: TradeId,
+        candidate: Option<TradeEvidence>,
+        settlement: Settlement,
+        delivery: FillDelivery,
+        info: Option<IndexMap<Ustr, Ustr>>,
+    ) -> TradeAdmission {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        if guard.orders.get(&venue_order_id).is_some() {
-            record_fill_in(&mut guard.orders, &venue_order_id, report.last_qty);
-            Some(report)
-        } else {
-            push_buffered(
-                &mut guard.pending_fills,
-                venue_order_id,
-                BufferedFill {
-                    report,
-                    correction: Some(correction),
-                },
-            );
-            None
+        let inner = &mut *guard;
+        let candidate = candidate.map(|mut evidence| {
+            evidence.last_qty =
+                snap_fill_qty_in(&inner.orders, &evidence.venue_order_id, evidence.last_qty);
+            evidence
+        });
+
+        match inner.evidence.observe(trade_id, candidate, settlement) {
+            EvidenceOutcome::Ignore => TradeAdmission::Ignored,
+            EvidenceOutcome::Void(leg) => {
+                // A fill still queued never reached the order's quantity, so the leg is simply
+                // dropped from the queue. Anything else was already counted, either by an emitted
+                // event or by the drain that is carrying it, and has to be given back here.
+                let queued =
+                    remove_buffered_fill(&mut inner.pending_fills, &leg.venue_order_id, &trade_id);
+
+                if !queued {
+                    reverse_fill_in(&mut inner.orders, &leg.venue_order_id, leg.last_qty);
+                }
+
+                TradeAdmission::Voided(leg)
+            }
+            EvidenceOutcome::Apply => {
+                let Some(evidence) = inner.evidence.evidence(&trade_id) else {
+                    return TradeAdmission::Ignored;
+                };
+                let report = evidence.to_fill_report(delivery);
+                let venue_order_id = report.venue_order_id;
+
+                if inner.orders.get(&venue_order_id).is_some() {
+                    record_fill_in(&mut inner.orders, &venue_order_id, report.last_qty);
+                    TradeAdmission::Emit(Box::new(report))
+                } else {
+                    push_buffered(
+                        &mut inner.pending_fills,
+                        venue_order_id,
+                        BufferedFill { report, info },
+                    );
+                    TradeAdmission::Queued
+                }
+            }
         }
     }
 
@@ -199,8 +257,8 @@ impl OrderFillTrackerMap {
     /// Registers the order, then drains and prepares its buffered fills under one lock.
     ///
     /// Registration and the drain are a single critical section, so a concurrent
-    /// [`Self::accept_or_buffer_fill`] cannot read the order as unregistered and buffer a fill into
-    /// the window after this drain.
+    /// [`Self::observe_trade_leg`] cannot read the order as unregistered and queue a fill into the
+    /// window after this drain.
     pub(crate) fn register_and_take_pending_fills(
         &self,
         venue_order_id: VenueOrderId,
@@ -263,88 +321,114 @@ impl OrderFillTrackerMap {
             .unwrap_or_default()
     }
 
-    /// Emits a buffered fill and records it for a possible later trade failure atomically.
+    /// Emits a fill drained from the queue and records the event against its evidence, atomically.
     ///
-    /// If `FAILED` won the lock first, the fill is suppressed and its tracker quantity is rolled
-    /// back. Otherwise the event is sent before it becomes visible to the failure path, preserving
-    /// `OrderFilled` before `OrderFillVoided` on the execution channel.
-    pub(crate) fn emit_buffered_fill<F>(
-        &self,
-        fill: OrderFilled,
-        correction: Option<&FillCorrectionMetadata>,
-        emit: F,
-    ) -> bool
+    /// A leg the venue failed after the drain took its fill is refused here, so the failure can
+    /// win that race without ever letting the fill through. The quantity is not given back on that
+    /// refusal: the failure gave it back when it decided the leg was void. Otherwise the event is
+    /// sent before it becomes visible to the failure path, preserving `OrderFilled` before
+    /// `OrderFillVoided` on the execution channel.
+    pub(crate) fn emit_buffered_fill<F>(&self, fill: OrderFilled, emit: F) -> bool
     where
         F: FnOnce(OrderFilled, Option<Quantity>),
     {
-        let Some(correction) = correction else {
-            let new_qty = self.buy_overfill_bump(&fill.venue_order_id);
-            emit(fill, new_qty);
-            return true;
-        };
-
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        if guard.voided_trades.contains(&correction.correction_key) {
-            reverse_fill_in(&mut guard.orders, &fill.venue_order_id, fill.last_qty);
+        let inner = &mut *guard;
+
+        if inner.evidence.is_voided(&fill.trade_id) {
+            log::warn!("Refusing a drained fill for failed trade {}", fill.trade_id);
             return false;
         }
 
-        let new_qty = buy_overfill_bump_in(&mut guard.orders, &fill.venue_order_id);
+        let new_qty = buy_overfill_bump_in(&mut inner.orders, &fill.venue_order_id);
         emit(fill.clone(), new_qty);
+        inner.evidence.record_fill_event(fill);
 
-        if let Some(fills) = guard
-            .applied_buffered_fills
-            .get_mut(&correction.correction_key)
-        {
-            fills.push(fill);
-        } else {
-            guard
-                .applied_buffered_fills
-                .insert(correction.correction_key.clone(), vec![fill]);
-        }
         true
     }
 
-    /// Marks a trade failed and returns buffered fills that were already emitted.
-    pub(crate) fn void_buffered_trade(&self, correction_key: &str) -> Vec<OrderFilled> {
-        let key = correction_key.to_string();
-        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        guard.confirmed_trades.remove(&key);
-        guard.voided_trades.add(key.clone());
-        let fills = guard
-            .applied_buffered_fills
-            .remove(&key)
-            .unwrap_or_default();
+    /// Emits a fill drained from the queue that has no local order to attach it to, as a report.
+    ///
+    /// Reports leave no event the engine can reverse, so nothing is recorded against the evidence,
+    /// but a leg the venue has failed is refused on the same terms as one that emits an event.
+    pub(crate) fn emit_buffered_report<F>(&self, fill: &FillReport, emit: F) -> bool
+    where
+        F: FnOnce(),
+    {
+        let guard = self.inner.lock().expect(MUTEX_POISONED);
 
-        for fill in &fills {
-            reverse_fill_in(&mut guard.orders, &fill.venue_order_id, fill.last_qty);
+        if guard.evidence.is_voided(&fill.trade_id) {
+            log::warn!(
+                "Refusing a drained fill report for failed trade {}",
+                fill.trade_id
+            );
+            return false;
         }
-        fills
+
+        drop(guard);
+        emit();
+
+        true
     }
 
-    pub(crate) fn mark_trade_confirmed(&self, correction_key: &str) {
+    /// Records the event an applied leg produced, so a later failure reverses what was applied.
+    pub(crate) fn record_fill_event(&self, filled: OrderFilled) {
         self.inner
             .lock()
             .expect(MUTEX_POISONED)
-            .confirmed_trades
-            .add(correction_key.to_string());
+            .evidence
+            .record_fill_event(filled);
     }
 
+    /// Returns whether the venue has confirmed the leg this fill came from.
     #[must_use]
-    pub(crate) fn is_trade_confirmed(&self, correction_key: &str) -> bool {
+    pub(crate) fn is_trade_confirmed(&self, trade_id: &TradeId) -> bool {
         self.inner
             .lock()
             .expect(MUTEX_POISONED)
-            .confirmed_trades
-            .contains(&correction_key.to_string())
+            .evidence
+            .is_confirmed(trade_id)
     }
 
-    pub(crate) fn reverse_fill(&self, venue_order_id: &VenueOrderId, quantity: Quantity) {
-        reverse_fill_in(
-            &mut self.inner.lock().expect(MUTEX_POISONED).orders,
-            venue_order_id,
-            quantity,
-        );
+    /// Returns whether the venue has confirmed the leg of `venue_trade_id` that filled this order.
+    ///
+    /// The order channel names its trades by the venue's own trade ID, while a maker leg is
+    /// recorded under the composite ID the engine indexes that fill by. Both forms are asked for,
+    /// so the answer comes from the evidence rather than from a second set kept alongside it.
+    #[must_use]
+    pub(crate) fn is_venue_trade_confirmed(
+        &self,
+        venue_trade_id: &str,
+        venue_order_id: &VenueOrderId,
+    ) -> bool {
+        let composite = make_composite_trade_id(venue_trade_id, venue_order_id.as_str());
+        let guard = self.inner.lock().expect(MUTEX_POISONED);
+
+        guard.evidence.is_confirmed(&composite)
+            || guard.evidence.is_confirmed(&TradeId::from(venue_trade_id))
+    }
+
+    /// Restores a leg applied in an earlier session, so the venue can still fail it.
+    pub(crate) fn restore_applied_evidence(&self, filled: &OrderFilled) {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .evidence
+            .restore_applied(filled);
+    }
+
+    /// Restores a leg voided in an earlier session, so it can never be applied again.
+    pub(crate) fn restore_voided_evidence(&self, voided: &OrderFillVoided) {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .evidence
+            .restore_voided(voided);
+    }
+
+    /// Drops every trade leg this adapter has accepted.
+    pub(crate) fn clear_trade_evidence(&self) {
+        self.inner.lock().expect(MUTEX_POISONED).evidence.clear();
     }
 
     /// Snap each report's `last_qty` against the registered submitted quantity
@@ -360,27 +444,6 @@ impl OrderFillTrackerMap {
             report.last_qty =
                 snap_fill_qty_in(&guard.orders, &report.venue_order_id, report.last_qty);
         }
-    }
-
-    /// Snap a single fill qty DOWN to `submitted_qty` when the venue reports
-    /// dust overfill (within `DUST_SNAP_THRESHOLD_DEC`).
-    ///
-    /// Overfill snapping is required because the engine rejects fills past
-    /// `submitted_qty`. Underfill is intentionally left alone here: a single
-    /// partial fill that happens to land near submitted_qty might still be
-    /// followed by additional matches, or the order might end up canceled
-    /// with the dust remaining as legitimate leaves. Terminal quantity
-    /// normalization handles the CLOB cent-tick truncation
-    /// case after all associated trades confirm.
-    ///
-    /// See `docs/integrations/polymarket.md` (Fill quantity normalization).
-    pub(crate) fn snap_fill_qty(
-        &self,
-        venue_order_id: &VenueOrderId,
-        fill_qty: Quantity,
-    ) -> Quantity {
-        let guard = self.inner.lock().expect(MUTEX_POISONED);
-        snap_fill_qty_in(&guard.orders, venue_order_id, fill_qty)
     }
 
     /// Raise the registered quantity to the cumulative BUY fills when they exceed it, returning
@@ -508,9 +571,34 @@ fn take_and_prepare_fills(
             buffered.report.last_qty =
                 snap_fill_qty_in(&inner.orders, &venue_order_id, buffered.report.last_qty);
             record_fill_in(&mut inner.orders, &venue_order_id, buffered.report.last_qty);
+            inner
+                .evidence
+                .record_applied_quantity(&buffered.report.trade_id, buffered.report.last_qty);
             buffered
         })
         .collect()
+}
+
+/// Drops a queued fill for one trade leg, returning whether it was still queued.
+///
+/// A queued fill has not been counted against the order, so dropping it is the whole reversal.
+fn remove_buffered_fill(
+    buffer: &mut FifoCacheMap<VenueOrderId, Vec<BufferedFill>, 1_000>,
+    venue_order_id: &VenueOrderId,
+    trade_id: &TradeId,
+) -> bool {
+    let Some(fills) = buffer.get_mut(venue_order_id) else {
+        return false;
+    };
+    let before = fills.len();
+    fills.retain(|fill| fill.report.trade_id != *trade_id);
+    let removed = fills.len() != before;
+
+    if fills.is_empty() {
+        buffer.remove(venue_order_id);
+    }
+
+    removed
 }
 
 fn push_buffered<V>(
@@ -527,6 +615,27 @@ fn push_buffered<V>(
 
 #[cfg(test)]
 impl OrderFillTrackerMap {
+    /// Snap a single fill qty DOWN to `submitted_qty` when the venue reports
+    /// dust overfill (within `DUST_SNAP_THRESHOLD_DEC`).
+    ///
+    /// Overfill snapping is required because the engine rejects fills past
+    /// `submitted_qty`. Underfill is intentionally left alone here: a single
+    /// partial fill that happens to land near submitted_qty might still be
+    /// followed by additional matches, or the order might end up canceled
+    /// with the dust remaining as legitimate leaves. Terminal quantity
+    /// normalization handles the CLOB cent-tick truncation
+    /// case after all associated trades confirm.
+    ///
+    /// See `docs/integrations/polymarket.md` (Fill quantity normalization).
+    pub(crate) fn snap_fill_qty(
+        &self,
+        venue_order_id: &VenueOrderId,
+        fill_qty: Quantity,
+    ) -> Quantity {
+        let guard = self.inner.lock().expect(MUTEX_POISONED);
+        snap_fill_qty_in(&guard.orders, venue_order_id, fill_qty)
+    }
+
     /// Registers an order directly, for tests that set up an already-accepted order.
     pub(crate) fn register(
         &self,
@@ -568,11 +677,27 @@ impl OrderFillTrackerMap {
         push_buffered(
             &mut self.inner.lock().expect(MUTEX_POISONED).pending_fills,
             venue_order_id,
-            BufferedFill {
-                report,
-                correction: None,
-            },
+            BufferedFill { report, info: None },
         );
+    }
+
+    /// Marks a trade leg settled, as a `CONFIRMED` statement from the venue would.
+    pub(crate) fn confirm_evidence_for_test(&self, filled: &OrderFilled) {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .evidence
+            .restore_confirmed(filled);
+    }
+
+    /// Returns the state the ledger holds for a trade leg.
+    pub(crate) fn evidence_state_for_test(&self, trade_id: &TradeId) -> Option<EvidenceState> {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .evidence
+            .evidence(trade_id)
+            .map(|evidence| evidence.state)
     }
 
     /// Buffers an order report as if it arrived on the WS channel before the order was registered.
@@ -675,6 +800,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::execution::trade_evidence::{LegEconomics, LegIdentity};
 
     fn pusd() -> Currency {
         Currency::pUSD()
@@ -697,23 +823,44 @@ mod tests {
         assert!(tracker.contains(&vid));
     }
 
-    #[rstest]
-    fn test_failed_trade_suppresses_buffered_fill_drained_later() {
-        use std::cell::Cell;
+    /// Builds the evidence a report states, so tests can drive the ledger the way dispatch does.
+    fn evidence_for(report: &FillReport) -> TradeEvidence {
+        TradeEvidence::build(
+            LegIdentity {
+                trade_id: report.trade_id,
+                venue_order_id: report.venue_order_id,
+                instrument_id: report.instrument_id,
+                order_side: report.order_side,
+                liquidity_side: report.liquidity_side,
+            },
+            LegEconomics {
+                size: report.last_qty.as_decimal(),
+                price: report.last_px.as_decimal(),
+                size_precision: report.last_qty.precision,
+                price_precision: report.last_px.precision,
+                fee_rate: Decimal::ZERO,
+                fee_exponent: 1.0,
+                currency: pusd(),
+            },
+            Some(report.ts_event),
+        )
+        .expect("valid evidence")
+    }
 
-        use nautilus_model::{
-            enums::OrderType,
-            identifiers::{StrategyId, TraderId},
-        };
+    fn delivery_for(report: &FillReport) -> FillDelivery {
+        FillDelivery {
+            account_id: report.account_id,
+            client_order_id: report.client_order_id,
+            ts_init: report.ts_init,
+        }
+    }
 
-        let tracker = OrderFillTrackerMap::new();
-        let venue_order_id = VenueOrderId::from("order-failed-before-drain");
-        let instrument_id = InstrumentId::from("TEST.POLYMARKET");
-        let report = FillReport {
+    fn queued_fill_report(venue_order_id: VenueOrderId, trade_id: &str) -> FillReport {
+        FillReport {
             account_id: AccountId::from("POLY-001"),
-            instrument_id,
+            instrument_id: InstrumentId::from("TEST.POLYMARKET"),
             venue_order_id,
-            trade_id: TradeId::from("trade-failed-before-drain"),
+            trade_id: TradeId::from(trade_id),
             order_side: OrderSide::Buy,
             last_qty: Quantity::new(5.0, 6),
             last_px: Price::new(0.55, 2),
@@ -725,32 +872,21 @@ mod tests {
             ts_init: UnixNanos::default(),
             client_order_id: None,
             venue_position_id: None,
-        };
-        let correction_key = "trade-failed-before-drain-order-failed-before-drain";
+        }
+    }
 
-        let accepted = tracker.accept_or_buffer_fill(
-            venue_order_id,
-            report.clone(),
-            FillCorrectionMetadata {
-                correction_key: correction_key.to_string(),
-                info: None,
-                is_confirmed: false,
-            },
-        );
-        let prior_fills = tracker.void_buffered_trade(correction_key);
-        let drained = tracker.register_and_take_pending_fills(
-            venue_order_id,
-            Some(ClientOrderId::from("O-FAILED-BEFORE-DRAIN")),
-            Quantity::new(10.0, 6),
-            OrderSide::Buy,
-        );
-        let buffered = &drained[0];
-        let fill = OrderFilled::new(
+    fn filled_from(report: &FillReport) -> OrderFilled {
+        use nautilus_model::{
+            enums::OrderType,
+            identifiers::{StrategyId, TraderId},
+        };
+
+        OrderFilled::new(
             TraderId::from("TESTER-001"),
             StrategyId::from("S-001"),
-            instrument_id,
+            report.instrument_id,
             ClientOrderId::from("O-FAILED-BEFORE-DRAIN"),
-            venue_order_id,
+            report.venue_order_id,
             report.account_id,
             report.trade_id,
             report.order_side,
@@ -766,17 +902,226 @@ mod tests {
             None,
             Some(report.commission),
             None,
+        )
+    }
+
+    #[rstest]
+    fn test_failed_trade_drops_a_still_queued_fill() {
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("order-failed-before-drain");
+        let report = queued_fill_report(venue_order_id, "trade-failed-before-drain");
+        let evidence = evidence_for(&report);
+
+        let queued = tracker.observe_trade_leg(
+            report.trade_id,
+            Some(evidence.clone()),
+            Settlement::Pending,
+            delivery_for(&report),
+            None,
+        );
+        let failed = tracker.observe_trade_leg(
+            report.trade_id,
+            Some(evidence),
+            Settlement::Failed,
+            delivery_for(&report),
+            None,
+        );
+        let drained = tracker.register_and_take_pending_fills(
+            venue_order_id,
+            Some(ClientOrderId::from("O-FAILED-BEFORE-DRAIN")),
+            Quantity::new(10.0, 6),
+            OrderSide::Buy,
+        );
+
+        assert!(matches!(queued, TradeAdmission::Queued));
+        match failed {
+            TradeAdmission::Voided(leg) => assert!(leg.filled.is_none()),
+            other => panic!("expected a void, was {other:?}"),
+        }
+        assert!(drained.is_empty());
+        assert_eq!(
+            tracker.get_cumulative_filled(&venue_order_id),
+            Some(Quantity::zero(6))
+        );
+    }
+
+    #[rstest]
+    fn test_failed_trade_refuses_a_fill_already_drained() {
+        use std::cell::Cell;
+
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("order-failed-mid-flight");
+        let report = queued_fill_report(venue_order_id, "trade-failed-mid-flight");
+        let evidence = evidence_for(&report);
+
+        let queued = tracker.observe_trade_leg(
+            report.trade_id,
+            Some(evidence.clone()),
+            Settlement::Pending,
+            delivery_for(&report),
+            None,
+        );
+        let drained = tracker.register_and_take_pending_fills(
+            venue_order_id,
+            Some(ClientOrderId::from("O-FAILED-BEFORE-DRAIN")),
+            Quantity::new(10.0, 6),
+            OrderSide::Buy,
+        );
+        let failed = tracker.observe_trade_leg(
+            report.trade_id,
+            Some(evidence),
+            Settlement::Failed,
+            delivery_for(&report),
+            None,
         );
         let was_emitted = Cell::new(false);
-        let emitted = tracker.emit_buffered_fill(fill, buffered.correction.as_ref(), |_, _| {
+        let emitted = tracker.emit_buffered_fill(filled_from(&report), |_, _| {
             was_emitted.set(true);
         });
 
-        assert!(accepted.is_none());
-        assert!(prior_fills.is_empty());
+        assert!(matches!(queued, TradeAdmission::Queued));
         assert_eq!(drained.len(), 1);
+
+        match failed {
+            TradeAdmission::Voided(leg) => assert!(leg.filled.is_none()),
+            other => panic!("expected a void, was {other:?}"),
+        }
+
         assert!(!emitted);
         assert!(!was_emitted.get());
+        assert_eq!(
+            tracker.get_cumulative_filled(&venue_order_id),
+            Some(Quantity::zero(6))
+        );
+    }
+
+    /// A fill for an order this client does not own locally leaves the adapter as a report rather
+    /// than an event, and a failed trade has to refuse it on the same terms: reconciliation would
+    /// otherwise read the report as a fill the venue never settled.
+    #[rstest]
+    fn test_failed_trade_refuses_a_drained_fill_report() {
+        use std::cell::Cell;
+
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("order-report-after-failure");
+        let report = queued_fill_report(venue_order_id, "trade-report-after-failure");
+        let evidence = evidence_for(&report);
+
+        tracker.observe_trade_leg(
+            report.trade_id,
+            Some(evidence.clone()),
+            Settlement::Pending,
+            delivery_for(&report),
+            None,
+        );
+        let drained = tracker.register_and_take_pending_fills(
+            venue_order_id,
+            None,
+            Quantity::new(10.0, 6),
+            OrderSide::Buy,
+        );
+        tracker.observe_trade_leg(
+            report.trade_id,
+            Some(evidence),
+            Settlement::Failed,
+            delivery_for(&report),
+            None,
+        );
+        let was_emitted = Cell::new(false);
+        let emitted = tracker.emit_buffered_report(&drained[0].report, || {
+            was_emitted.set(true);
+        });
+
+        assert!(!emitted);
+        assert!(!was_emitted.get());
+        assert_eq!(
+            tracker.get_cumulative_filled(&venue_order_id),
+            Some(Quantity::zero(6))
+        );
+    }
+
+    /// A leg is queued before the order's registered size is known, so the drain's dust snap is
+    /// the first moment its applied quantity is settled. The `CONFIRMED` statement that follows
+    /// restates the venue's own numbers, and must settle the leg rather than read as a conflict
+    /// against the snapped quantity.
+    #[rstest]
+    fn test_confirmation_after_a_snapped_drain_settles_the_leg() {
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("order-snapped-drain");
+        let mut report = queued_fill_report(venue_order_id, "trade-snapped-drain");
+        report.last_qty = Quantity::new(5.202914, 6);
+        let submitted_qty = Quantity::new(5.202910, 6);
+        let evidence = evidence_for(&report);
+
+        let queued = tracker.observe_trade_leg(
+            report.trade_id,
+            Some(evidence.clone()),
+            Settlement::Pending,
+            delivery_for(&report),
+            None,
+        );
+        let drained = tracker.register_and_take_pending_fills(
+            venue_order_id,
+            Some(ClientOrderId::from("O-SNAPPED-DRAIN")),
+            submitted_qty,
+            OrderSide::Buy,
+        );
+        let confirmed = tracker.observe_trade_leg(
+            report.trade_id,
+            Some(evidence),
+            Settlement::Confirmed,
+            delivery_for(&report),
+            None,
+        );
+
+        assert!(matches!(queued, TradeAdmission::Queued));
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].report.last_qty, submitted_qty);
+        assert!(matches!(confirmed, TradeAdmission::Ignored));
+        assert!(tracker.is_trade_confirmed(&report.trade_id));
+    }
+
+    #[rstest]
+    fn test_applied_fill_is_voided_once_with_its_event() {
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("order-applied-then-failed");
+        let report = queued_fill_report(venue_order_id, "trade-applied-then-failed");
+        tracker.register(
+            venue_order_id,
+            Quantity::new(10.0, 6),
+            OrderSide::Buy,
+            report.instrument_id,
+            6,
+            2,
+        );
+        let evidence = evidence_for(&report);
+
+        let applied = tracker.observe_trade_leg(
+            report.trade_id,
+            Some(evidence.clone()),
+            Settlement::Pending,
+            delivery_for(&report),
+            None,
+        );
+        tracker.record_fill_event(filled_from(&report));
+        let failed = tracker.observe_trade_leg(
+            report.trade_id,
+            Some(evidence),
+            Settlement::Failed,
+            delivery_for(&report),
+            None,
+        );
+
+        assert!(matches!(applied, TradeAdmission::Emit(_)));
+        match failed {
+            TradeAdmission::Voided(leg) => {
+                assert_eq!(
+                    leg.filled.map(|filled| filled.trade_id),
+                    Some(report.trade_id)
+                );
+            }
+            other => panic!("expected a void, was {other:?}"),
+        }
         assert_eq!(
             tracker.get_cumulative_filled(&venue_order_id),
             Some(Quantity::zero(6))

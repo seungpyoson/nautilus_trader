@@ -30,7 +30,10 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use nautilus_core::UnixNanos;
 use nautilus_model::{enums::LiquiditySide, instruments::Instrument, types::Currency};
 use nautilus_polymarket::{
-    execution::parse::{build_maker_fill_report, parse_fill_report, parse_order_status_report},
+    execution::{
+        parse::{parse_order_status_report, parse_timestamp},
+        trade_evidence::{FillDelivery, maker_leg_evidence, taker_leg_evidence},
+    },
     http::models::{PolymarketOpenOrder, PolymarketTradeReport},
     websocket::{
         messages::MarketWsMessage,
@@ -207,7 +210,9 @@ fn bench_order_event(c: &mut Criterion) {
 
 fn bench_order_fill(c: &mut Criterion) {
     // Same rationale as `order_event`: REST `GET /trades` parse stands in for
-    // the (private) WS user-trade -> FillReport conversion.
+    // the (private) WS user-trade -> FillReport conversion. Both transports now
+    // reach a fill through the same leg builder, so this measures the shared
+    // validation boundary rather than one transport's own parse.
     let instrument = yes_instrument();
     let (px_prec, sz_prec) = instrument_precisions();
     let account_id = common::account_id();
@@ -222,19 +227,26 @@ fn bench_order_fill(c: &mut Criterion) {
         b.iter(|| {
             let trade: PolymarketTradeReport =
                 serde_json::from_str(black_box(fixtures::HTTP_TRADE_REPORT)).unwrap();
-            let report = parse_fill_report(
-                &trade,
+            let evidence = taker_leg_evidence(
+                &trade.id,
+                &trade.taker_order_id,
+                trade.side,
                 instrument.id(),
-                account_id,
-                None,
+                trade.size,
+                trade.price,
                 px_prec,
                 sz_prec,
                 currency,
                 taker_fee,
                 fee_exponent,
-                ts_init,
+                parse_timestamp(&trade.match_time),
             )
             .expect("benchmark fixture fill should be valid");
+            let report = evidence.to_fill_report(FillDelivery {
+                account_id,
+                client_order_id: None,
+                ts_init,
+            });
             black_box(report);
         });
     });
@@ -258,22 +270,25 @@ fn bench_order_fill_maker(c: &mut Criterion) {
                 .maker_orders
                 .iter()
                 .map(|order| {
-                    build_maker_fill_report(
+                    maker_leg_evidence(
                         order,
                         &trade.id,
                         trade.trader_side,
                         trade.side,
                         trade.asset_id.as_str(),
-                        account_id,
                         instrument.id(),
                         px_prec,
                         sz_prec,
                         currency,
                         LiquiditySide::Maker,
-                        ts_init,
-                        ts_init,
+                        parse_timestamp(&trade.match_time),
                     )
                     .expect("benchmark fixture maker fill should be valid")
+                    .to_fill_report(FillDelivery {
+                        account_id,
+                        client_order_id: None,
+                        ts_init,
+                    })
                 })
                 .collect();
             black_box(reports);

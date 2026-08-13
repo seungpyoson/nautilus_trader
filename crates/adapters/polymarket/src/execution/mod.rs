@@ -17,7 +17,9 @@
 
 pub mod order_builder;
 pub mod parse;
+pub mod trade_evidence;
 
+pub(crate) mod evidence_ledger;
 pub(crate) mod identity;
 pub(crate) mod order_fill_tracker;
 pub(crate) mod pending;

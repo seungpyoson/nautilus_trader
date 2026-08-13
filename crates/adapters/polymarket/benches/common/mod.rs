@@ -225,7 +225,7 @@ pub(crate) mod fixtures {
         "created_at": 1703875200
     }"#;
 
-    /// HTTP REST `GET /trades` row used by `parse_fill_report`.
+    /// HTTP REST `GET /trades` row used by `taker_leg_evidence` and `maker_leg_evidence`.
     pub(crate) const HTTP_TRADE_REPORT: &str = r#"{
         "id": "trade-0xabcdef1234",
         "taker_order_id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",

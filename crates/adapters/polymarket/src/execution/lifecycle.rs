@@ -21,16 +21,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use anyhow::Context;
-use indexmap::IndexMap;
 use nautilus_common::{
     live::{runner::get_exec_event_sender, runtime::get_runtime},
     msgbus::{self, TypedHandler},
 };
 use nautilus_core::{MUTEX_POISONED, collections::AtomicMap, time::AtomicTime};
 use nautilus_model::{
-    events::{OrderEventAny, OrderFilled, PositionEvent},
+    events::{OrderEventAny, PositionEvent},
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
     orders::Order,
@@ -410,9 +409,6 @@ impl PolymarketExecutionClient {
             .collect();
         drop(cache);
 
-        let mut matched_fills: AHashMap<String, Vec<OrderFilled>> = AHashMap::new();
-        let mut voided_trades = AHashSet::new();
-
         for order in &orders {
             let Some(venue_order_id) = order.venue_order_id() else {
                 continue;
@@ -428,33 +424,19 @@ impl PolymarketExecutionClient {
                 order.order_side(),
             );
 
+            // Replayed in order, so a fill this client later voided is restored as voided: what
+            // the venue can still do to a trade depends on what this client last did about it.
             for event in order.events() {
                 match event {
                     OrderEventAny::Filled(fill) => {
-                        if let Some(key) = polymarket_trade_key(fill.info.as_ref()) {
-                            matched_fills.entry(key).or_default().push(fill.clone());
-                        }
+                        self.fill_tracker.restore_applied_evidence(fill);
                     }
                     OrderEventAny::FillVoided(voided) => {
-                        if let Some(key) = polymarket_trade_key(voided.info.as_ref()) {
-                            voided_trades.insert(key);
-                        }
+                        self.fill_tracker.restore_voided_evidence(voided);
                     }
                     _ => {}
                 }
             }
-        }
-
-        let mut state = self.ws_dispatch_state.lock().expect(MUTEX_POISONED);
-
-        for (key, fills) in matched_fills {
-            if !voided_trades.contains(&key) {
-                state.restore_matched_trade(key, fills);
-            }
-        }
-
-        for key in voided_trades {
-            state.restore_voided_trade(key);
         }
 
         log::debug!("Loaded {} order lifecycles from cache", orders.len());
@@ -509,6 +491,7 @@ impl PolymarketExecutionClient {
         self.shared_token_instruments.store(AHashMap::new());
         self.neg_risk_index.store(AHashMap::new());
         *self.ws_dispatch_state.lock().expect(MUTEX_POISONED) = WsDispatchState::default();
+        self.fill_tracker.clear_trade_evidence();
     }
 
     pub(super) async fn connect_client(&mut self) -> anyhow::Result<()> {
@@ -716,13 +699,6 @@ async fn run_heartbeats(
     }
 }
 
-fn polymarket_trade_key(info: Option<&IndexMap<Ustr, Ustr>>) -> Option<String> {
-    let info = info?;
-    let trade_id = info.get(&Ustr::from("id"))?;
-    let taker_order_id = info.get(&Ustr::from("taker_order_id"))?;
-    Some(format!("{trade_id}-{taker_order_id}"))
-}
-
 fn upsert_execution_lookup(
     shared_token_instruments: &AtomicMap<Ustr, InstrumentAny>,
     neg_risk_index: &AtomicMap<InstrumentId, bool>,
@@ -812,6 +788,7 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use indexmap::IndexMap;
     use nautilus_common::{
         cache::Cache,
         live::runner::set_exec_event_sender,
@@ -820,8 +797,14 @@ mod tests {
     use nautilus_core::{UUID4, UnixNanos, nanos::DurationNanos};
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
-        enums::{AccountType, OmsType, OrderSide, OrderStatus, PositionSide, TimeInForce},
-        events::{OrderEventAny, PositionClosed, PositionEvent, order::spec::OrderFillVoidedSpec},
+        enums::{
+            AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
+            TimeInForce,
+        },
+        events::{
+            OrderEventAny, OrderFilled, PositionClosed, PositionEvent,
+            order::spec::OrderFillVoidedSpec,
+        },
         identifiers::{
             AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId,
             TraderId, VenueOrderId,
@@ -835,7 +818,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::factories::spawn_rejecting_proxy;
+    use crate::{execution::trade_evidence::EvidenceState, factories::spawn_rejecting_proxy};
 
     const TEST_PRIVATE_KEY: &str =
         "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
@@ -1177,12 +1160,11 @@ mod tests {
 
         client.load_orders_from_cache();
 
-        let key = "trade-restart-V-001";
+        let trade_id = TradeId::from("trade-restart");
         let identity = client
             .order_identities
             .get(&venue_order_id)
             .expect("order identity restored");
-        let state = client.ws_dispatch_state.lock().expect(MUTEX_POISONED);
 
         assert_eq!(identity.client_order_id, order.client_order_id());
         assert!(!client.order_identities.mark_accepted(venue_order_id));
@@ -1191,9 +1173,10 @@ mod tests {
             Some(order.filled_qty())
         );
         assert_eq!(order.status(), OrderStatus::Voided);
-        assert!(state.processed_fills.contains(&key.to_string()));
-        assert_eq!(state.matched_fill_count(key), 0);
-        assert!(state.is_voided_trade(key));
+        assert_eq!(
+            client.fill_tracker.evidence_state_for_test(&trade_id),
+            Some(EvidenceState::Voided)
+        );
     }
 
     #[rstest]
@@ -1466,12 +1449,10 @@ mod tests {
         client.upsert_execution_lookup(&expired);
         client.ensure_order_event_subscription();
         client.ensure_position_event_subscription();
+        let trade_id = TradeId::from("trade-1");
         client
-            .ws_dispatch_state
-            .lock()
-            .expect(MUTEX_POISONED)
-            .processed_fills
-            .add("trade-1".to_string());
+            .fill_tracker
+            .restore_applied_evidence(&restored_fill(trade_id));
 
         client.reset_client();
 
@@ -1484,36 +1465,53 @@ mod tests {
         );
         assert!(!client.neg_risk_index.contains_key(&expired.id()));
         assert!(
-            !client
-                .ws_dispatch_state
-                .lock()
-                .expect(MUTEX_POISONED)
-                .processed_fills
-                .contains(&"trade-1".to_string())
+            client
+                .fill_tracker
+                .evidence_state_for_test(&trade_id)
+                .is_none()
         );
     }
 
     #[rstest]
-    fn stop_preserves_websocket_dedup_state_for_reconnect() {
+    fn stop_preserves_trade_evidence_for_reconnect() {
         let (mut client, _cache) = test_client();
-        let dedup_key = "trade-reconnect".to_string();
+        let trade_id = TradeId::from("trade-reconnect");
         client.start_client();
         client
-            .ws_dispatch_state
-            .lock()
-            .expect(MUTEX_POISONED)
-            .processed_fills
-            .add(dedup_key.clone());
+            .fill_tracker
+            .restore_applied_evidence(&restored_fill(trade_id));
 
         client.stop_client();
 
-        assert!(
-            client
-                .ws_dispatch_state
-                .lock()
-                .expect(MUTEX_POISONED)
-                .processed_fills
-                .contains(&dedup_key)
+        assert_eq!(
+            client.fill_tracker.evidence_state_for_test(&trade_id),
+            Some(EvidenceState::Applied)
         );
+    }
+
+    /// A fill from an earlier session, for tests that need evidence already in the ledger.
+    fn restored_fill(trade_id: TradeId) -> OrderFilled {
+        OrderFilled::new(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("S-001"),
+            InstrumentId::from("0xTOKEN.POLYMARKET"),
+            ClientOrderId::from("O-RESTORED"),
+            VenueOrderId::from("V-RESTORED"),
+            AccountId::from("POLYMARKET-001"),
+            trade_id,
+            OrderSide::Buy,
+            OrderType::Limit,
+            ModelQuantity::from("10"),
+            ModelPrice::from("0.5000"),
+            Currency::pUSD(),
+            LiquiditySide::Taker,
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            false,
+            None,
+            None,
+            None,
+        )
     }
 }

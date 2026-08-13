@@ -17,7 +17,7 @@
 
 use jiff::Timestamp;
 use nautilus_core::{
-    UUID4, UnixNanos,
+    UnixNanos,
     datetime::{NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND},
 };
 use nautilus_model::{
@@ -25,7 +25,7 @@ use nautilus_model::{
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     instruments::InstrumentAny,
     reports::{FillReport, OrderStatusReport},
-    types::{AccountBalance, Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use thiserror::Error;
@@ -37,9 +37,8 @@ use crate::{
             PolymarketEventType, PolymarketLiquiditySide, PolymarketOrderSide,
             PolymarketOrderStatus, PolymarketOrderType,
         },
-        models::PolymarketMakerOrder,
     },
-    http::models::{ClobBookLevel, PolymarketOpenOrder, PolymarketTradeReport},
+    http::models::{ClobBookLevel, PolymarketOpenOrder},
 };
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]
@@ -53,6 +52,8 @@ pub enum ReportParseError {
     Price,
     #[error("timestamp is not representable")]
     Timestamp,
+    #[error("instrument the fill names is not known to this client")]
+    UnknownInstrument,
     #[error("conflicting duplicate fill evidence")]
     ConflictingFill,
     #[error("conflicting duplicate order evidence")]
@@ -214,119 +215,6 @@ fn parse_expiration_nanos(
         (_, None | Some("0")) => Ok(None),
         (_, Some(_)) => Err(ReportParseError::Timestamp),
     }
-}
-
-/// Parses a [`PolymarketTradeReport`] into a [`FillReport`].
-///
-/// Produces one fill report for the overall trade. The `trade_id` is
-/// derived from the Polymarket trade ID. Commission is computed from the
-/// instrument's effective taker fee rate, fee exponent, and fill notional.
-#[expect(clippy::too_many_arguments)]
-pub fn parse_fill_report(
-    trade: &PolymarketTradeReport,
-    instrument_id: InstrumentId,
-    account_id: AccountId,
-    client_order_id: Option<ClientOrderId>,
-    price_precision: u8,
-    size_precision: u8,
-    currency: Currency,
-    taker_fee_rate: Decimal,
-    fee_exponent: f64,
-    ts_init: UnixNanos,
-) -> Result<FillReport, ReportParseError> {
-    let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
-    let trade_id = TradeId::from(trade.id.as_str());
-    let order_side = OrderSide::from(trade.side);
-    let (last_qty, last_px) =
-        parse_fill_values(trade.size, trade.price, size_precision, price_precision)?;
-    let liquidity_side = parse_liquidity_side(trade.trader_side);
-
-    let commission_value = compute_commission(
-        taker_fee_rate,
-        fee_exponent,
-        trade.size,
-        trade.price,
-        liquidity_side,
-    );
-    let commission = Money::new(commission_value, currency);
-
-    let ts_event = parse_timestamp(&trade.match_time).ok_or(ReportParseError::Timestamp)?;
-
-    Ok(FillReport {
-        account_id,
-        instrument_id,
-        venue_order_id,
-        trade_id,
-        order_side,
-        last_qty,
-        last_px,
-        commission,
-        liquidity_side,
-        avg_px: None,
-        report_id: UUID4::new(),
-        ts_event,
-        ts_init,
-        client_order_id,
-        venue_position_id: None,
-    })
-}
-
-/// Builds a [`FillReport`] from a [`PolymarketMakerOrder`] and trade-level context.
-///
-/// Used by both the WS stream handler and REST fill report generation since both
-/// share the same [`PolymarketMakerOrder`] type for maker fills. Maker fills never
-/// pay commission per Polymarket's fee rules.
-#[expect(clippy::too_many_arguments)]
-pub fn build_maker_fill_report(
-    mo: &PolymarketMakerOrder,
-    trade_id: &str,
-    trader_side: PolymarketLiquiditySide,
-    trade_side: PolymarketOrderSide,
-    taker_asset_id: &str,
-    account_id: AccountId,
-    instrument_id: InstrumentId,
-    price_precision: u8,
-    size_precision: u8,
-    currency: Currency,
-    liquidity_side: LiquiditySide,
-    ts_event: UnixNanos,
-    ts_init: UnixNanos,
-) -> Result<FillReport, ReportParseError> {
-    let venue_order_id = VenueOrderId::from(mo.order_id.as_str());
-    let fill_trade_id = make_composite_trade_id(trade_id, &mo.order_id);
-    let order_side = determine_order_side(
-        trader_side,
-        trade_side,
-        taker_asset_id,
-        mo.asset_id.as_str(),
-    );
-    let (last_qty, last_px) =
-        parse_fill_values(mo.matched_amount, mo.price, size_precision, price_precision)?;
-    let commission_value = compute_commission(
-        Decimal::ZERO,
-        1.0,
-        mo.matched_amount,
-        mo.price,
-        liquidity_side,
-    );
-
-    Ok(FillReport {
-        account_id,
-        instrument_id,
-        venue_order_id,
-        trade_id: fill_trade_id,
-        order_side,
-        last_qty,
-        last_px,
-        commission: Money::new(commission_value, currency),
-        liquidity_side,
-        avg_px: None,
-        report_id: UUID4::new(),
-        ts_event,
-        ts_init,
-        client_order_id: None,
-        venue_position_id: None,
-    })
 }
 
 fn parse_positive_quantity(value: Decimal, precision: u8) -> Result<Quantity, ReportParseError> {
@@ -663,14 +551,19 @@ mod tests {
         enums::OrderType,
         instruments::{Instrument, InstrumentAny, stubs::binary_option},
         orders::{OrderAny, builder::OrderTestBuilder, stubs::TestOrderStubs},
+        types::Money,
     };
     use rstest::rstest;
     use rust_decimal_macros::dec;
     use ustr::Ustr;
 
     use super::*;
-    use crate::common::enums::{
-        PolymarketOrderSide, PolymarketOrderStatus, PolymarketOrderType, PolymarketOutcome,
+    use crate::{
+        common::enums::{
+            PolymarketOrderSide, PolymarketOrderStatus, PolymarketOrderType, PolymarketOutcome,
+        },
+        execution::trade_evidence::taker_leg_evidence,
+        http::models::PolymarketTradeReport,
     };
 
     fn load<T: serde::de::DeserializeOwned>(filename: &str) -> T {
@@ -1592,97 +1485,121 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_fill_report_from_fixture() {
+    fn test_taker_leg_evidence_from_rest_fixture() {
         let path = "test_data/http_trade_report.json";
         let content = std::fs::read_to_string(path).expect("Failed to read test data");
         let trade: PolymarketTradeReport =
             serde_json::from_str(&content).expect("Failed to parse test data");
-
         let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-        let account_id = AccountId::from("POLYMARKET-001");
-        let currency = Currency::pUSD();
 
-        let report = parse_fill_report(
-            &trade,
+        let evidence = taker_leg_evidence(
+            &trade.id,
+            &trade.taker_order_id,
+            trade.side,
             instrument_id,
-            account_id,
-            None,
+            trade.size,
+            trade.price,
             4,
             6,
-            currency,
+            Currency::pUSD(),
             Decimal::ZERO,
             1.0,
-            UnixNanos::from(1_000_000_000u64),
+            parse_timestamp(&trade.match_time),
         )
         .expect("fixture fill should be valid");
 
-        assert_eq!(report.account_id, account_id);
-        assert_eq!(report.instrument_id, instrument_id);
-        assert_eq!(report.order_side, OrderSide::Buy);
-        assert_eq!(report.liquidity_side, LiquiditySide::Taker);
-        assert_eq!(report.commission.as_f64(), 0.0);
+        assert_eq!(evidence.instrument_id, instrument_id);
+        assert_eq!(evidence.order_side, OrderSide::Buy);
+        assert_eq!(evidence.liquidity_side, LiquiditySide::Taker);
+        assert_eq!(evidence.commission.as_f64(), 0.0);
     }
 
     #[rstest]
     #[case::quantity_rounds_to_zero(dec!(0.0000004), dec!(0.5), ReportParseError::Quantity)]
     #[case::zero_price(dec!(1), Decimal::ZERO, ReportParseError::Price)]
     #[case::unit_price(dec!(1), Decimal::ONE, ReportParseError::Price)]
-    fn test_parse_fill_report_rejects_degenerate_values(
+    fn test_taker_leg_evidence_rejects_degenerate_values(
         #[case] quantity: Decimal,
         #[case] price: Decimal,
         #[case] expected: ReportParseError,
     ) {
         let path = "test_data/http_trade_report.json";
         let content = std::fs::read_to_string(path).expect("Failed to read test data");
-        let mut trade: PolymarketTradeReport =
+        let trade: PolymarketTradeReport =
             serde_json::from_str(&content).expect("Failed to parse test data");
-        trade.size = quantity;
-        trade.price = price;
 
-        let result = parse_fill_report(
-            &trade,
+        let result = taker_leg_evidence(
+            &trade.id,
+            &trade.taker_order_id,
+            trade.side,
             InstrumentId::from("TEST-TOKEN.POLYMARKET"),
-            AccountId::from("POLYMARKET-001"),
-            None,
+            quantity,
+            price,
             4,
             6,
             Currency::pUSD(),
             Decimal::ZERO,
             1.0,
-            UnixNanos::from(1_000_000_000u64),
+            parse_timestamp(&trade.match_time),
         );
 
-        assert_eq!(result, Err(expected));
+        assert_eq!(result.map(|evidence| evidence.last_qty), Err(expected));
     }
 
     #[rstest]
-    fn test_parse_fill_report_forwards_fee_schedule() {
+    fn test_taker_leg_evidence_refuses_an_unstated_timestamp() {
         let path = "test_data/http_trade_report.json";
         let content = std::fs::read_to_string(path).expect("Failed to read test data");
         let trade: PolymarketTradeReport =
             serde_json::from_str(&content).expect("Failed to parse test data");
 
-        let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-        let account_id = AccountId::from("POLYMARKET-001");
-        let currency = Currency::pUSD();
-
-        // Expected: 25 * 0.03 * (0.5 * 0.5)^2 = 0.04688 pUSD after rounding.
-        let report = parse_fill_report(
-            &trade,
-            instrument_id,
-            account_id,
-            None,
+        let result = taker_leg_evidence(
+            &trade.id,
+            &trade.taker_order_id,
+            trade.side,
+            InstrumentId::from("TEST-TOKEN.POLYMARKET"),
+            trade.size,
+            trade.price,
             4,
             6,
-            currency,
+            Currency::pUSD(),
+            Decimal::ZERO,
+            1.0,
+            parse_timestamp("not-a-time"),
+        );
+
+        assert_eq!(
+            result.map(|evidence| evidence.last_qty),
+            Err(ReportParseError::Timestamp)
+        );
+    }
+
+    #[rstest]
+    fn test_taker_leg_evidence_forwards_fee_schedule() {
+        let path = "test_data/http_trade_report.json";
+        let content = std::fs::read_to_string(path).expect("Failed to read test data");
+        let trade: PolymarketTradeReport =
+            serde_json::from_str(&content).expect("Failed to parse test data");
+
+        // Expected: 25 * 0.03 * (0.5 * 0.5)^2 = 0.04688 pUSD after rounding.
+        let evidence = taker_leg_evidence(
+            &trade.id,
+            &trade.taker_order_id,
+            trade.side,
+            InstrumentId::from("TEST-TOKEN.POLYMARKET"),
+            trade.size,
+            trade.price,
+            4,
+            6,
+            Currency::pUSD(),
             dec!(0.03),
             2.0,
-            UnixNanos::from(1_000_000_000u64),
+            parse_timestamp(&trade.match_time),
         )
         .expect("fixture fill should be valid");
 
-        assert_eq!(report.liquidity_side, LiquiditySide::Taker);
-        assert_eq!(report.commission.as_f64(), 0.04688);
+        assert_eq!(evidence.liquidity_side, LiquiditySide::Taker);
+        assert_eq!(evidence.commission.as_f64(), 0.04688);
     }
 
     #[rstest]

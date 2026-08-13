@@ -36,9 +36,10 @@ use ustr::Ustr;
 use super::{
     order_fill_tracker::OrderFillTrackerMap,
     parse::{
-        ReportParseError, build_maker_fill_report, instrument_fee_exponent, instrument_taker_fee,
-        parse_fill_report, parse_order_status_report, parse_timestamp,
+        ReportParseError, instrument_fee_exponent, instrument_taker_fee, parse_order_status_report,
+        parse_timestamp,
     },
+    trade_evidence::{FillDelivery, maker_leg_evidence, taker_leg_evidence},
 };
 use crate::{
     common::{
@@ -432,29 +433,20 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
                     continue;
                 }
 
-                let Some(ts_event) = parse_timestamp(&trade.match_time) else {
-                    output.omit(
-                        OmissionScope::Instrument(instrument_id),
-                        ReconciliationOmission::InvalidFill(ReportParseError::Timestamp),
-                    );
-                    continue;
-                };
-                let report = match build_maker_fill_report(
+                let evidence = match maker_leg_evidence(
                     mo,
                     &trade.id,
                     trade.trader_side,
                     trade.side,
                     trade.asset_id.as_str(),
-                    ctx.account_id,
                     instrument_id,
                     price_prec,
                     size_prec,
                     ctx.pusd,
                     LiquiditySide::Maker,
-                    ts_event,
-                    ts_init,
+                    parse_timestamp(&trade.match_time),
                 ) {
-                    Ok(report) => report,
+                    Ok(evidence) => evidence,
                     Err(e) => {
                         output.omit(
                             OmissionScope::Instrument(instrument_id),
@@ -463,7 +455,11 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
                         continue;
                     }
                 };
-                output.reports.push(report);
+                output.reports.push(evidence.to_fill_report(FillDelivery {
+                    account_id: ctx.account_id,
+                    client_order_id: None,
+                    ts_init,
+                }));
             }
         } else {
             let token_id = Ustr::from(trade.asset_id.as_str());
@@ -501,19 +497,21 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
                 continue;
             }
 
-            let report = match parse_fill_report(
-                trade,
+            let evidence = match taker_leg_evidence(
+                &trade.id,
+                &trade.taker_order_id,
+                trade.side,
                 instrument_id,
-                ctx.account_id,
-                None,
+                trade.size,
+                trade.price,
                 price_prec,
                 size_prec,
                 ctx.pusd,
                 taker_fee_rate,
                 fee_exponent,
-                ts_init,
+                parse_timestamp(&trade.match_time),
             ) {
-                Ok(report) => report,
+                Ok(evidence) => evidence,
                 Err(e) => {
                     output.omit(
                         OmissionScope::Instrument(instrument_id),
@@ -522,7 +520,11 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
                     continue;
                 }
             };
-            output.reports.push(report);
+            output.reports.push(evidence.to_fill_report(FillDelivery {
+                account_id: ctx.account_id,
+                client_order_id: None,
+                ts_init,
+            }));
         }
     }
 
