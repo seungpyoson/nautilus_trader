@@ -436,7 +436,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::consts::USDC_DECIMALS,
+        common::consts::{DUST_POSITION_THRESHOLD, USDC_DECIMALS},
         execution::reconciliation::build_position_reports,
         http::models::{DataApiPosition, DataApiTrade},
     };
@@ -478,7 +478,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_build_position_reports_filters_dust_and_zero() {
+    fn test_build_position_reports_reports_dust_and_zero_as_flat() {
         let positions = load_positions();
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
@@ -490,11 +490,40 @@ mod tests {
             ts_now,
         );
 
-        // 4 positions: 150.5, 0.0, 42.0, 0.005 (dust)
-        // Only 150.5 and 42.0 pass the DUST_POSITION_THRESHOLD (0.01)
-        assert_eq!(output.reports.len(), 2);
+        // 4 positions: 150.5, 0.0, 42.0, 0.005 (dust). The rows below the
+        // DUST_POSITION_THRESHOLD (0.01) are reported flat rather than dropped.
+        assert_eq!(output.reports.len(), 4);
         assert!(output.reports[0].is_long());
-        assert!(output.reports[1].is_long());
+        assert!(output.reports[1].is_flat());
+        assert!(output.reports[2].is_long());
+        assert!(output.reports[3].is_flat());
+        assert!(output.reports[1].quantity.is_zero());
+        assert!(output.reports[3].quantity.is_zero());
+        assert!(output.omissions.is_empty());
+    }
+
+    #[rstest]
+    fn test_build_position_reports_omits_unmapped_flat_rows() {
+        let positions = load_positions();
+        let account_id = AccountId::from("POLYMARKET-001");
+        let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
+        let instruments = AtomicMap::new();
+
+        for position in positions
+            .iter()
+            .filter(|p| p.size >= DUST_POSITION_THRESHOLD)
+        {
+            instruments.insert(
+                Ustr::from(position.asset.as_str()),
+                InstrumentAny::BinaryOption(binary_option()),
+            );
+        }
+
+        let output = build_position_reports(&positions, &instruments, account_id, ts_now);
+
+        // Flat rows for assets outside the instrument catalog carry no position, so they
+        // stay non-invalidating omissions rather than becoming unmapped-instrument failures.
+        assert_eq!(output.reports.len(), 2);
         assert_eq!(
             output.omissions.count(
                 crate::execution::reconciliation::ReconciliationOmission::Position(
@@ -510,6 +539,14 @@ mod tests {
                 ),
             ),
             1,
+        );
+        assert_eq!(
+            output.omissions.count(
+                crate::execution::reconciliation::ReconciliationOmission::Position(
+                    crate::execution::reconciliation::PositionOmission::UnmappedInstrument,
+                ),
+            ),
+            0,
         );
     }
 
@@ -527,9 +564,12 @@ mod tests {
         )
         .reports;
 
-        assert_eq!(reports.len(), 2);
+        assert_eq!(reports.len(), 4);
         assert_eq!(reports[0].avg_px_open, Some(dec!(0.55)));
-        assert_eq!(reports[1].avg_px_open, Some(dec!(0.3)));
+        assert_eq!(reports[2].avg_px_open, Some(dec!(0.3)));
+        // A flat report states a balance, not an entry price.
+        assert_eq!(reports[1].avg_px_open, None);
+        assert_eq!(reports[3].avg_px_open, None);
     }
 
     #[rstest]
@@ -546,9 +586,10 @@ mod tests {
         )
         .reports;
 
-        assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].quantity.precision, USDC_DECIMALS as u8);
-        assert_eq!(reports[1].quantity.precision, USDC_DECIMALS as u8);
+        assert_eq!(reports.len(), 4);
+        for report in &reports {
+            assert_eq!(report.quantity.precision, USDC_DECIMALS as u8);
+        }
     }
 
     #[rstest]

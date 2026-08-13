@@ -414,7 +414,12 @@ pub(crate) fn apply_fill_filters(
     reports
 }
 
-/// Builds position status reports from Data API positions, filtering dust.
+/// Builds position status reports from Data API positions, reporting dust as flat.
+///
+/// A row at or below [`DUST_POSITION_THRESHOLD`] is the venue stating a flat balance, so it is
+/// reported as [`PositionSideSpecified::Flat`] rather than dropped. Dropping it would leave a
+/// consumer to infer flat from a report that is simply absent, which is indistinguishable from
+/// having no evidence for the instrument at all.
 pub(crate) fn build_position_reports<'a>(
     positions: impl IntoIterator<Item = &'a DataApiPosition>,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
@@ -424,17 +429,45 @@ pub(crate) fn build_position_reports<'a>(
     let mut output = ReportSet::new();
 
     for position in positions {
-        if position.size == Decimal::ZERO {
-            output.omit(ReconciliationOmission::Position(PositionOmission::Zero));
+        let instrument = instruments.get_cloned(&Ustr::from(position.asset.as_str()));
+
+        if position.size >= Decimal::ZERO && position.size < DUST_POSITION_THRESHOLD {
+            // Without an instrument mapping there is no position for a report to be about, so a
+            // flat row for an unmapped asset carries no evidence and stays out of the snapshot.
+            let Some(instrument) = instrument else {
+                let reason = if position.size > Decimal::ZERO {
+                    PositionOmission::Dust
+                } else {
+                    PositionOmission::Zero
+                };
+                output.omit(ReconciliationOmission::Position(reason));
+                continue;
+            };
+
+            if position.size > Decimal::ZERO {
+                log::debug!(
+                    "Reporting dust position as flat: {}-{}, size={}",
+                    position.condition_id,
+                    position.asset,
+                    position.size,
+                );
+            }
+
+            output.reports.push(PositionStatusReport::new(
+                account_id,
+                instrument.id(),
+                PositionSideSpecified::Flat,
+                Quantity::zero(USDC_DECIMALS as u8),
+                ts,
+                ts,
+                None,
+                None,
+                None,
+            ));
             continue;
         }
 
-        if position.size > Decimal::ZERO && position.size < DUST_POSITION_THRESHOLD {
-            output.omit(ReconciliationOmission::Position(PositionOmission::Dust));
-            continue;
-        }
-
-        let Some(instrument) = instruments.get_cloned(&Ustr::from(position.asset.as_str())) else {
+        let Some(instrument) = instrument else {
             output.omit(ReconciliationOmission::Position(
                 PositionOmission::UnmappedInstrument,
             ));
@@ -865,7 +898,39 @@ mod tests {
     }
 
     #[rstest]
-    fn reconciliation_snapshot_omits_zero_position_evidence() {
+    fn reconciliation_snapshot_reports_zero_position_as_flat() {
+        let position = DataApiPosition {
+            asset: "123".to_string(),
+            condition_id: "0xabc".to_string(),
+            size: Decimal::ZERO,
+            avg_price: Some(Decimal::new(5, 1)),
+        };
+        let instruments = AtomicMap::new();
+        instruments.insert(Ustr::from("123"), test_instrument());
+
+        let snapshot = build_reconciliation_snapshot(
+            &[],
+            &[],
+            &[position],
+            &instruments,
+            &OrderFillTrackerMap::new(),
+            &test_fill_context(),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("a stated zero balance must not make the snapshot non-authoritative");
+
+        // The venue stated a flat balance, so the snapshot states it too. Dropping the row would
+        // leave the consumer to read flat out of a report that is merely absent, which it cannot
+        // tell apart from having no evidence for the instrument.
+        assert_eq!(snapshot.positions.len(), 1);
+        assert!(snapshot.positions[0].is_flat());
+        assert!(snapshot.positions[0].quantity.is_zero());
+        assert_eq!(snapshot.positions[0].avg_px_open, None);
+    }
+
+    #[rstest]
+    fn reconciliation_snapshot_omits_unmapped_zero_position() {
         let position = DataApiPosition {
             asset: "123".to_string(),
             condition_id: "0xabc".to_string(),
@@ -882,9 +947,39 @@ mod tests {
             None,
             UnixNanos::from(1_000_000_000u64),
         )
-        .expect("zero rows should not be treated as position-close evidence");
+        .expect("a flat row for an unmapped asset must not make the snapshot non-authoritative");
 
         assert!(snapshot.positions.is_empty());
+    }
+
+    #[rstest]
+    fn reconciliation_snapshot_keeps_failed_trade_out_of_filled_quantity() {
+        let instrument = test_instrument();
+        let order: PolymarketOpenOrder = load("http_open_order.json");
+        let mut trade: PolymarketTradeReport = load("http_trade_report.json");
+        trade.status = PolymarketTradeStatus::Failed;
+
+        let instruments = AtomicMap::new();
+        instruments.insert(order.asset_id, instrument);
+        let snapshot = build_reconciliation_snapshot(
+            &[order],
+            &[trade],
+            &[],
+            &instruments,
+            &OrderFillTrackerMap::new(),
+            &test_fill_context(),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("a failed trade is a terminal venue answer, not missing evidence");
+
+        // A failed trade never becomes a fill, and the order report it belongs to reports the
+        // confirmed quantity only. That lower filled quantity is what lets a consumer void a
+        // provisional fill applied before the trade failed, so the snapshot must still be
+        // produced rather than withheld.
+        assert!(snapshot.fills.is_empty());
+        assert_eq!(snapshot.orders.len(), 1);
+        assert!(snapshot.orders[0].filled_qty.is_zero());
     }
 
     #[rstest]
