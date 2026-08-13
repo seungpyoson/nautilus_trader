@@ -1044,6 +1044,7 @@ mod tests {
         #[case] status: PolymarketTradeStatus,
     ) {
         let instrument = test_instrument();
+        let instrument_id = instrument.id();
         let mut trade: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
         trade.status = status;
 
@@ -1066,12 +1067,21 @@ mod tests {
         );
 
         assert!(output.reports.is_empty());
-        let expected = if status.is_pending_settlement() {
-            crate::execution::reconciliation::ReconciliationOmission::PendingTrade
+
+        // An unsettled trade is evidence about the instrument it names, so it is bound to that
+        // instrument. A failed trade never becomes a fill, so it names no instrument to withhold.
+        let (scope, expected) = if status.is_pending_settlement() {
+            (
+                crate::execution::reconciliation::OmissionScope::Instrument(instrument_id),
+                crate::execution::reconciliation::ReconciliationOmission::PendingTrade,
+            )
         } else {
-            crate::execution::reconciliation::ReconciliationOmission::FailedTrade
+            (
+                crate::execution::reconciliation::OmissionScope::Account,
+                crate::execution::reconciliation::ReconciliationOmission::FailedTrade,
+            )
         };
-        assert_eq!(output.omissions.count(expected), 1);
+        assert_eq!(output.omissions.count(scope, expected), 1);
     }
 
     #[rstest]
@@ -1121,16 +1131,18 @@ mod tests {
         );
         assert_eq!(output.reports[0].venue_order_id, expected_venue_order_id);
         assert_eq!(
-            output
-                .omissions
-                .count(crate::execution::reconciliation::ReconciliationOmission::UnownedMakerTrade),
+            output.omissions.count(
+                crate::execution::reconciliation::OmissionScope::Account,
+                crate::execution::reconciliation::ReconciliationOmission::UnownedMakerTrade,
+            ),
             0,
             "entry-level skips of foreign entries in an owned trade are not trade drops",
         );
         assert_eq!(
-            output
-                .omissions
-                .count(crate::execution::reconciliation::ReconciliationOmission::UnmappedFill),
+            output.omissions.count(
+                crate::execution::reconciliation::OmissionScope::Foreign,
+                crate::execution::reconciliation::ReconciliationOmission::UnmappedFill,
+            ),
             0,
         );
     }
@@ -1162,9 +1174,10 @@ mod tests {
 
         assert_eq!(output.reports.len(), 0,);
         assert_eq!(
-            output
-                .omissions
-                .count(crate::execution::reconciliation::ReconciliationOmission::UnmappedFill),
+            output.omissions.count(
+                crate::execution::reconciliation::OmissionScope::Foreign,
+                crate::execution::reconciliation::ReconciliationOmission::UnmappedFill,
+            ),
             1,
         );
     }
@@ -1197,16 +1210,18 @@ mod tests {
 
         assert!(output.reports.is_empty());
         assert_eq!(
-            output
-                .omissions
-                .count(crate::execution::reconciliation::ReconciliationOmission::UnownedMakerTrade),
+            output.omissions.count(
+                crate::execution::reconciliation::OmissionScope::Account,
+                crate::execution::reconciliation::ReconciliationOmission::UnownedMakerTrade,
+            ),
             1,
             "a confirmed maker trade dropped whole must be counted, not silent",
         );
         assert_eq!(
-            output
-                .omissions
-                .count(crate::execution::reconciliation::ReconciliationOmission::UnmappedFill),
+            output.omissions.count(
+                crate::execution::reconciliation::OmissionScope::Foreign,
+                crate::execution::reconciliation::ReconciliationOmission::UnmappedFill,
+            ),
             0,
         );
     }

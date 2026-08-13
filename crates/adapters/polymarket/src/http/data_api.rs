@@ -526,6 +526,7 @@ mod tests {
         assert_eq!(output.reports.len(), 2);
         assert_eq!(
             output.omissions.count(
+                crate::execution::reconciliation::OmissionScope::Foreign,
                 crate::execution::reconciliation::ReconciliationOmission::Position(
                     crate::execution::reconciliation::PositionOmission::Zero,
                 ),
@@ -534,6 +535,7 @@ mod tests {
         );
         assert_eq!(
             output.omissions.count(
+                crate::execution::reconciliation::OmissionScope::Foreign,
                 crate::execution::reconciliation::ReconciliationOmission::Position(
                     crate::execution::reconciliation::PositionOmission::Dust,
                 ),
@@ -542,6 +544,7 @@ mod tests {
         );
         assert_eq!(
             output.omissions.count(
+                crate::execution::reconciliation::OmissionScope::Foreign,
                 crate::execution::reconciliation::ReconciliationOmission::Position(
                     crate::execution::reconciliation::PositionOmission::UnmappedInstrument,
                 ),
@@ -613,6 +616,7 @@ mod tests {
         assert!(output.reports.is_empty());
         assert_eq!(
             output.omissions.count(
+                crate::execution::reconciliation::OmissionScope::Instrument(binary_option().id),
                 crate::execution::reconciliation::ReconciliationOmission::Position(
                     crate::execution::reconciliation::PositionOmission::InvalidAveragePrice,
                 ),

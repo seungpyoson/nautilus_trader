@@ -65,7 +65,7 @@ use nautilus_model::{
     },
     events::{AccountState, OrderEventAny, OrderPendingCancel},
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TraderId,
+        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TradeId, TraderId,
         VenueOrderId,
     },
     instruments::{BinaryOption, InstrumentAny},
@@ -1346,10 +1346,17 @@ async fn test_exec_client_get_account_after_cache_add() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_reject_unmapped_orders() {
+async fn test_generate_order_status_reports_ignore_orders_for_untraded_instruments() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
-    let (client, _rx, _cache) = create_test_execution_client(addr);
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    // The venue returns the whole funder wallet's open orders. Only the first belongs to an
+    // instrument this client trades; the second is another user of the same wallet.
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
 
     let cmd = GenerateOrderStatusReports {
         command_id: UUID4::new(),
@@ -1364,14 +1371,16 @@ async fn test_generate_order_status_reports_reject_unmapped_orders() {
         causation_id: None,
     };
 
-    let error = client
+    let reports = client
         .generate_order_status_reports(&cmd)
         .await
-        .expect_err("unmapped orders must make bulk coverage incomplete");
+        .expect("an order in a market this client does not trade must not destroy authority");
 
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].instrument_id, instrument_id);
     assert_eq!(
-        error.to_string(),
-        "Order reports is not authoritative: UnmappedOrder=2",
+        reports[0].venue_order_id,
+        VenueOrderId::from("0xaaaa000000000000000000000000000000000000000000000000000000000001"),
     );
 }
 
@@ -1440,10 +1449,26 @@ async fn test_generate_order_status_reports_recovers_confirmed_rest_fill() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_fill_reports_rejects_unmapped_relevant_trade() {
+async fn test_generate_fill_reports_ignore_trades_for_untraded_instruments() {
     let state = TestServerState::default();
+    let mut trades = load_json("http_trades_page.json");
+    let traded = trades["data"][0].clone();
+    let mut untraded = traded.clone();
+    untraded["id"] = Value::String("trade-untraded".to_string());
+    untraded["asset_id"] = Value::String(
+        "52114319501245915516055106046884209969926127482827954674443846427813813222426".to_string(),
+    );
+    trades["data"] = Value::Array(vec![traded, untraded]);
+    *state.trades_response_override.lock().await = Some(trades);
     let addr = start_mock_server(state).await;
-    let (client, _rx, _cache) = create_test_execution_client(addr);
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    // Both trades are on the funder wallet, but only the first is on an instrument this client
+    // trades.
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
 
     let cmd = GenerateFillReports {
         command_id: UUID4::new(),
@@ -1458,14 +1483,14 @@ async fn test_generate_fill_reports_rejects_unmapped_relevant_trade() {
         causation_id: None,
     };
 
-    let error = client.generate_fill_reports(cmd).await.unwrap_err();
+    let reports = client
+        .generate_fill_reports(cmd)
+        .await
+        .expect("a trade in a market this client does not trade must not destroy authority");
 
-    assert!(
-        error
-            .to_string()
-            .contains("Fill reports is not authoritative")
-    );
-    assert!(error.to_string().contains("UnmappedFill=1"));
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].instrument_id, instrument_id);
+    assert_eq!(reports[0].trade_id, TradeId::from("trade-0x001"));
 }
 
 #[rstest]
@@ -1473,7 +1498,14 @@ async fn test_generate_fill_reports_rejects_unmapped_relevant_trade() {
 async fn test_generate_fill_reports_scopes_authority_to_requested_order() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
-    let (client, _rx, _cache) = create_test_execution_client(addr);
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    // The venue's trade is on an instrument this client trades, so only the requested order id
+    // keeps it out of the response.
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
 
     let cmd = GenerateFillReports {
         command_id: UUID4::new(),
@@ -1916,7 +1948,9 @@ async fn test_terminal_recovery_rejects_invalid_target_trade() {
 
     assert_eq!(
         error.to_string(),
-        format!("Order recovery for {venue_order_id} is not authoritative: InvalidFill(Price)=1"),
+        format!(
+            "Order recovery for {venue_order_id} is not authoritative: InvalidFill(Price)@TEST-TOKEN.POLYMARKET=1"
+        ),
     );
 }
 
@@ -1964,9 +1998,13 @@ async fn test_order_status_report_rejects_pending_fill_evidence() {
         .await
         .expect_err("pending evidence must make targeted coverage incomplete");
 
-    assert!(
-        format!("{error:#}").contains("PendingTrade=1"),
-        "unexpected error: {error}",
+    // Asserted on the non-alternate `Display`: a consumer logs targeted query failures with
+    // `{e}`, so the reason has to survive as the outermost message and not merely as a source.
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Order status for {venue_order_id} is not authoritative: PendingTrade@TEST-TOKEN.POLYMARKET=1"
+        ),
     );
 }
 

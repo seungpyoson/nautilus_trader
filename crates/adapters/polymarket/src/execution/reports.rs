@@ -38,9 +38,10 @@ use super::{
         sum_filled_quantity, weighted_average_price,
     },
     reconciliation::{
-        FillContext, ReconciliationOmission, apply_fill_filters, build_fill_reports_from_trades,
-        build_position_reports, cap_order_report_filled_qty, confirmed_filled_quantities,
-        log_reconciliation_summary, normalize_terminal_order_report_quantity,
+        FillContext, OmissionScope, ReconciliationOmission, ReportSet, apply_fill_filters,
+        build_fill_reports_from_trades, build_position_reports, cap_order_report_filled_qty,
+        confirmed_filled_quantities, ensure_execution_lookup_loaded, log_reconciliation_summary,
+        normalize_terminal_order_report_quantity, withhold_non_authoritative,
     },
 };
 use crate::{
@@ -150,9 +151,10 @@ impl PolymarketExecutionClient {
             Some(instrument_id),
             ts_init,
         );
-        output
-            .omissions
-            .ensure_authoritative(&format!("Order recovery for {venue_order_id}"))?;
+        output.omissions.ensure_authoritative(
+            &format!("Order recovery for {venue_order_id}"),
+            Some(instrument_id),
+        )?;
         let mut order_fills = output.reports;
         self.fill_tracker.snap_fill_reports(&mut order_fills);
 
@@ -331,7 +333,7 @@ impl PolymarketExecutionClient {
                         )
                         .await
                         {
-                            Ok(fills) => match confirmed_filled_quantities(&fills) {
+                            Ok(fills) => match confirmed_filled_quantities(&fills.reports) {
                                 Ok(quantities) => quantities.get(&venue_order_id).copied(),
                                 Err(e) => {
                                     log::warn!(
@@ -342,7 +344,7 @@ impl PolymarketExecutionClient {
                             },
                             Err(e) => {
                                 log::warn!(
-                                    "Failed to fetch confirmed fills for order {venue_order_id}: {e}"
+                                    "Failed to fetch confirmed fills for order {venue_order_id}: {e:#}"
                                 );
                                 return Ok(());
                             }
@@ -435,7 +437,9 @@ impl PolymarketExecutionClient {
                 .unwrap_or_else(|| Quantity::zero(size_prec));
             let local_filled = cached_filled.max(tracked_filled);
             let confirmed_filled = if report.filled_qty > local_filled {
-                match fetch_confirmed_fill_reports(
+                // Returned unwrapped: a consumer logs this with the non-alternate `Display`, so
+                // the reason has to be the outermost message rather than a source behind it.
+                let fills = fetch_confirmed_fill_reports(
                     &self.http_client,
                     &self.fill_context(),
                     &self.shared_token_instruments,
@@ -444,17 +448,10 @@ impl PolymarketExecutionClient {
                     self.clock.get_time_ns(),
                     &format!("Order status for {venue_order_id}"),
                 )
-                .await
-                {
-                    Ok(fills) => confirmed_filled_quantities(&fills)?
-                        .get(&venue_order_id)
-                        .copied(),
-                    Err(e) => {
-                        return Err(e).context(format!(
-                            "failed to fetch confirmed fills for order {venue_order_id}"
-                        ));
-                    }
-                }
+                .await?;
+                confirmed_filled_quantities(&fills.reports)?
+                    .get(&venue_order_id)
+                    .copied()
             } else {
                 None
             };
@@ -485,6 +482,11 @@ impl PolymarketExecutionClient {
             .get_orders(params)
             .await
             .context("failed to fetch orders")?;
+        ensure_execution_lookup_loaded(
+            "Order reports",
+            &self.shared_token_instruments,
+            orders.len(),
+        )?;
 
         let scoped_orders = scope_order_rows(
             &orders,
@@ -515,7 +517,8 @@ impl PolymarketExecutionClient {
                 .iter()
                 .map(|report| report.venue_order_id)
                 .collect::<Vec<_>>();
-            match fetch_confirmed_fill_reports(
+
+            let fills = fetch_confirmed_fill_reports(
                 &self.http_client,
                 &self.fill_context(),
                 &self.shared_token_instruments,
@@ -524,18 +527,18 @@ impl PolymarketExecutionClient {
                 self.clock.get_time_ns(),
                 "Order reports",
             )
-            .await
-            {
-                Ok(fills) => confirmed_filled_quantities(&fills)?,
-                Err(e) => {
-                    return Err(e).context("failed to fetch confirmed fills for open-order check");
-                }
-            }
+            .await?;
+
+            // A trade the fill evidence could not account for leaves the order it belongs to
+            // unstatable, so carry that verdict into this response.
+            let quantities = confirmed_filled_quantities(&fills.reports)?;
+            output.omissions.merge(fills.omissions);
+            quantities
         } else {
             Default::default()
         };
 
-        let before_normalization = output.reports.len();
+        let mut invalid_orders = Vec::new();
         output.reports.retain_mut(|report| {
             let cached_filled = report
                 .client_order_id
@@ -551,17 +554,31 @@ impl PolymarketExecutionClient {
                 .fill_tracker
                 .get_cumulative_filled(&report.venue_order_id)
                 .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
-            cap_order_report_filled_qty(
+
+            match cap_order_report_filled_qty(
                 report,
                 cached_filled.max(tracked_filled),
                 confirmed_fills.get(&report.venue_order_id).copied(),
-            )
-            .is_ok()
+            ) {
+                Ok(()) => true,
+                Err(e) => {
+                    invalid_orders.push((report.instrument_id, e));
+                    false
+                }
+            }
         });
-        output.omissions.record_n(
-            ReconciliationOmission::InvalidOrder(super::parse::ReportParseError::FilledQuantity),
-            before_normalization - output.reports.len(),
-        );
+
+        for (instrument_id, error) in invalid_orders {
+            output.omissions.record(
+                OmissionScope::Instrument(instrument_id),
+                ReconciliationOmission::InvalidOrder(error),
+            );
+        }
+
+        let blocked = output.omissions.non_authoritative_instruments();
+        let withheld = withhold_non_authoritative(&mut output.reports, &blocked, |report| {
+            report.instrument_id
+        });
 
         let reports = if cmd.open_only {
             output
@@ -573,8 +590,17 @@ impl PolymarketExecutionClient {
             output.reports
         };
 
-        log_reconciliation_summary("order reports", reports.len(), 0, 0, &output.omissions);
-        output.omissions.ensure_authoritative("Order reports")?;
+        log_reconciliation_summary(
+            "order reports",
+            reports.len(),
+            0,
+            0,
+            withheld,
+            &output.omissions,
+        );
+        output
+            .omissions
+            .ensure_authoritative("Order reports", cmd.instrument_id)?;
         Ok(reports)
     }
 
@@ -587,6 +613,11 @@ impl PolymarketExecutionClient {
             .get_trades(GetTradesParams::default())
             .await
             .context("failed to fetch trades")?;
+        ensure_execution_lookup_loaded(
+            "Fill reports",
+            &self.shared_token_instruments,
+            trades.len(),
+        )?;
 
         let scoped_trades = scope_fill_trades(
             &trades,
@@ -607,10 +638,23 @@ impl PolymarketExecutionClient {
 
         self.fill_tracker.snap_fill_reports(&mut output.reports);
 
+        let blocked = output.omissions.non_authoritative_instruments();
+        let withheld = withhold_non_authoritative(&mut output.reports, &blocked, |report| {
+            report.instrument_id
+        });
         let reports = apply_fill_filters(output.reports, cmd.venue_order_id, cmd.start, cmd.end);
 
-        log_reconciliation_summary("fill reports", 0, reports.len(), 0, &output.omissions);
-        output.omissions.ensure_authoritative("Fill reports")?;
+        log_reconciliation_summary(
+            "fill reports",
+            0,
+            reports.len(),
+            0,
+            withheld,
+            &output.omissions,
+        );
+        output
+            .omissions
+            .ensure_authoritative("Fill reports", cmd.instrument_id)?;
         Ok(reports)
     }
 
@@ -624,6 +668,11 @@ impl PolymarketExecutionClient {
             .get_positions(ctx.user_address)
             .await
             .context("failed to fetch positions from Data API")?;
+        ensure_execution_lookup_loaded(
+            "Position reports",
+            &self.shared_token_instruments,
+            positions.len(),
+        )?;
 
         let ts_now = self.clock.get_time_ns();
         let scoped_positions = scope_position_rows(
@@ -631,21 +680,29 @@ impl PolymarketExecutionClient {
             &self.shared_token_instruments,
             cmd.instrument_id,
         )?;
-        let output = build_position_reports(
+        let mut output = build_position_reports(
             scoped_positions,
             &self.shared_token_instruments,
             self.core.account_id,
             ts_now,
         );
 
+        let blocked = output.omissions.non_authoritative_instruments();
+        let withheld = withhold_non_authoritative(&mut output.reports, &blocked, |report| {
+            report.instrument_id
+        });
+
         log_reconciliation_summary(
             "position reports",
             0,
             0,
             output.reports.len(),
+            withheld,
             &output.omissions,
         );
-        output.omissions.ensure_authoritative("Position reports")?;
+        output
+            .omissions
+            .ensure_authoritative("Position reports", cmd.instrument_id)?;
         Ok(output.reports)
     }
 
@@ -685,6 +742,7 @@ fn scope_fill_trades(
                 start.is_none_or(|start| timestamp >= start)
                     && end.is_none_or(|end| timestamp <= end)
             });
+
             if !in_time_range {
                 return None;
             }
@@ -793,7 +851,7 @@ async fn fetch_confirmed_fill_reports(
     instrument_id: Option<InstrumentId>,
     ts_init: UnixNanos,
     authority_context: &str,
-) -> anyhow::Result<Vec<FillReport>> {
+) -> anyhow::Result<ReportSet<FillReport>> {
     let trades = http_client
         .get_trades(GetTradesParams::default())
         .await
@@ -806,15 +864,23 @@ async fn fetch_confirmed_fill_reports(
         None,
         None,
     )?;
-    let output = build_fill_reports_from_trades(
+    let mut output = build_fill_reports_from_trades(
         &relevant_trades,
         ctx,
         token_instruments,
         instrument_id,
         ts_init,
     );
-    output.omissions.ensure_authoritative(authority_context)?;
-    Ok(output.reports)
+    output
+        .omissions
+        .ensure_authoritative(authority_context, instrument_id)?;
+
+    // The caller reads these fills as the confirmed quantity for an order, so a fill from an
+    // instrument the evidence cannot support must not reach it.
+    let blocked = output.omissions.non_authoritative_instruments();
+    withhold_non_authoritative(&mut output.reports, &blocked, |report| report.instrument_id);
+
+    Ok(output)
 }
 
 pub(crate) fn get_pusd_currency() -> Currency {

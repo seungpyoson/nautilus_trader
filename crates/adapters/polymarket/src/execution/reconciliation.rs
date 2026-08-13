@@ -17,7 +17,7 @@
 
 use std::fmt::Display;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use indexmap::IndexMap;
 use nautilus_core::{
@@ -60,6 +60,45 @@ pub(crate) struct FillContext<'a> {
     pub api_key: &'a str,
     pub pusd: Currency,
     pub clock: &'static AtomicTime,
+}
+
+/// What an omission concerns, which bounds the authority the omission can destroy.
+///
+/// The client answers for the instruments in its execution lookup and for nothing else. A row
+/// naming any other asset belongs to another user of the same funder wallet, so it is evidence
+/// about something this client does not trade and cannot make this client's own evidence
+/// unusable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum OmissionScope {
+    /// Evidence about an instrument in the execution lookup.
+    Instrument(InstrumentId),
+    /// Evidence naming an asset outside the execution lookup.
+    Foreign,
+    /// Evidence this client cannot bind to any asset.
+    Account,
+}
+
+impl OmissionScope {
+    /// Returns whether unusable evidence with this scope leaves nothing for the caller to state.
+    ///
+    /// `requested` is the instrument the caller asked about, if any.
+    fn blocks_response(self, requested: Option<InstrumentId>) -> bool {
+        match self {
+            Self::Instrument(instrument_id) => requested == Some(instrument_id),
+            Self::Foreign => false,
+            Self::Account => true,
+        }
+    }
+}
+
+impl Display for OmissionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Instrument(instrument_id) => write!(f, "{instrument_id}"),
+            Self::Foreign => f.write_str("foreign"),
+            Self::Account => f.write_str("account"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -109,24 +148,32 @@ impl ReconciliationOmission {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReconciliationOmissions {
-    counts: IndexMap<ReconciliationOmission, usize>,
+    counts: IndexMap<(OmissionScope, ReconciliationOmission), usize>,
 }
 
 impl ReconciliationOmissions {
-    pub(crate) fn record(&mut self, reason: ReconciliationOmission) {
-        self.record_n(reason, 1);
+    pub(crate) fn record(&mut self, scope: OmissionScope, reason: ReconciliationOmission) {
+        self.record_n(scope, reason, 1);
     }
 
-    pub(crate) fn record_n(&mut self, reason: ReconciliationOmission, count: usize) {
+    pub(crate) fn record_n(
+        &mut self,
+        scope: OmissionScope,
+        reason: ReconciliationOmission,
+        count: usize,
+    ) {
         if count > 0 {
-            *self.counts.entry(reason).or_default() += count;
+            *self.counts.entry((scope, reason)).or_default() += count;
         }
     }
 
     #[must_use]
     #[cfg(test)]
-    pub(crate) fn count(&self, reason: ReconciliationOmission) -> usize {
-        self.counts.get(&reason).copied().unwrap_or_default()
+    pub(crate) fn count(&self, scope: OmissionScope, reason: ReconciliationOmission) -> usize {
+        self.counts
+            .get(&(scope, reason))
+            .copied()
+            .unwrap_or_default()
     }
 
     #[must_use]
@@ -135,17 +182,42 @@ impl ReconciliationOmissions {
     }
 
     pub(crate) fn merge(&mut self, other: Self) {
-        for (reason, count) in other.counts {
-            self.record_n(reason, count);
+        for ((scope, reason), count) in other.counts {
+            self.record_n(scope, reason, count);
         }
     }
 
-    pub(crate) fn ensure_authoritative(&self, context: &str) -> anyhow::Result<()> {
+    /// Returns the instruments whose evidence is unusable, so no report about them can be stated.
+    #[must_use]
+    pub(crate) fn non_authoritative_instruments(&self) -> AHashSet<InstrumentId> {
+        self.counts
+            .keys()
+            .filter(|(_, reason)| reason.invalidates_snapshot())
+            .filter_map(|(scope, _)| match scope {
+                OmissionScope::Instrument(instrument_id) => Some(*instrument_id),
+                OmissionScope::Foreign | OmissionScope::Account => None,
+            })
+            .collect()
+    }
+
+    /// Fails when unusable evidence leaves nothing the caller can state.
+    ///
+    /// Unusable evidence about one instrument says nothing about another, so it withholds that
+    /// instrument's reports (see [`withhold_non_authoritative`]) rather than failing the whole
+    /// response. A response still fails when the evidence cannot be bound to any instrument, or
+    /// when it concerns `requested`: the single instrument the caller asked about.
+    pub(crate) fn ensure_authoritative(
+        &self,
+        context: &str,
+        requested: Option<InstrumentId>,
+    ) -> anyhow::Result<()> {
         let invalidating = self
             .counts
             .iter()
-            .filter(|(reason, _)| reason.invalidates_snapshot())
-            .map(|(reason, count)| format!("{reason:?}={count}"))
+            .filter(|((scope, reason), _)| {
+                reason.invalidates_snapshot() && scope.blocks_response(requested)
+            })
+            .map(|((scope, reason), count)| format!("{reason:?}@{scope}={count}"))
             .collect::<Vec<_>>();
         anyhow::ensure!(
             invalidating.is_empty(),
@@ -159,8 +231,9 @@ impl ReconciliationOmissions {
 impl Display for ReconciliationOmissions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut separator = "";
-        for (reason, count) in &self.counts {
-            write!(f, "{separator}{reason:?}={count}")?;
+
+        for ((scope, reason), count) in &self.counts {
+            write!(f, "{separator}{reason:?}@{scope}={count}")?;
             separator = ", ";
         }
 
@@ -185,9 +258,46 @@ impl<T> ReportSet<T> {
         }
     }
 
-    fn omit(&mut self, reason: ReconciliationOmission) {
-        self.omissions.record(reason);
+    fn omit(&mut self, scope: OmissionScope, reason: ReconciliationOmission) {
+        self.omissions.record(scope, reason);
     }
+}
+
+/// Fails when the client holds no execution lookup while the venue reports evidence for the wallet.
+///
+/// With an empty lookup every row is [`OmissionScope::Foreign`], so a response would be
+/// authoritative only because it covers nothing, and a consumer reads an absent order or position
+/// as "not at the venue". Instruments that failed to load would therefore present as a flat
+/// account. Absence must not read as authority, so this is reported as a load failure rather than
+/// answered. An empty lookup with no evidence is an account that genuinely holds nothing.
+pub(crate) fn ensure_execution_lookup_loaded(
+    context: &str,
+    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    evidence_rows: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        evidence_rows == 0 || !instruments.load().is_empty(),
+        "{context} cannot be stated: the execution lookup holds no instruments while the venue reports {evidence_rows} row(s) for the account",
+    );
+    Ok(())
+}
+
+/// Withholds every report about an instrument whose evidence is unusable, returning how many.
+///
+/// Authority is decided per instrument, so the reports the remaining evidence does support are
+/// still stated.
+pub(crate) fn withhold_non_authoritative<T>(
+    reports: &mut Vec<T>,
+    blocked: &AHashSet<InstrumentId>,
+    instrument_of: impl Fn(&T) -> InstrumentId,
+) -> usize {
+    if blocked.is_empty() {
+        return 0;
+    }
+
+    let before = reports.len();
+    reports.retain(|report| !blocked.contains(&instrument_of(report)));
+    before - reports.len()
 }
 
 #[derive(Debug)]
@@ -209,19 +319,20 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
     let mut output = ReportSet::new();
 
     for trade in trades {
-        match trade.status {
-            PolymarketTradeStatus::Confirmed => {}
-            PolymarketTradeStatus::Failed => {
-                output.omit(ReconciliationOmission::FailedTrade);
-                continue;
-            }
+        // Settlement is decided for the whole trade, but the omission it produces belongs to the
+        // instrument the trade is evidence about, so it is recorded once each leg is resolved.
+        let pending_settlement = match trade.status {
+            PolymarketTradeStatus::Confirmed => false,
             PolymarketTradeStatus::Matched
             | PolymarketTradeStatus::Mined
-            | PolymarketTradeStatus::Retrying => {
-                output.omit(ReconciliationOmission::PendingTrade);
+            | PolymarketTradeStatus::Retrying => true,
+            PolymarketTradeStatus::Failed => {
+                // A failed trade is a terminal venue answer that never becomes a fill, so there
+                // is no evidence about any instrument to account for.
+                output.omit(OmissionScope::Account, ReconciliationOmission::FailedTrade);
                 continue;
             }
-        }
+        };
 
         let is_maker = trade.trader_side == PolymarketLiquiditySide::Maker;
 
@@ -231,9 +342,14 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
                 .iter()
                 .any(|mo| mo.is_owned_by(ctx.user_address, ctx.api_key))
             {
-                output.omit(ReconciliationOmission::UnownedMakerTrade);
+                // The venue states the account made this trade, yet none of the maker orders
+                // identify it, so the fill cannot be bound to an instrument to withhold.
+                output.omit(
+                    OmissionScope::Account,
+                    ReconciliationOmission::UnownedMakerTrade,
+                );
                 log::debug!(
-                    "Confirmed maker trade {} holds no maker order owned by the account",
+                    "Maker trade {} holds no maker order owned by the account",
                     trade.id,
                 );
                 continue;
@@ -248,7 +364,7 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
                 let (instrument_id, price_prec, size_prec) = match instrument {
                     Some(i) => (i.id(), i.price_precision(), i.size_precision()),
                     None => {
-                        output.omit(ReconciliationOmission::UnmappedFill);
+                        output.omit(OmissionScope::Foreign, ReconciliationOmission::UnmappedFill);
                         continue;
                     }
                 };
@@ -259,10 +375,19 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
                     continue;
                 }
 
+                if pending_settlement {
+                    output.omit(
+                        OmissionScope::Instrument(instrument_id),
+                        ReconciliationOmission::PendingTrade,
+                    );
+                    continue;
+                }
+
                 let Some(ts_event) = parse_timestamp(&trade.match_time) else {
-                    output.omit(ReconciliationOmission::InvalidFill(
-                        ReportParseError::Timestamp,
-                    ));
+                    output.omit(
+                        OmissionScope::Instrument(instrument_id),
+                        ReconciliationOmission::InvalidFill(ReportParseError::Timestamp),
+                    );
                     continue;
                 };
                 let report = match build_maker_fill_report(
@@ -282,7 +407,10 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
                 ) {
                     Ok(report) => report,
                     Err(e) => {
-                        output.omit(ReconciliationOmission::InvalidFill(e));
+                        output.omit(
+                            OmissionScope::Instrument(instrument_id),
+                            ReconciliationOmission::InvalidFill(e),
+                        );
                         continue;
                     }
                 };
@@ -301,7 +429,7 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
                         instrument_fee_exponent(&i),
                     ),
                     None => {
-                        output.omit(ReconciliationOmission::UnmappedFill);
+                        output.omit(OmissionScope::Foreign, ReconciliationOmission::UnmappedFill);
                         continue;
                     }
                 };
@@ -309,6 +437,14 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
             if let Some(filter_id) = instrument_filter
                 && instrument_id != filter_id
             {
+                continue;
+            }
+
+            if pending_settlement {
+                output.omit(
+                    OmissionScope::Instrument(instrument_id),
+                    ReconciliationOmission::PendingTrade,
+                );
                 continue;
             }
 
@@ -326,7 +462,10 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
             ) {
                 Ok(report) => report,
                 Err(e) => {
-                    output.omit(ReconciliationOmission::InvalidFill(e));
+                    output.omit(
+                        OmissionScope::Instrument(instrument_id),
+                        ReconciliationOmission::InvalidFill(e),
+                    );
                     continue;
                 }
             };
@@ -334,12 +473,16 @@ pub(crate) fn build_fill_reports_from_trades<'a>(
         }
     }
 
-    match unique_fill_evidence(&output.reports) {
-        Ok(unique) => output.reports = unique.into_iter().cloned().collect(),
-        Err(error) => {
-            output.reports.clear();
-            output.omit(ReconciliationOmission::InvalidFill(error));
-        }
+    let (unique, conflicting) = dedupe_fill_evidence(&output.reports);
+    let mut reports = unique.into_iter().cloned().collect::<Vec<_>>();
+    reports.retain(|report| !conflicting.contains(&report.instrument_id));
+    output.reports = reports;
+
+    for instrument_id in conflicting {
+        output.omit(
+            OmissionScope::Instrument(instrument_id),
+            ReconciliationOmission::InvalidFill(ReportParseError::ConflictingFill),
+        );
     }
 
     output
@@ -361,7 +504,10 @@ pub(crate) fn build_order_reports_from_orders<'a>(
         let (instrument_id, price_prec, size_prec) = match instrument {
             Some(i) => (i.id(), i.price_precision(), i.size_precision()),
             None => {
-                output.omit(ReconciliationOmission::UnmappedOrder);
+                output.omit(
+                    OmissionScope::Foreign,
+                    ReconciliationOmission::UnmappedOrder,
+                );
                 continue;
             }
         };
@@ -383,7 +529,10 @@ pub(crate) fn build_order_reports_from_orders<'a>(
         ) {
             Ok(report) => report,
             Err(e) => {
-                output.omit(ReconciliationOmission::InvalidOrder(e));
+                output.omit(
+                    OmissionScope::Instrument(instrument_id),
+                    ReconciliationOmission::InvalidOrder(e),
+                );
                 continue;
             }
         };
@@ -440,7 +589,10 @@ pub(crate) fn build_position_reports<'a>(
                 } else {
                     PositionOmission::Zero
                 };
-                output.omit(ReconciliationOmission::Position(reason));
+                output.omit(
+                    OmissionScope::Foreign,
+                    ReconciliationOmission::Position(reason),
+                );
                 continue;
             };
 
@@ -468,18 +620,21 @@ pub(crate) fn build_position_reports<'a>(
         }
 
         let Some(instrument) = instrument else {
-            output.omit(ReconciliationOmission::Position(
-                PositionOmission::UnmappedInstrument,
-            ));
+            output.omit(
+                OmissionScope::Foreign,
+                ReconciliationOmission::Position(PositionOmission::UnmappedInstrument),
+            );
             continue;
         };
+        let instrument_id = instrument.id();
 
         let quantity = match Quantity::from_decimal_dp(position.size, USDC_DECIMALS as u8) {
             Ok(quantity) => quantity,
             Err(_) => {
-                output.omit(ReconciliationOmission::Position(
-                    PositionOmission::InvalidSize,
-                ));
+                output.omit(
+                    OmissionScope::Instrument(instrument_id),
+                    ReconciliationOmission::Position(PositionOmission::InvalidSize),
+                );
                 continue;
             }
         };
@@ -487,14 +642,15 @@ pub(crate) fn build_position_reports<'a>(
             .avg_price
             .filter(|price| *price > Decimal::ZERO && *price < Decimal::ONE)
         else {
-            output.omit(ReconciliationOmission::Position(
-                PositionOmission::InvalidAveragePrice,
-            ));
+            output.omit(
+                OmissionScope::Instrument(instrument_id),
+                ReconciliationOmission::Position(PositionOmission::InvalidAveragePrice),
+            );
             continue;
         };
         output.reports.push(PositionStatusReport::new(
             account_id,
-            instrument.id(),
+            instrument_id,
             PositionSideSpecified::Long,
             quantity,
             ts,
@@ -563,6 +719,12 @@ fn build_reconciliation_snapshot(
     lookback_mins: Option<u64>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<ReconciliationSnapshot> {
+    ensure_execution_lookup_loaded(
+        "Mass status",
+        instruments,
+        orders.len() + trades.len() + positions.len(),
+    )?;
+
     let cutoff = lookback_mins.map(|mins| {
         let lookback_ns = mins.saturating_mul(60).saturating_mul(1_000_000_000);
         UnixNanos::from(ts_init.as_u64().saturating_sub(lookback_ns))
@@ -580,34 +742,51 @@ fn build_reconciliation_snapshot(
         build_order_reports_from_orders(scoped_orders, instruments, ctx.account_id, None, ts_init);
     let mut fill_set =
         build_fill_reports_from_trades(scoped_trades, ctx, instruments, None, ts_init);
-    let position_set = build_position_reports(positions, instruments, ctx.account_id, ts_init);
+    let mut position_set = build_position_reports(positions, instruments, ctx.account_id, ts_init);
 
     fill_tracker.snap_fill_reports(&mut fill_set.reports);
-    order_set
-        .omissions
-        .record_n(ReconciliationOmission::LookbackOrder, old_orders);
-    fill_set
-        .omissions
-        .record_n(ReconciliationOmission::LookbackFill, old_trades);
-
-    let invalid_orders =
-        cap_order_reports_to_confirmed_fills(&mut order_set.reports, &fill_set.reports)?;
     order_set.omissions.record_n(
-        ReconciliationOmission::InvalidOrder(ReportParseError::FilledQuantity),
-        invalid_orders,
+        OmissionScope::Account,
+        ReconciliationOmission::LookbackOrder,
+        old_orders,
     );
+    fill_set.omissions.record_n(
+        OmissionScope::Account,
+        ReconciliationOmission::LookbackFill,
+        old_trades,
+    );
+
+    cap_order_reports_to_confirmed_fills(
+        &mut order_set.reports,
+        &fill_set.reports,
+        &mut order_set.omissions,
+    )?;
 
     let mut omissions = order_set.omissions;
     omissions.merge(fill_set.omissions);
     omissions.merge(position_set.omissions);
+
+    // An instrument without usable evidence is withheld whole: stating a position without the
+    // fills behind it, or an order without the position it moved, would have a consumer close
+    // the difference itself.
+    let blocked = omissions.non_authoritative_instruments();
+    let withheld = withhold_non_authoritative(&mut order_set.reports, &blocked, |report| {
+        report.instrument_id
+    }) + withhold_non_authoritative(&mut fill_set.reports, &blocked, |report| {
+        report.instrument_id
+    }) + withhold_non_authoritative(&mut position_set.reports, &blocked, |report| {
+        report.instrument_id
+    });
+
     log_reconciliation_summary(
         "mass status",
         order_set.reports.len(),
         fill_set.reports.len(),
         position_set.reports.len(),
+        withheld,
         &omissions,
     );
-    omissions.ensure_authoritative("Mass status")?;
+    omissions.ensure_authoritative("Mass status", None)?;
 
     Ok(ReconciliationSnapshot {
         orders: order_set.reports,
@@ -627,6 +806,7 @@ fn scope_by_lookback<T>(
 
     let mut selected = Vec::with_capacity(rows.len());
     let mut omitted = 0;
+
     for row in rows {
         match timestamp(row) {
             Some(ts) if ts < cutoff => omitted += 1,
@@ -641,13 +821,14 @@ pub(crate) fn log_reconciliation_summary(
     order_reports: usize,
     fill_reports: usize,
     position_reports: usize,
+    withheld_reports: usize,
     omissions: &ReconciliationOmissions,
 ) {
     let message = format!(
-        "Polymarket {route}: reports(order={order_reports}, fill={fill_reports}, position={position_reports}); omissions={omissions}"
+        "Polymarket {route}: reports(order={order_reports}, fill={fill_reports}, position={position_reports}); withheld={withheld_reports}; omissions={omissions}"
     );
 
-    if omissions.is_empty() {
+    if omissions.is_empty() && withheld_reports == 0 {
         log::debug!("{message}");
     } else {
         log::warn!("{message}");
@@ -657,21 +838,35 @@ pub(crate) fn log_reconciliation_summary(
 fn cap_order_reports_to_confirmed_fills(
     order_reports: &mut Vec<OrderStatusReport>,
     fill_reports: &[FillReport],
-) -> Result<usize, ReportParseError> {
+    omissions: &mut ReconciliationOmissions,
+) -> Result<(), ReportParseError> {
     let confirmed_by_order = confirmed_filled_quantities(fill_reports)?;
-    let before = order_reports.len();
+    let mut invalid = Vec::new();
 
     order_reports.retain_mut(|report| {
         let local_filled = Quantity::zero(report.quantity.precision);
-        cap_order_report_filled_qty(
+
+        match cap_order_report_filled_qty(
             report,
             local_filled,
             confirmed_by_order.get(&report.venue_order_id).copied(),
-        )
-        .is_ok()
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                invalid.push((report.instrument_id, e));
+                false
+            }
+        }
     });
 
-    Ok(before - order_reports.len())
+    for (instrument_id, error) in invalid {
+        omissions.record(
+            OmissionScope::Instrument(instrument_id),
+            ReconciliationOmission::InvalidOrder(error),
+        );
+    }
+
+    Ok(())
 }
 
 pub(crate) fn confirmed_filled_quantities(
@@ -686,19 +881,34 @@ pub(crate) fn confirmed_filled_quantities(
 }
 
 fn unique_fill_evidence(fill_reports: &[FillReport]) -> Result<Vec<&FillReport>, ReportParseError> {
+    let (unique, conflicting) = dedupe_fill_evidence(fill_reports);
+
+    if conflicting.is_empty() {
+        return Ok(unique);
+    }
+
+    Err(ReportParseError::ConflictingFill)
+}
+
+/// Collapses repeated venue rows, naming the instruments whose repeated rows disagree.
+fn dedupe_fill_evidence(fill_reports: &[FillReport]) -> (Vec<&FillReport>, AHashSet<InstrumentId>) {
     let mut unique = Vec::with_capacity(fill_reports.len());
     let mut seen = AHashMap::<(AccountId, InstrumentId, TradeId), &FillReport>::new();
+    let mut conflicting = AHashSet::new();
+
     for fill in fill_reports {
         let fill_key = (fill.account_id, fill.instrument_id, fill.trade_id);
+
         if let Some(previous) = seen.insert(fill_key, fill) {
             if !same_fill_evidence(previous, fill) {
-                return Err(ReportParseError::ConflictingFill);
+                conflicting.insert(fill.instrument_id);
             }
         } else {
             unique.push(fill);
         }
     }
-    Ok(unique)
+
+    (unique, conflicting)
 }
 
 fn same_fill_evidence(left: &FillReport, right: &FillReport) -> bool {
@@ -781,11 +991,62 @@ mod tests {
         serde_json::from_str(&content).expect("failed to parse test data")
     }
 
-    fn test_instrument() -> InstrumentAny {
+    /// The two outcome instruments of the fixture market, which are distinct instruments the
+    /// client can be responsible for independently.
+    fn test_instruments() -> Vec<InstrumentAny> {
         let market: GammaMarket = load("gamma_market.json");
         let defs = parse_gamma_market(&market).expect("market should parse");
-        create_instrument_from_def(&defs[0], UnixNanos::from(1_000_000_000u64))
-            .expect("instrument should parse")
+        defs.iter()
+            .map(|def| {
+                create_instrument_from_def(def, UnixNanos::from(1_000_000_000u64))
+                    .expect("instrument should parse")
+            })
+            .collect()
+    }
+
+    fn test_instrument() -> InstrumentAny {
+        test_instruments().swap_remove(0)
+    }
+
+    const TRADED_TOKEN: &str = "traded-token";
+    const OTHER_TRADED_TOKEN: &str = "other-traded-token";
+    const FOREIGN_TOKEN: &str = "foreign-token";
+
+    /// An execution lookup holding the two instruments this client trades.
+    fn traded_instruments() -> (AtomicMap<Ustr, InstrumentAny>, InstrumentId, InstrumentId) {
+        let mut instruments = test_instruments();
+        let other = instruments.remove(1);
+        let traded = instruments.remove(0);
+        let traded_id = traded.id();
+        let other_id = other.id();
+        let lookup = AtomicMap::new();
+        lookup.insert(Ustr::from(TRADED_TOKEN), traded);
+        lookup.insert(Ustr::from(OTHER_TRADED_TOKEN), other);
+        (lookup, traded_id, other_id)
+    }
+
+    fn order_on(token: &str, venue_order_id: &str) -> PolymarketOpenOrder {
+        let mut order: PolymarketOpenOrder = load("http_open_order.json");
+        order.asset_id = Ustr::from(token);
+        order.id = venue_order_id.to_string();
+        order
+    }
+
+    fn taker_trade_on(token: &str, venue_order_id: &str, trade_id: &str) -> PolymarketTradeReport {
+        let mut trade: PolymarketTradeReport = load("http_trade_report.json");
+        trade.asset_id = Ustr::from(token);
+        trade.taker_order_id = venue_order_id.to_string();
+        trade.id = trade_id.to_string();
+        trade
+    }
+
+    fn position_on(token: &str, size: Decimal) -> DataApiPosition {
+        DataApiPosition {
+            asset: token.to_string(),
+            condition_id: "0xabc".to_string(),
+            size,
+            avg_price: Some(Decimal::new(5, 1)),
+        }
     }
 
     fn test_fill_context() -> FillContext<'static> {
@@ -799,34 +1060,133 @@ mod tests {
     }
 
     #[rstest]
-    fn reconciliation_snapshot_rejects_pending_settlement() {
-        let instrument = test_instrument();
-        let mut trade: PolymarketTradeReport = load("http_trade_report.json");
-        trade.status = PolymarketTradeStatus::Matched;
-        let position = DataApiPosition {
-            asset: trade.asset_id.to_string(),
-            condition_id: "0xabc".to_string(),
-            size: Decimal::ZERO,
-            avg_price: None,
-        };
+    fn reconciliation_snapshot_ignores_evidence_for_instruments_not_traded() {
+        let (instruments, traded_id, _) = traded_instruments();
+        let traded_order = order_on(TRADED_TOKEN, "V-TRADED");
+        let foreign_order = order_on(FOREIGN_TOKEN, "V-FOREIGN");
+        let traded_trade = taker_trade_on(TRADED_TOKEN, "V-TRADED", "T-TRADED");
+        let mut foreign_trade = taker_trade_on(FOREIGN_TOKEN, "V-FOREIGN", "T-FOREIGN");
+        foreign_trade.status = PolymarketTradeStatus::Retrying;
 
-        let instruments = AtomicMap::new();
-        instruments.insert(trade.asset_id, instrument);
-        let error = build_reconciliation_snapshot(
-            &[],
-            &[trade],
-            &[position],
+        let snapshot = build_reconciliation_snapshot(
+            &[traded_order, foreign_order],
+            &[traded_trade, foreign_trade],
+            &[
+                position_on(TRADED_TOKEN, Decimal::TEN),
+                position_on(FOREIGN_TOKEN, Decimal::TEN),
+            ],
             &instruments,
             &OrderFillTrackerMap::new(),
             &test_fill_context(),
             None,
             UnixNanos::from(1_000_000_000u64),
         )
-        .expect_err("pending settlement must make the snapshot non-authoritative");
+        .expect("evidence for instruments the client does not trade must not destroy authority");
 
+        // Every foreign row belongs to another user of the same funder wallet: an open order in
+        // a market this client does not trade, an unsettled trade there, and the position it
+        // holds. None of them says anything about the instruments this client is responsible
+        // for, so all of the in-scope evidence is still stated.
+        assert_eq!(snapshot.orders.len(), 1);
+        assert_eq!(snapshot.orders[0].instrument_id, traded_id);
+        assert_eq!(snapshot.fills.len(), 1);
+        assert_eq!(snapshot.fills[0].instrument_id, traded_id);
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(snapshot.positions[0].instrument_id, traded_id);
+    }
+
+    #[rstest]
+    fn reconciliation_snapshot_bounds_pending_settlement_to_its_own_instrument() {
+        let (instruments, traded_id, other_id) = traded_instruments();
+        let mut pending = taker_trade_on(TRADED_TOKEN, "V-PENDING", "T-PENDING");
+        pending.status = PolymarketTradeStatus::Retrying;
+
+        let snapshot = build_reconciliation_snapshot(
+            &[
+                order_on(TRADED_TOKEN, "V-PENDING"),
+                order_on(OTHER_TRADED_TOKEN, "V-SETTLED"),
+            ],
+            &[pending],
+            &[
+                position_on(TRADED_TOKEN, Decimal::TEN),
+                position_on(OTHER_TRADED_TOKEN, Decimal::TEN),
+            ],
+            &instruments,
+            &OrderFillTrackerMap::new(),
+            &test_fill_context(),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("an unsettled trade on one order must not withhold every other order");
+
+        // Polymarket settles asynchronously, so an unsettled trade is ordinary. It leaves the
+        // order it belongs to unstatable and says nothing about any other order.
+        assert_eq!(snapshot.orders.len(), 1);
+        assert_eq!(snapshot.orders[0].instrument_id, other_id);
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(snapshot.positions[0].instrument_id, other_id);
+        assert!(
+            !snapshot
+                .orders
+                .iter()
+                .any(|report| report.instrument_id == traded_id),
+        );
+    }
+
+    #[rstest]
+    fn reconciliation_snapshot_withholds_instrument_with_pending_settlement() {
+        let (instruments, _, _) = traded_instruments();
+        let mut trade = taker_trade_on(TRADED_TOKEN, "V-PENDING", "T-PENDING");
+        trade.status = PolymarketTradeStatus::Matched;
+
+        let snapshot = build_reconciliation_snapshot(
+            &[order_on(TRADED_TOKEN, "V-PENDING")],
+            &[trade],
+            &[position_on(TRADED_TOKEN, Decimal::TEN)],
+            &instruments,
+            &OrderFillTrackerMap::new(),
+            &test_fill_context(),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("a bounded omission withholds its instrument rather than failing the snapshot");
+
+        // Negative control: the instrument IS traded, so the unsettled trade still destroys
+        // authority over it. Stating the position without the fill behind it would have the
+        // consumer close the difference itself.
+        assert!(snapshot.orders.is_empty());
+        assert!(snapshot.fills.is_empty());
+        assert!(snapshot.positions.is_empty());
+    }
+
+    #[rstest]
+    fn reconciliation_snapshot_rejects_fill_evidence_bound_to_no_instrument() {
+        let (instruments, _, _) = traded_instruments();
+        let mut trade = taker_trade_on(TRADED_TOKEN, "V-MAKER", "T-MAKER");
+        trade.trader_side = PolymarketLiquiditySide::Maker;
+
+        for maker_order in &mut trade.maker_orders {
+            maker_order.maker_address = "0x000000000000000000000000000000000000dead".to_string();
+            maker_order.owner = "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string();
+        }
+
+        let error = build_reconciliation_snapshot(
+            &[order_on(TRADED_TOKEN, "V-TRADED")],
+            &[trade],
+            &[position_on(TRADED_TOKEN, Decimal::TEN)],
+            &instruments,
+            &OrderFillTrackerMap::new(),
+            &test_fill_context(),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect_err("evidence that names no instrument leaves nothing that can be stated");
+
+        // The venue states the account made this trade but no maker order identifies it, so
+        // there is no instrument to withhold and the whole snapshot must be refused.
         assert_eq!(
             error.to_string(),
-            "Mass status is not authoritative: PendingTrade=1",
+            "Mass status is not authoritative: UnownedMakerTrade@account=1",
         );
     }
 
@@ -853,6 +1213,7 @@ mod tests {
     #[rstest]
     fn fill_builder_rejects_conflicting_repeated_rest_rows() {
         let instrument = test_instrument();
+        let instrument_id = instrument.id();
         let trade: PolymarketTradeReport = load("http_trade_report.json");
         let mut conflicting = trade.clone();
         conflicting.size += Decimal::ONE;
@@ -869,24 +1230,28 @@ mod tests {
 
         assert!(output.reports.is_empty());
         assert_eq!(
-            output.omissions.count(ReconciliationOmission::InvalidFill(
-                ReportParseError::ConflictingFill,
-            )),
+            output.omissions.count(
+                OmissionScope::Instrument(instrument_id),
+                ReconciliationOmission::InvalidFill(ReportParseError::ConflictingFill),
+            ),
             1,
         );
     }
 
     #[rstest]
     fn reconciliation_snapshot_scopes_old_pending_trade_before_authority_check() {
-        let mut trade: PolymarketTradeReport = load("http_trade_report.json");
+        // The instrument is traded, so the lookback window is the only thing keeping this
+        // unsettled trade out of the authority check.
+        let (instruments, _, _) = traded_instruments();
+        let mut trade = taker_trade_on(TRADED_TOKEN, "V-OLD", "T-OLD");
         trade.status = PolymarketTradeStatus::Matched;
         trade.match_time = "1".to_string();
 
         let snapshot = build_reconciliation_snapshot(
             &[],
             &[trade],
-            &[],
-            &AtomicMap::new(),
+            &[position_on(TRADED_TOKEN, Decimal::TEN)],
+            &instruments,
             &OrderFillTrackerMap::new(),
             &test_fill_context(),
             Some(1),
@@ -895,6 +1260,7 @@ mod tests {
         .expect("out-of-window pending evidence must not invalidate the selected snapshot");
 
         assert!(snapshot.fills.is_empty());
+        assert_eq!(snapshot.positions.len(), 1);
     }
 
     #[rstest]
@@ -931,17 +1297,12 @@ mod tests {
 
     #[rstest]
     fn reconciliation_snapshot_omits_unmapped_zero_position() {
-        let position = DataApiPosition {
-            asset: "123".to_string(),
-            condition_id: "0xabc".to_string(),
-            size: Decimal::ZERO,
-            avg_price: Some(Decimal::new(5, 1)),
-        };
+        let (instruments, _, _) = traded_instruments();
         let snapshot = build_reconciliation_snapshot(
             &[],
             &[],
-            &[position],
-            &AtomicMap::new(),
+            &[position_on(FOREIGN_TOKEN, Decimal::ZERO)],
+            &instruments,
             &OrderFillTrackerMap::new(),
             &test_fill_context(),
             None,
@@ -983,71 +1344,99 @@ mod tests {
     }
 
     #[rstest]
-    fn reconciliation_snapshot_rejects_invalid_open_position() {
-        let position = DataApiPosition {
-            asset: "123".to_string(),
-            condition_id: "0xabc".to_string(),
-            size: Decimal::TEN,
-            avg_price: None,
-        };
-        let instruments = AtomicMap::new();
-        instruments.insert(Ustr::from("123"), test_instrument());
-        let error = build_reconciliation_snapshot(
+    fn reconciliation_snapshot_withholds_instrument_with_invalid_open_position() {
+        let (instruments, _, other_id) = traded_instruments();
+        let mut invalid = position_on(TRADED_TOKEN, Decimal::TEN);
+        invalid.avg_price = None;
+
+        let snapshot = build_reconciliation_snapshot(
             &[],
             &[],
-            &[position],
+            &[invalid, position_on(OTHER_TRADED_TOKEN, Decimal::TEN)],
             &instruments,
             &OrderFillTrackerMap::new(),
             &test_fill_context(),
             None,
             UnixNanos::from(1_000_000_000u64),
         )
-        .expect_err("invalid open position must make the snapshot non-authoritative");
+        .expect("an unusable row withholds its instrument rather than failing the snapshot");
 
-        assert_eq!(
-            error.to_string(),
-            "Mass status is not authoritative: Position(InvalidAveragePrice)=1",
-        );
+        // Negative control: the row names an instrument this client trades and cannot be
+        // parsed, so that instrument stays out of the snapshot.
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(snapshot.positions[0].instrument_id, other_id);
     }
 
     #[rstest]
-    fn reconciliation_snapshot_rejects_unmapped_open_position() {
-        let position = DataApiPosition {
-            asset: "123".to_string(),
-            condition_id: "0xabc".to_string(),
-            size: Decimal::TEN,
-            avg_price: Some(Decimal::new(5, 1)),
-        };
+    fn reconciliation_snapshot_ignores_open_position_for_instrument_not_traded() {
+        let (instruments, _, _) = traded_instruments();
 
+        let snapshot = build_reconciliation_snapshot(
+            &[],
+            &[],
+            &[position_on(FOREIGN_TOKEN, Decimal::TEN)],
+            &instruments,
+            &OrderFillTrackerMap::new(),
+            &test_fill_context(),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("a position in a market this client does not trade is not its evidence");
+
+        assert!(snapshot.positions.is_empty());
+    }
+
+    #[rstest]
+    fn reconciliation_snapshot_rejects_account_evidence_without_an_execution_lookup() {
         let error = build_reconciliation_snapshot(
+            &[order_on(TRADED_TOKEN, "V-TRADED")],
             &[],
-            &[],
-            &[position],
+            &[position_on(TRADED_TOKEN, Decimal::TEN)],
             &AtomicMap::new(),
             &OrderFillTrackerMap::new(),
             &test_fill_context(),
             None,
             UnixNanos::from(1_000_000_000u64),
         )
-        .expect_err("unmapped open position must make the snapshot non-authoritative");
+        .expect_err("an empty execution lookup cannot make the venue's evidence foreign");
 
+        // Instruments that failed to load leave every row foreign, which would state an empty
+        // and therefore vacuously authoritative snapshot: a consumer reads that as a flat
+        // account. It is a load failure, not evidence that the venue holds nothing.
         assert_eq!(
             error.to_string(),
-            "Mass status is not authoritative: Position(UnmappedInstrument)=1",
+            "Mass status cannot be stated: the execution lookup holds no instruments while the venue reports 2 row(s) for the account",
         );
     }
 
     #[rstest]
-    fn reconciliation_snapshot_rejects_filled_order_without_confirmed_fill() {
-        let instrument = test_instrument();
-        let mut order: PolymarketOpenOrder = load("http_open_order.json");
+    fn reconciliation_snapshot_allows_an_empty_execution_lookup_without_evidence() {
+        let snapshot = build_reconciliation_snapshot(
+            &[],
+            &[],
+            &[],
+            &AtomicMap::new(),
+            &OrderFillTrackerMap::new(),
+            &test_fill_context(),
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("an account the venue reports nothing for is genuinely flat");
+
+        assert!(snapshot.orders.is_empty());
+        assert!(snapshot.fills.is_empty());
+        assert!(snapshot.positions.is_empty());
+    }
+
+    #[rstest]
+    fn reconciliation_snapshot_withholds_filled_order_without_confirmed_fill() {
+        let (instruments, _, other_id) = traded_instruments();
+        let mut order = order_on(TRADED_TOKEN, "V-MATCHED");
         order.status = crate::common::enums::PolymarketOrderStatus::Matched;
         order.size_matched = order.original_size;
 
-        let instruments = AtomicMap::new();
-        instruments.insert(order.asset_id, instrument);
-        let error = build_reconciliation_snapshot(
-            &[order],
+        let snapshot = build_reconciliation_snapshot(
+            &[order, order_on(OTHER_TRADED_TOKEN, "V-LIVE")],
             &[],
             &[],
             &instruments,
@@ -1056,12 +1445,12 @@ mod tests {
             None,
             UnixNanos::from(1_000_000_000u64),
         )
-        .expect_err("filled order without confirmed fill must not emit malformed state");
+        .expect("an unusable order withholds its instrument rather than failing the snapshot");
 
-        assert_eq!(
-            error.to_string(),
-            "Mass status is not authoritative: InvalidOrder(FilledQuantity)=1",
-        );
+        // Negative control: a filled order with no confirmed fill behind it is malformed state
+        // for an instrument this client trades, so it is never emitted.
+        assert_eq!(snapshot.orders.len(), 1);
+        assert_eq!(snapshot.orders[0].instrument_id, other_id);
     }
 
     #[rstest]
@@ -1102,7 +1491,12 @@ mod tests {
             None,
         )];
 
-        cap_order_reports_to_confirmed_fills(&mut reports, &fills).unwrap();
+        cap_order_reports_to_confirmed_fills(
+            &mut reports,
+            &fills,
+            &mut ReconciliationOmissions::default(),
+        )
+        .unwrap();
 
         assert_eq!(reports[0].filled_qty, Quantity::from("4.0000"));
     }
@@ -1200,7 +1594,12 @@ mod tests {
             None,
         )];
 
-        let invalid = cap_order_reports_to_confirmed_fills(&mut reports, &fills).unwrap();
+        let mut omissions = ReconciliationOmissions::default();
+        cap_order_reports_to_confirmed_fills(&mut reports, &fills, &mut omissions).unwrap();
+        let invalid = omissions.count(
+            OmissionScope::Instrument(instrument_id),
+            ReconciliationOmission::InvalidOrder(ReportParseError::FilledQuantity),
+        );
 
         if let Some(expected_quantity) = expected_quantity {
             assert_eq!(invalid, 0);
