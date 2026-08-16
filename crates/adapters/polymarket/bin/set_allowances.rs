@@ -25,12 +25,13 @@ use std::str::FromStr;
 
 use alloy::{
     network::{EthereumWallet, ReceiptResponse},
-    primitives::{Address, U256, address},
+    primitives::{Address, address},
     providers::ProviderBuilder,
     signers::local::PrivateKeySigner,
 };
 use nautilus_polymarket::{
-    common::credential::EvmPrivateKey, signing::eip712::COLLATERAL_APPROVAL_TARGETS,
+    common::credential::EvmPrivateKey,
+    signing::eip712::{CollateralApproval, collateral_approval_plan},
 };
 
 const DEFAULT_POLYGON_RPC_URL: &str = "https://polygon.drpc.org";
@@ -48,12 +49,6 @@ alloy::sol! {
     interface Erc1155 {
         function setApprovalForAll(address operator, bool approved) external;
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Approval {
-    Collateral { spender: Address, amount: U256 },
-    Ctf { operator: Address, approved: bool },
 }
 
 #[tokio::main]
@@ -78,9 +73,9 @@ async fn run(private_key: &str, rpc_url: &str) -> Result<(), Box<dyn std::error:
     let collateral = Erc20::new(PUSD_COLLATERAL, provider.clone());
     let ctf = Erc1155::new(CONDITIONAL_TOKENS, provider);
 
-    for approval in approval_transactions() {
+    for approval in collateral_approval_plan() {
         match approval {
-            Approval::Collateral { spender, amount } => {
+            CollateralApproval::Collateral { spender, amount } => {
                 let call = collateral.approve(spender, amount);
                 let receipt = call.send().await?.get_receipt().await?;
                 receipt.ensure_success()?;
@@ -89,7 +84,7 @@ async fn run(private_key: &str, rpc_url: &str) -> Result<(), Box<dyn std::error:
                     receipt.transaction_hash(),
                 );
             }
-            Approval::Ctf { operator, approved } => {
+            CollateralApproval::ConditionalTokens { operator, approved } => {
                 let call = ctf.setApprovalForAll(operator, approved);
                 let receipt = call.send().await?.get_receipt().await?;
                 receipt.ensure_success()?;
@@ -102,22 +97,4 @@ async fn run(private_key: &str, rpc_url: &str) -> Result<(), Box<dyn std::error:
     }
 
     Ok(())
-}
-
-fn approval_transactions() -> impl Iterator<Item = Approval> {
-    COLLATERAL_APPROVAL_TARGETS
-        .iter()
-        .copied()
-        .flat_map(|target| {
-            [
-                Approval::Collateral {
-                    spender: target,
-                    amount: U256::MAX,
-                },
-                Approval::Ctf {
-                    operator: target,
-                    approved: true,
-                },
-            ]
-        })
 }
