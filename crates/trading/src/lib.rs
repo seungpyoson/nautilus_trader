@@ -116,6 +116,7 @@ pub use algorithm::{
 pub use controller::ImportableControllerConfig;
 pub use strategy::{
     ImportableStrategyConfig, Strategy, StrategyConfig, StrategyCore, StrategyNative,
+    SubmitOrderError, SubmitOrderHandoff,
 };
 
 #[cfg(feature = "python")]
