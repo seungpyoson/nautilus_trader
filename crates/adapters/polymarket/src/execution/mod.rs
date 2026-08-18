@@ -22,6 +22,7 @@ pub(crate) mod identity;
 pub(crate) mod order_fill_tracker;
 pub(crate) mod pending;
 pub(crate) mod reconciliation;
+pub(crate) mod report_build;
 pub(crate) mod submitter;
 pub(crate) mod types;
 

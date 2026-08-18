@@ -342,7 +342,8 @@ fn bench_order_event(c: &mut Criterion) {
                 px_prec,
                 sz_prec,
                 ts_init,
-            );
+            )
+            .expect("benchmark fixture order is representable");
             black_box(report);
         });
     });

@@ -446,7 +446,10 @@ mod tests {
     use super::*;
     use crate::{
         common::consts::USDC_DECIMALS,
-        execution::reconciliation::build_position_reports,
+        execution::{
+            reconciliation::build_position_reports,
+            report_build::{ReportField, ReportOmission, ReportRow, ReportValueError},
+        },
         http::models::{DataApiPosition, DataApiTrade},
     };
 
@@ -477,18 +480,25 @@ mod tests {
     }
 
     #[rstest]
-    fn test_build_position_reports_filters_dust_and_zero() {
+    fn test_build_position_reports_reports_flat_and_types_dust_omission() {
         let positions = load_positions();
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let batch = build_position_reports(&positions, account_id, ts_now);
 
-        // 4 positions: 150.5, 0.0, 42.0, 0.005 (dust)
-        // Only 150.5 and 42.0 pass the DUST_POSITION_THRESHOLD (0.01)
-        assert_eq!(reports.len(), 2);
-        assert!(reports[0].is_long());
-        assert!(reports[1].is_long());
+        assert_eq!(batch.reports.len(), 3);
+        assert!(batch.reports[0].is_long());
+        assert!(batch.reports[1].is_flat());
+        assert!(batch.reports[2].is_long());
+        assert_eq!(
+            batch.omissions,
+            vec![ReportOmission::InvalidValue {
+                row: ReportRow::Position,
+                field: ReportField::PositionQuantity,
+                reason: ReportValueError::PositionDust,
+            }],
+        );
     }
 
     #[rstest]
@@ -497,11 +507,12 @@ mod tests {
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let batch = build_position_reports(&positions, account_id, ts_now);
 
-        assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].avg_px_open, Some(dec!(0.55)));
-        assert_eq!(reports[1].avg_px_open, Some(dec!(0.3)));
+        assert_eq!(batch.reports.len(), 3);
+        assert_eq!(batch.reports[0].avg_px_open, Some(dec!(0.55)));
+        assert_eq!(batch.reports[1].avg_px_open, None);
+        assert_eq!(batch.reports[2].avg_px_open, Some(dec!(0.3)));
     }
 
     #[rstest]
@@ -510,11 +521,15 @@ mod tests {
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let batch = build_position_reports(&positions, account_id, ts_now);
 
-        assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].quantity.precision, USDC_DECIMALS as u8);
-        assert_eq!(reports[1].quantity.precision, USDC_DECIMALS as u8);
+        assert_eq!(batch.reports.len(), 3);
+        assert!(
+            batch
+                .reports
+                .iter()
+                .all(|report| report.quantity.precision == USDC_DECIMALS as u8),
+        );
     }
 
     #[rstest]
@@ -528,10 +543,57 @@ mod tests {
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let batch = build_position_reports(&positions, account_id, ts_now);
 
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].avg_px_open, None);
+        assert_eq!(batch.reports.len(), 1);
+        assert_eq!(batch.reports[0].avg_px_open, None);
+        assert!(batch.omissions.is_empty());
+    }
+
+    #[rstest]
+    #[case::negative_size(
+        "0xabc",
+        dec!(-1),
+        Some(dec!(0.5)),
+        ReportField::PositionQuantity,
+        ReportValueError::Negative
+    )]
+    #[case::invalid_average_price(
+        "0xabc",
+        dec!(1),
+        Some(dec!(1)),
+        ReportField::AveragePrice,
+        ReportValueError::OutsideBinaryPriceRange
+    )]
+    fn test_build_position_reports_returns_typed_invalid_value_omission(
+        #[case] condition_id: &str,
+        #[case] size: Decimal,
+        #[case] avg_price: Option<Decimal>,
+        #[case] expected_field: ReportField,
+        #[case] expected_reason: ReportValueError,
+    ) {
+        let position = DataApiPosition {
+            asset: "123".to_string(),
+            condition_id: condition_id.to_string(),
+            size,
+            avg_price,
+        };
+
+        let batch = build_position_reports(
+            &[position],
+            AccountId::from("POLYMARKET-001"),
+            nautilus_core::UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(batch.reports.is_empty());
+        assert_eq!(
+            batch.omissions,
+            vec![ReportOmission::InvalidValue {
+                row: ReportRow::Position,
+                field: expected_field,
+                reason: expected_reason,
+            }],
+        );
     }
 
     #[rstest]

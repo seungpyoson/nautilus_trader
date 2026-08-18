@@ -228,6 +228,7 @@ struct TestServerState {
     single_order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     single_order_get_count: Arc<AtomicUsize>,
     trades_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
+    positions_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
 }
 
 impl Default for TestServerState {
@@ -289,6 +290,7 @@ impl Default for TestServerState {
             single_order_response: Arc::new(tokio::sync::Mutex::new(None)),
             single_order_get_count: Arc::new(AtomicUsize::new(0)),
             trades_response_override: Arc::new(tokio::sync::Mutex::new(None)),
+            positions_response_override: Arc::new(tokio::sync::Mutex::new(None)),
             book_response: Arc::new(tokio::sync::Mutex::new(Some(json!({
                 "bids": [
                     {"price": "0.48", "size": "100.00"},
@@ -848,8 +850,15 @@ async fn handle_health() -> impl IntoResponse {
     StatusCode::OK
 }
 
-async fn handle_get_positions() -> impl IntoResponse {
-    Json(serde_json::json!([]))
+async fn handle_get_positions(State(state): State<TestServerState>) -> impl IntoResponse {
+    Json(
+        state
+            .positions_response_override
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| json!([])),
+    )
 }
 
 fn create_test_router(state: TestServerState) -> Router {
@@ -1535,6 +1544,198 @@ async fn test_generate_order_status_reports_empty_without_instruments() {
 
     // Without loaded instruments, orders cannot be resolved to instrument IDs
     assert!(reports.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_rejects_unmapped_rows() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let error = client
+        .generate_mass_status(None)
+        .await
+        .expect_err("unmapped rows should fail mass-status generation");
+
+    assert!(format!("{error:#}").contains("incomplete"));
+    assert!(format!("{error:#}").contains("no loaded instrument"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_rejects_fill_omission_independently() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(recovery_trades_response(
+        "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",
+        "1.0000",
+        "0.5000",
+    ));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let error = client
+        .generate_mass_status(None)
+        .await
+        .expect_err("a fill omission should fail mass-status generation");
+
+    assert!(format!("{error:#}").contains("Fill row has no loaded instrument"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_rejects_position_omission_independently() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.positions_response_override.lock().await = Some(json!([{
+        "asset": "TEST-TOKEN",
+        "conditionId": "0xtest-condition",
+        "size": 0.005,
+        "avgPrice": 0.5,
+    }]));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let error = client
+        .generate_mass_status(None)
+        .await
+        .expect_err("a position omission should fail mass-status generation");
+
+    assert!(format!("{error:#}").contains("position is below the reportable dust threshold"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_rejects_duplicate_order_identity() {
+    let state = TestServerState::default();
+    let order = load_json("http_open_orders_page.json")["data"][0].clone();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [order.clone(), order],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let instrument = cache
+        .borrow()
+        .instrument(&instrument_id)
+        .expect("test instrument should be cached")
+        .clone();
+    client.on_instrument(instrument);
+
+    let error = client
+        .generate_mass_status(None)
+        .await
+        .expect_err("duplicate order identities should fail mass-status generation");
+
+    assert!(format!("{error:#}").contains("incomplete"));
+    assert!(format!("{error:#}").contains("duplicate authority identity"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_rejects_duplicate_fill_identity() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let trade = recovery_trades_response(
+        "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",
+        "1.0000",
+        "0.5000",
+    )["data"][0]
+        .clone();
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [trade.clone(), trade],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let instrument = cache
+        .borrow()
+        .instrument(&instrument_id)
+        .expect("test instrument should be cached")
+        .clone();
+    client.on_instrument(instrument);
+
+    let error = client
+        .generate_mass_status(None)
+        .await
+        .expect_err("duplicate fill identities should fail mass-status generation");
+
+    assert!(format!("{error:#}").contains("Fill rows contain a duplicate authority identity"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_rejects_duplicate_position_identity() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let position = json!({
+        "asset": "TEST-TOKEN",
+        "conditionId": "0xtest-condition",
+        "size": 1.0,
+        "avgPrice": 0.5,
+    });
+    *state.positions_response_override.lock().await = Some(json!([position.clone(), position]));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let error = client
+        .generate_mass_status(None)
+        .await
+        .expect_err("duplicate position identities should fail mass-status generation");
+
+    assert!(format!("{error:#}").contains("Position rows contain a duplicate authority identity"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_lookback_exclusion_is_not_an_omission() {
+    let state = TestServerState::default();
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let mass_status = client
+        .generate_mass_status(Some(1))
+        .await
+        .expect("mass-status request should succeed")
+        .expect("Polymarket should return a mass status");
+
+    assert!(mass_status.reports_complete());
+    assert!(mass_status.lookback_start().is_some());
+    assert!(mass_status.order_reports().is_empty());
+    assert!(mass_status.fill_reports().is_empty());
 }
 
 #[rstest]

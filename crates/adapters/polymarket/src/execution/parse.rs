@@ -26,7 +26,7 @@ use nautilus_model::{
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     instruments::InstrumentAny,
     reports::{FillReport, OrderStatusReport},
-    types::{AccountBalance, Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Quantity},
 };
 use rust_decimal::Decimal;
 
@@ -38,6 +38,10 @@ use crate::{
             PolymarketOrderStatus, PolymarketOrderType,
         },
         models::PolymarketMakerOrder,
+    },
+    execution::report_build::{
+        ReportBuildError, ReportField, ReportOmission, ReportRow, ReportValueError, binary_price,
+        non_negative_quantity, positive_quantity, unix_seconds,
     },
     http::models::{ClobBookLevel, PolymarketOpenOrder, PolymarketTradeReport},
 };
@@ -103,21 +107,45 @@ pub fn determine_order_side(
 /// per fill by combining the trade ID with part of the venue order ID.
 ///
 /// Format: `{trade_id[..27]}-{venue_order_id[last 8]}` = 36 chars.
+///
+/// # Panics
+///
+/// Panics if either identifier is empty, non-ASCII, whitespace-only, or contains an interior NUL.
 pub fn make_composite_trade_id(trade_id: &str, venue_order_id: &str) -> TradeId {
+    make_composite_trade_id_checked(trade_id, venue_order_id)
+        .expect("trade and venue order IDs must be valid ASCII identifiers")
+}
+
+fn make_composite_trade_id_checked(trade_id: &str, venue_order_id: &str) -> Option<TradeId> {
+    if !is_valid_composite_id_component(trade_id)
+        || !is_valid_composite_id_component(venue_order_id)
+    {
+        return None;
+    }
+
     let prefix_len = trade_id.len().min(27);
     let suffix_len = venue_order_id.len().min(8);
     let suffix_start = venue_order_id.len().saturating_sub(suffix_len);
-    TradeId::from(
-        format!(
-            "{}-{}",
-            &trade_id[..prefix_len],
-            &venue_order_id[suffix_start..]
-        )
-        .as_str(),
-    )
+    TradeId::new_checked(format!(
+        "{}-{}",
+        &trade_id[..prefix_len],
+        &venue_order_id[suffix_start..]
+    ))
+    .ok()
+}
+
+fn is_valid_composite_id_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.is_ascii()
+        && !value.as_bytes().contains(&0)
+        && !value.bytes().all(|byte| byte.is_ascii_whitespace())
 }
 
 /// Parses a [`PolymarketOpenOrder`] into an [`OrderStatusReport`].
+///
+/// # Errors
+///
+/// Returns an error when an authority-relevant venue value cannot be represented safely.
 pub fn parse_order_status_report(
     order: &PolymarketOpenOrder,
     instrument_id: InstrumentId,
@@ -126,8 +154,34 @@ pub fn parse_order_status_report(
     price_precision: u8,
     size_precision: u8,
     ts_init: UnixNanos,
-) -> OrderStatusReport {
-    let venue_order_id = VenueOrderId::from(order.id.as_str());
+) -> anyhow::Result<OrderStatusReport> {
+    parse_order_status_report_checked(
+        order,
+        instrument_id,
+        account_id,
+        client_order_id,
+        price_precision,
+        size_precision,
+        ts_init,
+    )
+    .map_err(ReportBuildError::into_anyhow)
+}
+
+pub(crate) fn parse_order_status_report_checked(
+    order: &PolymarketOpenOrder,
+    instrument_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: Option<ClientOrderId>,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+) -> Result<OrderStatusReport, ReportBuildError> {
+    let venue_order_id =
+        VenueOrderId::new_checked(order.id.as_str()).map_err(|_| ReportOmission::InvalidValue {
+            row: ReportRow::Order,
+            field: ReportField::VenueOrderIdentity,
+            reason: ReportValueError::InvalidIdentifier,
+        })?;
     let order_side = OrderSide::from(order.side);
     let time_in_force = TimeInForce::from(order.order_type);
     let order_status = if order.status == PolymarketOrderStatus::Matched
@@ -138,15 +192,45 @@ pub fn parse_order_status_report(
     } else {
         OrderStatus::from(order.status)
     };
-    let quantity = Quantity::from_decimal_dp(order.original_size, size_precision)
-        .unwrap_or_else(|_| Quantity::zero(size_precision));
-    let raw_filled_qty = Quantity::from_decimal_dp(order.size_matched, size_precision)
-        .unwrap_or_else(|_| Quantity::zero(size_precision));
-    let filled_qty = snap_filled_qty_to_quantity(quantity, raw_filled_qty, order_status);
-    let price = Price::from_decimal_dp(order.price, price_precision)
-        .unwrap_or_else(|_| Price::zero(price_precision));
+    let quantity = positive_quantity(order.original_size, size_precision).map_err(|reason| {
+        ReportOmission::InvalidValue {
+            row: ReportRow::Order,
+            field: ReportField::OriginalQuantity,
+            reason,
+        }
+    })?;
+    let raw_filled_qty =
+        non_negative_quantity(order.size_matched, size_precision).map_err(|reason| {
+            ReportOmission::InvalidValue {
+                row: ReportRow::Order,
+                field: ReportField::FilledQuantity,
+                reason,
+            }
+        })?;
 
-    let ts_accepted = UnixNanos::from(order.created_at * NANOSECONDS_IN_SECOND);
+    if order_status == OrderStatus::Filled && raw_filled_qty.is_zero() {
+        return Err(ReportOmission::InvalidValue {
+            row: ReportRow::Order,
+            field: ReportField::FilledQuantity,
+            reason: ReportValueError::NonPositive,
+        }
+        .into());
+    }
+    let filled_qty = snap_filled_qty_to_quantity(quantity, raw_filled_qty, order_status);
+    let price = binary_price(order.price, price_precision).map_err(|reason| {
+        ReportOmission::InvalidValue {
+            row: ReportRow::Order,
+            field: ReportField::Price,
+            reason,
+        }
+    })?;
+
+    let ts_accepted =
+        unix_seconds(order.created_at).map_err(|reason| ReportOmission::InvalidValue {
+            row: ReportRow::Order,
+            field: ReportField::Timestamp,
+            reason,
+        })?;
 
     let mut report = OrderStatusReport::new(
         account_id,
@@ -166,25 +250,35 @@ pub fn parse_order_status_report(
     );
     report.price = Some(price);
     // CLOB V2 emits `expiration` as Unix seconds; "0" means no expiration.
-    if let Some(nanos) = order.expiration.as_deref().and_then(parse_expiration_nanos) {
-        report.expire_time = Some(UnixNanos::from(nanos));
-    }
-    report
+    report.expire_time = order
+        .expiration
+        .as_deref()
+        .map(parse_expiration_nanos)
+        .transpose()
+        .map_err(|reason| ReportOmission::InvalidValue {
+            row: ReportRow::Order,
+            field: ReportField::Expiration,
+            reason,
+        })?
+        .flatten()
+        .map(UnixNanos::from);
+    Ok(report)
 }
 
-/// Parses a CLOB V2 `expiration` string into a Unix-nanos value. Returns
-/// `None` for `"0"`, missing values, unparsable input, or values that
-/// overflow `u64` when scaled to nanoseconds (e.g. accidentally-passed
-/// millisecond timestamps that exceed Unix-seconds bounds).
-fn parse_expiration_nanos(value: &str) -> Option<u64> {
-    let secs: u64 = value.parse().ok()?;
+/// Parses a CLOB V2 `expiration` string into a Unix-nanos value.
+///
+/// Returns `None` only for the venue's explicit no-expiration sentinel `"0"`.
+fn parse_expiration_nanos(value: &str) -> Result<Option<u64>, ReportValueError> {
+    let secs: u64 = value
+        .parse()
+        .map_err(|_| ReportValueError::InvalidTimestamp)?;
+
     if secs == 0 {
-        return None;
+        return Ok(None);
     }
-    secs.checked_mul(NANOSECONDS_IN_SECOND)
+    unix_seconds(secs).map(|timestamp| Some(timestamp.as_u64()))
 }
 
-// panics-doc-ok (transitive via validating identifier constructors)
 /// Parses a [`PolymarketTradeReport`] into a [`FillReport`].
 ///
 /// Produces one fill report for the overall trade. The `trade_id` is
@@ -193,11 +287,9 @@ fn parse_expiration_nanos(value: &str) -> Option<u64> {
 ///
 /// # Errors
 ///
-/// Returns an error if the computed commission cannot be represented as [`Money`].
+/// Returns an error when an authority-relevant venue value or the computed commission cannot be
+/// represented safely.
 ///
-/// # Panics
-///
-/// Panics if the trade identifiers are invalid.
 #[expect(clippy::too_many_arguments)]
 pub fn parse_fill_report(
     trade: &PolymarketTradeReport,
@@ -211,13 +303,63 @@ pub fn parse_fill_report(
     fee_exponent: f64,
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
-    let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
-    let trade_id = TradeId::from(trade.id.as_str());
+    parse_fill_report_checked(
+        trade,
+        instrument_id,
+        account_id,
+        client_order_id,
+        price_precision,
+        size_precision,
+        currency,
+        taker_fee_rate,
+        fee_exponent,
+        ts_init,
+    )
+    .map_err(ReportBuildError::into_anyhow)
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn parse_fill_report_checked(
+    trade: &PolymarketTradeReport,
+    instrument_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: Option<ClientOrderId>,
+    price_precision: u8,
+    size_precision: u8,
+    currency: Currency,
+    taker_fee_rate: Decimal,
+    fee_exponent: f64,
+    ts_init: UnixNanos,
+) -> Result<FillReport, ReportBuildError> {
+    let venue_order_id =
+        VenueOrderId::new_checked(trade.taker_order_id.as_str()).map_err(|_| {
+            ReportOmission::InvalidValue {
+                row: ReportRow::Fill,
+                field: ReportField::VenueOrderIdentity,
+                reason: ReportValueError::InvalidIdentifier,
+            }
+        })?;
+    let trade_id =
+        TradeId::new_checked(trade.id.as_str()).map_err(|_| ReportOmission::InvalidValue {
+            row: ReportRow::Fill,
+            field: ReportField::TradeIdentity,
+            reason: ReportValueError::InvalidIdentifier,
+        })?;
     let order_side = OrderSide::from(trade.side);
-    let last_qty = Quantity::from_decimal_dp(trade.size, size_precision)
-        .unwrap_or_else(|_| Quantity::zero(size_precision));
-    let last_px = Price::from_decimal_dp(trade.price, price_precision)
-        .unwrap_or_else(|_| Price::zero(price_precision));
+    let last_qty = positive_quantity(trade.size, size_precision).map_err(|reason| {
+        ReportOmission::InvalidValue {
+            row: ReportRow::Fill,
+            field: ReportField::MatchedQuantity,
+            reason,
+        }
+    })?;
+    let last_px = binary_price(trade.price, price_precision).map_err(|reason| {
+        ReportOmission::InvalidValue {
+            row: ReportRow::Fill,
+            field: ReportField::Price,
+            reason,
+        }
+    })?;
     let liquidity_side = parse_liquidity_side(trade.trader_side);
 
     let commission_value = compute_commission(
@@ -227,11 +369,19 @@ pub fn parse_fill_report(
         trade.price,
         liquidity_side,
     );
-    let commission = Money::from_decimal(commission_value, currency).with_context(|| {
-        format!("failed to represent commission {commission_value} for {instrument_id} as Money")
-    })?;
+    let commission = Money::from_decimal(commission_value, currency)
+        .with_context(|| {
+            format!(
+                "failed to represent commission {commission_value} for {instrument_id} as Money"
+            )
+        })
+        .map_err(ReportBuildError::Fatal)?;
 
-    let ts_event = parse_timestamp(&trade.match_time).unwrap_or(ts_init);
+    let ts_event = parse_timestamp(&trade.match_time).ok_or(ReportOmission::InvalidValue {
+        row: ReportRow::Fill,
+        field: ReportField::Timestamp,
+        reason: ReportValueError::InvalidTimestamp,
+    })?;
 
     Ok(FillReport {
         account_id,
@@ -252,7 +402,6 @@ pub fn parse_fill_report(
     })
 }
 
-// panics-doc-ok (transitive via validating identifier constructors)
 /// Builds a [`FillReport`] from a [`PolymarketMakerOrder`] and trade-level context.
 ///
 /// Used by both the WS stream handler and REST fill report generation since both
@@ -261,11 +410,9 @@ pub fn parse_fill_report(
 ///
 /// # Errors
 ///
-/// Returns an error if the computed commission cannot be represented as [`Money`].
+/// Returns an error when an authority-relevant venue value or the computed commission cannot be
+/// represented safely.
 ///
-/// # Panics
-///
-/// Panics if the maker order or generated trade identifier is invalid.
 #[expect(clippy::too_many_arguments)]
 pub fn build_maker_fill_report(
     mo: &PolymarketMakerOrder,
@@ -282,18 +429,74 @@ pub fn build_maker_fill_report(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
-    let venue_order_id = VenueOrderId::from(mo.order_id.as_str());
-    let fill_trade_id = make_composite_trade_id(trade_id, &mo.order_id);
+    build_maker_fill_report_checked(
+        mo,
+        trade_id,
+        trader_side,
+        trade_side,
+        taker_asset_id,
+        account_id,
+        instrument_id,
+        price_precision,
+        size_precision,
+        currency,
+        liquidity_side,
+        ts_event,
+        ts_init,
+    )
+    .map_err(ReportBuildError::into_anyhow)
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn build_maker_fill_report_checked(
+    mo: &PolymarketMakerOrder,
+    trade_id: &str,
+    trader_side: PolymarketLiquiditySide,
+    trade_side: PolymarketOrderSide,
+    taker_asset_id: &str,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    currency: Currency,
+    liquidity_side: LiquiditySide,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> Result<FillReport, ReportBuildError> {
+    let venue_order_id = VenueOrderId::new_checked(mo.order_id.as_str()).map_err(|_| {
+        ReportOmission::InvalidValue {
+            row: ReportRow::Fill,
+            field: ReportField::VenueOrderIdentity,
+            reason: ReportValueError::InvalidIdentifier,
+        }
+    })?;
+
+    let fill_trade_id = make_composite_trade_id_checked(trade_id, &mo.order_id).ok_or(
+        ReportOmission::InvalidValue {
+            row: ReportRow::Fill,
+            field: ReportField::TradeIdentity,
+            reason: ReportValueError::InvalidIdentifier,
+        },
+    )?;
     let order_side = determine_order_side(
         trader_side,
         trade_side,
         taker_asset_id,
         mo.asset_id.as_str(),
     );
-    let last_qty = Quantity::from_decimal_dp(mo.matched_amount, size_precision)
-        .unwrap_or_else(|_| Quantity::zero(size_precision));
-    let last_px = Price::from_decimal_dp(mo.price, price_precision)
-        .unwrap_or_else(|_| Price::zero(price_precision));
+    let last_qty = positive_quantity(mo.matched_amount, size_precision).map_err(|reason| {
+        ReportOmission::InvalidValue {
+            row: ReportRow::Fill,
+            field: ReportField::MatchedQuantity,
+            reason,
+        }
+    })?;
+    let last_px =
+        binary_price(mo.price, price_precision).map_err(|reason| ReportOmission::InvalidValue {
+            row: ReportRow::Fill,
+            field: ReportField::Price,
+            reason,
+        })?;
     let commission_value = compute_commission(
         Decimal::ZERO,
         1.0,
@@ -301,9 +504,13 @@ pub fn build_maker_fill_report(
         mo.price,
         liquidity_side,
     );
-    let commission = Money::from_decimal(commission_value, currency).with_context(|| {
-        format!("failed to represent commission {commission_value} for {instrument_id} as Money")
-    })?;
+    let commission = Money::from_decimal(commission_value, currency)
+        .with_context(|| {
+            format!(
+                "failed to represent commission {commission_value} for {instrument_id} as Money"
+            )
+        })
+        .map_err(ReportBuildError::Fatal)?;
 
     Ok(FillReport {
         account_id,
@@ -606,11 +813,12 @@ pub fn calculate_market_price(
 /// and RFC3339 strings ("2024-01-01T00:00:00Z").
 pub fn parse_timestamp(ts_str: &str) -> Option<UnixNanos> {
     if let Ok(n) = ts_str.parse::<u64>() {
-        return if n > 1_000_000_000_000 {
-            Some(UnixNanos::from(n * NANOSECONDS_IN_MILLISECOND))
+        let multiplier = if n >= 1_000_000_000_000 {
+            NANOSECONDS_IN_MILLISECOND
         } else {
-            Some(UnixNanos::from(n * NANOSECONDS_IN_SECOND))
+            NANOSECONDS_IN_SECOND
         };
+        return n.checked_mul(multiplier).map(UnixNanos::from);
     }
     let dt = ts_str.parse::<Timestamp>().ok()?;
     Some(UnixNanos::from(u64::try_from(dt.as_nanosecond()).ok()?))
@@ -623,6 +831,7 @@ mod tests {
         enums::OrderType,
         instruments::{Instrument, InstrumentAny, stubs::binary_option},
         orders::{OrderAny, builder::OrderTestBuilder, stubs::TestOrderStubs},
+        types::Price,
     };
     use rstest::rstest;
     use rust_decimal_macros::dec;
@@ -632,6 +841,23 @@ mod tests {
     use crate::common::enums::{
         PolymarketOrderSide, PolymarketOrderStatus, PolymarketOrderType, PolymarketOutcome,
     };
+
+    #[derive(Clone, Copy)]
+    enum InvalidOrderValue {
+        OriginalQuantity,
+        FilledQuantity,
+        Price,
+        Timestamp,
+        VenueOrderIdentity,
+    }
+
+    #[derive(Clone, Copy)]
+    enum InvalidFillValue {
+        Quantity,
+        Price,
+        Timestamp,
+        TradeIdentity,
+    }
 
     // Symmetric dust band: at terminal Filled, snap filled_qty to quantity
     // when within 0.01 shares. Other statuses (Accepted, Canceled, etc.)
@@ -1230,6 +1456,11 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_timestamp_rejects_numeric_overflow() {
+        assert_eq!(parse_timestamp(&u64::MAX.to_string()), None);
+    }
+
+    #[rstest]
     fn test_parse_timestamp_secs() {
         let ts = parse_timestamp("1703875200").unwrap();
         assert_eq!(ts, UnixNanos::from(1_703_875_200_000_000_000u64));
@@ -1275,7 +1506,8 @@ mod tests {
             4,
             6,
             UnixNanos::from(1_000_000_000u64),
-        );
+        )
+        .expect("fixture order is representable");
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument_id);
@@ -1295,6 +1527,73 @@ mod tests {
         assert_eq!(report.ts_init, UnixNanos::from(1_000_000_000u64));
         // Fixture has expiration=null which must surface as no expire_time.
         assert_eq!(report.expire_time, None);
+    }
+
+    #[rstest]
+    #[case::zero_original_quantity(
+        InvalidOrderValue::OriginalQuantity,
+        ReportField::OriginalQuantity,
+        ReportValueError::NonPositive
+    )]
+    #[case::filled_without_quantity(
+        InvalidOrderValue::FilledQuantity,
+        ReportField::FilledQuantity,
+        ReportValueError::NonPositive
+    )]
+    #[case::price_at_one(
+        InvalidOrderValue::Price,
+        ReportField::Price,
+        ReportValueError::OutsideBinaryPriceRange
+    )]
+    #[case::timestamp_overflow(
+        InvalidOrderValue::Timestamp,
+        ReportField::Timestamp,
+        ReportValueError::InvalidTimestamp
+    )]
+    #[case::invalid_venue_order_identity(
+        InvalidOrderValue::VenueOrderIdentity,
+        ReportField::VenueOrderIdentity,
+        ReportValueError::InvalidIdentifier
+    )]
+    fn test_checked_order_parser_returns_typed_omission(
+        #[case] invalid: InvalidOrderValue,
+        #[case] expected_field: ReportField,
+        #[case] expected_reason: ReportValueError,
+    ) {
+        let mut order: PolymarketOpenOrder =
+            serde_json::from_str(include_str!("../../test_data/http_open_order.json"))
+                .expect("fixture must deserialize");
+
+        match invalid {
+            InvalidOrderValue::OriginalQuantity => order.original_size = Decimal::ZERO,
+            InvalidOrderValue::FilledQuantity => {
+                order.status = PolymarketOrderStatus::Matched;
+                order.size_matched = Decimal::ZERO;
+            }
+            InvalidOrderValue::Price => order.price = Decimal::ONE,
+            InvalidOrderValue::Timestamp => order.created_at = u64::MAX,
+            InvalidOrderValue::VenueOrderIdentity => order.id.clear(),
+        }
+
+        let error = parse_order_status_report_checked(
+            &order,
+            InstrumentId::from("TEST-TOKEN.POLYMARKET"),
+            AccountId::from("POLYMARKET-001"),
+            None,
+            4,
+            6,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect_err("invalid order must be omitted");
+
+        assert!(matches!(
+            error,
+            ReportBuildError::Omitted(ReportOmission::InvalidValue {
+                row: ReportRow::Order,
+                field,
+                reason,
+            }) if field == expected_field && reason == expected_reason
+        ));
     }
 
     // Verifies parse_order_status_report wires `snap_filled_qty_to_quantity`
@@ -1340,7 +1639,8 @@ mod tests {
             3,
             6,
             UnixNanos::from(1_000_000_000u64),
-        );
+        )
+        .expect("test order is representable");
 
         assert_eq!(report.filled_qty, Quantity::new(expected_filled, 6));
         assert_eq!(
@@ -1377,7 +1677,8 @@ mod tests {
             3,
             6,
             UnixNanos::from(1_000_000_000u64),
-        );
+        )
+        .expect("partial FAK order is representable");
 
         assert_eq!(report.order_status, OrderStatus::Canceled);
         assert_eq!(report.time_in_force, TimeInForce::Ioc);
@@ -1388,8 +1689,6 @@ mod tests {
     #[rstest]
     #[case::null(None, None)]
     #[case::zero_string(Some("0"), None)]
-    #[case::empty_string(Some(""), None)]
-    #[case::garbage(Some("not-a-number"), None)]
     #[case::positive_seconds(
         Some("1735689600"),
         Some(UnixNanos::from(1_735_689_600_000_000_000u64))
@@ -1424,9 +1723,33 @@ mod tests {
             4,
             6,
             UnixNanos::from(1_000_000_000u64),
-        );
+        )
+        .expect("valid expiration is representable");
 
         assert_eq!(report.expire_time, expected);
+    }
+
+    #[rstest]
+    #[case::empty_string("")]
+    #[case::garbage("not-a-number")]
+    fn test_parse_order_status_report_rejects_invalid_expiration(#[case] raw: &str) {
+        let mut order: PolymarketOpenOrder =
+            serde_json::from_str(include_str!("../../test_data/http_open_order.json"))
+                .expect("fixture must deserialize");
+        order.order_type = PolymarketOrderType::GTD;
+        order.expiration = Some(raw.to_string());
+
+        let result = parse_order_status_report(
+            &order,
+            InstrumentId::from("TEST-TOKEN.POLYMARKET"),
+            AccountId::from("POLYMARKET-001"),
+            None,
+            4,
+            6,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(result.is_err());
     }
 
     #[rstest]
@@ -1455,6 +1778,67 @@ mod tests {
             result.is_err(),
             "an unrepresentable commission must surface as an error rather than panicking"
         );
+    }
+
+    #[rstest]
+    #[case::zero_quantity(
+        InvalidFillValue::Quantity,
+        ReportField::MatchedQuantity,
+        ReportValueError::NonPositive
+    )]
+    #[case::price_at_one(
+        InvalidFillValue::Price,
+        ReportField::Price,
+        ReportValueError::OutsideBinaryPriceRange
+    )]
+    #[case::invalid_timestamp(
+        InvalidFillValue::Timestamp,
+        ReportField::Timestamp,
+        ReportValueError::InvalidTimestamp
+    )]
+    #[case::invalid_trade_identity(
+        InvalidFillValue::TradeIdentity,
+        ReportField::TradeIdentity,
+        ReportValueError::InvalidIdentifier
+    )]
+    fn test_checked_fill_parser_returns_typed_omission(
+        #[case] invalid: InvalidFillValue,
+        #[case] expected_field: ReportField,
+        #[case] expected_reason: ReportValueError,
+    ) {
+        let mut trade: PolymarketTradeReport =
+            serde_json::from_str(include_str!("../../test_data/http_trade_report.json"))
+                .expect("fixture must deserialize");
+
+        match invalid {
+            InvalidFillValue::Quantity => trade.size = Decimal::ZERO,
+            InvalidFillValue::Price => trade.price = Decimal::ONE,
+            InvalidFillValue::Timestamp => trade.match_time = "not-a-timestamp".to_string(),
+            InvalidFillValue::TradeIdentity => trade.id.clear(),
+        }
+
+        let error = parse_fill_report_checked(
+            &trade,
+            InstrumentId::from("TEST-TOKEN.POLYMARKET"),
+            AccountId::from("POLYMARKET-001"),
+            None,
+            4,
+            6,
+            Currency::pUSD(),
+            Decimal::ZERO,
+            1.0,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect_err("invalid fill must be omitted");
+
+        assert!(matches!(
+            error,
+            ReportBuildError::Omitted(ReportOmission::InvalidValue {
+                row: ReportRow::Fill,
+                field,
+                reason,
+            }) if field == expected_field && reason == expected_reason
+        ));
     }
 
     #[rstest]

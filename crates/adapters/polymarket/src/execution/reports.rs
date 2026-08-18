@@ -42,6 +42,7 @@ use super::{
         cap_order_report_filled_qty, confirmed_filled_quantities,
         normalize_terminal_order_report_quantity,
     },
+    report_build::{ReportOmission, omission_summary},
 };
 use crate::{
     common::{consts::DUST_SNAP_THRESHOLD_DEC, enums::SignatureType},
@@ -139,13 +140,15 @@ impl PolymarketExecutionClient {
             return Ok(Some(report));
         }
 
-        let (mut order_fills, _) = build_fill_reports_from_trades(
+        let fill_batch = build_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
             Some(instrument_id),
             ts_init,
         )?;
+        log_report_omissions("terminal-order fill recovery", &fill_batch.omissions);
+        let mut order_fills = fill_batch.reports;
         order_fills.retain(|f| f.venue_order_id == venue_order_id);
         self.fill_tracker.snap_fill_reports(&mut order_fills);
 
@@ -295,7 +298,7 @@ impl PolymarketExecutionClient {
                         price_prec,
                         size_prec,
                         clock.get_time_ns(),
-                    );
+                    )?;
                     let venue_order_id = VenueOrderId::from(venue_order_id.as_str());
                     let tracked_filled = fill_tracker
                         .get_cumulative_filled(&venue_order_id)
@@ -391,7 +394,7 @@ impl PolymarketExecutionClient {
                 price_prec,
                 size_prec,
                 self.clock.get_time_ns(),
-            );
+            )?;
             let cached_filled = cmd
                 .client_order_id
                 .and_then(|id| self.core.cache().order(&id).map(|order| order.filled_qty()))
@@ -464,13 +467,15 @@ impl PolymarketExecutionClient {
             .await
             .context("failed to fetch orders")?;
 
-        let (mut reports, _) = super::reconciliation::build_order_reports_from_orders(
+        let report_batch = super::reconciliation::build_order_reports_from_orders(
             &orders,
             &self.shared_token_instruments,
             self.core.account_id,
             cmd.instrument_id,
             self.clock.get_time_ns(),
-        );
+        )?;
+        log_report_omissions("order-status generation", &report_batch.omissions);
+        let mut reports = report_batch.reports;
 
         let needs_confirmed_fills = reports.iter().any(|report| {
             let cached_filled = report
@@ -546,13 +551,15 @@ impl PolymarketExecutionClient {
             .context("failed to fetch trades")?;
 
         let ctx = self.fill_context();
-        let (mut reports, _) = build_fill_reports_from_trades(
+        let report_batch = build_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
             cmd.instrument_id,
             self.clock.get_time_ns(),
         )?;
+        log_report_omissions("fill-report generation", &report_batch.omissions);
+        let mut reports = report_batch.reports;
 
         self.fill_tracker.snap_fill_reports(&mut reports);
 
@@ -574,7 +581,9 @@ impl PolymarketExecutionClient {
             .context("failed to fetch positions from Data API")?;
 
         let ts_now = self.clock.get_time_ns();
-        let mut reports = build_position_reports(&positions, self.core.account_id, ts_now);
+        let report_batch = build_position_reports(&positions, self.core.account_id, ts_now);
+        log_report_omissions("position-report generation", &report_batch.omissions);
+        let mut reports = report_batch.reports;
 
         if let Some(ref filter_id) = cmd.instrument_id {
             reports.retain(|r| &r.instrument_id == filter_id);
@@ -632,9 +641,20 @@ async fn fetch_confirmed_fill_reports(
         .get_trades(params)
         .await
         .context("failed to fetch confirmed trades")?;
-    let (reports, _) =
+    let report_batch =
         build_fill_reports_from_trades(&trades, ctx, token_instruments, instrument_id, ts_init)?;
-    Ok(reports)
+    log_report_omissions("confirmed-fill recovery", &report_batch.omissions);
+    Ok(report_batch.reports)
+}
+
+fn log_report_omissions(context: &str, omissions: &[ReportOmission]) {
+    if !omissions.is_empty() {
+        log::warn!(
+            "Polymarket {context} omitted {} row(s): {}",
+            omissions.len(),
+            omission_summary(omissions),
+        );
+    }
 }
 
 pub(crate) fn get_pusd_currency() -> Currency {

@@ -1026,6 +1026,7 @@ mod tests {
             PolymarketEventType, PolymarketLiquiditySide, PolymarketOrderSide, PolymarketOutcome,
             PolymarketTradeStatus,
         },
+        execution::report_build::{ReportField, ReportOmission, ReportRow, ReportValueError},
         http::{
             models::GammaMarket,
             parse::{create_instrument_from_def, parse_gamma_market},
@@ -1496,7 +1497,7 @@ mod tests {
             clock: nautilus_core::time::get_atomic_clock_realtime(),
         };
 
-        let (reports, _) = crate::execution::reconciliation::build_fill_reports_from_trades(
+        let batch = crate::execution::reconciliation::build_fill_reports_from_trades(
             &[trade],
             &ctx,
             &instruments,
@@ -1505,7 +1506,8 @@ mod tests {
         )
         .expect("non-confirmed trades do not build fill reports");
 
-        assert!(reports.is_empty());
+        assert!(batch.reports.is_empty());
+        assert!(batch.omissions.is_empty());
     }
 
     #[rstest]
@@ -1540,7 +1542,7 @@ mod tests {
             clock: nautilus_core::time::get_atomic_clock_realtime(),
         };
 
-        let (reports, discards) = crate::execution::reconciliation::build_fill_reports_from_trades(
+        let batch = crate::execution::reconciliation::build_fill_reports_from_trades(
             &[trade],
             &ctx,
             &instruments,
@@ -1550,16 +1552,12 @@ mod tests {
         .expect("owned confirmed maker trade builds a fill report");
 
         assert_eq!(
-            reports.len(),
+            batch.reports.len(),
             1,
             "the account's own confirmed maker fill must be reported",
         );
-        assert_eq!(reports[0].venue_order_id, expected_venue_order_id);
-        assert_eq!(
-            discards.unowned_maker_trades, 0,
-            "entry-level skips of foreign entries in an owned trade are not trade drops",
-        );
-        assert_eq!(discards.unmapped_instruments, 0);
+        assert_eq!(batch.reports[0].venue_order_id, expected_venue_order_id);
+        assert!(batch.omissions.is_empty());
     }
 
     #[rstest]
@@ -1579,7 +1577,7 @@ mod tests {
             clock: nautilus_core::time::get_atomic_clock_realtime(),
         };
 
-        let (reports, discards) = crate::execution::reconciliation::build_fill_reports_from_trades(
+        let batch = crate::execution::reconciliation::build_fill_reports_from_trades(
             &[trade],
             &ctx,
             &instruments,
@@ -1588,13 +1586,12 @@ mod tests {
         )
         .expect("unmapped instruments are counted rather than parsed");
 
-        assert_eq!(reports.len(), 0);
+        assert_eq!(batch.reports.len(), 0);
         assert_eq!(
-            discards,
-            crate::execution::reconciliation::FillBuildDiscards {
-                unmapped_instruments: 1,
-                unowned_maker_trades: 0,
-            },
+            batch.omissions,
+            vec![ReportOmission::UnmappedInstrument {
+                row: ReportRow::Fill,
+            }],
         );
     }
 
@@ -1616,7 +1613,7 @@ mod tests {
             clock: nautilus_core::time::get_atomic_clock_realtime(),
         };
 
-        let (reports, discards) = crate::execution::reconciliation::build_fill_reports_from_trades(
+        let batch = crate::execution::reconciliation::build_fill_reports_from_trades(
             &[trade],
             &ctx,
             &instruments,
@@ -1625,12 +1622,129 @@ mod tests {
         )
         .expect("unowned maker trades are counted rather than parsed");
 
-        assert!(reports.is_empty());
+        assert!(batch.reports.is_empty());
         assert_eq!(
-            discards.unowned_maker_trades, 1,
+            batch.omissions,
+            vec![ReportOmission::UnownedMakerTrade],
             "a confirmed maker trade dropped whole must be counted, not silent",
         );
-        assert_eq!(discards.unmapped_instruments, 0);
+    }
+
+    #[rstest]
+    fn test_confirmed_maker_trade_with_invalid_value_is_typed_omission() {
+        let instrument = test_instrument();
+        let mut trade: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
+        trade.trader_side = PolymarketLiquiditySide::Maker;
+        trade.maker_orders[0].matched_amount = Decimal::ZERO;
+        let configured_address = trade.maker_orders[0].maker_address.clone();
+        let token_id = trade.maker_orders[0].asset_id;
+
+        let instruments = AtomicMap::new();
+        instruments.insert(token_id, instrument);
+        let ctx = crate::execution::reconciliation::FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: &configured_address,
+            api_key: "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let batch = crate::execution::reconciliation::build_fill_reports_from_trades(
+            &[trade],
+            &ctx,
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("invalid report value is an omission, not a fatal batch error");
+
+        assert!(batch.reports.is_empty());
+        assert_eq!(
+            batch.omissions,
+            vec![ReportOmission::InvalidValue {
+                row: ReportRow::Fill,
+                field: ReportField::MatchedQuantity,
+                reason: ReportValueError::NonPositive,
+            }],
+        );
+    }
+
+    #[rstest]
+    fn test_confirmed_maker_trade_with_invalid_timestamp_is_typed_omission() {
+        let instrument = test_instrument();
+        let mut trade: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
+        trade.trader_side = PolymarketLiquiditySide::Maker;
+        trade.match_time = "not-a-timestamp".to_string();
+        let configured_address = trade.maker_orders[0].maker_address.clone();
+        let token_id = trade.maker_orders[0].asset_id;
+
+        let instruments = AtomicMap::new();
+        instruments.insert(token_id, instrument);
+        let ctx = crate::execution::reconciliation::FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: &configured_address,
+            api_key: "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let batch = crate::execution::reconciliation::build_fill_reports_from_trades(
+            &[trade],
+            &ctx,
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("invalid report timestamp is an omission, not a fatal batch error");
+
+        assert!(batch.reports.is_empty());
+        assert_eq!(
+            batch.omissions,
+            vec![ReportOmission::InvalidValue {
+                row: ReportRow::Fill,
+                field: ReportField::Timestamp,
+                reason: ReportValueError::InvalidTimestamp,
+            }],
+        );
+    }
+
+    #[rstest]
+    fn test_confirmed_maker_trade_with_invalid_identity_is_typed_omission() {
+        let instrument = test_instrument();
+        let mut trade: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
+        trade.trader_side = PolymarketLiquiditySide::Maker;
+        trade.id.clear();
+        let configured_address = trade.maker_orders[0].maker_address.clone();
+        let token_id = trade.maker_orders[0].asset_id;
+
+        let instruments = AtomicMap::new();
+        instruments.insert(token_id, instrument);
+        let ctx = crate::execution::reconciliation::FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: &configured_address,
+            api_key: "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let batch = crate::execution::reconciliation::build_fill_reports_from_trades(
+            &[trade],
+            &ctx,
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("invalid report identity is an omission, not a fatal batch error");
+
+        assert!(batch.reports.is_empty());
+        assert_eq!(
+            batch.omissions,
+            vec![ReportOmission::InvalidValue {
+                row: ReportRow::Fill,
+                field: ReportField::TradeIdentity,
+                reason: ReportValueError::InvalidIdentifier,
+            }],
+        );
     }
 
     #[rstest]
@@ -1659,7 +1773,7 @@ mod tests {
             clock: nautilus_core::time::get_atomic_clock_realtime(),
         };
 
-        let (maker_reports, _) = crate::execution::reconciliation::build_fill_reports_from_trades(
+        let maker_batch = crate::execution::reconciliation::build_fill_reports_from_trades(
             &[maker.clone()],
             &ctx,
             &instruments,
@@ -1675,7 +1789,8 @@ mod tests {
             UnixNanos::from(1_000_000_000u64),
         );
 
-        assert_eq!(maker_reports.len(), 1);
+        assert_eq!(maker_batch.reports.len(), 1);
+        assert!(maker_batch.omissions.is_empty());
         assert!(
             result
                 .unwrap_err()

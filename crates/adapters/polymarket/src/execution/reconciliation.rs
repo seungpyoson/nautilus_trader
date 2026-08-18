@@ -15,9 +15,11 @@
 
 //! Reconciliation report generation for the Polymarket execution client.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
-use nautilus_core::{UnixNanos, collections::AtomicMap, time::AtomicTime};
+use nautilus_core::{
+    UnixNanos, collections::AtomicMap, datetime::NANOSECONDS_IN_SECOND, time::AtomicTime,
+};
 use nautilus_model::{
     enums::{LiquiditySide, OrderStatus, PositionSideSpecified},
     identifiers::{AccountId, ClientId, InstrumentId, Venue, VenueOrderId},
@@ -31,8 +33,12 @@ use ustr::Ustr;
 use super::{
     order_fill_tracker::OrderFillTrackerMap,
     parse::{
-        build_maker_fill_report, instrument_fee_exponent, instrument_taker_fee, parse_fill_report,
-        parse_order_status_report, parse_timestamp,
+        build_maker_fill_report_checked, instrument_fee_exponent, instrument_taker_fee,
+        parse_fill_report_checked, parse_order_status_report_checked, parse_timestamp,
+    },
+    report_build::{
+        ReportBatch, ReportField, ReportOmission, ReportRow, ReportValueError, binary_price,
+        omission_summary, positive_quantity, unix_seconds,
     },
 };
 use crate::{
@@ -57,16 +63,6 @@ pub(crate) struct FillContext<'a> {
     pub clock: &'static AtomicTime,
 }
 
-/// Counts of confirmed trade evidence dropped while building fill reports.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct FillBuildDiscards {
-    /// Fill entries dropped because their instrument is not loaded.
-    pub unmapped_instruments: usize,
-    /// Confirmed maker trades dropped because no maker order in the match is
-    /// owned by the account.
-    pub unowned_maker_trades: usize,
-}
-
 /// Converts trade reports into fill reports: single implementation of maker/taker
 /// parsing used by both `generate_fill_reports()` and `generate_mass_status()`.
 pub(crate) fn build_fill_reports_from_trades(
@@ -75,9 +71,8 @@ pub(crate) fn build_fill_reports_from_trades(
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     instrument_filter: Option<InstrumentId>,
     ts_init: UnixNanos,
-) -> anyhow::Result<(Vec<FillReport>, FillBuildDiscards)> {
-    let mut reports = Vec::new();
-    let mut discards = FillBuildDiscards::default();
+) -> anyhow::Result<ReportBatch<FillReport>> {
+    let mut batch = ReportBatch::default();
 
     for trade in trades {
         if trade.status != PolymarketTradeStatus::Confirmed {
@@ -92,11 +87,7 @@ pub(crate) fn build_fill_reports_from_trades(
                 .iter()
                 .any(|mo| mo.is_owned_by(ctx.user_address, ctx.api_key))
             {
-                discards.unowned_maker_trades += 1;
-                log::debug!(
-                    "Confirmed maker trade {} holds no maker order owned by the account",
-                    trade.id,
-                );
+                batch.push_omission(ReportOmission::UnownedMakerTrade);
                 continue;
             }
 
@@ -109,7 +100,9 @@ pub(crate) fn build_fill_reports_from_trades(
                 let (instrument_id, price_prec, size_prec) = match instrument {
                     Some(i) => (i.id(), i.price_precision(), i.size_precision()),
                     None => {
-                        discards.unmapped_instruments += 1;
+                        batch.push_omission(ReportOmission::UnmappedInstrument {
+                            row: ReportRow::Fill,
+                        });
                         continue;
                     }
                 };
@@ -120,9 +113,15 @@ pub(crate) fn build_fill_reports_from_trades(
                     continue;
                 }
 
-                let ts_event =
-                    parse_timestamp(&trade.match_time).unwrap_or(ctx.clock.get_time_ns());
-                let report = build_maker_fill_report(
+                let Some(ts_event) = parse_timestamp(&trade.match_time) else {
+                    batch.push_omission(ReportOmission::InvalidValue {
+                        row: ReportRow::Fill,
+                        field: ReportField::Timestamp,
+                        reason: ReportValueError::InvalidTimestamp,
+                    });
+                    continue;
+                };
+                let result = build_maker_fill_report_checked(
                     mo,
                     &trade.id,
                     trade.trader_side,
@@ -137,13 +136,13 @@ pub(crate) fn build_fill_reports_from_trades(
                     ts_event,
                     ts_init,
                 )
-                .with_context(|| {
-                    format!(
+                .map_err(|e| {
+                    e.with_context(format!(
                         "failed to build maker fill report for trade {} and order {}",
                         trade.id, mo.order_id,
-                    )
-                })?;
-                reports.push(report);
+                    ))
+                });
+                batch.push_result(result)?;
             }
         } else {
             let token_id = trade.asset_id;
@@ -158,7 +157,9 @@ pub(crate) fn build_fill_reports_from_trades(
                         instrument_fee_exponent(&i),
                     ),
                     None => {
-                        discards.unmapped_instruments += 1;
+                        batch.push_omission(ReportOmission::UnmappedInstrument {
+                            row: ReportRow::Fill,
+                        });
                         continue;
                     }
                 };
@@ -169,7 +170,7 @@ pub(crate) fn build_fill_reports_from_trades(
                 continue;
             }
 
-            let report = parse_fill_report(
+            let result = parse_fill_report_checked(
                 trade,
                 instrument_id,
                 ctx.account_id,
@@ -181,12 +182,17 @@ pub(crate) fn build_fill_reports_from_trades(
                 fee_exponent,
                 ts_init,
             )
-            .with_context(|| format!("failed to build taker fill report for trade {}", trade.id))?;
-            reports.push(report);
+            .map_err(|e| {
+                e.with_context(format!(
+                    "failed to build taker fill report for trade {}",
+                    trade.id,
+                ))
+            });
+            batch.push_result(result)?;
         }
     }
 
-    Ok((reports, discards))
+    Ok(batch)
 }
 
 /// Converts open orders into order status reports.
@@ -196,9 +202,8 @@ pub(crate) fn build_order_reports_from_orders(
     account_id: AccountId,
     instrument_filter: Option<InstrumentId>,
     ts_init: UnixNanos,
-) -> (Vec<OrderStatusReport>, usize) {
-    let mut reports = Vec::new();
-    let mut filtered = 0usize;
+) -> anyhow::Result<ReportBatch<OrderStatusReport>> {
+    let mut batch = ReportBatch::default();
 
     for order in orders {
         let token_id = order.asset_id;
@@ -206,7 +211,9 @@ pub(crate) fn build_order_reports_from_orders(
         let (instrument_id, price_prec, size_prec) = match instrument {
             Some(i) => (i.id(), i.price_precision(), i.size_precision()),
             None => {
-                filtered += 1;
+                batch.push_omission(ReportOmission::UnmappedInstrument {
+                    row: ReportRow::Order,
+                });
                 continue;
             }
         };
@@ -217,7 +224,7 @@ pub(crate) fn build_order_reports_from_orders(
             continue;
         }
 
-        let report = parse_order_status_report(
+        batch.push_result(parse_order_status_report_checked(
             order,
             instrument_id,
             account_id,
@@ -225,11 +232,10 @@ pub(crate) fn build_order_reports_from_orders(
             price_prec,
             size_prec,
             ts_init,
-        );
-        reports.push(report);
+        ))?;
     }
 
-    (reports, filtered)
+    Ok(batch)
 }
 
 /// Applies venue_order_id and time-range filters to fill reports.
@@ -253,53 +259,86 @@ pub(crate) fn apply_fill_filters(
     reports
 }
 
-/// Builds position status reports from Data API positions, filtering dust.
+/// Builds position status reports from Data API positions.
 pub(crate) fn build_position_reports(
     positions: &[DataApiPosition],
     account_id: AccountId,
     ts: UnixNanos,
-) -> Vec<PositionStatusReport> {
-    positions
-        .iter()
-        .filter(|p| {
-            if p.size > Decimal::ZERO && p.size < DUST_POSITION_THRESHOLD {
-                log::debug!(
-                    "Filtering dust position: {}-{}, size={}",
-                    p.condition_id,
-                    p.asset,
-                    p.size
-                );
-            }
-            p.size >= DUST_POSITION_THRESHOLD
-        })
-        .filter_map(|p| {
-            let instrument_id =
-                InstrumentId::from(format!("{}-{}.POLYMARKET", p.condition_id, p.asset).as_str());
-            let quantity = match Quantity::from_decimal_dp(p.size, USDC_DECIMALS as u8) {
-                Ok(quantity) => quantity,
-                Err(e) => {
-                    log::warn!(
-                        "Skipping invalid Data API position {}-{} size {}: {e}",
-                        p.condition_id,
-                        p.asset,
-                        p.size,
-                    );
-                    return None;
+) -> ReportBatch<PositionStatusReport> {
+    let mut batch = ReportBatch::default();
+    for position in positions {
+        batch.push_omittable(build_position_report_checked(position, account_id, ts));
+    }
+    batch
+}
+
+fn build_position_report_checked(
+    position: &DataApiPosition,
+    account_id: AccountId,
+    ts: UnixNanos,
+) -> Result<PositionStatusReport, ReportOmission> {
+    let raw_instrument_id = format!("{}-{}.POLYMARKET", position.condition_id, position.asset);
+    let instrument_id = InstrumentId::from_as_ref(&raw_instrument_id).map_err(|_| {
+        ReportOmission::InvalidValue {
+            row: ReportRow::Position,
+            field: ReportField::InstrumentIdentity,
+            reason: ReportValueError::InvalidIdentifier,
+        }
+    })?;
+    let (position_side, quantity) = match position.size.cmp(&Decimal::ZERO) {
+        std::cmp::Ordering::Less => {
+            return Err(ReportOmission::InvalidValue {
+                row: ReportRow::Position,
+                field: ReportField::PositionQuantity,
+                reason: ReportValueError::Negative,
+            });
+        }
+        std::cmp::Ordering::Equal => (
+            PositionSideSpecified::Flat,
+            Quantity::zero(USDC_DECIMALS as u8),
+        ),
+        std::cmp::Ordering::Greater if position.size < DUST_POSITION_THRESHOLD => {
+            return Err(ReportOmission::InvalidValue {
+                row: ReportRow::Position,
+                field: ReportField::PositionQuantity,
+                reason: ReportValueError::PositionDust,
+            });
+        }
+        std::cmp::Ordering::Greater => (
+            PositionSideSpecified::Long,
+            positive_quantity(position.size, USDC_DECIMALS as u8).map_err(|reason| {
+                ReportOmission::InvalidValue {
+                    row: ReportRow::Position,
+                    field: ReportField::PositionQuantity,
+                    reason,
                 }
-            };
-            Some(PositionStatusReport::new(
-                account_id,
-                instrument_id,
-                PositionSideSpecified::Long,
-                quantity,
-                ts,
-                ts,
-                None,
-                None,
-                p.avg_price,
-            ))
-        })
-        .collect()
+            })?,
+        ),
+    };
+    let avg_px_open = match (position_side, position.avg_price) {
+        (PositionSideSpecified::Flat, _) | (_, None) => None,
+        (_, Some(value)) => Some(
+            binary_price(value, USDC_DECIMALS as u8)
+                .map_err(|reason| ReportOmission::InvalidValue {
+                    row: ReportRow::Position,
+                    field: ReportField::AveragePrice,
+                    reason,
+                })?
+                .as_decimal(),
+        ),
+    };
+
+    Ok(PositionStatusReport::new(
+        account_id,
+        instrument_id,
+        position_side,
+        quantity,
+        ts,
+        ts,
+        None,
+        None,
+        avg_px_open,
+    ))
 }
 
 /// Full reconciliation mass status generation.
@@ -315,32 +354,40 @@ pub(crate) async fn generate_mass_status(
     lookback_mins: Option<u64>,
 ) -> anyhow::Result<Option<ExecutionMassStatus>> {
     let ts_init = ctx.clock.get_time_ns();
+    let cutoff = mass_status_cutoff(ts_init, lookback_mins);
 
     // Fetch orders
-    let orders = http_client
+    let mut orders = http_client
         .get_orders(GetOrdersParams::default())
         .await
         .context("failed to fetch orders for mass status")?;
+    let orders_removed = cutoff.map_or(0, |cutoff| filter_orders_to_lookback(&mut orders, cutoff));
 
-    let (mut order_reports, orders_filtered) =
-        build_order_reports_from_orders(&orders, instruments, ctx.account_id, None, ts_init);
+    let order_batch =
+        build_order_reports_from_orders(&orders, instruments, ctx.account_id, None, ts_init)?;
+    let mut order_reports = order_batch.reports;
+    let mut omissions = order_batch.omissions;
+    omissions.extend(duplicate_identity_omissions(
+        order_reports.iter().map(|report| report.venue_order_id),
+        ReportRow::Order,
+    ));
 
     // Fetch and parse fill reports
-    let trades = http_client
+    let mut trades = http_client
         .get_trades(GetTradesParams::default())
         .await
         .context("failed to fetch trades for mass status")?;
+    let trades_removed = cutoff.map_or(0, |cutoff| filter_trades_to_lookback(&mut trades, cutoff));
 
-    let (mut fill_reports, fill_discards) =
-        build_fill_reports_from_trades(&trades, ctx, instruments, None, ts_init)?;
-
-    if fill_discards.unowned_maker_trades > 0 {
-        log::error!(
-            "Mass status is missing {} confirmed maker trade(s) holding no maker order owned by \
-             the account; executed quantity may be understated",
-            fill_discards.unowned_maker_trades,
-        );
-    }
+    let fill_batch = build_fill_reports_from_trades(&trades, ctx, instruments, None, ts_init)?;
+    let mut fill_reports = fill_batch.reports;
+    omissions.extend(fill_batch.omissions);
+    omissions.extend(duplicate_identity_omissions(
+        fill_reports
+            .iter()
+            .map(|report| (report.venue_order_id, report.trade_id)),
+        ReportRow::Fill,
+    ));
 
     // Snap dust drift on REST fills the same way the WS path does.
     // Commission stays as venue-reported.
@@ -352,44 +399,29 @@ pub(crate) async fn generate_mass_status(
         .await
         .context("failed to fetch positions for mass status")?;
 
-    let position_reports = build_position_reports(&positions, ctx.account_id, ts_init);
+    let position_batch = build_position_reports(&positions, ctx.account_id, ts_init);
+    let position_reports = position_batch.reports;
+    omissions.extend(position_batch.omissions);
+    omissions.extend(duplicate_identity_omissions(
+        position_reports.iter().map(|report| report.instrument_id),
+        ReportRow::Position,
+    ));
 
-    // Apply lookback filter
-    if let Some(mins) = lookback_mins {
-        let now_ns = ctx.clock.get_time_ns();
-        let cutoff_ns = now_ns.as_u64().saturating_sub(mins * 60 * 1_000_000_000);
-        let cutoff = UnixNanos::from(cutoff_ns);
-
-        let orders_before = order_reports.len();
-        order_reports.retain(|r| r.ts_last >= cutoff);
-        let orders_removed = orders_before - order_reports.len();
-
-        let fills_before = fill_reports.len();
-        fill_reports.retain(|r| r.ts_event >= cutoff);
-        let fills_removed = fills_before - fill_reports.len();
-
-        log::debug!(
-            "Lookback filter ({}min): orders {}->{} (removed {}), fills {}->{} (removed {})",
-            mins,
-            orders_before,
-            order_reports.len(),
-            orders_removed,
-            fills_before,
-            fill_reports.len(),
-            fills_removed,
-        );
-    } else {
-        log::debug!(
-            "Generated mass status: {} orders ({} filtered), {} fills ({} instrument-filtered, \
-             {} unowned maker trades), {} positions",
-            order_reports.len(),
-            orders_filtered,
-            fill_reports.len(),
-            fill_discards.unmapped_instruments,
-            fill_discards.unowned_maker_trades,
-            position_reports.len(),
-        );
-    }
+    anyhow::ensure!(
+        omissions.is_empty(),
+        "Polymarket mass status is incomplete with {} omitted row(s): {}",
+        omissions.len(),
+        omission_summary(&omissions),
+    );
+    log::debug!(
+        "Generated mass status: {} orders, {} fills, {} positions; lookback removed {} order(s) \
+         and {} trade(s)",
+        order_reports.len(),
+        fill_reports.len(),
+        position_reports.len(),
+        orders_removed,
+        trades_removed,
+    );
 
     cap_order_reports_to_confirmed_fills(&mut order_reports, &fill_reports);
 
@@ -398,8 +430,52 @@ pub(crate) async fn generate_mass_status(
     mass_status.add_order_reports(order_reports);
     mass_status.add_position_reports(position_reports);
     mass_status.add_fill_reports(fill_reports);
+    mass_status.set_report_window(cutoff, true);
 
     Ok(Some(mass_status))
+}
+
+fn duplicate_identity_omissions<K>(
+    identities: impl IntoIterator<Item = K>,
+    row: ReportRow,
+) -> Vec<ReportOmission>
+where
+    K: Eq + std::hash::Hash,
+{
+    let mut seen = AHashSet::new();
+    identities
+        .into_iter()
+        .filter_map(|identity| {
+            (!seen.insert(identity)).then_some(ReportOmission::DuplicateIdentity { row })
+        })
+        .collect()
+}
+
+fn mass_status_cutoff(ts_init: UnixNanos, lookback_mins: Option<u64>) -> Option<UnixNanos> {
+    lookback_mins.map(|minutes| {
+        let duration_ns = minutes
+            .saturating_mul(60)
+            .saturating_mul(NANOSECONDS_IN_SECOND);
+        UnixNanos::from(ts_init.as_u64().saturating_sub(duration_ns))
+    })
+}
+
+fn filter_orders_to_lookback(orders: &mut Vec<PolymarketOpenOrder>, cutoff: UnixNanos) -> usize {
+    let before = orders.len();
+    orders.retain(|order| match unix_seconds(order.created_at) {
+        Ok(timestamp) => timestamp >= cutoff,
+        Err(_) => true,
+    });
+    before - orders.len()
+}
+
+fn filter_trades_to_lookback(trades: &mut Vec<PolymarketTradeReport>, cutoff: UnixNanos) -> usize {
+    let before = trades.len();
+    trades.retain(|trade| match parse_timestamp(&trade.match_time) {
+        Some(timestamp) => timestamp >= cutoff,
+        None => true,
+    });
+    before - trades.len()
 }
 
 fn cap_order_reports_to_confirmed_fills(
@@ -472,6 +548,40 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn mass_status_cutoff_saturates_without_overflow() {
+        assert_eq!(
+            mass_status_cutoff(UnixNanos::from(1_000_000_000), Some(u64::MAX)),
+            Some(UnixNanos::from(0)),
+        );
+        assert_eq!(mass_status_cutoff(UnixNanos::from(1), None), None);
+    }
+
+    #[rstest]
+    fn lookback_excludes_known_old_rows_but_retains_unclassifiable_rows() {
+        let cutoff = UnixNanos::from(2_000_000_000_u64 * NANOSECONDS_IN_SECOND);
+        let old_order: PolymarketOpenOrder =
+            serde_json::from_str(include_str!("../../test_data/http_open_order.json"))
+                .expect("order fixture must deserialize");
+        let mut invalid_order = old_order.clone();
+        invalid_order.created_at = u64::MAX;
+        let mut orders = vec![old_order, invalid_order];
+
+        let old_trade: PolymarketTradeReport =
+            serde_json::from_str(include_str!("../../test_data/http_trade_report.json"))
+                .expect("trade fixture must deserialize");
+        let mut invalid_trade = old_trade.clone();
+        invalid_trade.match_time = "not-a-timestamp".to_string();
+        let mut trades = vec![old_trade, invalid_trade];
+
+        assert_eq!(filter_orders_to_lookback(&mut orders, cutoff), 1);
+        assert_eq!(filter_trades_to_lookback(&mut trades, cutoff), 1);
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].created_at, u64::MAX);
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].match_time, "not-a-timestamp");
+    }
 
     #[rstest]
     fn caps_order_report_to_confirmed_companion_fills() {
