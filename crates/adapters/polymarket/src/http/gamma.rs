@@ -47,7 +47,9 @@ use crate::{
     http::{
         error::{Error, Result},
         models::{GammaEvent, GammaMarket, GammaTag, SearchResponse},
-        pagination::{Completion, CursorProtocol, FetchOutcome, Paginator, WindowedCollect},
+        pagination::{
+            Completion, CursorProtocol, FetchOutcome, PaginationLimits, Paginator, WindowedCollect,
+        },
         parse::{create_instrument_from_def, parse_gamma_market},
         query::{GetGammaEventsParams, GetGammaMarketsParams, GetSearchParams},
         rate_limits::POLYMARKET_GAMMA_REST_QUOTA,
@@ -511,7 +513,8 @@ impl PolymarketGammaHttpClient {
             base_params.max_markets.map(|value| value as usize),
             GammaStop::CallerCapped,
         );
-        let paginator = Paginator::new("Gamma market", protocol, reducer);
+        let paginator =
+            Paginator::new("Gamma market", PaginationLimits::DEFAULT, protocol, reducer);
         let completed = paginator
             .run(
                 |position| {
@@ -870,7 +873,7 @@ impl PolymarketGammaHttpClient {
             base_params.max_events.map(|value| value as usize),
             GammaStop::CallerCapped,
         );
-        let paginator = Paginator::new("Gamma event", protocol, reducer);
+        let paginator = Paginator::new("Gamma event", PaginationLimits::DEFAULT, protocol, reducer);
         let completed = paginator
             .run(
                 |position| {

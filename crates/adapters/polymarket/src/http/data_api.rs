@@ -38,7 +38,7 @@ use crate::{
         models::{DataApiPosition, DataApiTrade},
         pagination::{
             CollectAll, Completion, FetchOutcome, OffsetProtocol, PageFingerprint, PageReducer,
-            Paginator, encode_length_prefixed, fingerprint_multiset,
+            PaginationLimits, Paginator, encode_length_prefixed, fingerprint_multiset,
         },
     },
 };
@@ -272,7 +272,12 @@ impl PolymarketDataApiHttpClient {
             position_page_fingerprint,
             None,
         );
-        let paginator = Paginator::new("/positions", protocol, CollectAll::new());
+        let paginator = Paginator::new(
+            "/positions",
+            PaginationLimits::DEFAULT,
+            protocol,
+            CollectAll::new(),
+        );
         let completed = paginator
             .run(
                 |offset| async move {
@@ -430,7 +435,7 @@ impl PolymarketDataApiHttpClient {
                 TradeTickStop::VenueOffsetCeiling(OffsetCeilingSource::Local),
             )),
         );
-        let paginator = Paginator::new("/trades", protocol, reducer);
+        let paginator = Paginator::new("/trades", PaginationLimits::DEFAULT, protocol, reducer);
         let completed = paginator
             .run(
                 |offset| async move {

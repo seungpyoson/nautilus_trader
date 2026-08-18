@@ -884,6 +884,58 @@ async fn test_get_trades_paginates_with_driver_cursor() {
 
 #[rstest]
 #[tokio::test]
+async fn test_get_trades_accepts_finite_history_beyond_default_page_budget() {
+    let state = TestServerState::default();
+    let pages = (1..=101).map(|page_number| {
+        let mut page = load_json("http_trades_page.json");
+        page["data"][0]["id"] = json!(format!("trade-{page_number:03}"));
+        page["next_cursor"] = if page_number == 101 {
+            json!("LTE=")
+        } else {
+            json!(format!("cursor-{page_number}"))
+        };
+        page
+    });
+    state.trades_pages.lock().await.extend(pages);
+
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_clob_client(&addr);
+
+    let trades = client.get_trades(GetTradesParams::default()).await.unwrap();
+
+    assert_eq!(trades.len(), 101);
+    assert_eq!(*state.request_count.lock().await, 101);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_trades_rejects_continuation_after_trade_page_budget() {
+    let state = TestServerState::default();
+    let pages = (1..=1_000).map(|page_number| {
+        let mut page = load_json("http_trades_page.json");
+        page["data"][0]["id"] = json!(format!("trade-{page_number:04}"));
+        page["next_cursor"] = json!(format!("cursor-{page_number}"));
+        page
+    });
+    state.trades_pages.lock().await.extend(pages);
+
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_clob_client(&addr);
+
+    let error = client
+        .get_trades(GetTradesParams::default())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "decode error: /data/trades pagination exceeded 1000 pages"
+    );
+    assert_eq!(*state.request_count.lock().await, 1_000);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_get_balance_allowance_returns_data() {
     let state = TestServerState::default();
     let addr = start_mock_server(state.clone()).await;

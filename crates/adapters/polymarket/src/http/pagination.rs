@@ -21,6 +21,25 @@ pub(crate) const PAGINATION_PAGE_LIMIT: usize = 100;
 pub(crate) const PAGINATION_ROW_LIMIT: usize = 100_000;
 pub(crate) const PAGINATION_CURSOR_LIMIT: usize = 8 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PaginationLimits {
+    max_pages: usize,
+    max_rows: usize,
+}
+
+impl PaginationLimits {
+    pub(crate) const DEFAULT: Self = Self::new(PAGINATION_PAGE_LIMIT, PAGINATION_ROW_LIMIT);
+
+    pub(crate) const fn new(max_pages: usize, max_rows: usize) -> Self {
+        assert!(max_pages > 0, "pagination page limit must be positive");
+        assert!(max_rows > 0, "pagination row limit must be positive");
+        Self {
+            max_pages,
+            max_rows,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum FetchOutcome<T, W, S> {
     Page { rows: Vec<T>, wire: W },
@@ -390,6 +409,7 @@ where
 
 pub(crate) struct Paginator<P, R> {
     endpoint: &'static str,
+    limits: PaginationLimits,
     protocol: P,
     reducer: R,
     pages: usize,
@@ -397,9 +417,15 @@ pub(crate) struct Paginator<P, R> {
 }
 
 impl<P, R> Paginator<P, R> {
-    pub(crate) const fn new(endpoint: &'static str, protocol: P, reducer: R) -> Self {
+    pub(crate) const fn new(
+        endpoint: &'static str,
+        limits: PaginationLimits,
+        protocol: P,
+        reducer: R,
+    ) -> Self {
         Self {
             endpoint,
+            limits,
             protocol,
             reducer,
             pages: 0,
@@ -434,15 +460,17 @@ impl<P, R> Paginator<P, R> {
             let prospective_pages = self.pages.checked_add(1).ok_or_else(|| {
                 map_pagination_error(PaginationError::PageLimit {
                     endpoint: self.endpoint,
+                    limit: self.limits.max_pages,
                 })
             })?;
             let prospective_rows = self
                 .fetched_rows
                 .checked_add(rows.len())
-                .filter(|total| *total <= PAGINATION_ROW_LIMIT)
+                .filter(|total| *total <= self.limits.max_rows)
                 .ok_or_else(|| {
                     map_pagination_error(PaginationError::RowLimit {
                         endpoint: self.endpoint,
+                        limit: self.limits.max_rows,
                     })
                 })?;
             log::debug!(
@@ -476,15 +504,17 @@ impl<P, R> Paginator<P, R> {
                     return Ok(Completed { output, completion });
                 }
                 PageObservation::Continue { next, commit } => {
-                    if self.pages >= PAGINATION_PAGE_LIMIT {
+                    if self.pages >= self.limits.max_pages {
                         return Err(map_pagination_error(PaginationError::PageLimit {
                             endpoint: self.endpoint,
+                            limit: self.limits.max_pages,
                         }));
                     }
 
-                    if self.fetched_rows >= PAGINATION_ROW_LIMIT {
+                    if self.fetched_rows >= self.limits.max_rows {
                         return Err(map_pagination_error(PaginationError::RowLimit {
                             endpoint: self.endpoint,
+                            limit: self.limits.max_rows,
                         }));
                     }
                     self.protocol.commit_continue(commit);
@@ -519,10 +549,16 @@ pub(crate) enum PaginationError {
     },
     #[error("{endpoint} pagination offset overflowed u32")]
     OffsetOverflow { endpoint: &'static str },
-    #[error("{endpoint} pagination exceeded {PAGINATION_PAGE_LIMIT} pages")]
-    PageLimit { endpoint: &'static str },
-    #[error("{endpoint} pagination exceeded {PAGINATION_ROW_LIMIT} rows")]
-    RowLimit { endpoint: &'static str },
+    #[error("{endpoint} pagination exceeded {limit} pages")]
+    PageLimit {
+        endpoint: &'static str,
+        limit: usize,
+    },
+    #[error("{endpoint} pagination exceeded {limit} rows")]
+    RowLimit {
+        endpoint: &'static str,
+        limit: usize,
+    },
 }
 
 #[cfg(test)]
@@ -623,7 +659,12 @@ mod tests {
     async fn test_paginator_accepts_terminal_page_100_without_request_101() {
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_for_fetch = Arc::clone(&requests);
-        let paginator = Paginator::new("test", LinearProtocol, CollectAll::new());
+        let paginator = Paginator::new(
+            "test",
+            PaginationLimits::DEFAULT,
+            LinearProtocol,
+            CollectAll::new(),
+        );
 
         let completed = paginator
             .run(
@@ -650,7 +691,12 @@ mod tests {
     async fn test_paginator_rejects_continuation_after_page_100_without_request_101() {
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_for_fetch = Arc::clone(&requests);
-        let paginator = Paginator::new("test", LinearProtocol, CollectAll::new());
+        let paginator = Paginator::new(
+            "test",
+            PaginationLimits::DEFAULT,
+            LinearProtocol,
+            CollectAll::new(),
+        );
 
         let error = paginator
             .run(
@@ -670,14 +716,22 @@ mod tests {
 
         assert!(matches!(
             error,
-            PaginationError::PageLimit { endpoint: "test" }
+            PaginationError::PageLimit {
+                endpoint: "test",
+                limit: PAGINATION_PAGE_LIMIT,
+            }
         ));
         assert_eq!(requests.load(Ordering::SeqCst), PAGINATION_PAGE_LIMIT);
     }
 
     #[tokio::test]
     async fn test_paginator_accepts_exact_row_limit_when_terminal() {
-        let paginator = Paginator::new("test", LinearProtocol, CollectAll::new());
+        let paginator = Paginator::new(
+            "test",
+            PaginationLimits::DEFAULT,
+            LinearProtocol,
+            CollectAll::new(),
+        );
 
         let completed = paginator
             .run(
@@ -699,7 +753,12 @@ mod tests {
     async fn test_paginator_rejects_continuation_at_exact_row_limit() {
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_for_fetch = Arc::clone(&requests);
-        let paginator = Paginator::new("test", LinearProtocol, CollectAll::new());
+        let paginator = Paginator::new(
+            "test",
+            PaginationLimits::DEFAULT,
+            LinearProtocol,
+            CollectAll::new(),
+        );
 
         let error = paginator
             .run(
@@ -719,7 +778,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            PaginationError::RowLimit { endpoint: "test" }
+            PaginationError::RowLimit {
+                endpoint: "test",
+                limit: PAGINATION_ROW_LIMIT,
+            }
         ));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
@@ -730,7 +792,7 @@ mod tests {
         let reducer = TrackingReducer {
             consume_calls: Arc::clone(&consume_calls),
         };
-        let paginator = Paginator::new("test", LinearProtocol, reducer);
+        let paginator = Paginator::new("test", PaginationLimits::DEFAULT, LinearProtocol, reducer);
 
         let error = paginator
             .run(
@@ -747,7 +809,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            PaginationError::RowLimit { endpoint: "test" }
+            PaginationError::RowLimit {
+                endpoint: "test",
+                limit: PAGINATION_ROW_LIMIT,
+            }
         ));
         assert_eq!(consume_calls.load(Ordering::SeqCst), 0);
     }
@@ -758,6 +823,7 @@ mod tests {
         let requests_for_fetch = Arc::clone(&requests);
         let paginator = Paginator::new(
             "test",
+            PaginationLimits::DEFAULT,
             StopProtocol,
             CollectAll::<usize, &'static str>::new(),
         );
@@ -782,6 +848,7 @@ mod tests {
     async fn test_paginator_finalizes_protocol_stop_after_consuming_page() {
         let paginator = Paginator::new(
             "test",
+            PaginationLimits::DEFAULT,
             StopProtocol,
             CollectAll::<usize, &'static str>::new(),
         );
@@ -819,7 +886,12 @@ mod tests {
     async fn test_clob_cursor_protocol_reports_immediate_echo_as_stalled() {
         let protocol =
             CursorProtocol::<Infallible>::clob("test", "seed".to_string(), "END").unwrap();
-        let paginator = Paginator::new("test", protocol, CollectAll::new());
+        let paginator = Paginator::new(
+            "test",
+            PaginationLimits::DEFAULT,
+            protocol,
+            CollectAll::new(),
+        );
 
         let error = paginator
             .run(

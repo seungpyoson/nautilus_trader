@@ -48,7 +48,10 @@ use crate::{
             ClobBookResponse, ClobMarketResponse, FeeRateResponse, PolymarketOpenOrder,
             PolymarketOrder, PolymarketTradeReport, TickSizeResponse,
         },
-        pagination::{CollectAll, Completion, CursorProtocol, FetchOutcome, Paginator},
+        pagination::{
+            CollectAll, Completion, CursorProtocol, FetchOutcome, PAGINATION_ROW_LIMIT,
+            PaginationLimits, Paginator,
+        },
         query::{
             BalanceAllowance, BatchCancelResponse, CancelMarketOrdersParams, CancelResponse,
             ClobVersionResponse, GetBalanceAllowanceParams, GetOrdersParams, GetTradesParams,
@@ -61,6 +64,11 @@ use crate::{
 
 const CURSOR_START: &str = "MA==";
 const CURSOR_END: &str = "LTE=";
+const CLOB_TRADE_PAGE_SIZE: usize = 100;
+const CLOB_TRADE_PAGINATION_LIMITS: PaginationLimits = PaginationLimits::new(
+    PAGINATION_ROW_LIMIT / CLOB_TRADE_PAGE_SIZE,
+    PAGINATION_ROW_LIMIT,
+);
 
 const PATH_ORDERS: &str = "/data/orders";
 const PATH_TRADES: &str = "/data/trades";
@@ -461,7 +469,12 @@ impl PolymarketClobHttpClient {
             .unwrap_or_else(|| CURSOR_START.to_string());
         let protocol = CursorProtocol::<Infallible>::clob(PATH_ORDERS, initial_cursor, CURSOR_END)
             .map_err(|e| Error::decode(e.to_string()))?;
-        let paginator = Paginator::new(PATH_ORDERS, protocol, CollectAll::new());
+        let paginator = Paginator::new(
+            PATH_ORDERS,
+            PaginationLimits::DEFAULT,
+            protocol,
+            CollectAll::new(),
+        );
         let completed = paginator
             .run(
                 |position| {
@@ -511,7 +524,12 @@ impl PolymarketClobHttpClient {
             .unwrap_or_else(|| CURSOR_START.to_string());
         let protocol = CursorProtocol::<Infallible>::clob(PATH_TRADES, initial_cursor, CURSOR_END)
             .map_err(|e| Error::decode(e.to_string()))?;
-        let paginator = Paginator::new(PATH_TRADES, protocol, CollectAll::new());
+        let paginator = Paginator::new(
+            PATH_TRADES,
+            CLOB_TRADE_PAGINATION_LIMITS,
+            protocol,
+            CollectAll::new(),
+        );
         let completed = paginator
             .run(
                 |position| {
