@@ -482,7 +482,7 @@ mod tests {
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let reports = build_position_reports(&positions, account_id, ts_now).unwrap();
 
         // 4 positions: 150.5, 0.0, 42.0, 0.005 (dust)
         // Only 150.5 and 42.0 pass the DUST_POSITION_THRESHOLD (0.01)
@@ -497,7 +497,7 @@ mod tests {
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let reports = build_position_reports(&positions, account_id, ts_now).unwrap();
 
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].avg_px_open, Some(dec!(0.55)));
@@ -510,7 +510,7 @@ mod tests {
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let reports = build_position_reports(&positions, account_id, ts_now).unwrap();
 
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].quantity.precision, USDC_DECIMALS as u8);
@@ -518,20 +518,19 @@ mod tests {
     }
 
     #[rstest]
-    fn test_build_position_reports_handles_missing_avg_price() {
+    fn test_build_position_reports_rejects_missing_avg_price() {
         let positions = vec![DataApiPosition {
             asset: "123".to_string(),
-            condition_id: "0xabc".to_string(),
+            condition_id: format!("0x{}", "a".repeat(64)),
             size: dec!(10),
             avg_price: None,
         }];
         let account_id = AccountId::from("POLYMARKET-001");
         let ts_now = nautilus_core::UnixNanos::from(1_000_000_000u64);
 
-        let reports = build_position_reports(&positions, account_id, ts_now);
+        let error = build_position_reports(&positions, account_id, ts_now).unwrap_err();
 
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].avg_px_open, None);
+        assert!(error.to_string().contains("has no average price"));
     }
 
     #[rstest]

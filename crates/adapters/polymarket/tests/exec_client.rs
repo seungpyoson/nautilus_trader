@@ -56,7 +56,7 @@ use nautilus_common::{
     },
     testing::wait_until_async,
 };
-use nautilus_core::{UUID4, UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::{AccountAny, cash::CashAccount},
@@ -84,7 +84,7 @@ use nautilus_polymarket::{
     },
     config::{PolymarketExecClientConfig, PolymarketInstrumentProviderConfig},
     execution::PolymarketExecutionClient,
-    http::models::PolymarketOrder,
+    http::models::{FeeSchedule, PolymarketOrder},
     signing::eip712::order_hash,
 };
 use rstest::rstest;
@@ -105,6 +105,8 @@ const TEST_SIGNER_ADDRESS: &str = "0x1be31a94361a391bbafb2a4ccd704f57dc04d4bb";
 const TEST_API_SECRET_B64: &str = "dGVzdF9zZWNyZXRfa2V5XzMyYnl0ZXNfcGFkMTIzNDU=";
 const DEFAULT_ACCEPTED_ORDER_ID: &str =
     "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12";
+const TEST_TOKEN_ID: &str =
+    "71321045679252212594626385532706912750332728571942532289631379312455583992563";
 const CANCEL_ALREADY_DONE_ORDER_ID: &str =
     "0xb816482a1234567890abcdef1234567890abcdef1234567890abcdef12345678";
 
@@ -1733,6 +1735,12 @@ async fn test_generate_mass_status_lookback_marks_in_scope_historical_incomplete
     assert!(mass_status.lookback_start().is_some());
     assert!(!mass_status.reports_complete());
     assert!(mass_status.fill_reports().is_empty());
+
+    let error = client
+        .generate_mass_status(None)
+        .await
+        .expect_err("an unwindowed mass status cannot omit in-scope confirmed evidence");
+    assert!(format!("{error:#}").contains("unmapped in-scope confirmed fill evidence"));
 }
 
 #[rstest]
@@ -1768,7 +1776,176 @@ async fn test_generate_fill_reports_drops_out_of_scope_unmapped_history() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_fill_reports_empty_without_instruments() {
+async fn test_generate_fill_reports_excludes_unrelated_invalid_order_evidence() {
+    let requested_order_id = VenueOrderId::from("requested-order");
+    let state = TestServerState::default();
+    *state.trades_response_override.lock().await =
+        Some(recovery_trades_response("unrelated-order", "10.0000", "0"));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let reports = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            venue_order_id: Some(requested_order_id),
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect("unrelated malformed fill evidence is outside the requested order scope");
+
+    assert!(reports.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_scopes_order_before_timestamp_validation() {
+    let requested_order_id = VenueOrderId::from("requested-order");
+    let state = TestServerState::default();
+    let mut response = recovery_trades_response("unrelated-order", "10.0000", "0.50");
+    response["data"][0]["match_time"] = json!("not-a-timestamp");
+    *state.trades_response_override.lock().await = Some(response);
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let reports = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            venue_order_id: Some(requested_order_id),
+            start: Some(UnixNanos::from(1)),
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect("unrelated malformed timestamps are outside the requested order scope");
+
+    assert!(reports.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_scopes_instrument_before_timestamp_validation() {
+    let state = TestServerState::default();
+    let mut response = recovery_trades_response("unrelated-order", "10.0000", "0.50");
+    response["data"][0]["match_time"] = json!("not-a-timestamp");
+    *state.trades_response_override.lock().await = Some(response);
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let response_instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, response_instrument_id, 4);
+    let instrument = cache
+        .borrow()
+        .instrument(&response_instrument_id)
+        .unwrap()
+        .clone();
+    client.on_instrument(instrument);
+
+    let reports = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(InstrumentId::from("OTHER.POLYMARKET")),
+            venue_order_id: None,
+            start: Some(UnixNanos::from(1)),
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect("unrelated malformed timestamps are outside the requested instrument scope");
+
+    assert!(reports.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_excludes_out_of_window_invalid_evidence() {
+    let venue_order_id = VenueOrderId::from("requested-order");
+    let state = TestServerState::default();
+    let mut response = recovery_trades_response(venue_order_id.as_str(), "10.0000", "0");
+    response["data"][0]["match_time"] = json!("1");
+    *state.trades_response_override.lock().await = Some(response);
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let reports = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            venue_order_id: Some(venue_order_id),
+            start: Some(UnixNanos::from(2_000_000_000u64)),
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect("malformed authority outside the requested time window is excluded");
+
+    assert!(reports.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_excludes_out_of_window_invalid_identity() {
+    let state = TestServerState::default();
+    let mut response = recovery_trades_response("unrelated-order", "10.0000", "0.50");
+    response["data"][0]["market"] = json!("invalid-condition");
+    response["data"][0]["asset_id"] = json!("not-a-token-id");
+    response["data"][0]["match_time"] = json!("1");
+    *state.trades_response_override.lock().await = Some(response);
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let reports = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: None,
+            venue_order_id: None,
+            start: Some(UnixNanos::from(2_000_000_000u64)),
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect("invalid identity outside the requested time window is non-authoritative");
+
+    assert!(reports.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_errors_on_in_scope_unmapped_history() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
     let (client, _rx, _cache) = create_test_execution_client(addr);
@@ -1786,14 +1963,21 @@ async fn test_generate_fill_reports_empty_without_instruments() {
         causation_id: None,
     };
 
-    let reports = client.generate_fill_reports(cmd).await.unwrap();
+    let error = client
+        .generate_fill_reports(cmd)
+        .await
+        .expect_err("in-scope confirmed evidence must not become an empty report batch");
 
-    assert!(reports.is_empty());
+    assert!(
+        error
+            .to_string()
+            .contains("unmapped in-scope confirmed fill")
+    );
 }
 
 #[rstest]
 #[tokio::test]
-async fn test_commission_failure_errors_direct_mass_and_targeted_rest_requests() {
+async fn test_invalid_fee_evidence_errors_direct_mass_and_targeted_rest_requests() {
     let venue_order_id =
         VenueOrderId::from("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12");
     let state = TestServerState::default();
@@ -1873,7 +2057,7 @@ async fn test_commission_failure_errors_direct_mass_and_targeted_rest_requests()
         .expect_err("targeted recovery must not omit the failed fill");
 
     for error in [fill_error, mass_error, targeted_error] {
-        assert!(format!("{error:#}").contains("failed to represent commission"));
+        assert!(format!("{error:#}").contains("invalid fee schedule for confirmed trade"));
     }
 }
 
@@ -1956,18 +2140,48 @@ async fn test_generate_order_status_report_single_requires_instrument_id() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_report_single_returns_report() {
+async fn test_generate_order_status_report_requires_loaded_instrument() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
     let (client, _rx, _cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+
+    let error = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            client_order_id: None,
+            venue_order_id: Some(VenueOrderId::from(
+                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",
+            )),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect_err("provider order identity cannot be verified without the canonical instrument");
+
+    assert!(error.to_string().contains("instrument is not loaded"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_single_returns_report() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (client, _rx, cache) = create_test_execution_client(addr);
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
     let cmd = GenerateOrderStatusReport {
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
         instrument_id: Some(instrument_id),
         client_order_id: None,
-        venue_order_id: Some(VenueOrderId::from("0x123")),
+        venue_order_id: Some(VenueOrderId::from(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",
+        )),
         params: None,
         correlation_id: None,
         causation_id: None,
@@ -1982,6 +2196,53 @@ async fn test_generate_order_status_report_single_returns_report() {
     assert_eq!(report.order_type, OrderType::Limit,);
     assert_eq!(report.filled_qty, Quantity::zero(4));
     assert!(report.price.is_some());
+}
+
+#[rstest]
+#[case::wrong_order_id("0xdifferent", None, "returned order ID")]
+#[case::wrong_asset(
+    "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",
+    Some("999"),
+    "returned asset"
+)]
+#[tokio::test]
+async fn test_generate_order_status_report_rejects_mismatched_response_identity(
+    #[case] returned_order_id: &str,
+    #[case] returned_asset: Option<&str>,
+    #[case] expected_error: &str,
+) {
+    let state = TestServerState::default();
+    let mut response = load_json("http_open_order.json");
+    response["id"] = Value::String(returned_order_id.to_string());
+    if let Some(asset) = returned_asset {
+        response["asset_id"] = Value::String(asset.to_string());
+    }
+    *state.single_order_response.lock().await = Some(response);
+    let addr = start_mock_server(state).await;
+    let (client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let requested_order_id =
+        VenueOrderId::from("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12");
+    let error = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            client_order_id: None,
+            venue_order_id: Some(requested_order_id),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect_err("mismatched provider identity must not be relabeled as the requested order");
+
+    assert!(
+        error.to_string().contains(expected_error),
+        "unexpected identity error: {error:#}"
+    );
 }
 
 #[rstest]
@@ -2096,6 +2357,91 @@ async fn test_generate_active_order_report_recovers_confirmed_rest_fill() {
 
     assert_eq!(report.order_status, OrderStatus::Filled);
     assert_eq!(report.filled_qty, Quantity::from("10.0000"));
+}
+
+#[rstest]
+#[case::inexact_quantity("1.00001", "not exactly representable")]
+#[case::partial_filled_evidence("1.0000", "Filled order")]
+#[case::overfilled_evidence("20.0000", "exceeds order quantity")]
+#[tokio::test]
+async fn test_generate_active_order_reports_propagate_invalid_confirmed_fill(
+    #[case] fill_size: &str,
+    #[case] expected_error: &str,
+) {
+    let venue_order_id_str = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12";
+    let state = TestServerState::default();
+    let mut order = load_json("http_open_order.json");
+    order["id"] = Value::String(venue_order_id_str.to_string());
+    order["status"] = Value::String("MATCHED".to_string());
+    order["original_size"] = Value::String("10.0000".to_string());
+    order["size_matched"] = Value::String("10.0000".to_string());
+    *state.single_order_response.lock().await = Some(order.clone());
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [order],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(recovery_trades_response(
+        venue_order_id_str,
+        fill_size,
+        "0.5000",
+    ));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+    let venue_order_id = VenueOrderId::from(venue_order_id_str);
+    let client_order_id = ClientOrderId::from("O-ACTIVE-INVALID-FILL");
+    let mut cached_order = make_limit_order(
+        client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(cached_order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut cached_order, venue_order_id_str);
+
+    let single_error = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            client_order_id: Some(client_order_id),
+            venue_order_id: Some(venue_order_id),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect_err("invalid confirmed evidence must not produce an active order report");
+
+    let batch_error = client
+        .generate_order_status_reports(&GenerateOrderStatusReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            open_only: false,
+            instrument_id: Some(instrument_id),
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect_err("invalid confirmed evidence must not produce an order report batch");
+
+    for error in [single_error, batch_error] {
+        assert!(format!("{error:#}").contains(expected_error));
+    }
 }
 
 #[rstest]
@@ -3644,6 +3990,14 @@ async fn test_fok_deferred_check_emits_terminal_event(
     #[case] expect_accepted: bool,
 ) {
     let state = TestServerState::default();
+    *state.order_response.lock().await = Some(json!({
+        "errorMsg": "",
+        "orderID": "test-fok-order-id",
+        "takingAmount": "",
+        "makingAmount": "",
+        "status": "delayed",
+        "success": true
+    }));
     // REST resolves the unfilled FOK order to a terminal status for the deferred check.
     *state.single_order_response.lock().await = Some(json!({
         "associate_trades": [],
@@ -3657,10 +4011,10 @@ async fn test_fok_deferred_check_emits_terminal_event(
         "price": "0.5100",
         "side": "BUY",
         "size_matched": "0.0000",
-        "asset_id": "TEST-TOKEN",
+        "asset_id": TEST_TOKEN_ID,
         "expiration": null,
         "order_type": "FOK",
-        "created_at": 1_703_875_200_000_i64
+        "created_at": 1_703_875_200_i64
     }));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -3717,6 +4071,82 @@ async fn test_fok_deferred_check_emits_terminal_event(
 }
 
 #[rstest]
+#[case::invalid_price(TEST_TOKEN_ID, "0", "BUY", "FOK")]
+#[case::wrong_asset("OTHER-TOKEN", "0.5100", "BUY", "FOK")]
+#[case::wrong_side(TEST_TOKEN_ID, "0.5100", "SELL", "FOK")]
+#[case::wrong_time_in_force(TEST_TOKEN_ID, "0.5100", "BUY", "GTC")]
+#[tokio::test]
+async fn test_fok_deferred_check_rejects_invalid_terminal_evidence_before_emitting_authority(
+    #[case] returned_asset: &str,
+    #[case] returned_price: &str,
+    #[case] returned_side: &str,
+    #[case] returned_order_type: &str,
+) {
+    let state = TestServerState::default();
+    *state.order_response.lock().await = Some(json!({
+        "errorMsg": "",
+        "orderID": "test-fok-order-id",
+        "takingAmount": "",
+        "makingAmount": "",
+        "status": "delayed",
+        "success": true
+    }));
+    *state.single_order_response.lock().await = Some(json!({
+        "associate_trades": [],
+        "id": "test-fok-order-id",
+        "status": "CANCELED",
+        "market": "0xtest",
+        "original_size": "10.0000",
+        "outcome": "Yes",
+        "maker_address": "0xtest",
+        "owner": "test-owner",
+        "price": returned_price,
+        "side": returned_side,
+        "size_matched": "0.0000",
+        "asset_id": returned_asset,
+        "expiration": null,
+        "order_type": returned_order_type,
+        "created_at": 1_703_875_200_i64
+    }));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_market_order_with_time_in_force(
+        "O-FOK-INVALID-REST",
+        instrument_id,
+        OrderSide::Buy,
+        true,
+        TimeInForce::Fok,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+
+    for expected in ["Submitted", "Updated"] {
+        assert_order_event(recv_execution_event(&mut rx).await, expected);
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state.single_order_get_count.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("deferred FOK status request should finish");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_limit_fok_absent_submit_status_uses_deferred_check() {
     let state = TestServerState::default();
@@ -3737,10 +4167,10 @@ async fn test_limit_fok_absent_submit_status_uses_deferred_check() {
         "price": "0.5100",
         "side": "BUY",
         "size_matched": "0.0000",
-        "asset_id": "TEST-TOKEN",
+        "asset_id": TEST_TOKEN_ID,
         "expiration": null,
         "order_type": "FOK",
-        "created_at": 1_703_875_200_000_i64
+        "created_at": 1_703_875_200_i64
     }));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -3777,11 +4207,20 @@ async fn test_limit_fok_absent_submit_status_uses_deferred_check() {
     assert_eq!(state.single_order_get_count.load(Ordering::Acquire), 1);
 }
 
-// A MATCHED FOK report excludes provisional quantity until the trade confirms
+// A MATCHED FOK row can confirm acceptance, but cannot confer terminal authority until the trade
+// confirms its fill quantity.
 #[rstest]
 #[tokio::test]
-async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
+async fn test_fok_deferred_check_filled_without_confirmed_fills_emits_no_terminal_report() {
     let state = TestServerState::default();
+    *state.order_response.lock().await = Some(json!({
+        "errorMsg": "",
+        "orderID": "test-fok-order-id",
+        "takingAmount": "",
+        "makingAmount": "",
+        "status": "delayed",
+        "success": true
+    }));
     *state.single_order_response.lock().await = Some(json!({
         "associate_trades": [],
         "id": "test-fok-order-id",
@@ -3794,10 +4233,10 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
         "price": "0.5100",
         "side": "BUY",
         "size_matched": "10.0000",
-        "asset_id": "TEST-TOKEN",
+        "asset_id": TEST_TOKEN_ID,
         "expiration": null,
         "order_type": "FOK",
-        "created_at": 1_703_875_200_000_i64
+        "created_at": 1_703_875_200_i64
     }));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -3835,19 +4274,8 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
         .unwrap();
     assert_order_event(accepted, "Accepted");
 
-    // Venue Filled with no confirmed local fills surfaces no fill quantity
-    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-
-    match event {
-        ExecutionEvent::Report(ExecutionReport::Order(report)) => {
-            assert_eq!(report.order_status, OrderStatus::Filled);
-            assert_eq!(report.filled_qty, Quantity::zero(0));
-        }
-        other => panic!("Expected Order report, was {other:?}"),
-    }
+    assert_eq!(state.single_order_get_count.load(Ordering::Acquire), 1);
+    assert_no_execution_event(&mut rx).await;
 }
 
 #[rstest]
@@ -4158,7 +4586,6 @@ fn add_instrument_to_cache_with_tick_and_taker_fee(
     size_precision: u8,
     taker_fee: Decimal,
 ) {
-    let symbol = "71321045679252212594626385532706912750332728571942532289631379312455583992563";
     let price_increment = Price::from(tick_size);
     let size_increment = if size_precision == 0 {
         Quantity::from("1")
@@ -4168,7 +4595,23 @@ fn add_instrument_to_cache_with_tick_and_taker_fee(
             "0".repeat((size_precision as usize).saturating_sub(1))
         ))
     };
-    let raw_symbol = Symbol::from(symbol);
+    let raw_symbol = Symbol::from(TEST_TOKEN_ID);
+    let info = if taker_fee.is_zero() {
+        None
+    } else {
+        let mut info = Params::new();
+        info.insert(
+            "fee_schedule".to_string(),
+            serde_json::to_value(FeeSchedule {
+                exponent: Decimal::ONE,
+                rate: taker_fee,
+                taker_only: true,
+                rebate_rate: Decimal::ZERO,
+            })
+            .unwrap(),
+        );
+        Some(info)
+    };
 
     let instrument = BinaryOption::new(
         instrument_id,
@@ -4194,7 +4637,7 @@ fn add_instrument_to_cache_with_tick_and_taker_fee(
         None, // maker_fee
         Some(taker_fee),
         None, // tick_scheme
-        None, // info
+        info,
         UnixNanos::default(),
         UnixNanos::default(),
     );
@@ -8530,7 +8973,36 @@ async fn test_query_order_does_not_block_within_runtime() {
         .await
         .unwrap()
         .unwrap();
-    assert_order_status_report(event, OrderStatus::Accepted);
+    assert_order_status_report(event, OrderStatus::PartiallyFilled);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_order_without_loaded_instrument_emits_no_report() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, _cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+
+    client
+        .query_order(QueryOrder::new(
+            TraderId::from("TESTER-001"),
+            Some(*POLYMARKET_CLIENT_ID),
+            StrategyId::from("S-001"),
+            instrument_id,
+            ClientOrderId::from("O-QUERY-NO-INSTRUMENT"),
+            Some(VenueOrderId::from(
+                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",
+            )),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    assert_no_execution_event(&mut rx).await;
 }
 
 #[rstest]
@@ -8556,7 +9028,7 @@ async fn test_order_queries_use_registered_identity_after_delayed_submit() {
         "price": "0.5100",
         "side": "BUY",
         "size_matched": "0.0000",
-        "asset_id": "TEST-TOKEN",
+        "asset_id": TEST_TOKEN_ID,
         "expiration": null,
         "order_type": "GTC",
         "created_at": 1_703_875_200_i64
@@ -8650,7 +9122,7 @@ async fn test_order_queries_use_registered_identity_after_delayed_submit() {
 
 #[rstest]
 #[tokio::test]
-async fn test_query_order_excludes_unconfirmed_matched_quantity() {
+async fn test_query_order_with_unconfirmed_filled_quantity_emits_no_report() {
     let state = TestServerState::default();
     *state.single_order_response.lock().await = Some(json!({
         "associate_trades": ["pending-trade"],
@@ -8692,18 +9164,7 @@ async fn test_query_order_excludes_unconfirmed_matched_quantity() {
 
     client.query_order(cmd).unwrap();
 
-    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-
-    match event {
-        ExecutionEvent::Report(ExecutionReport::Order(report)) => {
-            assert_eq!(report.order_status, OrderStatus::Filled);
-            assert_eq!(report.filled_qty, Quantity::zero(4));
-        }
-        other => panic!("Expected Order report, was {other:?}"),
-    }
+    assert_no_execution_event(&mut rx).await;
 }
 
 #[rstest]

@@ -32,7 +32,7 @@ use super::{
     PolymarketExecutionClient,
     cancellations::execute_deferred_cancel,
     order_builder::PolymarketOrderBuilder,
-    parse::{compute_commission, instrument_fee_exponent, instrument_taker_fee},
+    parse::{compute_commission_checked, instrument_fee_exponent, instrument_taker_fee},
     reports::fetch_collateral_balance_pusd,
     responses::{
         check_fok_status, emit_market_order_submitted, fok_check_order_id,
@@ -155,6 +155,7 @@ impl PolymarketExecutionClient {
                             &submitter,
                             &order_id,
                             &order,
+                            &request.token_id,
                             &fill_tracker,
                             &order_identities,
                             &emitter,
@@ -230,7 +231,16 @@ impl PolymarketExecutionClient {
             Decimal::ZERO
         };
         let fee_exponent = if needs_fee_adjustment {
-            instrument_fee_exponent(&instrument)
+            match instrument_fee_exponent(&instrument) {
+                Ok(exponent) => exponent,
+                Err(e) => {
+                    self.emitter.emit_order_denied(
+                        &order,
+                        &format!("Invalid Polymarket fee schedule: {e}"),
+                    );
+                    return;
+                }
+            }
         } else {
             1.0
         };
@@ -276,7 +286,7 @@ impl PolymarketExecutionClient {
 
             match submitter
                 .submit_market_order(MarketOrderSubmitRequest {
-                    token_id,
+                    token_id: token_id.clone(),
                     side,
                     amount,
                     time_in_force,
@@ -344,6 +354,7 @@ impl PolymarketExecutionClient {
                             &submitter,
                             &order_id,
                             &order,
+                            &token_id,
                             &fill_tracker,
                             &order_identities,
                             &emitter,
@@ -798,15 +809,15 @@ pub(super) fn calculate_commission(
     liquidity_side: LiquiditySide,
 ) -> anyhow::Result<Money> {
     let fee_rate = instrument_taker_fee(instrument);
-    let fee_exponent = instrument_fee_exponent(instrument);
+    let fee_exponent = instrument_fee_exponent(instrument)?;
 
-    let commission = compute_commission(
+    let commission = compute_commission_checked(
         fee_rate,
         fee_exponent,
         last_qty.as_decimal(),
         last_px.as_decimal(),
         liquidity_side,
-    );
+    )?;
 
     Money::from_decimal(commission, instrument.quote_currency()).with_context(|| {
         format!(
@@ -822,6 +833,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::execution::parse::compute_commission;
 
     #[rstest]
     fn test_calculate_commission_returns_exact_money() {
@@ -840,7 +852,7 @@ mod tests {
             commission.as_decimal(),
             compute_commission(
                 instrument_taker_fee(&instrument),
-                instrument_fee_exponent(&instrument),
+                instrument_fee_exponent(&instrument).unwrap(),
                 dec!(100),
                 dec!(0.50),
                 LiquiditySide::Taker,

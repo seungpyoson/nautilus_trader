@@ -343,7 +343,7 @@ fn bench_order_event(c: &mut Criterion) {
                 sz_prec,
                 ts_init,
             );
-            black_box(report);
+            black_box(report.unwrap());
         });
     });
     group.finish();

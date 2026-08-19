@@ -38,7 +38,7 @@ use nautilus_model::{
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
-use super::PolymarketExecutionClient;
+use super::{PolymarketExecutionClient, parse::make_trade_correction_key};
 use crate::{
     execution::{identity::OrderIdentity, reports::fetch_and_emit_account_state},
     http::{clob::HeartbeatResponse, error::Error as HttpError},
@@ -735,7 +735,7 @@ fn polymarket_trade_key(info: Option<&IndexMap<Ustr, Ustr>>) -> Option<String> {
     let info = info?;
     let trade_id = info.get(&Ustr::from("id"))?;
     let taker_order_id = info.get(&Ustr::from("taker_order_id"))?;
-    Some(format!("{trade_id}-{taker_order_id}"))
+    Some(make_trade_correction_key(trade_id, taker_order_id))
 }
 
 fn upsert_execution_lookup(
@@ -1192,7 +1192,7 @@ mod tests {
 
         client.load_orders_from_cache();
 
-        let key = "trade-restart-V-001";
+        let key = make_trade_correction_key("trade-restart", "V-001");
         let identity = client
             .order_identities
             .get(&venue_order_id)
@@ -1206,9 +1206,9 @@ mod tests {
             Some(order.filled_qty())
         );
         assert_eq!(order.status(), OrderStatus::Voided);
-        assert!(state.processed_fills.contains(&key.to_string()));
-        assert_eq!(state.matched_fill_count(key), 0);
-        assert!(state.is_voided_trade(key));
+        assert!(state.processed_fills.contains(&key));
+        assert_eq!(state.matched_fill_count(&key), 0);
+        assert!(state.is_voided_trade(&key));
     }
 
     #[rstest]
