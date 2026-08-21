@@ -38,7 +38,7 @@ use nautilus_model::{
 /// `trader_id` and `account_id` are client-wide constants threaded from the dispatch context,
 /// so they are not stored here. Fill-specific values (`last_qty`, `last_px`, `trade_id`,
 /// `commission`) come from the venue trade payload.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OrderIdentity {
     pub client_order_id: ClientOrderId,
     pub strategy_id: StrategyId,
@@ -117,6 +117,46 @@ impl OrderIdentity {
     pub(crate) fn requires_terminal_quantity_normalization(&self) -> bool {
         self.time_in_force == TimeInForce::Fok
     }
+
+    fn ensure_equal(&self, cached: &Self, venue_order_id: VenueOrderId) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.client_order_id == cached.client_order_id,
+            "cached client order ID {} does not match tracked client order ID {} for order {venue_order_id}",
+            cached.client_order_id,
+            self.client_order_id,
+        );
+        anyhow::ensure!(
+            self.strategy_id == cached.strategy_id,
+            "cached strategy {} does not match tracked strategy {} for order {venue_order_id}",
+            cached.strategy_id,
+            self.strategy_id,
+        );
+        anyhow::ensure!(
+            self.instrument_id == cached.instrument_id,
+            "cached instrument {} does not match tracked instrument {} for order {venue_order_id}",
+            cached.instrument_id,
+            self.instrument_id,
+        );
+        anyhow::ensure!(
+            self.order_side == cached.order_side,
+            "cached side {} does not match tracked side {} for order {venue_order_id}",
+            cached.order_side,
+            self.order_side,
+        );
+        anyhow::ensure!(
+            self.order_type == cached.order_type,
+            "cached order type {} does not match tracked type {} for order {venue_order_id}",
+            cached.order_type,
+            self.order_type,
+        );
+        anyhow::ensure!(
+            self.time_in_force == cached.time_in_force,
+            "cached time in force {} does not match tracked time in force {} for order {venue_order_id}",
+            cached.time_in_force,
+            self.time_in_force,
+        );
+        Ok(())
+    }
 }
 
 /// Shared registry of tracked own-order identities, keyed by venue order ID.
@@ -143,6 +183,9 @@ impl OrderIdentityRegistry {
     }
 
     /// Records the identity for a tracked order under its venue order ID.
+    ///
+    /// This also publishes the client-to-venue mapping used by cancel routing. Use
+    /// [`Self::reserve_order_identity`] before the submit response is known.
     pub(crate) fn register_order_identity(
         &self,
         venue_order_id: VenueOrderId,
@@ -155,6 +198,19 @@ impl OrderIdentityRegistry {
             .insert(identity.client_order_id, venue_order_id);
     }
 
+    /// Publishes immutable identity for validation without claiming a routable venue order.
+    pub(crate) fn reserve_order_identity(
+        &self,
+        venue_order_id: VenueOrderId,
+        identity: OrderIdentity,
+    ) {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .identities
+            .insert(venue_order_id, identity);
+    }
+
     /// Returns the identity for a tracked order, if known.
     pub(crate) fn get(&self, venue_order_id: &VenueOrderId) -> Option<OrderIdentity> {
         self.inner
@@ -163,6 +219,22 @@ impl OrderIdentityRegistry {
             .identities
             .get(venue_order_id)
             .copied()
+    }
+
+    /// Resolves cache identity without allowing it to replace retained submit-time identity.
+    pub(crate) fn resolve_cached_order_identity(
+        &self,
+        venue_order_id: VenueOrderId,
+        order: &OrderAny,
+    ) -> anyhow::Result<OrderIdentity> {
+        let cached = OrderIdentity::from_order(order);
+        match self.get(&venue_order_id) {
+            Some(retained) => {
+                retained.ensure_equal(&cached, venue_order_id)?;
+                Ok(retained)
+            }
+            None => Ok(cached),
+        }
     }
 
     pub(crate) fn remove(&self, venue_order_id: &VenueOrderId) -> Option<OrderIdentity> {

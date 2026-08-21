@@ -30,12 +30,11 @@ use nautilus_common::{
 };
 use nautilus_core::{MUTEX_POISONED, collections::AtomicMap, time::AtomicTime};
 use nautilus_model::{
-    enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
+    enums::{OrderStatus, TimeInForce},
     events::{OrderEventAny, OrderFillVoided, OrderFilled, PositionEvent},
     identifiers::{InstrumentId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
-    orders::{Order, OrderAny},
-    types::Quantity,
+    orders::Order,
 };
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
@@ -44,7 +43,7 @@ use super::PolymarketExecutionClient;
 use crate::{
     common::enums::{PolymarketLiquiditySide, PolymarketTradeStatus},
     execution::{
-        identity::{OrderIdentity, OrderIdentityRegistry},
+        identity::OrderIdentityRegistry,
         order_fill_tracker::{
             FillFingerprint, OrderFillTrackerMap, RestoredOrder, TradeCorrectionIdentity,
         },
@@ -593,14 +592,19 @@ impl PolymarketExecutionClient {
                 "cannot restore open order {venue_order_id}: active trade IDs and cached fill events differ"
             );
 
-            let identity = OrderIdentity::from_order(order);
+            let identity = self
+                .order_identities
+                .resolve_cached_order_identity(venue_order_id, order)?;
+            let authority = self
+                .fill_tracker
+                .resolve_order_authority(&venue_order_id, Some(order))?;
             restored_orders.push(RestoredOrder {
                 venue_order_id,
-                original_submitted_qty: restored_submitted_quantity(order),
+                original_submitted_qty: authority.restored_original_quantity(order),
                 submitted_qty: order.quantity(),
                 filled_qty: order.filled_qty(),
-                growth_policy: restored_fill_growth_policy(order),
                 applied_fills: active_fills,
+                authority,
             });
             restored_identities.push((venue_order_id, identity));
         }
@@ -770,15 +774,22 @@ impl PolymarketExecutionClient {
                 "cannot hydrate terminal order {venue_order_id}: active trade IDs and cached fill events differ",
             );
 
+            let authority = self
+                .fill_tracker
+                .resolve_order_authority(&venue_order_id, Some(&order))?;
             restored_orders.push(RestoredOrder {
                 venue_order_id,
-                original_submitted_qty: restored_submitted_quantity(&order),
+                original_submitted_qty: authority.restored_original_quantity(&order),
                 submitted_qty: order.quantity(),
                 filled_qty: order.filled_qty(),
-                growth_policy: restored_fill_growth_policy(&order),
                 applied_fills: active_fills,
+                authority,
             });
-            restored_identities.push((venue_order_id, OrderIdentity::from_order(&order)));
+            restored_identities.push((
+                venue_order_id,
+                self.order_identities
+                    .resolve_cached_order_identity(venue_order_id, &order)?,
+            ));
 
             if order.status() == OrderStatus::Canceled {
                 terminal_cancels.push((venue_order_id, order.ts_last()));
@@ -993,46 +1004,6 @@ impl PolymarketExecutionClient {
     pub(super) fn on_instrument_update(&self, instrument: &InstrumentAny) {
         self.upsert_execution_lookup(instrument);
     }
-}
-
-pub(super) fn restored_fill_growth_policy(
-    order: &OrderAny,
-) -> crate::execution::order_fill_tracker::FillGrowthPolicy {
-    let initialized_as_quote = order.events().first().is_some_and(|event| {
-        matches!(event, OrderEventAny::Initialized(initialized) if initialized.quote_quantity)
-    });
-
-    if initialized_as_quote
-        && order.order_side() == OrderSide::Buy
-        && order.order_type() == OrderType::Market
-        && matches!(order.time_in_force(), TimeInForce::Ioc | TimeInForce::Fok)
-    {
-        crate::execution::order_fill_tracker::FillGrowthPolicy::QuoteImmediateBuyUnproven
-    } else {
-        crate::execution::order_fill_tracker::FillGrowthPolicy::Fixed
-    }
-}
-
-fn restored_submitted_quantity(order: &OrderAny) -> Quantity {
-    if !matches!(
-        restored_fill_growth_policy(order),
-        crate::execution::order_fill_tracker::FillGrowthPolicy::QuoteImmediateBuyUnproven
-    ) {
-        return order.quantity();
-    }
-
-    order
-        .events()
-        .iter()
-        .find_map(|event| match event {
-            OrderEventAny::Updated(updated)
-                if updated.venue_order_id.is_none() && !updated.is_quote_quantity =>
-            {
-                Some(updated.quantity)
-            }
-            _ => None,
-        })
-        .unwrap_or_else(|| order.quantity())
 }
 
 async fn run_heartbeats(
@@ -1280,7 +1251,8 @@ mod tests {
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
         enums::{
-            AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, PositionSide, TimeInForce,
+            AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
+            TimeInForce,
         },
         events::{
             OrderEventAny, OrderExpired, OrderUpdated, PositionClosed, PositionEvent,
@@ -1300,6 +1272,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        execution::{identity::OrderIdentity, order_authority::OrderAuthority},
         factories::spawn_rejecting_proxy,
         websocket::messages::{PolymarketUserOrder, PolymarketUserTrade, UserWsMessage},
     };
@@ -1500,6 +1473,34 @@ mod tests {
         ))
     }
 
+    fn open_market_order_with_identity(
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+    ) -> OrderAny {
+        OrderAny::Market(MarketOrder::new(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("S-001"),
+            instrument_id,
+            client_order_id,
+            order_side,
+            ModelQuantity::from("10.00"),
+            TimeInForce::Ioc,
+            UUID4::new(),
+            UnixNanos::default(),
+            false,
+            order_side == OrderSide::Buy,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+    }
+
     fn cache_accepted_open_order(cache: &mut Cache, instrument_id: InstrumentId) -> OrderAny {
         cache_accepted_order(cache, open_limit_order(instrument_id))
     }
@@ -1524,6 +1525,163 @@ mod tests {
             venue_order_id,
         );
         cache.update_order(&accepted).unwrap()
+    }
+
+    #[rstest]
+    #[case::open(false)]
+    #[case::pending_terminal(true)]
+    fn retained_signed_market_authority_survives_cache_merge(#[case] pending_terminal: bool) {
+        let (client, cache) = test_client();
+        let venue_order_id = VenueOrderId::from(TEST_VENUE_ORDER_ID);
+        let mut trade_json: Value =
+            serde_json::from_str(include_str!("../../test_data/http_trade_report.json")).unwrap();
+        trade_json["status"] = Value::String("MATCHED".to_string());
+        trade_json["owner"] = Value::String("test_api_key".to_string());
+        trade_json["taker_order_id"] = Value::String(TEST_VENUE_ORDER_ID.to_string());
+        trade_json["size"] = Value::String("4.00".to_string());
+        let trade: PolymarketTradeReport = serde_json::from_value(trade_json).unwrap();
+        let instrument = {
+            let mut binary = binary_option();
+            binary.id = InstrumentId::from(
+                format!("{}-{}.POLYMARKET", trade.market, trade.asset_id).as_str(),
+            );
+            binary.raw_symbol = Symbol::new(trade.asset_id.as_str());
+            binary.currency = Currency::pUSD();
+            binary.outcome = Some(Ustr::from("Yes"));
+            let mut info = nautilus_core::Params::new();
+            info.insert(
+                "condition_id".to_string(),
+                Value::String(trade.market.to_string()),
+            );
+            info.insert("fees_enabled".to_string(), Value::Bool(false));
+            binary.info = Some(info);
+            InstrumentAny::BinaryOption(binary)
+        };
+        let order = open_market_order_with_identity(
+            instrument.id(),
+            ClientOrderId::from("O-RETAIN-SIGNED-MARKET"),
+            OrderSide::Buy,
+        );
+        let authority = OrderAuthority::for_test(
+            OrderSide::Buy,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            ModelQuantity::from("10.00"),
+            ModelPrice::from("0.5000"),
+            None,
+        );
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument).unwrap();
+            let order = cache_accepted_order_with_venue(&mut cache, order, venue_order_id);
+            if pending_terminal {
+                let canceled = TestOrderEventStubs::canceled(
+                    &order,
+                    AccountId::from("POLYMARKET-001"),
+                    Some(venue_order_id),
+                );
+                cache.update_order(&canceled).unwrap();
+            }
+        }
+        client
+            .fill_tracker
+            .reserve_orders_with_authority(&[(venue_order_id, authority)])
+            .unwrap();
+
+        client.load_instruments_from_cache();
+        client.load_orders_from_cache().unwrap();
+        if pending_terminal {
+            assert_eq!(
+                client
+                    .hydrate_pending_terminal_orders_from(vec![trade])
+                    .unwrap(),
+                1,
+            );
+        }
+
+        assert_eq!(
+            client.fill_tracker.order_authority(&venue_order_id),
+            Some(authority),
+        );
+        assert!(client.fill_tracker.contains(&venue_order_id));
+    }
+
+    #[rstest]
+    fn retained_signed_authority_rejects_contradictory_cached_order() {
+        let (client, cache) = test_client();
+        let venue_order_id = VenueOrderId::from(TEST_VENUE_ORDER_ID);
+        let instrument = test_binary_option("0xRETAINED-AUTHORITY", false, false);
+        let cached_order = open_market_order_with_identity(
+            instrument.id(),
+            ClientOrderId::from("O-RETAINED-AUTHORITY"),
+            OrderSide::Sell,
+        );
+        let authority = OrderAuthority::for_test(
+            OrderSide::Buy,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            ModelQuantity::from("10.00"),
+            ModelPrice::from("0.5000"),
+            None,
+        );
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument).unwrap();
+            cache_accepted_order_with_venue(&mut cache, cached_order, venue_order_id);
+        }
+        client
+            .fill_tracker
+            .reserve_orders_with_authority(&[(venue_order_id, authority)])
+            .unwrap();
+
+        let error = client.load_orders_from_cache().unwrap_err();
+        assert!(format!("{error:#}").contains("signed side"), "{error:#}");
+    }
+
+    #[rstest]
+    fn retained_identity_rejects_contradictory_cached_order() {
+        let (client, cache) = test_client();
+        let venue_order_id = VenueOrderId::from(TEST_VENUE_ORDER_ID);
+        let expected_instrument = test_binary_option("0xEXPECTED-IDENTITY", false, false);
+        let cached_instrument = test_binary_option("0xCACHED-IDENTITY", false, false);
+        let expected_order = open_market_order_with_identity(
+            expected_instrument.id(),
+            ClientOrderId::from("O-RETAINED-IDENTITY"),
+            OrderSide::Buy,
+        );
+        let cached_order = open_market_order_with_identity(
+            cached_instrument.id(),
+            expected_order.client_order_id(),
+            OrderSide::Buy,
+        );
+        let authority = OrderAuthority::for_test(
+            OrderSide::Buy,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            ModelQuantity::from("10.00"),
+            ModelPrice::from("0.5000"),
+            None,
+        );
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(expected_instrument).unwrap();
+            cache.add_instrument(cached_instrument).unwrap();
+            cache_accepted_order_with_venue(&mut cache, cached_order, venue_order_id);
+        }
+        client
+            .fill_tracker
+            .reserve_orders_with_authority(&[(venue_order_id, authority)])
+            .unwrap();
+        client
+            .order_identities
+            .reserve_order_identity(venue_order_id, OrderIdentity::from_order(&expected_order));
+
+        let error = client.load_orders_from_cache().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("tracked instrument"),
+            "{error:#}"
+        );
     }
 
     #[rstest]
@@ -1915,13 +2073,16 @@ mod tests {
         failed_json["taker_order_id"] = Value::String(TEST_VENUE_ORDER_ID.to_string());
         failed_json["size"] = Value::String(fill_size.to_string());
         failed_json["status"] = Value::String("FAILED".to_string());
-        let failed = UserWsMessage::Trade(serde_json::from_value(failed_json).unwrap());
         let user_address = client
             .secrets
             .funder
             .clone()
             .unwrap_or_else(|| client.secrets.address.clone());
         let user_api_key = client.secrets.credential.api_key().to_string();
+        failed_json["owner"] = Value::String(user_api_key.clone());
+        failed_json["trade_owner"] = Value::String(user_api_key.clone());
+        failed_json["maker_address"] = Value::String(user_address.clone());
+        let failed = UserWsMessage::Trade(serde_json::from_value(failed_json).unwrap());
         let ctx = WsDispatchContext {
             token_instruments: &client.shared_token_instruments,
             fill_tracker: &client.fill_tracker,
@@ -2101,13 +2262,16 @@ mod tests {
         failed_json["taker_order_id"] = Value::String(TEST_VENUE_ORDER_ID.to_string());
         failed_json["size"] = Value::String("11.00".to_string());
         failed_json["status"] = Value::String("FAILED".to_string());
-        let failed = UserWsMessage::Trade(serde_json::from_value(failed_json).unwrap());
         let user_address = client
             .secrets
             .funder
             .clone()
             .unwrap_or_else(|| client.secrets.address.clone());
         let user_api_key = client.secrets.credential.api_key().to_string();
+        failed_json["owner"] = Value::String(user_api_key.clone());
+        failed_json["trade_owner"] = Value::String(user_api_key.clone());
+        failed_json["maker_address"] = Value::String(user_address.clone());
+        let failed = UserWsMessage::Trade(serde_json::from_value(failed_json).unwrap());
         let ctx = WsDispatchContext {
             token_instruments: &client.shared_token_instruments,
             fill_tracker: &client.fill_tracker,
@@ -2873,6 +3037,12 @@ mod tests {
             .clone()
             .unwrap_or_else(|| client.secrets.address.clone());
         let user_api_key = client.secrets.credential.api_key().to_string();
+        trade.owner = Ustr::from(user_api_key.as_str());
+        trade.trade_owner = Ustr::from(user_api_key.as_str());
+        trade.maker_address = Ustr::from(user_address.as_str());
+        order.owner = Ustr::from(user_api_key.as_str());
+        order.order_owner = Some(Ustr::from(user_api_key.as_str()));
+        order.maker_address = Some(Ustr::from(user_address.as_str()));
         let ctx = WsDispatchContext {
             token_instruments: &client.shared_token_instruments,
             fill_tracker: &client.fill_tracker,

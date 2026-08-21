@@ -38,12 +38,9 @@ use ustr::Ustr;
 use super::{
     PolymarketExecutionClient,
     identity::OrderIdentity,
-    lifecycle::restored_fill_growth_policy,
-    order_fill_tracker::{
-        FillFingerprint, FillReplayFingerprint, OrderFillTrackerMap, snap_fill_qty_for_policy,
-    },
+    order_authority::OrderReportSurface,
+    order_fill_tracker::{FillFingerprint, FillReplayFingerprint, OrderFillTrackerMap},
     parse::{parse_balance_allowance, parse_order_status_report, recovered_terminal_order_status},
-    pending::PendingSubmitTracker,
     reconciliation::{
         FillContext, apply_fill_filters, build_fill_reports_from_trades,
         build_position_reports_scoped, cap_order_report_filled_qty, confirmed_filled_quantities,
@@ -100,9 +97,12 @@ impl PolymarketExecutionClient {
                 .cache()
                 .order(&identity.client_order_id)
                 .map(|order| order.cloned());
-            if let Some(expected_order) = expected_order.as_ref() {
-                bind_known_order_terms(report, expected_order, expected_order.quantity())?;
-            }
+            self.fill_tracker.bind_known_order_report(
+                report,
+                None,
+                OrderReportSurface::Rest,
+                expected_order.as_ref(),
+            )?;
         }
         Ok(identity)
     }
@@ -155,12 +155,8 @@ impl PolymarketExecutionClient {
                     .or_insert_with(|| order.cloned());
             }
         }
-        let mut validated = validate_confirmed_fill_evidence(
-            &self.fill_tracker,
-            &self.pending_submits,
-            &cached_orders,
-            reports,
-        )?;
+        let mut validated =
+            validate_confirmed_fill_evidence(&self.fill_tracker, &cached_orders, reports)?;
 
         for report in &mut validated.normalized_reports {
             if let Some(identity) = self.known_order_identity(report.venue_order_id, None) {
@@ -481,7 +477,6 @@ impl PolymarketExecutionClient {
 
         let http_client = self.http_client.clone();
         let fill_tracker = self.fill_tracker.clone();
-        let pending_submits = self.pending_submits.clone();
         let token_instruments = self.shared_token_instruments.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -513,13 +508,13 @@ impl PolymarketExecutionClient {
                         }
                     };
                     let requested_venue_order_id = VenueOrderId::from(venue_order_id.as_str());
-
                     if let Err(e) = validate_order_response_scope(
                         &order,
                         &mut report,
                         requested_venue_order_id,
                         &instrument,
                         expected_order.as_ref(),
+                        &fill_tracker,
                     ) {
                         log::warn!("Rejected queried order {venue_order_id}: {e}");
                         return Ok(());
@@ -529,7 +524,7 @@ impl PolymarketExecutionClient {
                         .get_cumulative_filled(&venue_order_id)
                         .unwrap_or_else(|| Quantity::zero(size_prec));
                     let local_filled = cached_filled.max(tracked_filled);
-                    let confirmed_fills = if report.filled_qty > local_filled {
+                    let mut confirmed_fills = if report.filled_qty > local_filled {
                         let ctx = FillContext {
                             account_id,
                             user_address: &user_address,
@@ -554,7 +549,6 @@ impl PolymarketExecutionClient {
                             Some(fills) => {
                                 validate_confirmed_fill_evidence(
                                     &fill_tracker,
-                                    &pending_submits,
                                     &cached_orders,
                                     &fills,
                                 )?
@@ -577,6 +571,7 @@ impl PolymarketExecutionClient {
                         tracked_filled,
                         confirmed_filled,
                     )?;
+                    confirmed_fills.admit(&fill_tracker)?;
 
                     if confirmed_fills.normalized_reports.is_empty() {
                         emitter.send_order_status_report(report);
@@ -651,6 +646,7 @@ impl PolymarketExecutionClient {
                 venue_order_id,
                 &instrument,
                 expected_order.as_ref(),
+                &self.fill_tracker,
             )?;
             let cached_filled = cmd
                 .client_order_id
@@ -895,13 +891,10 @@ impl PolymarketExecutionClient {
         )?;
         discards.ensure_complete("fill report generation")?;
 
-        let validated = self.validated_confirmed_fills(&reports)?;
-        let reports = apply_fill_filters(
-            validated.normalized_reports,
-            cmd.venue_order_id,
-            cmd.start,
-            cmd.end,
-        );
+        let reports = apply_fill_filters(reports, cmd.venue_order_id, cmd.start, cmd.end);
+        let mut validated = self.validated_confirmed_fills(&reports)?;
+        validated.admit(&self.fill_tracker)?;
+        let reports = validated.normalized_reports;
 
         log::debug!("Generated {} fill reports", reports.len());
         Ok(reports)
@@ -953,7 +946,7 @@ impl PolymarketExecutionClient {
         let Some(generated) = generated else {
             return Ok(None);
         };
-        let (validated_fills, mut order_reports) = {
+        let (mut validated_fills, mut order_reports) = {
             let status = &generated.status;
             let mut order_reports = status.order_reports().into_values().collect::<Vec<_>>();
             self.validate_known_order_reports(&mut order_reports)?;
@@ -962,7 +955,6 @@ impl PolymarketExecutionClient {
                 order_reports,
             )
         };
-
         for report in &mut order_reports {
             let cached_filled = {
                 let cache = self.core.cache();
@@ -990,6 +982,7 @@ impl PolymarketExecutionClient {
                     .map(|quantity| quantity.as_decimal()),
             )?;
         }
+        validated_fills.admit(&self.fill_tracker)?;
         let mut status = generated.status;
         status.add_order_reports(order_reports);
         status.add_fill_reports(validated_fills.normalized_reports);
@@ -1002,6 +995,19 @@ struct ValidatedConfirmedFills {
     quantities: AHashMap<VenueOrderId, Quantity>,
     weighted_average_prices: AHashMap<VenueOrderId, Decimal>,
     normalized_reports: Vec<FillReport>,
+    cached_fills: Vec<OrderFilled>,
+    provider_reports: Vec<FillReport>,
+}
+
+impl ValidatedConfirmedFills {
+    fn admit(&mut self, fill_tracker: &OrderFillTrackerMap) -> anyhow::Result<()> {
+        self.quantities.extend(fill_tracker.admit_confirmed_fills(
+            &self.cached_fills,
+            &self.provider_reports,
+            &self.normalized_reports,
+        )?);
+        Ok(())
+    }
 }
 
 fn insert_fill_economics(
@@ -1024,12 +1030,10 @@ fn insert_fill_economics(
 
 fn validate_confirmed_fill_evidence(
     fill_tracker: &OrderFillTrackerMap,
-    pending_submits: &PendingSubmitTracker,
     cached_orders: &HashMap<VenueOrderId, OrderAny>,
     provider_reports: &[FillReport],
 ) -> anyhow::Result<ValidatedConfirmedFills> {
     let mut reports = provider_reports.to_vec();
-    fill_tracker.snap_fill_reports(&mut reports);
     for report in &mut reports {
         let Some(order) = cached_orders.get(&report.venue_order_id) else {
             continue;
@@ -1049,13 +1053,7 @@ fn validate_confirmed_fill_evidence(
             report.venue_order_id,
         );
 
-        if !fill_tracker.contains(&report.venue_order_id) {
-            report.last_qty = snap_fill_qty_for_policy(
-                order.quantity(),
-                restored_fill_growth_policy(order),
-                report.last_qty,
-            );
-        }
+        fill_tracker.bind_known_fill_report(report, order)?;
     }
     let mut confirmed_filled = confirmed_filled_quantities(&reports)?;
     let mut returned_fills = HashMap::<(VenueOrderId, TradeId), FillFingerprint>::new();
@@ -1090,20 +1088,8 @@ fn validate_confirmed_fill_evidence(
     // The tracker owns current-session quantity semantics, including a signed quote budget.
     // It returns the exact orders validated under its lock, leaving only cache-only orders for
     // the fixed ceiling below.
-    let pending_orders = provider_reports
-        .iter()
-        .filter_map(|report| {
-            pending_submits
-                .fill_validation_proof(&report.venue_order_id)
-                .map(|proof| (report.venue_order_id, proof))
-        })
-        .collect::<AHashMap<_, _>>();
-    let tracker_totals = fill_tracker.validate_confirmed_fills_with_pending(
-        &cached_fills,
-        provider_reports,
-        &reports,
-        &pending_orders,
-    )?;
+    let tracker_totals =
+        fill_tracker.validate_confirmed_fills(&cached_fills, provider_reports, &reports)?;
     let mut prospective_totals = HashMap::new();
     let mut seen_fills = HashMap::<(VenueOrderId, TradeId), FillReplayFingerprint>::new();
     let mut fill_economics = HashMap::new();
@@ -1253,6 +1239,8 @@ fn validate_confirmed_fill_evidence(
         quantities: confirmed_filled,
         weighted_average_prices,
         normalized_reports: reports,
+        cached_fills,
+        provider_reports: provider_reports.to_vec(),
     })
 }
 
@@ -1362,6 +1350,7 @@ pub(super) fn validate_order_response_scope(
     requested_venue_order_id: VenueOrderId,
     instrument: &InstrumentAny,
     expected_order: Option<&OrderAny>,
+    fill_tracker: &OrderFillTrackerMap,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         report.venue_order_id == requested_venue_order_id,
@@ -1400,50 +1389,14 @@ pub(super) fn validate_order_response_scope(
             "returned order time in force {provider_tif} does not match tracked order time in force {}",
             expected_order.time_in_force(),
         );
-        bind_known_order_terms(report, expected_order, expected_order.quantity())?;
+        fill_tracker.bind_known_order_report(
+            report,
+            None,
+            OrderReportSurface::Rest,
+            Some(expected_order),
+        )?;
     }
 
-    Ok(())
-}
-
-pub(crate) fn bind_known_order_terms(
-    report: &mut OrderStatusReport,
-    expected_order: &OrderAny,
-    expected_quantity: Quantity,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        report.quantity == expected_quantity,
-        "returned order quantity {} does not match authorized order quantity {expected_quantity}",
-        report.quantity,
-    );
-
-    let expected_order_type = expected_order.order_type();
-    match expected_order_type {
-        OrderType::Limit => anyhow::ensure!(
-            report.price == expected_order.price(),
-            "returned order price {:?} does not match signed order price {:?}",
-            report.price,
-            expected_order.price(),
-        ),
-        OrderType::Market => {
-            report.price = expected_order.price();
-        }
-        _ => anyhow::bail!(
-            "tracked order type {expected_order_type} is unsupported by Polymarket reconciliation"
-        ),
-    }
-    report.order_type = expected_order_type;
-
-    if expected_order.time_in_force() == TimeInForce::Gtd {
-        anyhow::ensure!(
-            report.expire_time == expected_order.expire_time(),
-            "returned order expiration {:?} does not match signed order expiration {:?}",
-            report.expire_time,
-            expected_order.expire_time(),
-        );
-    } else {
-        report.expire_time = expected_order.expire_time();
-    }
     Ok(())
 }
 

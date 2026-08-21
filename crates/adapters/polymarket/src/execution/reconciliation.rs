@@ -477,7 +477,7 @@ pub(crate) async fn generate_mass_status(
     }
 
     let provider_fill_reports = fill_reports.clone();
-    fill_tracker.snap_fill_reports(&mut fill_reports);
+    fill_tracker.normalize_tracked_fill_reports(&mut fill_reports);
     validate_known_order_fill_aggregates(&provider_fill_reports, &fill_reports, fill_tracker)?;
 
     let positions = data_api_client
@@ -849,8 +849,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        execution::order_fill_tracker::{
-            FillCorrectionMetadata, FillGrowthPolicy, TradeCorrectionIdentity,
+        execution::{
+            order_authority::OrderAuthority,
+            order_fill_tracker::{FillCorrectionMetadata, TradeCorrectionIdentity},
         },
         http::{
             models::GammaMarket,
@@ -1093,14 +1094,20 @@ mod tests {
         let instrument_id = InstrumentId::from("TEST.POLYMARKET");
         let venue_order_id = VenueOrderId::from("V-KNOWN-OVERFILL");
         let tracker = OrderFillTrackerMap::new();
-        tracker.register(
-            venue_order_id,
-            Quantity::from("10.0000"),
-            OrderSide::Sell,
-            instrument_id,
-            4,
-            4,
-        );
+        tracker
+            .reserve_orders_with_authority(&[(
+                venue_order_id,
+                OrderAuthority::for_test(
+                    OrderSide::Sell,
+                    OrderType::Limit,
+                    TimeInForce::Gtc,
+                    Quantity::from("10.0000"),
+                    Price::from("0.5000"),
+                    None,
+                ),
+            )])
+            .unwrap();
+        assert!(tracker.register_without_draining(venue_order_id));
         let fills = ["T-KNOWN-1", "T-KNOWN-2"]
             .into_iter()
             .map(|trade_id| {
@@ -1135,11 +1142,20 @@ mod tests {
         let instrument_id = InstrumentId::from("TEST.POLYMARKET");
         let venue_order_id = VenueOrderId::from("V-TRACKED-OVERFILL");
         let tracker = OrderFillTrackerMap::new();
-        tracker.register_without_draining(
-            venue_order_id,
-            Quantity::from("10.0000"),
-            FillGrowthPolicy::Fixed,
-        );
+        tracker
+            .reserve_orders_with_authority(&[(
+                venue_order_id,
+                OrderAuthority::for_test(
+                    OrderSide::Sell,
+                    OrderType::Limit,
+                    TimeInForce::Gtc,
+                    Quantity::from("10.0000"),
+                    Price::from("0.5000"),
+                    None,
+                ),
+            )])
+            .unwrap();
+        assert!(tracker.register_without_draining(venue_order_id));
         let fill = |trade_id: &str, last_qty: &str| {
             FillReport::new(
                 account_id,

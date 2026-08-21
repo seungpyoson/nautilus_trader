@@ -62,76 +62,17 @@ const SMOKE_API_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const SMOKE_PASSPHRASE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 #[rstest]
-fn test_polymarket_python_factories_extract_from_registry() {
+fn test_polymarket_python_runtime_surfaces() {
     setup_data_event_sender();
     setup_exec_event_sender();
     Python::initialize();
 
     Python::attach(|py| {
-        register_polymarket_python_module(py);
+        let module = register_polymarket_python_module(py);
         assert_data_factory_extracts_from_python_object(py);
         assert_exec_factory_extracts_from_python_object(py);
-    });
-}
-
-#[rstest]
-fn test_polymarket_python_module_registers_data_loader() {
-    Python::initialize();
-
-    Python::attach(|py| {
-        let module = PyModule::new(py, "polymarket").expect("Polymarket module should be created");
-        python::polymarket(py, &module).expect("Polymarket Python module should register");
-        let loader = module
-            .getattr("PolymarketDataLoader")
-            .expect("PolymarketDataLoader should be registered");
-
-        assert_eq!(
-            loader
-                .getattr("__name__")
-                .expect("loader name")
-                .extract::<String>()
-                .expect("string loader name"),
-            "PolymarketDataLoader",
-        );
-        assert!(loader.getattr("from_market_slug").is_ok());
-        assert!(loader.getattr("query_events").is_ok());
-    });
-}
-
-#[rstest]
-fn test_polymarket_python_fee_model_uses_runtime_handle() {
-    Python::initialize();
-
-    Python::attach(|py| {
-        let module = PyModule::new(py, "polymarket").expect("Polymarket module should be created");
-        python::polymarket(py, &module).expect("Polymarket Python module should register");
-        let model = module
-            .getattr("PolymarketFeeModel")
-            .expect("PolymarketFeeModel should be registered")
-            .call0()
-            .expect("PolymarketFeeModel should construct");
-        let handle = pyobject_to_fee_model_handle(&model).expect("fee model should extract");
-        let instrument = fee_instrument();
-        let order = OrderTestBuilder::new(OrderType::Limit)
-            .instrument_id(instrument.id())
-            .side(OrderSide::Buy)
-            .price(Price::from("0.50"))
-            .quantity(Quantity::from("100"))
-            .build();
-        let order = TestOrderStubs::make_filled_order(&order, &instrument, LiquiditySide::Maker);
-
-        let commission = handle
-            .get_commission(
-                &order,
-                Quantity::from("100"),
-                Price::from("0.50"),
-                &instrument,
-            )
-            .unwrap();
-
-        assert!(model.is_instance_of::<PyFeeModel>());
-        assert_eq!(commission.as_decimal(), dec!(-0.18750));
-        assert_eq!(commission.currency, instrument.quote_currency());
+        assert_data_loader_registered(&module);
+        assert_fee_model_uses_runtime_handle(&module);
     });
 }
 
@@ -145,9 +86,57 @@ fn setup_exec_event_sender() {
     replace_exec_event_sender(sender);
 }
 
-fn register_polymarket_python_module(py: Python<'_>) {
+fn register_polymarket_python_module(py: Python<'_>) -> pyo3::Bound<'_, PyModule> {
     let module = PyModule::new(py, "polymarket").expect("Polymarket module should be created");
     python::polymarket(py, &module).expect("Polymarket Python module should register");
+    module
+}
+
+fn assert_data_loader_registered(module: &pyo3::Bound<'_, PyModule>) {
+    let loader = module
+        .getattr("PolymarketDataLoader")
+        .expect("PolymarketDataLoader should be registered");
+
+    assert_eq!(
+        loader
+            .getattr("__name__")
+            .expect("loader name")
+            .extract::<String>()
+            .expect("string loader name"),
+        "PolymarketDataLoader",
+    );
+    assert!(loader.getattr("from_market_slug").is_ok());
+    assert!(loader.getattr("query_events").is_ok());
+}
+
+fn assert_fee_model_uses_runtime_handle(module: &pyo3::Bound<'_, PyModule>) {
+    let model = module
+        .getattr("PolymarketFeeModel")
+        .expect("PolymarketFeeModel should be registered")
+        .call0()
+        .expect("PolymarketFeeModel should construct");
+    let handle = pyobject_to_fee_model_handle(&model).expect("fee model should extract");
+    let instrument = fee_instrument();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("0.50"))
+        .quantity(Quantity::from("100"))
+        .build();
+    let order = TestOrderStubs::make_filled_order(&order, &instrument, LiquiditySide::Maker);
+
+    let commission = handle
+        .get_commission(
+            &order,
+            Quantity::from("100"),
+            Price::from("0.50"),
+            &instrument,
+        )
+        .unwrap();
+
+    assert!(model.is_instance_of::<PyFeeModel>());
+    assert_eq!(commission.as_decimal(), dec!(-0.18750));
+    assert_eq!(commission.currency, instrument.quote_currency());
 }
 
 fn assert_data_factory_extracts_from_python_object(py: Python<'_>) {

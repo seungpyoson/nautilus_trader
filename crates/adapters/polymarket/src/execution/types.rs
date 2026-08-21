@@ -27,6 +27,7 @@ use nautilus_model::{
 
 use crate::{
     common::{consts::CANCEL_ALREADY_DONE, enums::PolymarketOrderType},
+    execution::order_authority::OrderAuthority,
     http::{error::Error, models::PolymarketOrder},
 };
 
@@ -76,6 +77,7 @@ pub(crate) struct SignedLimitOrderSubmission {
     pub(crate) order_type: PolymarketOrderType,
     pub(crate) post_only: bool,
     pub(crate) expected_venue_order_id: VenueOrderId,
+    pub(crate) authority: OrderAuthority,
 }
 
 #[derive(Clone, Debug)]

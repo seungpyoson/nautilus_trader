@@ -28,7 +28,7 @@ use std::sync::{
 
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    enums::{OrderSide, TimeInForce},
+    enums::{OrderSide, OrderType, TimeInForce},
     identifiers::VenueOrderId,
     types::{Price, Quantity},
 };
@@ -37,6 +37,7 @@ use rust_decimal::Decimal;
 use thiserror::Error;
 
 use super::{
+    order_authority::OrderAuthority,
     order_builder::{PolymarketOrderBuilder, validated_limit_expiration_seconds},
     parse::{adjust_market_buy_amount, calculate_market_price},
     report_validation::venue_order_id,
@@ -81,7 +82,6 @@ pub(crate) struct MarketOrderSubmitRequest {
 pub(crate) struct MarketOrderSubmitResult {
     pub response: OrderResponse,
     pub expected_base_qty: Decimal,
-    pub signed_quote_budget: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Error)]
@@ -90,7 +90,6 @@ pub(crate) struct UnknownSubmitError {
     pub reason: String,
     pub expected_venue_order_id: VenueOrderId,
     pub expected_base_qty: Option<Decimal>,
-    pub signed_quote_budget: Option<Decimal>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,7 +154,7 @@ impl OrderSubmitter {
         abandon_order: A,
     ) -> anyhow::Result<MarketOrderSubmitResult>
     where
-        R: FnOnce(VenueOrderId) -> anyhow::Result<()>,
+        R: FnOnce(VenueOrderId, OrderAuthority) -> anyhow::Result<()>,
         A: Fn(VenueOrderId) -> bool,
     {
         let MarketOrderSubmitRequest {
@@ -222,11 +221,17 @@ impl OrderSubmitter {
         // SELL. Market SELL signing truncates shares to two decimal places.
         let signed_base_qty =
             signed_base_quantity(poly_order.maker_amount, poly_order.taker_amount, poly_side);
-        let signed_quote_budget = signed_quote_budget(poly_order.maker_amount, poly_side);
+        let authority = OrderAuthority::from_signed_order(
+            &poly_order,
+            OrderType::Market,
+            time_in_force,
+            price,
+            None,
+        )?;
         let expected_venue_order_id = self
             .order_builder
             .expected_order_id(&poly_order, neg_risk)?;
-        reserve_order(expected_venue_order_id)?;
+        reserve_order(expected_venue_order_id, authority)?;
 
         let http_client = self.http_client.clone();
         let saw_unknown_outcome = Arc::new(AtomicBool::new(false));
@@ -276,7 +281,6 @@ impl OrderSubmitter {
                         ),
                         expected_venue_order_id,
                         expected_base_qty: Some(signed_base_qty),
-                        signed_quote_budget,
                     }
                     .into());
                 }
@@ -288,7 +292,6 @@ impl OrderSubmitter {
                         reason: "venue rejection contradicted buffered order activity".to_string(),
                         expected_venue_order_id,
                         expected_base_qty: Some(signed_base_qty),
-                        signed_quote_budget,
                     }
                     .into());
                 }
@@ -302,7 +305,6 @@ impl OrderSubmitter {
                     reason: e.to_string(),
                     expected_venue_order_id,
                     expected_base_qty: Some(signed_base_qty),
-                    signed_quote_budget,
                 }
                 .into());
             }
@@ -314,7 +316,6 @@ impl OrderSubmitter {
                         ),
                         expected_venue_order_id,
                         expected_base_qty: Some(signed_base_qty),
-                        signed_quote_budget,
                     }
                     .into());
                 }
@@ -325,7 +326,6 @@ impl OrderSubmitter {
         Ok(MarketOrderSubmitResult {
             response,
             expected_base_qty: signed_base_qty,
-            signed_quote_budget,
         })
     }
 
@@ -465,12 +465,20 @@ impl OrderSubmitter {
         let expected_venue_order_id = self
             .order_builder
             .expected_order_id(&order, request.neg_risk)?;
+        let authority = OrderAuthority::from_signed_order(
+            &order,
+            OrderType::Limit,
+            request.time_in_force,
+            request.price.as_decimal(),
+            request.expire_time,
+        )?;
 
         Ok(SignedLimitOrderSubmission {
             order,
             order_type,
             post_only: request.post_only,
             expected_venue_order_id,
+            authority,
         })
     }
 
@@ -665,13 +673,6 @@ fn signed_base_quantity(
     }
 }
 
-fn signed_quote_budget(maker_amount: Decimal, side: PolymarketOrderSide) -> Option<Decimal> {
-    match side {
-        PolymarketOrderSide::Buy => Some(maker_amount / Decimal::from(1_000_000u32)),
-        PolymarketOrderSide::Sell => None,
-    }
-}
-
 // Converts a nanos expire time to the unix-seconds string expected by the
 // Polymarket API. Returns `"0"` when there is no expiration.
 fn limit_order_expiration(
@@ -736,17 +737,6 @@ mod tests {
             signed_base_quantity(maker_amount, taker_amount, side),
             expected
         );
-    }
-
-    #[rstest]
-    #[case::buy(dec!(4_800_000), PolymarketOrderSide::Buy, Some(dec!(4.8)))]
-    #[case::sell(dec!(5_200_000), PolymarketOrderSide::Sell, None)]
-    fn test_signed_quote_budget_uses_signed_maker_amount(
-        #[case] maker_amount: Decimal,
-        #[case] side: PolymarketOrderSide,
-        #[case] expected: Option<Decimal>,
-    ) {
-        assert_eq!(signed_quote_budget(maker_amount, side), expected);
     }
 
     #[rstest]

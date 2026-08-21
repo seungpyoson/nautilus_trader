@@ -1921,6 +1921,7 @@ async fn test_ambiguous_submit_identity_binds_rest_reports_before_cache_acceptan
     #[case] fill_report: bool,
 ) {
     let state = TestServerState::default();
+    state.order_request_gate.enable();
     *state.order_response.lock().await = Some(json!({"unexpected": true}));
     *state.positions_response_override.lock().await = Some(json!([]));
     let addr = start_mock_server(state.clone()).await;
@@ -2044,6 +2045,7 @@ async fn test_ambiguous_submit_identity_binds_rest_reports_before_cache_acceptan
 
     let error = result.expect_err("ambiguous-submit identity must bind REST authority");
     assert!(format!("{error:#}").contains("tracked instrument"));
+    state.order_request_gate.release();
 }
 
 #[rstest]
@@ -2965,19 +2967,16 @@ async fn test_windowed_fill_reports_do_not_double_count_cached_trade_id() {
         .add_order(order.clone(), None, None, false)
         .unwrap();
     submit_and_accept_order(&cache, &mut order, venue_order_id.as_str());
-    let applied = TestOrderEventStubs::filled(
+    apply_named_recovery_fill_to_cached_order(
+        &cache,
         &order,
         &instrument,
-        Some(TradeId::from("trade-recovery")),
-        None,
-        Some(Price::from("0.5000")),
-        Some(Quantity::from("8.0000")),
-        Some(LiquiditySide::Taker),
-        Some(Money::zero(Currency::pUSD())),
-        Some(UnixNanos::from(1_704_067_200_000_000_000_u64)),
-        Some(AccountId::from("POLYMARKET-001")),
+        venue_order_id.as_str(),
+        "trade-recovery",
+        "8.0000",
+        "8.0000",
+        "0.5000",
     );
-    cache.borrow_mut().update_order(&applied).unwrap();
 
     let reports = client
         .generate_fill_reports(GenerateFillReports {
@@ -3031,19 +3030,16 @@ async fn test_windowed_fill_reports_reject_changed_cached_trade_replay() {
         .add_order(order.clone(), None, None, false)
         .unwrap();
     submit_and_accept_order(&cache, &mut order, venue_order_id.as_str());
-    let applied = TestOrderEventStubs::filled(
+    apply_named_recovery_fill_to_cached_order(
+        &cache,
         &order,
         &instrument,
-        Some(TradeId::from("trade-recovery")),
-        None,
-        Some(Price::from("0.5000")),
-        Some(Quantity::from("8.0000")),
-        Some(LiquiditySide::Taker),
-        Some(Money::zero(Currency::pUSD())),
-        Some(UnixNanos::from(1_704_067_200_000_000_000_u64)),
-        Some(AccountId::from("POLYMARKET-001")),
+        venue_order_id.as_str(),
+        "trade-recovery",
+        "8.0000",
+        "8.0000",
+        "0.5000",
     );
-    cache.borrow_mut().update_order(&applied).unwrap();
 
     let error = client
         .generate_fill_reports(GenerateFillReports {
@@ -3488,7 +3484,7 @@ async fn test_missing_order_recovery_weights_cached_and_returned_fill_union() {
     let venue_order_id = DEFAULT_ACCEPTED_ORDER_ID;
     let state = TestServerState::default();
     *state.single_order_response.lock().await = Some(Value::Null);
-    let mut returned = recovery_trades_response(venue_order_id, "6.0000", "0.6000");
+    let mut returned = recovery_trades_response(venue_order_id, "6.0000", "0.4000");
     returned["data"][0]["id"] = json!("trade-recovery-second");
     *state.trades_response_override.lock().await = Some(returned);
     let addr = start_mock_server(state).await;
@@ -3511,7 +3507,7 @@ async fn test_missing_order_recovery_weights_cached_and_returned_fill_union() {
         "trade-recovery-second",
         "6.0000",
         "6.0000",
-        "0.6000",
+        "0.4000",
     );
 
     let report = client
@@ -3530,7 +3526,7 @@ async fn test_missing_order_recovery_weights_cached_and_returned_fill_union() {
         .expect("cached and returned fill union must recover the order");
 
     assert_eq!(report.filled_qty, Quantity::from("10.0000"));
-    assert_eq!(report.avg_px, Some(dec!(0.56)));
+    assert_eq!(report.avg_px, Some(dec!(0.44)));
 }
 
 #[rstest]
@@ -6298,7 +6294,7 @@ async fn test_fok_deferred_check_emits_terminal_event(
         "outcome": "Yes",
         "maker_address": "0xtest",
         "owner": "test-owner",
-        "price": "0.5000",
+        "price": "0.5100",
         "side": "BUY",
         "size_matched": "0.0000",
         "asset_id": "71321045679252212594626385532706912750332728571942532289631379312455583992563",
@@ -6311,7 +6307,7 @@ async fn test_fok_deferred_check_emits_terminal_event(
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 6);
 
     let order = make_market_order_with_time_in_force(
         "O-FOK-UNMATCHED",
@@ -11773,7 +11769,7 @@ async fn test_query_order_enforces_ambiguous_submit_signed_quote_budget() {
     let mut order_response =
         open_order_response_with_fill(venue_order_id.as_str(), base_qty.to_string().as_str());
     order_response["original_size"] = json!(base_qty.to_string());
-    order_response["price"] = json!("0.6000");
+    order_response["price"] = json!("0.5100");
     order_response["order_type"] = json!("FAK");
     order_response["status"] = json!("MATCHED");
     *state.single_order_response.lock().await = Some(order_response.clone());
@@ -11806,7 +11802,6 @@ async fn test_query_order_enforces_ambiguous_submit_signed_quote_budget() {
     .await;
     assert_no_execution_event(&mut rx).await;
 
-    order_response["price"] = json!("0.5000");
     *state.single_order_response.lock().await = Some(order_response);
     *state.trades_response_override.lock().await = Some(recovery_trades_response(
         venue_order_id.as_str(),
@@ -11937,6 +11932,104 @@ async fn test_query_order_bundled_fill_caps_to_cached_and_returned_union() {
         }
         other => panic!("Expected bundled order and canonical fill union, was {other:?}"),
     }
+}
+
+#[rstest]
+#[case::query_order(false)]
+#[case::mass_status(true)]
+#[tokio::test]
+async fn test_failed_order_snapshot_preflight_does_not_commit_confirmed_fills(
+    #[case] mass_status: bool,
+) {
+    let venue_order_id = DEFAULT_ACCEPTED_ORDER_ID;
+    let state = TestServerState::default();
+    let mut invalid_order = open_order_response_with_fill(venue_order_id, "10.0000");
+    invalid_order["status"] = json!("MATCHED");
+    *state.single_order_response.lock().await = Some(invalid_order.clone());
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [invalid_order],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await =
+        Some(recovery_trades_response(venue_order_id, "6.0000", "0.5000"));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    let client_order_id = ClientOrderId::from("O-FAILED-SNAPSHOT-PREFLIGHT");
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    client.on_instrument(cache.borrow().instrument(&instrument_id).unwrap().clone());
+    let mut cached_order = make_limit_order(
+        client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(cached_order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut cached_order, venue_order_id);
+    client.start().unwrap();
+
+    if mass_status {
+        client
+            .generate_mass_status(None)
+            .await
+            .expect_err("invalid cumulative snapshot must abort mass status");
+    } else {
+        client
+            .query_order(QueryOrder::new(
+                TraderId::from("TESTER-001"),
+                Some(*POLYMARKET_CLIENT_ID),
+                StrategyId::from("S-001"),
+                instrument_id,
+                client_order_id,
+                Some(VenueOrderId::from(venue_order_id)),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+        wait_until_async(
+            || {
+                let state = state.clone();
+                async move { state.trades_get_count.load(Ordering::Acquire) == 1 }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_no_execution_event(&mut rx).await;
+    }
+
+    let mut distinct_fill = recovery_trades_response(venue_order_id, "6.0000", "0.5000");
+    distinct_fill["data"][0]["id"] = json!("trade-after-failed-preflight");
+    *state.trades_response_override.lock().await = Some(distinct_fill);
+
+    let reports = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            venue_order_id: Some(VenueOrderId::from(venue_order_id)),
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect("aborted report preflight must not consume fill authority");
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].trade_id,
+        TradeId::from("trade-after-failed-preflight")
+    );
 }
 
 #[rstest]
