@@ -40,7 +40,7 @@ use super::{
     pending::{PendingCancelTracker, PendingSubmitTracker},
     reconciliation::cap_order_report_filled_qty,
     report_validation::parse_user_channel_timestamp,
-    reports::{get_pusd_currency, validate_order_response_scope},
+    reports::{bind_known_order_terms, get_pusd_currency, validate_order_response_scope},
     submitter::{
         OrderSubmitter, SubmitResponseOutcome, is_fok_unfilled, submit_response_confirms_expected,
         submit_response_outcome, submit_response_unknown_reason, submit_response_venue_order_id,
@@ -582,11 +582,24 @@ pub(super) fn handle_unknown_submit_result_with_growth_policy(
 }
 
 fn buffered_order_report_matches(
+    order: &OrderAny,
     identity: &OrderIdentity,
     venue_order_id: VenueOrderId,
+    authorized_quantity: Quantity,
     report: &OrderStatusReport,
 ) -> bool {
-    match identity.validate_order_report(report, venue_order_id, None) {
+    let result = identity
+        .validate_order_report(report, venue_order_id, None)
+        .and_then(|()| {
+            if report.order_status != OrderStatus::Filled {
+                return Ok(());
+            }
+
+            let mut bound = report.clone();
+            bind_known_order_terms(&mut bound, order, authorized_quantity)
+        });
+
+    match result {
         Ok(()) => true,
         Err(e) => {
             log::warn!("Discarding contradictory buffered order report {venue_order_id}: {e}");
@@ -617,7 +630,15 @@ fn drain_pending_reports_for_known_order_with_growth_policy(
         venue_order_id,
         tracker_quantity,
         growth_policy,
-        |report| buffered_order_report_matches(&identity, venue_order_id, report),
+        |report| {
+            buffered_order_report_matches(
+                order,
+                &identity,
+                venue_order_id,
+                tracker_quantity,
+                report,
+            )
+        },
     ) {
         PendingOrderReportDrain::Empty => {
             accept_order_with_pending_fills(
@@ -704,7 +725,15 @@ fn drain_pending_reports_for_known_order_with_growth_policy(
     let buffered = fill_tracker
         .take_pending_reports(&venue_order_id)
         .into_iter()
-        .filter(|report| buffered_order_report_matches(&identity, venue_order_id, report))
+        .filter(|report| {
+            buffered_order_report_matches(
+                order,
+                &identity,
+                venue_order_id,
+                tracker_quantity,
+                report,
+            )
+        })
         .collect::<Vec<_>>();
 
     emit_drained_activity(
@@ -848,7 +877,13 @@ pub(super) fn handle_order_response_with_growth_policy(
                     let identity = OrderIdentity::from_order(order);
 
                     fill_tracker.retain_pending_reports_for(&venue_order_id, |report| {
-                        buffered_order_report_matches(&identity, venue_order_id, report)
+                        buffered_order_report_matches(
+                            order,
+                            &identity,
+                            venue_order_id,
+                            order.quantity(),
+                            report,
+                        )
                     });
 
                     order_identities.register_order_identity(venue_order_id, identity);
@@ -931,7 +966,13 @@ pub(super) fn handle_order_response_with_growth_policy(
                         .take_pending_reports(&venue_order_id)
                         .into_iter()
                         .filter(|report| {
-                            buffered_order_report_matches(&identity, venue_order_id, report)
+                            buffered_order_report_matches(
+                                order,
+                                &identity,
+                                venue_order_id,
+                                order.quantity(),
+                                report,
+                            )
                         })
                         .collect::<Vec<_>>();
                     let activity_proves_accepted = !fills.is_empty()
@@ -3429,7 +3470,7 @@ mod tests {
         let pending_cancels = PendingCancelTracker::default();
         let order_identities = OrderIdentityRegistry::default();
 
-        let filled_report = OrderStatusReport::new(
+        let mut filled_report = OrderStatusReport::new(
             account_id,
             instrument_id,
             None,
@@ -3445,6 +3486,7 @@ mod tests {
             UnixNanos::from(1_000u64),
             None,
         );
+        filled_report.price = order.price();
         fill_tracker.buffer_report_for_test(venue_order_id, filled_report);
         fill_tracker.buffer_fill_for_test(
             venue_order_id,
@@ -3497,6 +3539,85 @@ mod tests {
 
         assert!(!fill_tracker.contains(&venue_order_id));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_unknown_submit_rejects_filled_report_with_unauthorized_quantity() {
+        let instrument = test_instrument();
+        let instrument_id = instrument.id();
+        let venue_order_id = VenueOrderId::from("0xdrain-filled-wrong-quantity");
+        let account_id = AccountId::from("POLY-001");
+        let submitted_qty = Quantity::from("5.192100");
+        let venue_fill_qty = Quantity::from("5.192081");
+        let order = test_limit_order("O-DRAIN-FILLED-WRONG-QUANTITY", instrument_id);
+        let (emitter, mut receiver) = test_emitter();
+        let fill_tracker = Arc::new(OrderFillTrackerMap::new());
+        let pending_submits = PendingSubmitTracker::default();
+        let pending_cancels = PendingCancelTracker::default();
+        let order_identities = OrderIdentityRegistry::default();
+
+        let unauthorized_qty = Quantity::from("6.000000");
+        let mut filled_report = OrderStatusReport::new(
+            account_id,
+            instrument_id,
+            None,
+            venue_order_id,
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Filled,
+            unauthorized_qty,
+            unauthorized_qty,
+            UnixNanos::from(1_000u64),
+            UnixNanos::from(1_000u64),
+            UnixNanos::from(1_000u64),
+            None,
+        );
+        filled_report.price = order.price();
+        fill_tracker.buffer_report_for_test(venue_order_id, filled_report);
+        fill_tracker.buffer_fill_for_test(
+            venue_order_id,
+            test_fill_report(
+                instrument_id,
+                venue_order_id,
+                venue_fill_qty,
+                UnixNanos::from(900u64),
+            ),
+        );
+
+        assert!(
+            handle_unknown_submit_result(
+                &order,
+                venue_order_id,
+                "transport timeout",
+                Some(submitted_qty),
+                &emitter,
+                nautilus_core::time::get_atomic_clock_realtime(),
+                &fill_tracker,
+                &order_identities,
+                &pending_submits,
+                &pending_cancels,
+                account_id,
+                instrument.size_precision(),
+                instrument.price_precision(),
+            )
+            .is_none()
+        );
+
+        assert!(matches!(
+            receiver.try_recv().expect("expected accepted event"),
+            ExecutionEvent::Order(OrderEventAny::Accepted(_))
+        ));
+        assert!(matches!(
+            receiver.try_recv().expect("expected venue fill event"),
+            ExecutionEvent::Order(OrderEventAny::Filled(_))
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert!(fill_tracker.contains(&venue_order_id));
+        assert_eq!(
+            fill_tracker.submitted_qty(&venue_order_id),
+            Some(submitted_qty)
+        );
     }
 
     fn test_taker_trade(

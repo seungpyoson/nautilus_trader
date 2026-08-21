@@ -101,7 +101,7 @@ impl PolymarketExecutionClient {
                 .order(&identity.client_order_id)
                 .map(|order| order.cloned());
             if let Some(expected_order) = expected_order.as_ref() {
-                bind_known_order_terms(report, expected_order)?;
+                bind_known_order_terms(report, expected_order, expected_order.quantity())?;
             }
         }
         Ok(identity)
@@ -1400,17 +1400,17 @@ pub(super) fn validate_order_response_scope(
             "returned order time in force {provider_tif} does not match tracked order time in force {}",
             expected_order.time_in_force(),
         );
-        bind_known_order_terms(report, expected_order)?;
+        bind_known_order_terms(report, expected_order, expected_order.quantity())?;
     }
 
     Ok(())
 }
 
-fn bind_known_order_terms(
+pub(crate) fn bind_known_order_terms(
     report: &mut OrderStatusReport,
     expected_order: &OrderAny,
+    expected_quantity: Quantity,
 ) -> anyhow::Result<()> {
-    let expected_quantity = expected_order.quantity();
     anyhow::ensure!(
         report.quantity == expected_quantity,
         "returned order quantity {} does not match authorized order quantity {expected_quantity}",
