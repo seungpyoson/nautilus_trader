@@ -94,6 +94,15 @@ impl PolymarketExecutionClient {
             report
                 .client_order_id
                 .get_or_insert(identity.client_order_id);
+
+            let expected_order = self
+                .core
+                .cache()
+                .order(&identity.client_order_id)
+                .map(|order| order.cloned());
+            if let Some(expected_order) = expected_order.as_ref() {
+                bind_known_order_terms(report, expected_order)?;
+            }
         }
         Ok(identity)
     }
@@ -198,11 +207,22 @@ impl PolymarketExecutionClient {
             client_order_id.or_else(|| self.core.cache().client_order_id(&venue_order_id).copied());
         let cached = resolved_client_order_id.and_then(|cid| self.core.cache().order_owned(&cid));
         if let Some(cached) = cached.as_ref() {
-            anyhow::ensure!(
-                cached.venue_order_id() == Some(venue_order_id),
-                "tracked venue order {:?} does not match requested recovery order {venue_order_id}",
-                cached.venue_order_id(),
-            );
+            if let Some(cached_venue_order_id) = cached.venue_order_id() {
+                anyhow::ensure!(
+                    cached_venue_order_id == venue_order_id,
+                    "tracked venue order {cached_venue_order_id} does not match requested recovery order {venue_order_id}",
+                );
+            } else {
+                let client_order_id = cached.client_order_id();
+                let retained_venue_order_id =
+                    self.order_identities.venue_order_id(&client_order_id);
+                let pending_client_order_id = self.pending_submits.client_order_id(&venue_order_id);
+                anyhow::ensure!(
+                    retained_venue_order_id == Some(venue_order_id)
+                        || pending_client_order_id == Some(client_order_id),
+                    "tracked client order {client_order_id} has no retained binding to requested recovery order {venue_order_id}",
+                );
+            }
             anyhow::ensure!(
                 cached.instrument_id() == instrument_id,
                 "tracked order instrument {} does not match requested recovery instrument {instrument_id}",
@@ -421,15 +441,21 @@ impl PolymarketExecutionClient {
     pub(super) fn query_order_command(&self, cmd: &QueryOrder) {
         log::debug!("Querying order: client_order_id={}", cmd.client_order_id);
 
-        let Some(venue_order_id) =
-            self.resolve_venue_order_id(cmd.venue_order_id, Some(cmd.client_order_id))
-        else {
-            log::warn!(
-                "query_order requires a venue_order_id for Polymarket: {}",
-                cmd.client_order_id
-            );
-            return;
-        };
+        let venue_order_id =
+            match self.resolve_venue_order_id(cmd.venue_order_id, Some(cmd.client_order_id)) {
+                Ok(Some(venue_order_id)) => venue_order_id,
+                Ok(None) => {
+                    log::warn!(
+                        "query_order requires a venue_order_id for Polymarket: {}",
+                        cmd.client_order_id
+                    );
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("Rejected query_order identity: {e}");
+                    return;
+                }
+            };
         let requested_venue_order_id = venue_order_id;
         let venue_order_id = requested_venue_order_id.to_string();
 
@@ -490,7 +516,7 @@ impl PolymarketExecutionClient {
 
                     if let Err(e) = validate_order_response_scope(
                         &order,
-                        &report,
+                        &mut report,
                         requested_venue_order_id,
                         &instrument,
                         expected_order.as_ref(),
@@ -574,7 +600,7 @@ impl PolymarketExecutionClient {
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
         let Some(venue_order_id) =
-            self.resolve_venue_order_id(cmd.venue_order_id, cmd.client_order_id)
+            self.resolve_venue_order_id(cmd.venue_order_id, cmd.client_order_id)?
         else {
             anyhow::bail!("generate_order_status_report requires venue_order_id");
         };
@@ -621,7 +647,7 @@ impl PolymarketExecutionClient {
             };
             validate_order_response_scope(
                 &order,
-                &report,
+                &mut report,
                 venue_order_id,
                 &instrument,
                 expected_order.as_ref(),
@@ -681,9 +707,64 @@ impl PolymarketExecutionClient {
         &self,
         venue_order_id: Option<VenueOrderId>,
         client_order_id: Option<ClientOrderId>,
-    ) -> Option<VenueOrderId> {
-        venue_order_id
-            .or_else(|| client_order_id.and_then(|id| self.order_identities.venue_order_id(&id)))
+    ) -> anyhow::Result<Option<VenueOrderId>> {
+        let Some(client_order_id) = client_order_id else {
+            return Ok(venue_order_id);
+        };
+
+        let retained_venue_order_id = self.order_identities.venue_order_id(&client_order_id);
+        let cached_venue_order_id = self
+            .core
+            .cache()
+            .order(&client_order_id)
+            .and_then(|order| order.venue_order_id());
+
+        if let (Some(retained), Some(cached)) = (retained_venue_order_id, cached_venue_order_id) {
+            anyhow::ensure!(
+                retained == cached,
+                "client order {client_order_id} maps to retained venue order {retained} but cached venue order {cached}",
+            );
+        }
+
+        let resolved = venue_order_id
+            .or(retained_venue_order_id)
+            .or(cached_venue_order_id);
+        if let (Some(requested), Some(retained)) = (venue_order_id, retained_venue_order_id) {
+            anyhow::ensure!(
+                requested == retained,
+                "client order {client_order_id} maps to retained venue order {retained}, not requested venue order {requested}",
+            );
+        }
+        if let (Some(requested), Some(cached)) = (venue_order_id, cached_venue_order_id) {
+            anyhow::ensure!(
+                requested == cached,
+                "client order {client_order_id} maps to cached venue order {cached}, not requested venue order {requested}",
+            );
+        }
+        let pending_proves_binding = if let Some(requested) = venue_order_id {
+            if let Some(pending_client_order_id) = self.pending_submits.client_order_id(&requested)
+            {
+                anyhow::ensure!(
+                    pending_client_order_id == client_order_id,
+                    "requested venue order {requested} maps to pending client order {pending_client_order_id}, not {client_order_id}",
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if let Some(requested) = venue_order_id {
+            anyhow::ensure!(
+                retained_venue_order_id.is_some()
+                    || cached_venue_order_id.is_some()
+                    || pending_proves_binding,
+                "client order {client_order_id} has no retained binding to requested venue order {requested}",
+            );
+        }
+
+        Ok(resolved)
     }
 
     pub(super) async fn generate_order_status_reports_impl(
@@ -700,7 +781,7 @@ impl PolymarketExecutionClient {
         let (mut reports, _) = super::reconciliation::build_order_reports_from_orders(
             &orders,
             &self.shared_token_instruments,
-            self.core.account_id,
+            &self.fill_context(),
             cmd.instrument_id,
             self.clock.get_time_ns(),
             self.config.reconciliation_load_ids(),
@@ -712,7 +793,11 @@ impl PolymarketExecutionClient {
                 .client_order_id
                 .and_then(|id| self.core.cache().order(&id).map(|order| order.filled_qty()))
                 .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
-            report.filled_qty > cached_filled
+            let tracked_filled = self
+                .fill_tracker
+                .get_cumulative_filled(&report.venue_order_id)
+                .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
+            report.filled_qty > cached_filled.max(tracked_filled)
         });
 
         if needs_confirmed_fills {
@@ -1273,7 +1358,7 @@ async fn fetch_confirmed_fill_reports(
 
 pub(super) fn validate_order_response_scope(
     order: &PolymarketOpenOrder,
-    report: &OrderStatusReport,
+    report: &mut OrderStatusReport,
     requested_venue_order_id: VenueOrderId,
     instrument: &InstrumentAny,
     expected_order: Option<&OrderAny>,
@@ -1315,8 +1400,50 @@ pub(super) fn validate_order_response_scope(
             "returned order time in force {provider_tif} does not match tracked order time in force {}",
             expected_order.time_in_force(),
         );
+        bind_known_order_terms(report, expected_order)?;
     }
 
+    Ok(())
+}
+
+fn bind_known_order_terms(
+    report: &mut OrderStatusReport,
+    expected_order: &OrderAny,
+) -> anyhow::Result<()> {
+    let expected_quantity = expected_order.quantity();
+    anyhow::ensure!(
+        report.quantity == expected_quantity,
+        "returned order quantity {} does not match authorized order quantity {expected_quantity}",
+        report.quantity,
+    );
+
+    let expected_order_type = expected_order.order_type();
+    match expected_order_type {
+        OrderType::Limit => anyhow::ensure!(
+            report.price == expected_order.price(),
+            "returned order price {:?} does not match signed order price {:?}",
+            report.price,
+            expected_order.price(),
+        ),
+        OrderType::Market => {
+            report.price = expected_order.price();
+        }
+        _ => anyhow::bail!(
+            "tracked order type {expected_order_type} is unsupported by Polymarket reconciliation"
+        ),
+    }
+    report.order_type = expected_order_type;
+
+    if expected_order.time_in_force() == TimeInForce::Gtd {
+        anyhow::ensure!(
+            report.expire_time == expected_order.expire_time(),
+            "returned order expiration {:?} does not match signed order expiration {:?}",
+            report.expire_time,
+            expected_order.expire_time(),
+        );
+    } else {
+        report.expire_time = expected_order.expire_time();
+    }
     Ok(())
 }
 

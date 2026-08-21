@@ -27,7 +27,10 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 
-use crate::http::models::FeeSchedule;
+use crate::{
+    execution::{parse::compute_fee_equivalent, report_validation::validate_fee_schedule},
+    http::models::FeeSchedule,
+};
 
 /// Polymarket fee model for binary-option backtests.
 ///
@@ -69,30 +72,37 @@ impl FeeModel for PolymarketFeeModel {
             }
         };
 
-        let Some(schedule) = binary
+        let fees_enabled = binary
+            .info
+            .as_ref()
+            .and_then(|info| info.get("fees_enabled"))
+            .and_then(serde_json::Value::as_bool);
+        let schedule = binary
             .info
             .as_ref()
             .and_then(|info| info.get("fee_schedule"))
             .map(|value| serde_json::from_value::<FeeSchedule>(value.clone()))
             .transpose()
-            .context("invalid Polymarket fee schedule")?
-        else {
-            return Ok(Money::zero(instrument.quote_currency()));
+            .context("invalid Polymarket fee schedule")?;
+        let schedule = match (fees_enabled, schedule) {
+            (Some(false), None) => return Ok(Money::zero(instrument.quote_currency())),
+            (Some(true), Some(schedule)) => schedule,
+            _ => anyhow::bail!("inconsistent fee metadata for PolymarketFeeModel"),
         };
 
-        validate_schedule(&schedule)?;
+        let (_, fee_exponent) = validate_fee_schedule(&schedule, "PolymarketFeeModel")?;
 
         let fill_price = fill_px.as_decimal();
         if !(Decimal::ZERO..=Decimal::ONE).contains(&fill_price) {
             anyhow::bail!("PolymarketFeeModel requires a fill price in [0, 1]");
         }
 
-        let fee_equivalent = fill_quantity
-            .as_decimal()
-            .checked_mul(schedule.rate)
-            .and_then(|value| value.checked_mul(fill_price))
-            .and_then(|value| value.checked_mul(Decimal::ONE - fill_price))
-            .context("commission calculation overflow")?;
+        let fee_equivalent = compute_fee_equivalent(
+            schedule.rate,
+            fee_exponent,
+            fill_quantity.as_decimal(),
+            fill_price,
+        )?;
         let commission = match liquidity_side {
             LiquiditySide::Maker => -fee_equivalent
                 .checked_mul(schedule.rebate_rate)
@@ -104,28 +114,6 @@ impl FeeModel for PolymarketFeeModel {
 
         Money::from_decimal(commission, instrument.quote_currency()).map_err(Into::into)
     }
-}
-
-fn validate_schedule(schedule: &FeeSchedule) -> anyhow::Result<()> {
-    if schedule.exponent != Decimal::ONE {
-        anyhow::bail!(
-            "PolymarketFeeModel requires fee schedule exponent 1, was {}",
-            schedule.exponent
-        );
-    }
-
-    if schedule.rate < Decimal::ZERO {
-        anyhow::bail!("Polymarket fee rate must be greater than or equal to zero");
-    }
-
-    if !(Decimal::ZERO..=Decimal::ONE).contains(&schedule.rebate_rate) {
-        anyhow::bail!("Polymarket rebate rate must be in [0, 1]");
-    }
-
-    if !schedule.taker_only {
-        anyhow::bail!("PolymarketFeeModel requires a taker-only fee schedule");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -195,6 +183,29 @@ mod tests {
     }
 
     #[rstest]
+    fn test_taker_fee_uses_market_fee_exponent() {
+        let instrument = instrument_with_schedule(Some(FeeSchedule {
+            exponent: dec!(2),
+            rate: dec!(0.04),
+            taker_only: true,
+            rebate_rate: dec!(0.25),
+        }))
+        .unwrap();
+        let order = fill_order(&instrument, LiquiditySide::Taker);
+
+        let commission = PolymarketFeeModel
+            .get_commission(
+                &order,
+                Quantity::from("100"),
+                Price::from("0.50"),
+                &instrument,
+            )
+            .unwrap();
+
+        assert_eq!(commission.as_decimal(), dec!(0.25));
+    }
+
+    #[rstest]
     #[case("0.01", dec!(0.00000))]
     #[case("0.02", dec!(0.00001))]
     fn test_taker_fee_rounds_to_five_decimal_places(
@@ -256,6 +267,28 @@ mod tests {
 
         assert_eq!(commission.as_decimal(), Decimal::ZERO);
         assert_eq!(commission.currency, instrument.quote_currency());
+    }
+
+    #[rstest]
+    fn test_enabled_market_without_schedule_is_not_implicitly_fee_free() {
+        let mut market: GammaMarket =
+            serde_json::from_str(include_str!("../test_data/gamma_market.json")).unwrap();
+        market.fees_enabled = Some(true);
+        market.fee_schedule = None;
+        let definition = parse_gamma_market(&market).unwrap().remove(0);
+        let instrument = create_instrument_from_def(&definition, UnixNanos::default()).unwrap();
+        let order = fill_order(&instrument, LiquiditySide::Taker);
+
+        let error = PolymarketFeeModel
+            .get_commission(
+                &order,
+                Quantity::from("100"),
+                Price::from("0.50"),
+                &instrument,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("inconsistent fee metadata"));
     }
 
     #[rstest]

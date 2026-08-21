@@ -30,8 +30,6 @@ use rust_decimal::Decimal;
 
 use crate::http::models::FeeSchedule;
 
-const POLYMARKET_VENUE_ORDER_ID_MAX_BYTES: usize = 66;
-
 pub(crate) fn decimal_from_str_exact(value: &str, field: &str) -> anyhow::Result<Decimal> {
     Decimal::from_str_exact(value)
         .with_context(|| format!("{field} {value:?} is not an exact decimal"))
@@ -105,9 +103,15 @@ pub(crate) fn exact_binary_price(value: Decimal, field: &str) -> anyhow::Result<
 }
 
 pub(crate) fn venue_order_id(value: &str, field: &str) -> anyhow::Result<VenueOrderId> {
+    let hash = value
+        .strip_prefix("0x")
+        .with_context(|| format!("{field} {value:?} must start with a lowercase 0x prefix"))?;
     anyhow::ensure!(
-        value.len() <= POLYMARKET_VENUE_ORDER_ID_MAX_BYTES,
-        "{field} is longer than the {POLYMARKET_VENUE_ORDER_ID_MAX_BYTES}-byte Polymarket order-hash representation"
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+        "{field} {value:?} must be a canonical lowercase 32-byte order hash"
     );
     VenueOrderId::new_checked(value)
         .with_context(|| format!("{field} {value:?} is not a valid venue order ID"))
@@ -415,13 +419,34 @@ mod tests {
     #[rstest]
     fn test_checked_identifiers_reject_invalid_values() {
         let oversized = "X".repeat(100);
-        let maximum_venue_order_id = "X".repeat(66);
-        let oversized_venue_order_id = "X".repeat(67);
+        let valid_venue_order_id =
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
         assert!(venue_order_id("", "order ID").is_err());
         assert!(venue_order_id("non-ascii-☃", "order ID").is_err());
-        assert!(venue_order_id(&maximum_venue_order_id, "order ID").is_ok());
-        assert!(venue_order_id(&oversized_venue_order_id, "order ID").is_err());
+        assert!(venue_order_id(valid_venue_order_id, "order ID").is_ok());
+        assert!(venue_order_id("0x123", "order ID").is_err());
+        assert!(
+            venue_order_id(
+                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdeg",
+                "order ID"
+            )
+            .is_err()
+        );
+        assert!(
+            venue_order_id(
+                "0X1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+                "order ID"
+            )
+            .is_err()
+        );
+        assert!(
+            venue_order_id(
+                "0x1234567890ABCDEF1234567890abcdef1234567890abcdef1234567890abcdef",
+                "order ID"
+            )
+            .is_err()
+        );
         assert!(trade_id("", "trade ID").is_err());
         assert!(trade_id(&oversized, "trade ID").is_err());
     }

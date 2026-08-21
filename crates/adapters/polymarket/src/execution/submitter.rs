@@ -39,6 +39,7 @@ use thiserror::Error;
 use super::{
     order_builder::{PolymarketOrderBuilder, validated_limit_expiration_seconds},
     parse::{adjust_market_buy_amount, calculate_market_price},
+    report_validation::venue_order_id,
     types::{LimitOrderSubmitRequest, SignedLimitOrderSubmission},
 };
 use crate::{
@@ -570,7 +571,10 @@ pub(super) fn submit_response_outcome(
     response: &OrderResponse,
     is_fok: bool,
 ) -> SubmitResponseOutcome {
-    if is_fok && response.error_msg.as_deref().is_some_and(is_fok_unfilled) {
+    if is_fok
+        && response.status.is_none()
+        && response.error_msg.as_deref().is_some_and(is_fok_unfilled)
+    {
         SubmitResponseOutcome::Rejected
     } else if response.success && submit_response_venue_order_id(response).is_some() {
         SubmitResponseOutcome::Accepted
@@ -589,7 +593,7 @@ pub(super) fn submit_response_venue_order_id(response: &OrderResponse) -> Option
     response
         .order_id
         .as_deref()
-        .and_then(|order_id| VenueOrderId::new_checked(order_id).ok())
+        .and_then(|order_id| venue_order_id(order_id, "submit response order ID").ok())
 }
 
 pub(super) fn submit_response_confirms_expected(
@@ -687,6 +691,9 @@ mod tests {
 
     use super::*;
 
+    const TEST_ORDER_HASH: &str =
+        "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
     #[rstest]
     #[case::gtc_none(None, TimeInForce::Gtc, "0")]
     #[case::gtd_one_second(Some(UnixNanos::from(1_000_000_000u64)), TimeInForce::Gtd, "1")]
@@ -764,7 +771,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case::accepted(false, true, Some("0xorder"), None, SubmitResponseOutcome::Accepted)]
+    #[case::accepted(
+        false,
+        true,
+        Some(TEST_ORDER_HASH),
+        None,
+        SubmitResponseOutcome::Accepted
+    )]
+    #[case::noncanonical_hash(false, true, Some("0xorder"), None, SubmitResponseOutcome::Unknown)]
     #[case::rejected(false, false, None, Some("rejected"), SubmitResponseOutcome::Rejected)]
     #[case::successful_rejection(
         false,
@@ -787,7 +801,7 @@ mod tests {
     #[case::fok_unfilled(
         true,
         true,
-        Some("0xfok"),
+        Some(TEST_ORDER_HASH),
         Some("order couldn't be fully filled. FOK orders are fully filled or killed."),
         SubmitResponseOutcome::Rejected
     )]
@@ -814,7 +828,7 @@ mod tests {
 
     #[rstest]
     fn test_submit_response_confirms_only_expected_order_id() {
-        let expected_venue_order_id = VenueOrderId::from("0xexpected");
+        let expected_venue_order_id = VenueOrderId::from(TEST_ORDER_HASH);
         let mut response = OrderResponse {
             success: true,
             order_id: Some(expected_venue_order_id.to_string()),

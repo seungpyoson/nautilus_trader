@@ -189,7 +189,14 @@ pub fn create_instrument_from_def(
             let (rate, _) = validate_fee_schedule(schedule, def.symbol.as_str())?;
             (Decimal::ZERO, rate)
         }
-        _ => anyhow::bail!("inconsistent fee metadata for {}", def.symbol),
+        (Some(false), Some(_)) => {
+            anyhow::bail!("inconsistent fee metadata for {}", def.symbol)
+        }
+        (None, Some(schedule)) => {
+            let (rate, _) = validate_fee_schedule(schedule, def.symbol.as_str())?;
+            (Decimal::ZERO, rate)
+        }
+        (Some(true) | None, None) => (Decimal::ZERO, Decimal::ZERO),
     };
     let symbol = Symbol::new(def.symbol);
     let venue = *POLYMARKET_VENUE;
@@ -497,8 +504,8 @@ mod tests {
         for (enabled, schedule, accepted) in [
             (Some(false), None, true),
             (Some(true), Some(valid_fee_schedule()), true),
-            (None, None, false),
-            (Some(true), None, false),
+            (None, None, true),
+            (Some(true), None, true),
             (Some(false), Some(valid_fee_schedule()), false),
         ] {
             market.fees_enabled = enabled;
@@ -515,11 +522,12 @@ mod tests {
     }
 
     #[rstest]
-    fn test_captured_enabled_market_without_schedule_is_rejected() {
+    fn test_captured_enabled_market_without_schedule_remains_data_available() {
         let market = load_gamma_market("gamma_market.json");
         let definition = parse_gamma_market(&market).unwrap().remove(0);
 
-        assert!(create_instrument_from_def(&definition, UnixNanos::from(1)).is_err());
+        let instrument = create_instrument_from_def(&definition, UnixNanos::from(1)).unwrap();
+        assert!(crate::execution::report_validation::instrument_fee_policy(&instrument).is_err());
     }
 
     #[rstest]

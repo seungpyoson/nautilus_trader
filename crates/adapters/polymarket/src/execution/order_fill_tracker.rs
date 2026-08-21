@@ -31,7 +31,6 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
-use super::identity::OrderIdentity;
 use crate::{
     common::{consts::DUST_SNAP_THRESHOLD_DEC, models::PolymarketMakerOrder},
     execution::report_validation::positive_quantity,
@@ -356,7 +355,7 @@ pub(crate) struct VoidedTradeFills {
 /// the WS dispatch's accepted-check and buffer, and the submit path's register and drain, are all
 /// single critical sections on this one lock, so a buffer can never slip between a register and the
 /// drain that follows it.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct TrackerInner {
     operational_orders: AHashSet<VenueOrderId>,
     reserved_submits: AHashSet<VenueOrderId>,
@@ -388,6 +387,16 @@ enum ProspectiveFillAdmission {
 pub(crate) struct OrderFillTrackerMap {
     inner: Mutex<TrackerInner>,
     max_operational_orders: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RestoredOrder {
+    pub venue_order_id: VenueOrderId,
+    pub original_submitted_qty: Quantity,
+    pub submitted_qty: Quantity,
+    pub filled_qty: Quantity,
+    pub growth_policy: FillGrowthPolicy,
+    pub applied_fills: Vec<OrderFilled>,
 }
 
 impl OrderFillTrackerMap {
@@ -444,6 +453,7 @@ impl OrderFillTrackerMap {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn restore_order(
         &self,
         venue_order_id: VenueOrderId,
@@ -452,37 +462,75 @@ impl OrderFillTrackerMap {
         growth_policy: FillGrowthPolicy,
         applied_fills: Vec<OrderFilled>,
     ) -> anyhow::Result<()> {
-        let mut state = new_order_state(submitted_qty, growth_policy);
-        state.cumulative_filled = filled_qty;
+        self.restore_orders(vec![RestoredOrder {
+            venue_order_id,
+            original_submitted_qty: submitted_qty,
+            submitted_qty,
+            filled_qty,
+            growth_policy,
+            applied_fills,
+        }])
+    }
 
-        for fill in applied_fills {
+    pub(crate) fn restore_orders(&self, orders: Vec<RestoredOrder>) -> anyhow::Result<()> {
+        let mut restored = Vec::with_capacity(orders.len());
+        for order in orders {
             anyhow::ensure!(
-                fill.venue_order_id == venue_order_id,
-                "restored fill {} belongs to order {}, expected {venue_order_id}",
-                fill.trade_id,
-                fill.venue_order_id,
+                order.original_submitted_qty <= order.submitted_qty,
+                "restored original quantity {} exceeds current quantity {} for order {}",
+                order.original_submitted_qty,
+                order.submitted_qty,
+                order.venue_order_id,
             );
-            let fingerprint = FillReplayFingerprint::from_event(&fill)?;
-            if let Some(existing) = state.applied_fills.get(&fill.trade_id) {
-                existing.ensure_equal(&fingerprint, venue_order_id)?;
-            } else {
-                state.applied_fills.insert(fill.trade_id, fingerprint);
-            }
-        }
-        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        reserve_operational_orders(&mut guard, [venue_order_id], self.max_operational_orders)?;
-        if let Some(existing) = guard.orders.get(&venue_order_id) {
-            let mut merged = existing.clone();
+            let mut state = new_order_state(order.submitted_qty, order.growth_policy);
+            state.original_submitted_qty = order.original_submitted_qty;
+            state.cumulative_filled = order.filled_qty;
 
-            for fingerprint in state.applied_fills.into_values() {
-                let admitted_qty = fingerprint.admitted.last_qty;
-                validate_or_admit_fill_in(&mut merged, fingerprint, admitted_qty, &venue_order_id)?;
+            for fill in order.applied_fills {
+                anyhow::ensure!(
+                    fill.venue_order_id == order.venue_order_id,
+                    "restored fill {} belongs to order {}, expected {}",
+                    fill.trade_id,
+                    fill.venue_order_id,
+                    order.venue_order_id,
+                );
+                let fingerprint = FillReplayFingerprint::from_event(&fill)?;
+                if let Some(existing) = state.applied_fills.get(&fill.trade_id) {
+                    existing.ensure_equal(&fingerprint, order.venue_order_id)?;
+                } else {
+                    state.applied_fills.insert(fill.trade_id, fingerprint);
+                }
             }
-            guard.orders.insert(venue_order_id, merged);
-        } else {
-            guard.orders.insert(venue_order_id, state);
+            restored.push((order.venue_order_id, state));
         }
-        guard.reserved_submits.remove(&venue_order_id);
+
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let mut prospective = guard.clone();
+        reserve_operational_orders(
+            &mut prospective,
+            restored.iter().map(|(venue_order_id, _)| *venue_order_id),
+            self.max_operational_orders,
+        )?;
+        for (venue_order_id, state) in restored {
+            if let Some(existing) = prospective.orders.get(&venue_order_id) {
+                let mut merged = existing.clone();
+
+                for fingerprint in state.applied_fills.into_values() {
+                    let admitted_qty = fingerprint.admitted.last_qty;
+                    validate_or_admit_fill_in(
+                        &mut merged,
+                        fingerprint,
+                        admitted_qty,
+                        &venue_order_id,
+                    )?;
+                }
+                prospective.orders.insert(venue_order_id, merged);
+            } else {
+                prospective.orders.insert(venue_order_id, state);
+            }
+            prospective.reserved_submits.remove(&venue_order_id);
+        }
+        *guard = prospective;
         Ok(())
     }
 
@@ -492,6 +540,19 @@ impl OrderFillTrackerMap {
             .expect(MUTEX_POISONED)
             .operational_orders
             .contains(venue_order_id)
+    }
+
+    pub(crate) fn has_applied_fill_id(
+        &self,
+        venue_order_id: &VenueOrderId,
+        trade_id: &TradeId,
+    ) -> bool {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .orders
+            .get(venue_order_id)
+            .is_some_and(|state| state.applied_fills.contains_key(trade_id))
     }
 
     pub(crate) fn operational_order_ids(&self) -> Vec<VenueOrderId> {
@@ -567,6 +628,15 @@ impl OrderFillTrackerMap {
             .orders
             .get(venue_order_id)
             .is_some()
+    }
+
+    /// Returns true if a fill is currently buffered for the order.
+    pub(crate) fn has_pending_fill(&self, venue_order_id: &VenueOrderId) -> bool {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .pending_fills
+            .contains_key(venue_order_id)
     }
 
     /// Returns true if the order has received any fills or been removed (settled).
@@ -780,137 +850,105 @@ impl OrderFillTrackerMap {
     pub(crate) fn accept_or_buffer_fills<T, F>(
         &self,
         fills: Vec<(VenueOrderId, FillReport, FillCorrectionMetadata)>,
-        mut reversible_target: F,
+        reversible_target: F,
     ) -> anyhow::Result<FillBatchAdmission<T>>
     where
         F: FnMut(&FillReport) -> anyhow::Result<Option<T>>,
     {
-        let report_count = fills.len();
-        let mut participants =
-            AHashSet::<(TradeCorrectionIdentity, VenueOrderId, TradeId)>::with_capacity(
-                fills.len(),
-            );
-
-        for (venue_order_id, report, correction) in &fills {
-            let participant = (
-                correction.correction_key.clone(),
-                *venue_order_id,
-                report.trade_id,
-            );
-
-            if !participants.insert(participant) {
-                anyhow::bail!(
-                    "duplicate correction participant {} for order {} and trade {}",
-                    correction.correction_key,
-                    venue_order_id,
-                    report.trade_id
-                );
-            }
-        }
-
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        anyhow::ensure!(
-            fills
-                .iter()
-                .all(|(venue_order_id, _, _)| guard.operational_orders.contains(venue_order_id)),
-            "cannot retain fill evidence for an unreserved order"
-        );
-        let already_pending = fills
-            .iter()
-            .map(|(_, report, correction)| {
-                pending_correction_participant(&guard, report, correction)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        accept_or_buffer_fills_in(&mut guard, fills, reversible_target)
+    }
 
-        if already_pending.iter().any(|pending| *pending) {
-            for (_, report, correction) in &fills {
-                anyhow::ensure!(
-                    existing_correction_participant(&guard, report, correction)?,
-                    "partial correction replay {} has no pending or applied evidence for order {} and trade {}",
-                    correction.correction_key,
-                    report.venue_order_id,
-                    report.trade_id,
-                );
-            }
-            return Ok(FillBatchAdmission {
-                reports: (0..report_count).map(|_| None).collect(),
-                binding_error: None,
-            });
-        }
-
-        let mut decisions = Vec::with_capacity(fills.len());
-        for (_, report, _) in &fills {
-            match reversible_target(report) {
-                Ok(target) => decisions.push(target),
-                Err(e) => {
-                    let report_count = fills.len();
-                    for (venue_order_id, report, correction) in fills {
-                        push_buffered(
-                            &mut guard.pending_fills,
-                            venue_order_id,
-                            BufferedFill {
-                                report,
-                                correction: Some(correction),
-                            },
-                        );
-                    }
-                    return Ok(FillBatchAdmission {
-                        reports: (0..report_count).map(|_| None).collect(),
-                        binding_error: Some(e),
-                    });
-                }
-            }
-        }
-
-        let mut prospective_orders = AHashMap::new();
-        let mut admissions = Vec::with_capacity(fills.len());
-        for ((venue_order_id, report, correction), target) in fills.iter().zip(&decisions) {
-            let admission = if target.is_some() {
-                guard.orders.get(venue_order_id).cloned().map(|current| {
-                    let state = prospective_orders.entry(*venue_order_id).or_insert(current);
-                    admit_fill_in(state, report, Some(correction), venue_order_id)
-                })
-            } else {
-                None
-            }
-            .transpose()?;
-            admissions.push(admission);
-        }
-
-        for (venue_order_id, state) in prospective_orders {
-            guard.orders.insert(venue_order_id, state);
-        }
-
-        let reports = fills
+    /// Atomically admits complete buffered correction batches once every participant is bound.
+    ///
+    /// The trigger order can belong to several independent corrections. They are all preflighted
+    /// against one prospective tracker snapshot and committed together, so an error never leaves
+    /// tracker authority applied without the caller receiving every event it must emit.
+    pub(crate) fn admit_ready_pending_corrections<T, F, E>(
+        &self,
+        trigger_venue_order_id: VenueOrderId,
+        mut reversible_target: F,
+        mut emit: E,
+    ) -> anyhow::Result<Vec<BufferedFillEmission>>
+    where
+        F: FnMut(&FillReport) -> anyhow::Result<Option<T>>,
+        E: FnMut(&T, &BufferedFill, Option<Quantity>) -> OrderFilled,
+    {
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let correction_keys = guard
+            .pending_fills
+            .get(&trigger_venue_order_id)
             .into_iter()
-            .zip(decisions)
-            .zip(admissions)
-            .map(
-                |(((venue_order_id, report, correction), target), admission)| match (
-                    target, admission,
-                ) {
-                    (Some(target), Some(ProspectiveFillAdmission::New { quantity_update })) => {
-                        Some((report, target, quantity_update))
-                    }
-                    (Some(_), Some(ProspectiveFillAdmission::Replay)) => None,
-                    _ => {
-                        push_buffered(
-                            &mut guard.pending_fills,
-                            venue_order_id,
-                            BufferedFill {
-                                report,
-                                correction: Some(correction),
-                            },
-                        );
-                        None
-                    }
-                },
-            )
-            .collect();
-        Ok(FillBatchAdmission {
-            reports,
-            binding_error: None,
-        })
+            .flatten()
+            .filter_map(|buffered| {
+                buffered
+                    .correction
+                    .as_ref()
+                    .map(|correction| correction.correction_key.clone())
+            })
+            .collect::<AHashSet<_>>();
+        if correction_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut prospective = guard.clone();
+        let mut admitted = Vec::new();
+        for correction_key in correction_keys {
+            let fills = prospective
+                .pending_fills
+                .iter()
+                .flat_map(|(venue_order_id, pending)| {
+                    pending.iter().filter_map(|buffered| {
+                        buffered
+                            .correction
+                            .as_ref()
+                            .filter(|correction| correction.correction_key == correction_key)
+                            .map(|correction| {
+                                (*venue_order_id, buffered.report.clone(), correction.clone())
+                            })
+                    })
+                })
+                .collect::<Vec<_>>();
+            let metadata = fills
+                .iter()
+                .map(|(venue_order_id, report, correction)| {
+                    ((*venue_order_id, report.trade_id), correction.clone())
+                })
+                .collect::<AHashMap<_, _>>();
+            let result =
+                accept_or_buffer_fills_in(&mut prospective, fills, &mut reversible_target)?;
+            if let Some(error) = result.binding_error {
+                return Err(error);
+            }
+
+            for (report, target, quantity_update) in result.reports.into_iter().flatten() {
+                let correction = metadata
+                    .get(&(report.venue_order_id, report.trade_id))
+                    .cloned()
+                    .context("admitted buffered fill lost its correction metadata")?;
+                admitted.push((
+                    BufferedFill {
+                        report,
+                        correction: Some(correction),
+                    },
+                    target,
+                    quantity_update,
+                ));
+            }
+        }
+
+        *guard = prospective;
+        Ok(admitted
+            .into_iter()
+            .map(|(buffered, target, quantity_update)| {
+                let filled = emit(&target, &buffered, quantity_update);
+                record_applied_buffered_fill(&mut guard, &buffered, filled);
+                BufferedFillEmission {
+                    buffered,
+                    emitted: true,
+                }
+            })
+            .collect())
     }
 
     /// Registers an accepted order while retaining fills until reversible identity is available.
@@ -1094,46 +1132,6 @@ impl OrderFillTrackerMap {
             before_emit,
             emit,
         )
-    }
-
-    /// Registers and emits only when a buffered fill already proves venue acceptance.
-    pub(crate) fn register_and_emit_pending_fills_if_buffered<B, F>(
-        &self,
-        venue_order_id: VenueOrderId,
-        identity: OrderIdentity,
-        submitted_qty: Quantity,
-        growth_policy: FillGrowthPolicy,
-        before_emit: B,
-        emit: F,
-    ) -> anyhow::Result<Option<Vec<BufferedFillEmission>>>
-    where
-        B: FnOnce(&[BufferedFill]),
-        F: FnMut(&BufferedFill, Option<Quantity>) -> OrderFilled,
-    {
-        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        if !guard.pending_fills.contains_key(&venue_order_id) {
-            return Ok(None);
-        }
-        validate_pending_fill_binding(
-            &guard,
-            venue_order_id,
-            identity.instrument_id,
-            identity.order_side,
-        )?;
-        guard.orders.insert(
-            venue_order_id,
-            new_order_state(submitted_qty, growth_policy),
-        );
-        guard.reserved_submits.remove(&venue_order_id);
-        Ok(Some(emit_pending_fills(
-            &mut guard,
-            venue_order_id,
-            Some(identity.client_order_id),
-            identity.instrument_id,
-            identity.order_side,
-            before_emit,
-            emit,
-        )?))
     }
 
     /// Drains buffered order reports for a registered order (raw, for conversion by the caller).
@@ -1653,6 +1651,31 @@ where
     B: FnOnce(&[BufferedFill]),
     F: FnMut(&BufferedFill, Option<Quantity>) -> OrderFilled,
 {
+    if let Some(fills) = inner.pending_fills.get(&venue_order_id) {
+        for correction_key in fills.iter().filter_map(|fill| {
+            fill.correction
+                .as_ref()
+                .map(|correction| &correction.correction_key)
+        }) {
+            let has_pending_sibling =
+                inner
+                    .pending_fills
+                    .iter()
+                    .any(|(other_venue_order_id, other_fills)| {
+                        *other_venue_order_id != venue_order_id
+                            && other_fills.iter().any(|other| {
+                                other.correction.as_ref().is_some_and(|correction| {
+                                    &correction.correction_key == correction_key
+                                })
+                            })
+                    });
+            anyhow::ensure!(
+                !has_pending_sibling,
+                "multi-participant correction {correction_key} cannot drain one order at a time",
+            );
+        }
+    }
+
     let fills = prepare_pending_fills(
         inner,
         venue_order_id,
@@ -1687,29 +1710,38 @@ where
         };
 
         let filled = emit(&buffered, quantity_update);
-        if let Some(correction) = buffered.correction.as_ref() {
-            if let Some(applied) = inner
-                .applied_buffered_fills
-                .get_mut(&correction.correction_key)
-            {
-                applied.fills.push(filled);
-                applied.is_confirmed |= correction.is_confirmed;
-            } else {
-                inner.applied_buffered_fills.insert(
-                    correction.correction_key.clone(),
-                    AppliedBufferedCorrection {
-                        fills: vec![filled],
-                        is_confirmed: correction.is_confirmed,
-                    },
-                );
-            }
-        }
+        record_applied_buffered_fill(inner, &buffered, filled);
         emissions.push(BufferedFillEmission {
             buffered,
             emitted: true,
         });
     }
     Ok(emissions)
+}
+
+fn record_applied_buffered_fill(
+    inner: &mut TrackerInner,
+    buffered: &BufferedFill,
+    filled: OrderFilled,
+) {
+    let Some(correction) = buffered.correction.as_ref() else {
+        return;
+    };
+    if let Some(applied) = inner
+        .applied_buffered_fills
+        .get_mut(&correction.correction_key)
+    {
+        applied.fills.push(filled);
+        applied.is_confirmed |= correction.is_confirmed;
+    } else {
+        inner.applied_buffered_fills.insert(
+            correction.correction_key.clone(),
+            AppliedBufferedCorrection {
+                fills: vec![filled],
+                is_confirmed: correction.is_confirmed,
+            },
+        );
+    }
 }
 
 fn promote_pending_correction(
@@ -1745,6 +1777,177 @@ fn push_buffered<V>(
     } else {
         buffer.insert(venue_order_id, vec![value]);
     }
+}
+
+fn accept_or_buffer_fills_in<T, F>(
+    inner: &mut TrackerInner,
+    fills: Vec<(VenueOrderId, FillReport, FillCorrectionMetadata)>,
+    mut reversible_target: F,
+) -> anyhow::Result<FillBatchAdmission<T>>
+where
+    F: FnMut(&FillReport) -> anyhow::Result<Option<T>>,
+{
+    let report_count = fills.len();
+    let mut participants =
+        AHashSet::<(TradeCorrectionIdentity, VenueOrderId, TradeId)>::with_capacity(fills.len());
+
+    for (venue_order_id, report, correction) in &fills {
+        let participant = (
+            correction.correction_key.clone(),
+            *venue_order_id,
+            report.trade_id,
+        );
+
+        if !participants.insert(participant) {
+            anyhow::bail!(
+                "duplicate correction participant {} for order {} and trade {}",
+                correction.correction_key,
+                venue_order_id,
+                report.trade_id
+            );
+        }
+    }
+
+    anyhow::ensure!(
+        fills
+            .iter()
+            .all(|(venue_order_id, _, _)| inner.operational_orders.contains(venue_order_id)),
+        "cannot retain fill evidence for an unreserved order"
+    );
+    let already_pending = fills
+        .iter()
+        .map(|(_, report, correction)| pending_correction_participant(inner, report, correction))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let has_pending_participant = already_pending.iter().any(|pending| *pending);
+    if has_pending_participant {
+        for (_, report, correction) in &fills {
+            anyhow::ensure!(
+                existing_correction_participant(inner, report, correction)?,
+                "partial correction replay {} has no pending or applied evidence for order {} and trade {}",
+                correction.correction_key,
+                report.venue_order_id,
+                report.trade_id,
+            );
+        }
+    }
+
+    let mut decisions = Vec::with_capacity(fills.len());
+    for (_, report, _) in &fills {
+        match reversible_target(report) {
+            Ok(target) => decisions.push(target),
+            Err(e) => {
+                if !has_pending_participant {
+                    for (venue_order_id, report, correction) in fills {
+                        push_buffered(
+                            &mut inner.pending_fills,
+                            venue_order_id,
+                            BufferedFill {
+                                report,
+                                correction: Some(correction),
+                            },
+                        );
+                    }
+                }
+                return Ok(FillBatchAdmission {
+                    reports: (0..report_count).map(|_| None).collect(),
+                    binding_error: Some(e),
+                });
+            }
+        }
+    }
+
+    let entire_correction_is_reversible = decisions.iter().all(Option::is_some)
+        && fills
+            .iter()
+            .all(|(venue_order_id, _, _)| inner.orders.contains_key(venue_order_id));
+    if !entire_correction_is_reversible {
+        if !has_pending_participant {
+            for (venue_order_id, report, correction) in fills {
+                push_buffered(
+                    &mut inner.pending_fills,
+                    venue_order_id,
+                    BufferedFill {
+                        report,
+                        correction: Some(correction),
+                    },
+                );
+            }
+        }
+        return Ok(FillBatchAdmission {
+            reports: (0..report_count).map(|_| None).collect(),
+            binding_error: None,
+        });
+    }
+
+    let mut prospective_orders = AHashMap::new();
+    let mut admissions = Vec::with_capacity(fills.len());
+    for ((venue_order_id, report, correction), target) in fills.iter().zip(&decisions) {
+        let admission = if target.is_some() {
+            inner.orders.get(venue_order_id).cloned().map(|current| {
+                let state = prospective_orders.entry(*venue_order_id).or_insert(current);
+                admit_fill_in(state, report, Some(correction), venue_order_id)
+            })
+        } else {
+            None
+        }
+        .transpose()?;
+        admissions.push(admission);
+    }
+
+    if has_pending_participant {
+        let mut emptied_orders = AHashSet::new();
+        for (venue_order_id, report, correction) in &fills {
+            if let Some(pending) = inner.pending_fills.get_mut(venue_order_id) {
+                pending.retain(|buffered| {
+                    !(buffered.report.trade_id == report.trade_id
+                        && buffered.correction.as_ref().is_some_and(|metadata| {
+                            metadata.correction_key == correction.correction_key
+                        }))
+                });
+                if pending.is_empty() {
+                    emptied_orders.insert(*venue_order_id);
+                }
+            }
+        }
+        for venue_order_id in emptied_orders {
+            inner.pending_fills.remove(&venue_order_id);
+        }
+    }
+
+    for (venue_order_id, state) in prospective_orders {
+        inner.orders.insert(venue_order_id, state);
+    }
+
+    let reports = fills
+        .into_iter()
+        .zip(decisions)
+        .zip(admissions)
+        .map(
+            |(((venue_order_id, report, correction), target), admission)| match (target, admission)
+            {
+                (Some(target), Some(ProspectiveFillAdmission::New { quantity_update })) => {
+                    Some((report, target, quantity_update))
+                }
+                (Some(_), Some(ProspectiveFillAdmission::Replay)) => None,
+                _ => {
+                    push_buffered(
+                        &mut inner.pending_fills,
+                        venue_order_id,
+                        BufferedFill {
+                            report,
+                            correction: Some(correction),
+                        },
+                    );
+                    None
+                }
+            },
+        )
+        .collect();
+    Ok(FillBatchAdmission {
+        reports,
+        binding_error: None,
+    })
 }
 
 fn reserve_operational_orders(
@@ -1796,7 +1999,17 @@ fn push_buffered_report(
         .iter_mut()
         .find(|current| current.order_status == report.order_status)
     {
-        Some(current) if current.ts_last < report.ts_last => *current = report,
+        Some(current) if current.ts_last < report.ts_last => {
+            anyhow::ensure!(
+                same_order_report_binding(current, &report),
+                "newer order report changed immutable evidence for order {venue_order_id}"
+            );
+            anyhow::ensure!(
+                report.filled_qty >= current.filled_qty,
+                "newer order report reduced filled quantity for order {venue_order_id}"
+            );
+            *current = report;
+        }
         Some(current) if current.ts_last == report.ts_last => {
             anyhow::ensure!(
                 same_order_report_evidence(current, &report),
@@ -1808,6 +2021,20 @@ fn push_buffered_report(
         None => reports.push(report),
     }
     Ok(())
+}
+
+fn same_order_report_binding(left: &OrderStatusReport, right: &OrderStatusReport) -> bool {
+    left.account_id == right.account_id
+        && left.instrument_id == right.instrument_id
+        && left.client_order_id == right.client_order_id
+        && left.venue_order_id == right.venue_order_id
+        && left.order_side == right.order_side
+        && left.order_type == right.order_type
+        && left.time_in_force == right.time_in_force
+        && left.quantity == right.quantity
+        && left.ts_accepted == right.ts_accepted
+        && left.expire_time == right.expire_time
+        && left.price == right.price
 }
 
 fn same_order_report_evidence(left: &OrderStatusReport, right: &OrderStatusReport) -> bool {
@@ -1825,6 +2052,10 @@ fn same_order_report_evidence(left: &OrderStatusReport, right: &OrderStatusRepor
         && left.ts_last == right.ts_last
         && left.expire_time == right.expire_time
         && left.price == right.price
+        && left.avg_px == right.avg_px
+        && left.post_only == right.post_only
+        && left.reduce_only == right.reduce_only
+        && left.cancel_reason == right.cancel_reason
 }
 
 #[cfg(test)]
@@ -1879,15 +2110,6 @@ impl OrderFillTrackerMap {
         report: OrderStatusReport,
     ) {
         self.buffer_report(venue_order_id, report).unwrap();
-    }
-
-    /// Returns true if a fill is currently buffered for the order.
-    pub(crate) fn has_pending_fill(&self, venue_order_id: &VenueOrderId) -> bool {
-        self.inner
-            .lock()
-            .expect(MUTEX_POISONED)
-            .pending_fills
-            .contains_key(venue_order_id)
     }
 
     /// Returns the fills currently buffered for the order.
@@ -2837,11 +3059,19 @@ mod tests {
             )
             .unwrap();
 
-        let mut contradictory = accepted;
+        let mut contradictory = accepted.clone();
         contradictory.filled_qty = Quantity::from("2");
         assert!(
             tracker
                 .buffer_report(venue_order_id, contradictory)
+                .is_err()
+        );
+        let mut newer_contradictory = accepted;
+        newer_contradictory.ts_last = UnixNanos::from(3_000u64);
+        newer_contradictory.instrument_id = InstrumentId::from("OTHER.POLYMARKET");
+        assert!(
+            tracker
+                .buffer_report(venue_order_id, newer_contradictory)
                 .is_err()
         );
         tracker
@@ -2995,7 +3225,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_binding_error_replay_drains_exactly_one_retained_fill() {
+    fn test_binding_error_replay_commits_exactly_one_retained_fill() {
         use std::cell::Cell;
 
         let tracker = OrderFillTrackerMap::new();
@@ -3037,11 +3267,11 @@ mod tests {
             .accept_or_buffer_fills(vec![(venue_order_id, report, correction)], |_| Ok(Some(())))
             .unwrap();
         assert!(replay.binding_error.is_none());
-        assert!(replay.reports.iter().all(Option::is_none));
-        assert_eq!(tracker.pending_fills_for(&venue_order_id).len(), 1);
+        assert_eq!(replay.reports.iter().flatten().count(), 1);
+        assert!(!tracker.has_pending_fill(&venue_order_id));
         assert_eq!(
             tracker.get_cumulative_filled(&venue_order_id),
-            Some(Quantity::zero(6))
+            Some(Quantity::new(10.0, 6))
         );
 
         let emitted = Cell::new(0);
@@ -3062,11 +3292,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(emitted.get(), 1);
-        assert_eq!(
-            emissions.iter().filter(|emission| emission.emitted).count(),
-            1
-        );
+        assert_eq!(emitted.get(), 0);
+        assert!(emissions.is_empty());
         assert_eq!(
             tracker.get_cumulative_filled(&venue_order_id),
             Some(Quantity::new(10.0, 6))
@@ -3469,7 +3696,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_partial_batch_replay_does_not_buffer_already_emitted_sibling() {
+    fn test_multi_participant_batch_cannot_drain_one_sibling() {
         use std::cell::Cell;
 
         let tracker = OrderFillTrackerMap::new();
@@ -3520,13 +3747,12 @@ mod tests {
             .accept_or_buffer_fills(batch(), |_| Ok(Some(())))
             .unwrap();
         assert!(first.binding_error.is_none());
-        assert!(first.reports[0].is_some());
-        assert!(first.reports[1].is_none());
-        assert!(!tracker.has_pending_fill(&first_order));
+        assert!(first.reports.iter().all(Option::is_none));
+        assert!(tracker.has_pending_fill(&first_order));
         assert!(tracker.has_pending_fill(&second_order));
         assert_eq!(
             tracker.get_cumulative_filled(&first_order),
-            Some(Quantity::new(10.0, 6))
+            Some(Quantity::zero(6))
         );
 
         let replay = tracker
@@ -3534,15 +3760,15 @@ mod tests {
             .unwrap();
         assert!(replay.binding_error.is_none());
         assert!(replay.reports.iter().all(Option::is_none));
-        assert!(!tracker.has_pending_fill(&first_order));
+        assert_eq!(tracker.pending_fills_for(&first_order).len(), 1);
         assert_eq!(tracker.pending_fills_for(&second_order).len(), 1);
         assert_eq!(
             tracker.get_cumulative_filled(&first_order),
-            Some(Quantity::new(10.0, 6))
+            Some(Quantity::zero(6))
         );
 
         let duplicate_emissions = Cell::new(0);
-        let drained = tracker
+        let error = tracker
             .emit_pending_fills_for_registered(
                 first_order,
                 Some(ClientOrderId::from("O-PARTIAL-BATCH-REPLAY")),
@@ -3557,12 +3783,101 @@ mod tests {
                     )
                 },
             )
-            .unwrap();
-        assert!(drained.is_empty());
+            .expect_err("one participant must not drain before its correction sibling");
+        assert!(error.to_string().contains("multi-participant correction"));
         assert_eq!(duplicate_emissions.get(), 0);
+        assert_eq!(tracker.pending_fills_for(&first_order).len(), 1);
+        assert_eq!(tracker.pending_fills_for(&second_order).len(), 1);
+        assert_eq!(
+            tracker.get_cumulative_filled(&first_order),
+            Some(Quantity::zero(6))
+        );
+    }
+
+    #[rstest]
+    fn test_multi_participant_correction_commits_without_replay_after_every_order_registered() {
+        let tracker = OrderFillTrackerMap::new();
+        let first_order = VenueOrderId::from("maker-order-atomic-first");
+        let second_order = VenueOrderId::from("maker-order-atomic-second");
+        let instrument_id = InstrumentId::from("TEST.POLYMARKET");
+        tracker.register_without_draining(
+            first_order,
+            Quantity::new(100.0, 6),
+            FillGrowthPolicy::Fixed,
+        );
+        tracker.reserve_orders(&[second_order]).unwrap();
+        let first_report = test_fill_report(
+            instrument_id,
+            first_order,
+            "maker-trade-atomic-first",
+            Quantity::new(10.0, 6),
+        );
+        let second_report = test_fill_report(
+            instrument_id,
+            second_order,
+            "maker-trade-atomic-second",
+            Quantity::new(20.0, 6),
+        );
+        let metadata = |raw_trade_id: &str| FillCorrectionMetadata {
+            correction_key: TradeCorrectionIdentity::from("maker-atomic-replay"),
+            raw_trade_id: raw_trade_id.to_string(),
+            raw_corrective_timestamp: "1700000000000".to_string(),
+            info: None,
+            is_confirmed: true,
+        };
+        let batch = || {
+            vec![
+                (
+                    first_order,
+                    first_report.clone(),
+                    metadata("maker-trade-atomic-first"),
+                ),
+                (
+                    second_order,
+                    second_report.clone(),
+                    metadata("maker-trade-atomic-second"),
+                ),
+            ]
+        };
+
+        let retained = tracker
+            .accept_or_buffer_fills(batch(), |_| Ok(Some(())))
+            .unwrap();
+        assert!(retained.reports.iter().all(Option::is_none));
+        assert_eq!(tracker.pending_fills_for(&first_order).len(), 1);
+        assert_eq!(tracker.pending_fills_for(&second_order).len(), 1);
+
+        assert!(tracker.register_without_draining(
+            second_order,
+            Quantity::new(100.0, 6),
+            FillGrowthPolicy::Fixed,
+        ));
+        let admitted = tracker
+            .admit_ready_pending_corrections(
+                second_order,
+                |_| Ok(Some(())),
+                |(), buffered, _| {
+                    test_order_filled(&buffered.report, ClientOrderId::from("O-ATOMIC-CORRECTION"))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(admitted.len(), 2);
+        assert!(admitted.iter().all(|fill| {
+            fill.buffered
+                .correction
+                .as_ref()
+                .is_some_and(|correction| correction.is_confirmed)
+        }));
+        assert!(!tracker.has_pending_fill(&first_order));
+        assert!(!tracker.has_pending_fill(&second_order));
         assert_eq!(
             tracker.get_cumulative_filled(&first_order),
             Some(Quantity::new(10.0, 6))
+        );
+        assert_eq!(
+            tracker.get_cumulative_filled(&second_order),
+            Some(Quantity::new(20.0, 6))
         );
     }
 
@@ -3766,6 +4081,49 @@ mod tests {
             .expect_err("restart without a signed quote budget must fail closed");
 
         assert!(error.to_string().contains("exceeds submitted quantity"));
+        assert_eq!(
+            tracker.get_cumulative_filled(&venue_order_id),
+            Some(Quantity::zero(6))
+        );
+    }
+
+    #[rstest]
+    fn test_restored_quote_growth_reverses_to_original_signed_quantity() {
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("restored-quote-growth");
+        let report = test_fill_report(
+            InstrumentId::from("TEST.POLYMARKET"),
+            venue_order_id,
+            "trade-restored-quote-growth",
+            Quantity::new(11.0, 6),
+        );
+        let fill = test_order_filled(&report, ClientOrderId::from("O-RESTORED-QUOTE-GROWTH"));
+        let correction_key =
+            TradeCorrectionIdentity::new("trade-restored-quote-growth", venue_order_id.as_str());
+
+        tracker
+            .restore_orders(vec![RestoredOrder {
+                venue_order_id,
+                original_submitted_qty: Quantity::new(10.0, 6),
+                submitted_qty: Quantity::new(11.0, 6),
+                filled_qty: Quantity::new(11.0, 6),
+                growth_policy: FillGrowthPolicy::QuoteImmediateBuyUnproven,
+                applied_fills: vec![fill.clone()],
+            }])
+            .unwrap();
+
+        let voided = tracker
+            .void_trade(&[venue_order_id], &correction_key, &[fill])
+            .unwrap();
+
+        assert_eq!(
+            voided.quantity_updates,
+            vec![(venue_order_id, Quantity::new(10.0, 6))]
+        );
+        assert_eq!(
+            tracker.submitted_qty(&venue_order_id),
+            Some(Quantity::new(10.0, 6))
+        );
         assert_eq!(
             tracker.get_cumulative_filled(&venue_order_id),
             Some(Quantity::zero(6))

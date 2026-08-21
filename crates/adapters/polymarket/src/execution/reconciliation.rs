@@ -59,6 +59,15 @@ pub(crate) struct FillContext<'a> {
     pub clock: &'static AtomicTime,
 }
 
+fn payload_is_owned_by(
+    owner: &str,
+    maker_address: &str,
+    user_address: &str,
+    api_key: &str,
+) -> bool {
+    maker_address.eq_ignore_ascii_case(user_address) || owner == api_key
+}
+
 /// Counts of confirmed trade evidence dropped while building fill reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FillBuildDiscards {
@@ -66,9 +75,8 @@ pub(crate) struct FillBuildDiscards {
     pub unmapped_instruments: usize,
     /// In-scope historical fills dropped because their instrument is not loaded.
     pub in_scope_historical: usize,
-    /// Confirmed maker trades dropped because no maker order in the match is
-    /// owned by the account.
-    pub unowned_maker_trades: usize,
+    /// Confirmed trades dropped because the selected participant is not owned by the account.
+    pub unowned_trades: usize,
 }
 
 impl FillBuildDiscards {
@@ -79,9 +87,9 @@ impl FillBuildDiscards {
             self.in_scope_historical,
         );
         anyhow::ensure!(
-            self.unowned_maker_trades == 0,
-            "{context} has {} confirmed maker trade(s) without an account-owned maker leg",
-            self.unowned_maker_trades,
+            self.unowned_trades == 0,
+            "{context} has {} confirmed trade(s) without an account-owned participant",
+            self.unowned_trades,
         );
         Ok(())
     }
@@ -113,7 +121,7 @@ pub(crate) fn build_fill_reports_from_trades(
                 .iter()
                 .any(|mo| mo.is_owned_by(ctx.user_address, ctx.api_key))
             {
-                discards.unowned_maker_trades += 1;
+                discards.unowned_trades += 1;
                 log::debug!(
                     "Confirmed maker trade {} holds no maker order owned by the account",
                     trade.id,
@@ -211,6 +219,20 @@ pub(crate) fn build_fill_reports_from_trades(
                 continue;
             }
 
+            if !payload_is_owned_by(
+                &trade.owner,
+                &trade.maker_address,
+                ctx.user_address,
+                ctx.api_key,
+            ) {
+                discards.unowned_trades += 1;
+                log::debug!(
+                    "Confirmed taker trade {} is not owned by the account",
+                    trade.id
+                );
+                continue;
+            }
+
             let report = parse_fill_report(trade, &instrument, ctx.account_id, None, ts_init)
                 .with_context(|| {
                     format!("failed to build taker fill report for trade {}", trade.id)
@@ -226,7 +248,7 @@ pub(crate) fn build_fill_reports_from_trades(
 pub(crate) fn build_order_reports_from_orders(
     orders: &[PolymarketOpenOrder],
     instruments: &AtomicMap<Ustr, InstrumentAny>,
-    account_id: AccountId,
+    ctx: &FillContext<'_>,
     instrument_filter: Option<InstrumentId>,
     ts_init: UnixNanos,
     load_ids: Option<&[InstrumentId]>,
@@ -264,7 +286,18 @@ pub(crate) fn build_order_reports_from_orders(
             continue;
         }
 
-        let report = parse_order_status_report(order, &instrument, account_id, None, ts_init)?;
+        if !payload_is_owned_by(
+            &order.owner,
+            &order.maker_address,
+            ctx.user_address,
+            ctx.api_key,
+        ) {
+            log::debug!("Dropping open order {} not owned by the account", order.id);
+            filtered += 1;
+            continue;
+        }
+
+        let report = parse_order_status_report(order, &instrument, ctx.account_id, None, ts_init)?;
         reports.push(report);
     }
 
@@ -344,9 +377,7 @@ pub(crate) fn build_position_reports_scoped(
         )?;
         let quantity =
             non_negative_quantity(position.size, instrument.size_precision(), "position size")?;
-        if position.size > Decimal::ZERO
-            && let Some(avg_price) = position.avg_price
-        {
+        if let Some(avg_price) = position.avg_price {
             validate_binary_price_decimal(avg_price, "position avg_price")?;
         }
 
@@ -412,14 +443,8 @@ pub(crate) async fn generate_mass_status(
         .await
         .context("failed to fetch orders for mass status")?;
 
-    let (order_reports, orders_filtered) = build_order_reports_from_orders(
-        &orders,
-        instruments,
-        ctx.account_id,
-        None,
-        ts_init,
-        load_ids,
-    )?;
+    let (order_reports, orders_filtered) =
+        build_order_reports_from_orders(&orders, instruments, ctx, None, ts_init, load_ids)?;
 
     let mut trades = http_client
         .get_trades(trades_params_for_window(
@@ -443,11 +468,11 @@ pub(crate) async fn generate_mass_status(
         fill_discards.ensure_complete("unwindowed mass status")?;
     }
 
-    if fill_discards.unowned_maker_trades > 0 {
+    if fill_discards.unowned_trades > 0 {
         log::error!(
             "Mass status is missing {} confirmed maker trade(s) holding no maker order owned by \
              the account; executed quantity may be understated",
-            fill_discards.unowned_maker_trades,
+            fill_discards.unowned_trades,
         );
     }
 
@@ -471,13 +496,13 @@ pub(crate) async fn generate_mass_status(
 
     log::debug!(
         "Generated mass status: {} orders ({} filtered), {} fills ({} instrument-filtered, \
-         {} in-scope historical misses, {} unowned maker trades), {} positions",
+         {} in-scope historical misses, {} unowned trades), {} positions",
         order_reports.len(),
         orders_filtered,
         fill_reports.len(),
         fill_discards.unmapped_instruments,
         fill_discards.in_scope_historical,
-        fill_discards.unowned_maker_trades,
+        fill_discards.unowned_trades,
         position_reports.len(),
     );
 
@@ -489,7 +514,7 @@ pub(crate) async fn generate_mass_status(
             .map(|report| report.venue_order_id)
             .collect();
         let reports_complete = fill_discards.in_scope_historical == 0
-            && fill_discards.unowned_maker_trades == 0
+            && fill_discards.unowned_trades == 0
             && untimestamped_trades == 0
             && fill_reports
                 .iter()
@@ -612,7 +637,14 @@ pub(crate) fn confirmed_trade_in_static_scope(
             }
         }
         Ok(false)
-    } else if venue_order_in_scope(&trade.taker_order_id, venue_order_filter) {
+    } else if venue_order_in_scope(&trade.taker_order_id, venue_order_filter)
+        && payload_is_owned_by(
+            &trade.owner,
+            &trade.maker_address,
+            ctx.user_address,
+            ctx.api_key,
+        )
+    {
         instrument_in_scope(trade.asset_id.as_str())
     } else {
         Ok(false)
@@ -837,6 +869,15 @@ mod tests {
         market.fee_schedule = None;
         let definition = parse_gamma_market(&market).unwrap().remove(0);
         create_instrument_from_def(&definition, UnixNanos::default()).unwrap()
+    }
+
+    fn test_fill_context() -> FillContext<'static> {
+        FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            api_key: "00000000-0000-0000-0000-000000000001",
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        }
     }
 
     fn instrument_for_position(position: &DataApiPosition) -> InstrumentAny {
@@ -1242,7 +1283,7 @@ mod tests {
         let error = build_order_reports_from_orders(
             &[unmapped_open_order()],
             &AtomicMap::new(),
-            AccountId::from("POLY-001"),
+            &test_fill_context(),
             None,
             UnixNanos::from(1),
             None,
@@ -1261,7 +1302,7 @@ mod tests {
         let error = build_order_reports_from_orders(
             &[unmapped_open_order()],
             &AtomicMap::new(),
-            AccountId::from("POLY-001"),
+            &test_fill_context(),
             None,
             UnixNanos::from(1),
             Some(std::slice::from_ref(&instrument_id)),
@@ -1280,7 +1321,7 @@ mod tests {
         let (reports, filtered) = build_order_reports_from_orders(
             &[unmapped_open_order()],
             &AtomicMap::new(),
-            AccountId::from("POLY-001"),
+            &test_fill_context(),
             None,
             UnixNanos::from(1),
             Some(std::slice::from_ref(&scoped)),
@@ -1304,7 +1345,7 @@ mod tests {
         let result = build_order_reports_from_orders(
             &[valid, invalid],
             &instruments,
-            AccountId::from("POLY-001"),
+            &test_fill_context(),
             None,
             UnixNanos::from(1),
             None,
@@ -1314,6 +1355,30 @@ mod tests {
             result.is_err(),
             "a malformed later row must discard the valid prefix"
         );
+    }
+
+    #[rstest]
+    fn foreign_open_order_payload_is_not_admitted() {
+        let mut order: PolymarketOpenOrder =
+            serde_json::from_str(include_str!("../../test_data/http_open_order.json")).unwrap();
+        let instrument = instrument_for_open_order(&order);
+        let instruments = AtomicMap::new();
+        instruments.insert(order.asset_id, instrument);
+        order.owner = "foreign-api-key".to_string();
+        order.maker_address = "0xforeign".to_string();
+
+        let (reports, filtered) = build_order_reports_from_orders(
+            &[order],
+            &instruments,
+            &test_fill_context(),
+            None,
+            UnixNanos::from(1),
+            None,
+        )
+        .unwrap();
+
+        assert!(reports.is_empty());
+        assert_eq!(filtered, 1);
     }
 
     #[rstest]
@@ -1481,6 +1546,28 @@ mod tests {
         assert!(error.to_string().contains("position avg_price"));
     }
 
+    #[rstest]
+    #[case("0")]
+    #[case("0.000001")]
+    fn test_zero_and_dust_positions_still_validate_present_average_price(#[case] size: &str) {
+        let mut position = test_position();
+        let instruments = position_map(&position);
+        position.size = Decimal::from_str_exact(size).unwrap();
+        position.avg_price = Some(dec!(-0.1));
+
+        let error = build_position_reports_scoped(
+            &[position],
+            &instruments,
+            AccountId::from("POLY-001"),
+            None,
+            None,
+            UnixNanos::from(1),
+        )
+        .expect_err("scoped provider fields must validate before zero/dust containment");
+
+        assert!(error.to_string().contains("position avg_price"));
+    }
+
     fn maker_trade_for_scope(owner: &str, maker_asset: &str) -> PolymarketTradeReport {
         let mut trade: PolymarketTradeReport =
             serde_json::from_str(include_str!("../../test_data/http_trade_report.json")).unwrap();
@@ -1613,5 +1700,38 @@ mod tests {
 
         assert!(reports.is_empty());
         assert_eq!(discards, FillBuildDiscards::default());
+    }
+
+    #[rstest]
+    fn test_taker_builder_rejects_foreign_payload_owner() {
+        let mut trade: PolymarketTradeReport =
+            serde_json::from_str(include_str!("../../test_data/http_trade_report.json")).unwrap();
+        trade.owner = "foreign-api-key".to_string();
+        trade.maker_address = "0xforeign".to_string();
+        let mut order = unmapped_open_order();
+        order.market = trade.market;
+        order.asset_id = trade.asset_id;
+        order.outcome = trade.outcome;
+        let instrument = instrument_for_open_order(&order);
+        let instruments = AtomicMap::new();
+        instruments.insert(trade.asset_id, instrument);
+        let ctx = FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: "0xowned",
+            api_key: "owned-api-key",
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let (reports, _) = build_fill_reports_from_trades(
+            &[trade],
+            &ctx,
+            &instruments,
+            None,
+            UnixNanos::from(1),
+            None,
+        )
+        .unwrap();
+
+        assert!(reports.is_empty());
     }
 }

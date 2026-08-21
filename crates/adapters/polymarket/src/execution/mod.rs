@@ -342,8 +342,7 @@ impl ExecutionClient for PolymarketExecutionClient {
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
-        self.reset_client();
-        Ok(())
+        self.reset_client()
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {

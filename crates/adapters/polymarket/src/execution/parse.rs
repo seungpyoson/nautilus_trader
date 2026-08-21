@@ -430,6 +430,20 @@ pub fn compute_commission(
     price: Decimal,
     liquidity_side: LiquiditySide,
 ) -> anyhow::Result<Decimal> {
+    let fee_equivalent = compute_fee_equivalent(fee_rate, fee_exponent, size, price)?;
+
+    if liquidity_side != LiquiditySide::Taker {
+        return Ok(Decimal::ZERO);
+    }
+    Ok(fee_equivalent.round_dp(5))
+}
+
+pub(crate) fn compute_fee_equivalent(
+    fee_rate: Decimal,
+    fee_exponent: f64,
+    size: Decimal,
+    price: Decimal,
+) -> anyhow::Result<Decimal> {
     anyhow::ensure!(
         (Decimal::ZERO..=Decimal::ONE).contains(&fee_rate),
         "fee rate must be in [0, 1], was {fee_rate}"
@@ -443,7 +457,7 @@ pub fn compute_commission(
         "fill price must be in [0, 1], was {price}"
     );
 
-    if liquidity_side != LiquiditySide::Taker || fee_rate.is_zero() {
+    if fee_rate.is_zero() {
         return Ok(Decimal::ZERO);
     }
     anyhow::ensure!(
@@ -451,10 +465,8 @@ pub fn compute_commission(
         "fee exponent must be positive and finite, was {fee_exponent}"
     );
 
-    let commission = size
-        .checked_mul(fee_curve_rate(fee_rate, price, fee_exponent)?)
-        .context("commission calculation overflow")?;
-    Ok(commission.round_dp(5))
+    size.checked_mul(fee_curve_rate(fee_rate, price, fee_exponent)?)
+        .context("commission calculation overflow")
 }
 
 fn fee_curve_rate(fee_rate: Decimal, price: Decimal, fee_exponent: f64) -> anyhow::Result<Decimal> {
@@ -707,6 +719,8 @@ mod tests {
         "0xad22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917";
     const TEST_TOKEN_ID: &str =
         "71321045679252212594626385532706912750332728571942532289631379312455583992563";
+    const TEST_VENUE_ORDER_ID: &str =
+        "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
     fn instrument_for_provider_values(
         condition_id: &str,
@@ -1649,7 +1663,7 @@ mod tests {
     ) {
         let order = PolymarketOpenOrder {
             associate_trades: None,
-            id: "0xid".to_string(),
+            id: TEST_VENUE_ORDER_ID.to_string(),
             status,
             market: Ustr::from(TEST_CONDITION_ID),
             original_size,
@@ -1701,7 +1715,7 @@ mod tests {
     ) {
         let order = PolymarketOpenOrder {
             associate_trades: None,
-            id: "0xterminal".to_string(),
+            id: TEST_VENUE_ORDER_ID.to_string(),
             status: PolymarketOrderStatus::Matched,
             market: Ustr::from(TEST_CONDITION_ID),
             original_size,
@@ -1742,7 +1756,7 @@ mod tests {
     fn test_parse_order_status_report_maps_partial_fak_match_to_canceled() {
         let order = PolymarketOpenOrder {
             associate_trades: Some(vec!["trade-partial-fak".to_string()]),
-            id: "0xpartial-fak".to_string(),
+            id: TEST_VENUE_ORDER_ID.to_string(),
             status: PolymarketOrderStatus::Matched,
             market: Ustr::from(TEST_CONDITION_ID),
             original_size: dec!(30),
@@ -1785,7 +1799,7 @@ mod tests {
     ) {
         let order = PolymarketOpenOrder {
             associate_trades: None,
-            id: "0xid".to_string(),
+            id: TEST_VENUE_ORDER_ID.to_string(),
             status: PolymarketOrderStatus::Live,
             market: Ustr::from(TEST_CONDITION_ID),
             original_size: dec!(100),
