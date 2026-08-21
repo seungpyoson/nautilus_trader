@@ -252,6 +252,8 @@ pub struct GammaMarket {
     /// Neg-risk market ID for CTF exchange interaction.
     #[serde(rename = "negRiskMarketID")]
     pub neg_risk_market_id: Option<String>,
+    /// Whether fees are enabled for this market.
+    pub fees_enabled: Option<bool>,
     /// Fee schedule for this market.
     pub fee_schedule: Option<FeeSchedule>,
     /// Game ID for sport markets, kept verbatim because Gamma emits both
@@ -480,8 +482,14 @@ pub struct DataApiPosition {
     pub asset: String,
     #[serde(alias = "conditionId", alias = "condition_id")]
     pub condition_id: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_json_number")]
     pub size: Decimal,
-    #[serde(alias = "avgPrice", alias = "avg_price")]
+    #[serde(
+        default,
+        alias = "avgPrice",
+        alias = "avg_price",
+        deserialize_with = "deserialize_optional_decimal_from_json_number"
+    )]
     pub avg_price: Option<Decimal>,
 }
 
@@ -532,7 +540,7 @@ mod tests {
 
         assert_eq!(
             order.id,
-            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
         );
         assert_eq!(order.status, PolymarketOrderStatus::Live);
         assert_eq!(order.side, PolymarketOrderSide::Buy);
@@ -574,7 +582,7 @@ mod tests {
         assert_eq!(trade.id, "trade-0xabcdef1234");
         assert_eq!(
             trade.taker_order_id,
-            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
         );
         assert_eq!(trade.side, PolymarketOrderSide::Buy);
         assert_eq!(trade.size, dec!(25.0000));
@@ -1192,6 +1200,22 @@ mod tests {
         // Dust position (below DUST_POSITION_THRESHOLD)
         assert_eq!(positions[3].size, dec!(0.005));
         assert_eq!(positions[3].avg_price, Some(dec!(0.7)));
+    }
+
+    #[rstest]
+    fn test_data_api_position_deserializes_exact_numeric_tokens() {
+        let position: DataApiPosition = serde_json::from_str(
+            r#"{
+                "asset":"123",
+                "conditionId":"0xabc",
+                "size":1.000001,
+                "avgPrice":0.123456789012345678
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(position.size, dec!(1.000001));
+        assert_eq!(position.avg_price, Some(dec!(0.123456789012345678)));
     }
 
     #[rstest]

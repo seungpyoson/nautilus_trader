@@ -502,7 +502,9 @@ mod tests {
     }
 
     fn test_instrument() -> InstrumentAny {
-        let market: crate::http::models::GammaMarket = load("gamma_market.json");
+        let mut market: crate::http::models::GammaMarket = load("gamma_market.json");
+        market.fees_enabled = Some(false);
+        market.fee_schedule = None;
         let defs = parse_gamma_market(&market).unwrap();
         create_instrument_from_def(&defs[0], UnixNanos::from(1_000_000_000u64)).unwrap()
     }
@@ -514,7 +516,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_timestamp_ms() {
+    fn test_ws_market_data_timestamp_parser_is_unchanged() {
         let ns = parse_timestamp_ms("1703875200000").unwrap();
         assert_eq!(ns, UnixNanos::from(1_703_875_200_000_000_000u64));
     }

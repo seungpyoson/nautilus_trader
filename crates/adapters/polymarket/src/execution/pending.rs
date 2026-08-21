@@ -19,29 +19,89 @@ use std::sync::{Arc, Mutex};
 
 use ahash::{AHashMap, AHashSet};
 use nautilus_core::MUTEX_POISONED;
-use nautilus_model::identifiers::{ClientOrderId, VenueOrderId};
+use nautilus_model::{
+    identifiers::{ClientOrderId, VenueOrderId},
+    types::Quantity,
+};
 
-/// Maps an in-flight submit's expected venue order ID to its local client order ID, so the
-/// cache-free WS dispatch can resolve a tracked own order before the submit response lands.
+use super::order_fill_tracker::FillGrowthPolicy;
+
+#[derive(Clone, Copy, Debug)]
+struct PendingSubmit {
+    client_order_id: ClientOrderId,
+    submitted_qty: Quantity,
+    growth_policy: FillGrowthPolicy,
+}
+
+/// Maps an in-flight submit's expected venue order ID to the local identity and fill-growth
+/// authority needed before the submit response lands.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PendingSubmitTracker {
-    venue_to_client: Arc<Mutex<AHashMap<VenueOrderId, ClientOrderId>>>,
+    venue_to_submit: Arc<Mutex<AHashMap<VenueOrderId, PendingSubmit>>>,
 }
 
 impl PendingSubmitTracker {
-    pub(crate) fn insert(&self, venue_order_id: VenueOrderId, client_order_id: ClientOrderId) {
-        self.venue_to_client
+    pub(crate) fn clear(&self) {
+        self.venue_to_submit.lock().expect(MUTEX_POISONED).clear();
+    }
+
+    pub(crate) fn remove(&self, venue_order_id: &VenueOrderId) {
+        self.venue_to_submit
             .lock()
             .expect(MUTEX_POISONED)
-            .insert(venue_order_id, client_order_id);
+            .remove(venue_order_id);
+    }
+
+    pub(crate) fn insert_with_growth_policy(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_id: ClientOrderId,
+        submitted_qty: Quantity,
+        growth_policy: FillGrowthPolicy,
+    ) {
+        self.venue_to_submit.lock().expect(MUTEX_POISONED).insert(
+            venue_order_id,
+            PendingSubmit {
+                client_order_id,
+                submitted_qty,
+                growth_policy,
+            },
+        );
     }
 
     pub(crate) fn client_order_id(&self, venue_order_id: &VenueOrderId) -> Option<ClientOrderId> {
-        self.venue_to_client
+        self.venue_to_submit
             .lock()
             .expect(MUTEX_POISONED)
             .get(venue_order_id)
-            .copied()
+            .map(|submit| submit.client_order_id)
+    }
+
+    pub(crate) fn growth_policy(&self, venue_order_id: &VenueOrderId) -> Option<FillGrowthPolicy> {
+        self.venue_to_submit
+            .lock()
+            .expect(MUTEX_POISONED)
+            .get(venue_order_id)
+            .map(|submit| submit.growth_policy)
+    }
+
+    pub(crate) fn submitted_qty(&self, venue_order_id: &VenueOrderId) -> Option<Quantity> {
+        self.venue_to_submit
+            .lock()
+            .expect(MUTEX_POISONED)
+            .get(venue_order_id)
+            .map(|submit| submit.submitted_qty)
+    }
+
+    pub(crate) fn fill_validation_proof(
+        &self,
+        venue_order_id: &VenueOrderId,
+    ) -> Option<(Quantity, FillGrowthPolicy)> {
+        self.venue_to_submit
+            .lock()
+            .expect(MUTEX_POISONED)
+            .get(venue_order_id)
+            .map(|submit| (submit.submitted_qty, submit.growth_policy))
     }
 }
 
@@ -53,6 +113,10 @@ pub(crate) struct PendingCancelTracker {
 }
 
 impl PendingCancelTracker {
+    pub(crate) fn clear(&self) {
+        self.client_order_ids.lock().expect(MUTEX_POISONED).clear();
+    }
+
     pub(crate) fn insert(&self, client_order_id: ClientOrderId) {
         self.client_order_ids
             .lock()

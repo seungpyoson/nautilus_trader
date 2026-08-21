@@ -277,7 +277,8 @@ fn bench_compute_commission(c: &mut Criterion) {
                 black_box(dec!(25)),
                 black_box(dec!(0.50)),
                 black_box(LiquiditySide::Taker),
-            );
+            )
+            .unwrap();
             black_box(commission);
         });
     });
@@ -335,7 +336,7 @@ fn bench_event_filled_construct(c: &mut Criterion) {
     let strategy = StrategyId::from("S-BENCH");
     let cid = ClientOrderId::from("O-BENCH-F");
     let voi =
-        VenueOrderId::from("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12");
+        VenueOrderId::from("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
     let acct = account_id();
     let trade_id = TradeId::new("TRADE-1");
     let qty = Quantity::from("25");
@@ -378,7 +379,7 @@ fn bench_event_accepted_construct(c: &mut Criterion) {
     let strategy = StrategyId::from("S-BENCH");
     let cid = ClientOrderId::from("O-BENCH-A");
     let voi =
-        VenueOrderId::from("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12");
+        VenueOrderId::from("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
     let acct = account_id();
     let instrument_id = yes_instrument().id();
 

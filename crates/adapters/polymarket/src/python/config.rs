@@ -232,7 +232,7 @@ impl PolymarketExecClientConfig {
     /// derive list.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (trader_id=None, account_id=None, private_key=None, api_key=None, api_secret=None, passphrase=None, funder=None, signature_type=None, base_url_http=None, base_url_ws=None, base_url_data_api=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_enabled=None, transport_backend=None, proxy_url=None, instrument_config=None))]
+    #[pyo3(signature = (trader_id=None, account_id=None, private_key=None, api_key=None, api_secret=None, passphrase=None, funder=None, signature_type=None, base_url_http=None, base_url_ws=None, base_url_data_api=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, max_retained_execution_records=None, heartbeat_enabled=None, transport_backend=None, proxy_url=None, instrument_config=None))]
     fn py_new(
         trader_id: Option<String>,
         account_id: Option<String>,
@@ -249,6 +249,7 @@ impl PolymarketExecClientConfig {
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
+        max_retained_execution_records: Option<usize>,
         heartbeat_enabled: Option<bool>,
         transport_backend: Option<TransportBackend>,
         proxy_url: Option<String>,
@@ -273,6 +274,8 @@ impl PolymarketExecClientConfig {
             retry_delay_initial_ms: retry_delay_initial_ms
                 .unwrap_or(default.retry_delay_initial_ms),
             retry_delay_max_ms: retry_delay_max_ms.unwrap_or(default.retry_delay_max_ms),
+            max_retained_execution_records: max_retained_execution_records
+                .unwrap_or(default.max_retained_execution_records),
             heartbeat_enabled: heartbeat_enabled.unwrap_or(default.heartbeat_enabled),
             transport_backend: transport_backend.unwrap_or(default.transport_backend),
             instrument_config,
@@ -573,12 +576,19 @@ mod tests {
     #[rstest]
     fn direct_pyo3_exec_config_propagates_proxy_without_raw_getter() {
         const SECRET: &str = "exec-python-proxy-secret";
+        const MAX_RETAINED_EXECUTION_RECORDS: usize = 321;
         Python::initialize();
         Python::attach(|py| {
             let proxy_url = format!("https://exec-user:{SECRET}@127.0.0.1:18084");
             let kwargs = PyDict::new(py);
             kwargs.set_item("proxy_url", &proxy_url).unwrap();
             kwargs.set_item("heartbeat_enabled", true).unwrap();
+            kwargs
+                .set_item(
+                    "max_retained_execution_records",
+                    MAX_RETAINED_EXECUTION_RECORDS,
+                )
+                .unwrap();
             let cls = py.get_type::<PolymarketExecClientConfig>();
             let obj = cls
                 .call((), Some(&kwargs))
@@ -599,6 +609,10 @@ mod tests {
                 .expect("extract execution config");
 
             assert_eq!(config.proxy_url.as_deref(), Some(proxy_url.as_str()));
+            assert_eq!(
+                config.max_retained_execution_records,
+                MAX_RETAINED_EXECUTION_RECORDS,
+            );
             assert!(config.heartbeat_enabled);
             assert!(has_proxy_url);
             assert!(heartbeat_enabled);
