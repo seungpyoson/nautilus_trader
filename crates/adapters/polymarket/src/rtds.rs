@@ -1288,6 +1288,8 @@ impl PolymarketRtdsFeed {
         symbol_lower: &str,
         timestamp_ms: u64,
         guard: TimestampGuard,
+        // Runs under the subscription entry guard; keep it synchronous and do not access
+        // `inner.subscriptions` from the validator.
         validate: impl FnOnce() -> anyhow::Result<ValidatedPriceObservation>,
     ) -> anyhow::Result<Option<(ValidatedPriceObservation, Vec<DataType>)>> {
         let key = tracked_key(topic.as_str(), symbol_lower);
