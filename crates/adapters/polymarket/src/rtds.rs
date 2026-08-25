@@ -1014,12 +1014,14 @@ impl PolymarketRtdsFeed {
             &symbol_lower,
             payload.timestamp,
             TimestampGuard::Live,
-            validate_price_observation(
-                &payload.value,
-                None,
-                "payload.timestamp",
-                payload.timestamp,
-            ),
+            || {
+                validate_price_observation(
+                    &payload.value,
+                    None,
+                    "payload.timestamp",
+                    payload.timestamp,
+                )
+            },
         );
         let Some((observation, data_types)) = (match admitted {
             Ok(admitted) => admitted,
@@ -1059,7 +1061,14 @@ impl PolymarketRtdsFeed {
                 &symbol_lower,
                 point.timestamp,
                 TimestampGuard::Snapshot,
-                validate_price_observation(&point.value, None, "point.timestamp", point.timestamp),
+                || {
+                    validate_price_observation(
+                        &point.value,
+                        None,
+                        "point.timestamp",
+                        point.timestamp,
+                    )
+                },
             );
             let Some((observation, data_types)) = (match admitted {
                 Ok(admitted) => admitted,
@@ -1080,7 +1089,7 @@ impl PolymarketRtdsFeed {
                 ts_init,
             ));
 
-            self.emit_custom_payload(&custom_payload, data_types.clone());
+            self.emit_custom_payload(&custom_payload, data_types);
         }
     }
 
@@ -1145,12 +1154,14 @@ impl PolymarketRtdsFeed {
             &symbol_lower,
             payload.timestamp,
             TimestampGuard::Live,
-            validate_price_observation(
-                &payload.value,
-                payload.full_accuracy_value.as_deref(),
-                "payload.timestamp",
-                payload.timestamp,
-            ),
+            || {
+                validate_price_observation(
+                    &payload.value,
+                    payload.full_accuracy_value.as_deref(),
+                    "payload.timestamp",
+                    payload.timestamp,
+                )
+            },
         );
         let Some((observation, data_types)) = (match admitted {
             Ok(admitted) => admitted,
@@ -1193,7 +1204,14 @@ impl PolymarketRtdsFeed {
                 &symbol_lower,
                 point.timestamp,
                 TimestampGuard::Snapshot,
-                validate_price_observation(&point.value, None, "point.timestamp", point.timestamp),
+                || {
+                    validate_price_observation(
+                        &point.value,
+                        None,
+                        "point.timestamp",
+                        point.timestamp,
+                    )
+                },
             );
             let Some((observation, data_types)) = (match admitted {
                 Ok(admitted) => admitted,
@@ -1217,7 +1235,7 @@ impl PolymarketRtdsFeed {
                 ts_init,
             ));
 
-            self.emit_custom_payload(&custom_payload, data_types.clone());
+            self.emit_custom_payload(&custom_payload, data_types);
         }
     }
 
@@ -1270,7 +1288,7 @@ impl PolymarketRtdsFeed {
         symbol_lower: &str,
         timestamp_ms: u64,
         guard: TimestampGuard,
-        observation: anyhow::Result<ValidatedPriceObservation>,
+        validate: impl FnOnce() -> anyhow::Result<ValidatedPriceObservation>,
     ) -> anyhow::Result<Option<(ValidatedPriceObservation, Vec<DataType>)>> {
         let key = tracked_key(topic.as_str(), symbol_lower);
         let Some(mut subscription) = self.inner.subscriptions.get_mut(&key) else {
@@ -1280,7 +1298,12 @@ impl PolymarketRtdsFeed {
         if !guard.admits(subscription.last_price_timestamp_ms, timestamp_ms) {
             return Ok(None);
         }
-        let observation = observation?;
+
+        debug_assert!(
+            !subscription.data_types.is_empty(),
+            "tracked subscription {key} has no routed data types",
+        );
+        let observation = validate()?;
 
         subscription.last_price_timestamp_ms = Some(
             subscription
@@ -1752,11 +1775,11 @@ mod tests {
         update.to_string()
     }
 
-    fn collect_crypto_symbols(
+    fn collect_crypto_observations(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
         expected_count: usize,
-    ) -> Vec<String> {
-        let mut symbols = Vec::with_capacity(expected_count);
+    ) -> Vec<(String, u64)> {
+        let mut observations = Vec::with_capacity(expected_count);
         for _ in 0..expected_count {
             let event = rx.try_recv().expect("custom data event");
             let DataEvent::Data(NautilusData::Custom(custom)) = event else {
@@ -1767,10 +1790,20 @@ mod tests {
                 .as_any()
                 .downcast_ref::<PolymarketRtdsCryptoPrice>()
                 .expect("PolymarketRtdsCryptoPrice");
-            symbols.push(payload.symbol.clone());
+            observations.push((payload.symbol.clone(), payload.price_timestamp_ms));
         }
-        symbols.sort_unstable();
-        symbols
+        observations.sort_unstable();
+        observations
+    }
+
+    fn collect_crypto_symbols(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+        expected_count: usize,
+    ) -> Vec<String> {
+        collect_crypto_observations(rx, expected_count)
+            .into_iter()
+            .map(|(symbol, _)| symbol)
+            .collect()
     }
 
     async fn start_rtds_server(state: TestServerState) -> SocketAddr {
@@ -2513,6 +2546,16 @@ mod tests {
             .expect("track crypto price");
         assert_eq!(feed.tracked_data_type_count("crypto_prices:btcusdt"), 1);
 
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(RTDS_CRYPTO_SUBSCRIBE_FIXTURE).expect("parse fixture");
+        snapshot["payload"]["data"] = json!([
+            {"timestamp": timestamp_ms, "value": 61164.12}
+        ]);
+        feed.handle_text_message(&snapshot.to_string())
+            .expect("seed replay state before unsubscribe");
+        rx.try_recv().expect("seed custom data event");
+        assert!(rx.try_recv().is_err());
+
         assert!(
             feed.track_unsubscribe(&data_type)
                 .expect("unsubscribe final crypto price reference")
@@ -2523,12 +2566,14 @@ mod tests {
                 "btcusdt",
                 timestamp_ms,
                 TimestampGuard::Snapshot,
-                Ok(ValidatedPriceObservation {
-                    value: Price::from("61164.12"),
-                    full_accuracy_value: Price::from("61164.12"),
-                    ts_event: unix_nanos_from_millis("point.timestamp", timestamp_ms)
-                        .expect("valid point timestamp"),
-                }),
+                || {
+                    Ok(ValidatedPriceObservation {
+                        value: Price::from("61164.12"),
+                        full_accuracy_value: Price::from("61164.12"),
+                        ts_event: unix_nanos_from_millis("point.timestamp", timestamp_ms)
+                            .expect("valid point timestamp"),
+                    })
+                },
             )
             .expect("complete captured handler admission tail");
         assert!(tail_admission.is_none());
@@ -2537,11 +2582,6 @@ mod tests {
             feed.track_subscribe(data_type.clone())
                 .expect("resubscribe crypto price")
         );
-        let mut snapshot: serde_json::Value =
-            serde_json::from_str(RTDS_CRYPTO_SUBSCRIBE_FIXTURE).expect("parse fixture");
-        snapshot["payload"]["data"] = json!([
-            {"timestamp": timestamp_ms, "value": 61164.12}
-        ]);
         feed.handle_text_message(&snapshot.to_string())
             .expect("first replay after resubscribe");
 
@@ -2553,6 +2593,60 @@ mod tests {
         };
         assert_eq!(custom.data_type, data_type);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_price_admission_skips_validation_for_untracked_and_stale_observations() {
+        let (feed, _rx) = make_feed();
+        let timestamp_ms = 1780726209000_u64;
+        let validation_calls = std::cell::Cell::new(0_u8);
+        let validate = |timestamp_ms| {
+            validation_calls.set(validation_calls.get() + 1);
+            Ok(ValidatedPriceObservation {
+                value: Price::from("61164.12"),
+                full_accuracy_value: Price::from("61164.12"),
+                ts_event: unix_nanos_from_millis("point.timestamp", timestamp_ms)
+                    .expect("valid point timestamp"),
+            })
+        };
+
+        let untracked = feed
+            .admit_price_observation(
+                RtdsTopic::CryptoPrices,
+                "alpha/usd",
+                timestamp_ms,
+                TimestampGuard::Snapshot,
+                || validate(timestamp_ms),
+            )
+            .expect("untracked observation admission");
+        assert!(untracked.is_none());
+        assert_eq!(validation_calls.get(), 0);
+
+        feed.track_subscribe(crypto_data_type("alpha/usd"))
+            .expect("track crypto price");
+        let admitted = feed
+            .admit_price_observation(
+                RtdsTopic::CryptoPrices,
+                "alpha/usd",
+                timestamp_ms,
+                TimestampGuard::Snapshot,
+                || validate(timestamp_ms),
+            )
+            .expect("admit current observation");
+        assert!(admitted.is_some());
+        assert_eq!(validation_calls.get(), 1);
+
+        let stale = feed
+            .admit_price_observation(
+                RtdsTopic::CryptoPrices,
+                "alpha/usd",
+                timestamp_ms - 1,
+                TimestampGuard::Snapshot,
+                || validate(timestamp_ms - 1),
+            )
+            .expect("stale observation admission");
+        assert!(stale.is_none());
+        assert_eq!(validation_calls.get(), 1);
     }
 
     #[rstest]
@@ -3138,6 +3232,120 @@ mod tests {
             assert_eq!(payload.value, Price::from(expected_value));
             assert_eq!(payload.price_timestamp_ms, 1786179814000);
         }
+    }
+
+    #[rstest]
+    fn test_handle_crypto_price_update_drops_strictly_older_point() {
+        let (feed, mut rx) = make_feed();
+        feed.track_subscribe(crypto_data_type("alpha/usd"))
+            .expect("track symbol");
+
+        feed.handle_text_message(&build_crypto_update(
+            "alpha/usd",
+            "65000.12",
+            1786179815000,
+            1786179815147,
+        ))
+        .expect("valid newer update");
+        feed.handle_text_message(&build_crypto_update(
+            "alpha/usd",
+            "64997.81",
+            1786179814000,
+            1786179814147,
+        ))
+        .expect("valid older update");
+
+        let observations = collect_crypto_observations(&mut rx, 1);
+        assert_eq!(observations, vec![("alpha/usd".to_string(), 1786179815000)]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_price_replay_high_water_is_isolated_by_symbol_on_shared_topic() {
+        let (feed, mut rx) = make_feed();
+        feed.track_subscribe(crypto_data_type("alpha/usd"))
+            .expect("track first symbol");
+        feed.track_subscribe(crypto_data_type("beta/usd"))
+            .expect("track second symbol");
+
+        feed.handle_text_message(&build_crypto_update(
+            "alpha/usd",
+            "65000.12",
+            1786179815000,
+            1786179815147,
+        ))
+        .expect("valid first-symbol update");
+        feed.handle_text_message(&build_crypto_update(
+            "beta/usd",
+            "2450.11",
+            1786179814000,
+            1786179814147,
+        ))
+        .expect("valid older second-symbol update");
+
+        assert_eq!(
+            collect_crypto_observations(&mut rx, 2),
+            vec![
+                ("alpha/usd".to_string(), 1786179815000),
+                ("beta/usd".to_string(), 1786179814000),
+            ]
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_price_replay_state_and_routing_survive_partial_unsubscribe() {
+        let (feed, mut rx) = make_feed();
+        let first_data_type = crypto_data_type("ALPHA/USD");
+        let remaining_data_type = crypto_data_type("alpha/usd");
+        let timestamp_ms = 1780726209000_u64;
+        feed.track_subscribe(first_data_type.clone())
+            .expect("track first consumer");
+        feed.track_subscribe(remaining_data_type.clone())
+            .expect("track second consumer");
+
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(RTDS_CRYPTO_SUBSCRIBE_FIXTURE).expect("parse fixture");
+        snapshot["payload"]["symbol"] = json!("alpha/usd");
+        snapshot["payload"]["data"] = json!([
+            {"timestamp": timestamp_ms, "value": 61164.12}
+        ]);
+        feed.handle_text_message(&snapshot.to_string())
+            .expect("seed shared replay state");
+
+        let mut routed_data_types = Vec::new();
+
+        for _ in 0..2 {
+            let DataEvent::Data(NautilusData::Custom(custom)) =
+                rx.try_recv().expect("fan-out custom data event")
+            else {
+                panic!("expected custom data event");
+            };
+            routed_data_types.push(custom.data_type.clone());
+        }
+        assert!(routed_data_types.contains(&first_data_type));
+        assert!(routed_data_types.contains(&remaining_data_type));
+        assert!(rx.try_recv().is_err());
+
+        assert!(
+            !feed
+                .track_unsubscribe(&first_data_type)
+                .expect("unsubscribe one consumer")
+        );
+        feed.handle_text_message(&snapshot.to_string())
+            .expect("replayed snapshot after partial unsubscribe");
+        assert!(rx.try_recv().is_err());
+
+        snapshot["payload"]["data"][0]["timestamp"] = json!(timestamp_ms + 1);
+        feed.handle_text_message(&snapshot.to_string())
+            .expect("new snapshot point for remaining consumer");
+        let DataEvent::Data(NautilusData::Custom(custom)) =
+            rx.try_recv().expect("remaining custom data event")
+        else {
+            panic!("expected custom data event");
+        };
+        assert_eq!(custom.data_type, remaining_data_type);
+        assert!(rx.try_recv().is_err());
     }
 
     #[rstest]
@@ -3953,10 +4161,10 @@ mod tests {
             tx,
         );
 
-        feed.track_subscribe(crypto_data_type("BTCUSDT"))
-            .expect("track BTC");
-        feed.track_subscribe(crypto_data_type("ETHUSDT"))
-            .expect("track ETH");
+        feed.track_subscribe(crypto_data_type("ALPHA/USD"))
+            .expect("track first symbol");
+        feed.track_subscribe(crypto_data_type("BETA/USD"))
+            .expect("track second symbol");
         feed.connect().await.expect("connect feed");
 
         wait_until_async(
@@ -3973,15 +4181,15 @@ mod tests {
 
         state
             .send_text_to_all(build_crypto_update(
-                "btcusdt",
-                "61035.86",
+                "alpha/usd",
+                "65000.12",
                 1780730269000,
                 1780730269142,
             ))
             .await;
         state
             .send_text_to_all(build_crypto_update(
-                "ethusdt",
+                "beta/usd",
                 "2450.11",
                 1780730270000,
                 1780730270142,
@@ -3991,7 +4199,7 @@ mod tests {
         wait_until_async(|| async { rx.len() >= 2 }, Duration::from_secs(2)).await;
         assert_eq!(
             collect_crypto_symbols(&mut rx, 2),
-            vec!["btcusdt".to_string(), "ethusdt".to_string()],
+            vec!["alpha/usd".to_string(), "beta/usd".to_string()],
             "both retained symbols should emit before disconnect",
         );
 
@@ -4012,15 +4220,31 @@ mod tests {
 
         state
             .send_text_to_all(build_crypto_update(
-                "btcusdt",
-                "61040.12",
+                "alpha/usd",
+                "64997.81",
+                1780730268000,
+                1780730268142,
+            ))
+            .await;
+        state
+            .send_text_to_all(build_crypto_update(
+                "beta/usd",
+                "2445.55",
+                1780730269000,
+                1780730269142,
+            ))
+            .await;
+        state
+            .send_text_to_all(build_crypto_update(
+                "alpha/usd",
+                "65001.12",
                 1780730271000,
                 1780730271142,
             ))
             .await;
         state
             .send_text_to_all(build_crypto_update(
-                "ethusdt",
+                "beta/usd",
                 "2455.55",
                 1780730272000,
                 1780730272142,
@@ -4029,10 +4253,14 @@ mod tests {
 
         wait_until_async(|| async { rx.len() >= 2 }, Duration::from_secs(2)).await;
         assert_eq!(
-            collect_crypto_symbols(&mut rx, 2),
-            vec!["btcusdt".to_string(), "ethusdt".to_string()],
-            "both retained symbols should resume after server-side reconnect",
+            collect_crypto_observations(&mut rx, 2),
+            vec![
+                ("alpha/usd".to_string(), 1780730271000),
+                ("beta/usd".to_string(), 1780730272000),
+            ],
+            "reconnect should retain each symbol's replay high-water mark",
         );
+        assert!(rx.try_recv().is_err());
 
         feed.disconnect().await;
     }
