@@ -87,7 +87,6 @@ struct PolymarketRtdsFeedInner {
     socket_sink: Option<SocketStateSink>,
     socket_control: Option<SocketControl>,
     subscriptions: dashmap::DashMap<String, TrackedSubscription>,
-    last_emitted_timestamps_ms: dashmap::DashMap<String, u64>,
     // Tracks the last venue state we successfully pushed so incremental syncs
     // can send only the delta from desired state to live wire state.
     live_subscriptions: StdMutex<AHashMap<String, RtdsWireSubscription>>,
@@ -112,6 +111,7 @@ struct TrackedSubscription {
     wire: RtdsWireSubscription,
     total_ref_count: usize,
     data_types: AHashMap<String, TrackedDataType>,
+    last_price_timestamp_ms: Option<u64>,
     last_twap_fingerprint: Option<TwapReplayFingerprint>,
 }
 
@@ -199,6 +199,16 @@ enum TimestampGuard {
     Live,
 }
 
+impl TimestampGuard {
+    fn admits(self, last_seen: Option<u64>, timestamp_ms: u64) -> bool {
+        match (self, last_seen) {
+            (_, None) => true,
+            (Self::Snapshot, Some(last_seen)) => timestamp_ms > last_seen,
+            (Self::Live, Some(last_seen)) => timestamp_ms >= last_seen,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ReconcileReason {
     DesiredChanged,
@@ -273,6 +283,12 @@ struct EquitySubscribePayloadRaw {
 struct SnapshotPointRaw {
     timestamp: u64,
     value: Number,
+}
+
+struct ValidatedPriceObservation {
+    value: Price,
+    full_accuracy_value: Price,
+    ts_event: UnixNanos,
 }
 
 impl PolymarketRtdsFeed {
@@ -362,7 +378,6 @@ impl PolymarketRtdsFeed {
                 socket_sink,
                 socket_control,
                 subscriptions: dashmap::DashMap::new(),
-                last_emitted_timestamps_ms: dashmap::DashMap::new(),
                 live_subscriptions: StdMutex::new(AHashMap::new()),
                 ws_client: StdMutex::new(None),
                 message_task_handle: StdMutex::new(None),
@@ -395,6 +410,7 @@ impl PolymarketRtdsFeed {
                 wire: parsed.wire.clone(),
                 total_ref_count: 0,
                 data_types: AHashMap::new(),
+                last_price_timestamp_ms: None,
                 last_twap_fingerprint: None,
             });
 
@@ -416,7 +432,7 @@ impl PolymarketRtdsFeed {
 
     pub(crate) fn track_unsubscribe(&self, data_type: &DataType) -> anyhow::Result<bool> {
         let parsed = ParsedSubscription::from_data_type(data_type)?;
-        let mut entry = match self.inner.subscriptions.entry(parsed.key.clone()) {
+        let mut entry = match self.inner.subscriptions.entry(parsed.key) {
             dashmap::mapref::entry::Entry::Occupied(entry) => entry,
             dashmap::mapref::entry::Entry::Vacant(_) => return Ok(false),
         };
@@ -440,7 +456,6 @@ impl PolymarketRtdsFeed {
             }
         }
 
-        self.inner.last_emitted_timestamps_ms.remove(&parsed.key);
         entry.remove();
         Ok(true)
     }
@@ -998,36 +1013,36 @@ impl PolymarketRtdsFeed {
         };
 
         let symbol_lower = payload.symbol.to_ascii_lowercase();
-        let data_types = self.matching_data_types(RtdsTopic::CryptoPrices, &symbol_lower);
-        if data_types.is_empty() {
-            return;
-        }
-
-        if !self.should_emit_timestamp_ms(
+        let admitted = self.admit_price_observation(
             RtdsTopic::CryptoPrices,
             &symbol_lower,
             payload.timestamp,
             TimestampGuard::Live,
-        ) {
-            return;
-        }
-
-        let value = match price_from_json_number("value", &payload.value) {
-            Ok(value) => value,
+            || {
+                validate_price_observation(
+                    &payload.value,
+                    None,
+                    "payload.timestamp",
+                    payload.timestamp,
+                )
+            },
+        );
+        let Some((observation, data_types)) = (match admitted {
+            Ok(admitted) => admitted,
             Err(e) => {
-                log::error!("Failed to parse RTDS crypto price value: {e}");
+                log::error!("Failed to validate RTDS crypto price update: {e}");
                 return;
             }
+        }) else {
+            return;
         };
-
-        let ts_event = UnixNanos::from_millis(payload.timestamp);
         let ts_init = self.inner.clock.get_time_ns();
         let custom_payload = Arc::new(PolymarketRtdsCryptoPrice::new(
             symbol_lower,
-            value,
+            observation.value,
             payload.timestamp,
             envelope.timestamp,
-            ts_event,
+            observation.ts_event,
             ts_init,
         ));
 
@@ -1044,41 +1059,41 @@ impl PolymarketRtdsFeed {
         };
 
         let symbol_lower = payload.symbol.to_ascii_lowercase();
-        let data_types = self.matching_data_types(RtdsTopic::CryptoPrices, &symbol_lower);
-        if data_types.is_empty() {
-            return;
-        }
-
         for point in payload.data {
-            let value = match price_from_json_number("value", &point.value) {
-                Ok(value) => value,
-                Err(e) => {
-                    log::error!("Failed to parse RTDS crypto subscribe value: {e}");
-                    continue;
-                }
-            };
-
-            if !self.should_emit_timestamp_ms(
+            let admitted = self.admit_price_observation(
                 RtdsTopic::CryptoPrices,
                 &symbol_lower,
                 point.timestamp,
                 TimestampGuard::Snapshot,
-            ) {
+                || {
+                    validate_price_observation(
+                        &point.value,
+                        None,
+                        "point.timestamp",
+                        point.timestamp,
+                    )
+                },
+            );
+            let Some((observation, data_types)) = (match admitted {
+                Ok(admitted) => admitted,
+                Err(e) => {
+                    log::error!("Failed to validate RTDS crypto snapshot point: {e}");
+                    continue;
+                }
+            }) else {
                 continue;
-            }
-
-            let ts_event = UnixNanos::from_millis(point.timestamp);
+            };
             let ts_init = self.inner.clock.get_time_ns();
             let custom_payload = Arc::new(PolymarketRtdsCryptoPrice::new(
                 symbol_lower.clone(),
-                value,
+                observation.value,
                 point.timestamp,
                 envelope.timestamp,
-                ts_event,
+                observation.ts_event,
                 ts_init,
             ));
 
-            self.emit_custom_payload(&custom_payload, data_types.clone());
+            self.emit_custom_payload(&custom_payload, data_types);
         }
     }
 
@@ -1138,52 +1153,39 @@ impl PolymarketRtdsFeed {
         };
 
         let symbol_lower = payload.symbol.to_ascii_lowercase();
-        let data_types = self.matching_data_types(RtdsTopic::EquityPrices, &symbol_lower);
-        if data_types.is_empty() {
-            return;
-        }
-
-        if !self.should_emit_timestamp_ms(
+        let admitted = self.admit_price_observation(
             RtdsTopic::EquityPrices,
             &symbol_lower,
             payload.timestamp,
             TimestampGuard::Live,
-        ) {
-            return;
-        }
-
-        let value = match price_from_json_number("value", &payload.value) {
-            Ok(value) => value,
+            || {
+                validate_price_observation(
+                    &payload.value,
+                    payload.full_accuracy_value.as_deref(),
+                    "payload.timestamp",
+                    payload.timestamp,
+                )
+            },
+        );
+        let Some((observation, data_types)) = (match admitted {
+            Ok(admitted) => admitted,
             Err(e) => {
-                log::error!("Failed to parse RTDS equity price value: {e}");
+                log::error!("Failed to validate RTDS equity price update: {e}");
                 return;
             }
+        }) else {
+            return;
         };
-
-        let full_accuracy_value = match payload.full_accuracy_value {
-            Some(full_accuracy_value) => {
-                match price_from_str("full_accuracy_value", full_accuracy_value.as_str()) {
-                    Ok(value) => value,
-                    Err(e) => {
-                        log::error!("Failed to parse RTDS equity full_accuracy_value: {e}");
-                        return;
-                    }
-                }
-            }
-            None => value,
-        };
-
-        let ts_event = UnixNanos::from_millis(payload.timestamp);
         let ts_init = self.inner.clock.get_time_ns();
         let custom_payload = Arc::new(PolymarketRtdsEquityPrice::new(
             symbol_lower,
-            value,
-            full_accuracy_value,
+            observation.value,
+            observation.full_accuracy_value,
             payload.timestamp,
             envelope.timestamp,
             payload.received_at,
             payload.is_carried_forward.unwrap_or(false),
-            ts_event,
+            observation.ts_event,
             ts_init,
         ));
 
@@ -1200,44 +1202,44 @@ impl PolymarketRtdsFeed {
         };
 
         let symbol_lower = payload.symbol.to_ascii_lowercase();
-        let data_types = self.matching_data_types(RtdsTopic::EquityPrices, &symbol_lower);
-        if data_types.is_empty() {
-            return;
-        }
-
         for point in payload.data {
-            let value = match price_from_json_number("value", &point.value) {
-                Ok(value) => value,
-                Err(e) => {
-                    log::error!("Failed to parse RTDS equity subscribe value: {e}");
-                    continue;
-                }
-            };
-
-            if !self.should_emit_timestamp_ms(
+            let admitted = self.admit_price_observation(
                 RtdsTopic::EquityPrices,
                 &symbol_lower,
                 point.timestamp,
                 TimestampGuard::Snapshot,
-            ) {
+                || {
+                    validate_price_observation(
+                        &point.value,
+                        None,
+                        "point.timestamp",
+                        point.timestamp,
+                    )
+                },
+            );
+            let Some((observation, data_types)) = (match admitted {
+                Ok(admitted) => admitted,
+                Err(e) => {
+                    log::error!("Failed to validate RTDS equity snapshot point: {e}");
+                    continue;
+                }
+            }) else {
                 continue;
-            }
-
-            let ts_event = UnixNanos::from_millis(point.timestamp);
+            };
             let ts_init = self.inner.clock.get_time_ns();
             let custom_payload = Arc::new(PolymarketRtdsEquityPrice::new(
                 symbol_lower.clone(),
-                value,
-                value,
+                observation.value,
+                observation.full_accuracy_value,
                 point.timestamp,
                 envelope.timestamp,
                 None,
                 false,
-                ts_event,
+                observation.ts_event,
                 ts_init,
             ));
 
-            self.emit_custom_payload(&custom_payload, data_types.clone());
+            self.emit_custom_payload(&custom_payload, data_types);
         }
     }
 
@@ -1256,21 +1258,6 @@ impl PolymarketRtdsFeed {
                 log::error!("Failed to emit RTDS custom data: {e}");
             }
         }
-    }
-
-    fn matching_data_types(&self, topic: RtdsTopic, symbol_lower: &str) -> Vec<DataType> {
-        let key = tracked_key(topic.as_str(), symbol_lower);
-        self.inner
-            .subscriptions
-            .get(&key)
-            .map(|entry| {
-                entry
-                    .data_types
-                    .values()
-                    .map(|tracked| tracked.data_type.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     fn has_topic_subscription(&self, topic: &str) -> bool {
@@ -1299,37 +1286,42 @@ impl PolymarketRtdsFeed {
         }
     }
 
-    fn should_emit_timestamp_ms(
+    fn admit_price_observation(
         &self,
         topic: RtdsTopic,
         symbol_lower: &str,
         timestamp_ms: u64,
         guard: TimestampGuard,
-    ) -> bool {
+        // Runs under the subscription entry guard; keep it synchronous and do not access
+        // `inner.subscriptions` from the validator.
+        validate: impl FnOnce() -> anyhow::Result<ValidatedPriceObservation>,
+    ) -> anyhow::Result<Option<(ValidatedPriceObservation, Vec<DataType>)>> {
         let key = tracked_key(topic.as_str(), symbol_lower);
-        match self.inner.last_emitted_timestamps_ms.get_mut(&key) {
-            Some(mut last_seen) => {
-                let stale = match guard {
-                    TimestampGuard::Snapshot => timestamp_ms <= *last_seen,
-                    TimestampGuard::Live => timestamp_ms < *last_seen,
-                };
+        let Some(mut subscription) = self.inner.subscriptions.get_mut(&key) else {
+            return Ok(None);
+        };
 
-                if stale {
-                    false
-                } else {
-                    if timestamp_ms > *last_seen {
-                        *last_seen = timestamp_ms;
-                    }
-                    true
-                }
-            }
-            None => {
-                self.inner
-                    .last_emitted_timestamps_ms
-                    .insert(key, timestamp_ms);
-                true
-            }
+        if !guard.admits(subscription.last_price_timestamp_ms, timestamp_ms) {
+            return Ok(None);
         }
+
+        debug_assert!(
+            !subscription.data_types.is_empty(),
+            "tracked subscription {key} has no routed data types",
+        );
+        let observation = validate()?;
+
+        subscription.last_price_timestamp_ms = Some(
+            subscription
+                .last_price_timestamp_ms
+                .map_or(timestamp_ms, |last_seen| last_seen.max(timestamp_ms)),
+        );
+        let data_types = subscription
+            .data_types
+            .values()
+            .map(|tracked| tracked.data_type.clone())
+            .collect();
+        Ok(Some((observation, data_types)))
     }
 
     fn admit_twap_observation(
@@ -1464,6 +1456,25 @@ fn unix_nanos_from_millis(field: &str, value: u64) -> anyhow::Result<UnixNanos> 
         .with_context(|| format!("millisecond timestamp out of range for {field}: {value}"))?;
     UnixNanos::from_millis_checked(millis)
         .with_context(|| format!("millisecond timestamp overflows UnixNanos for {field}: {value}"))
+}
+
+fn validate_price_observation(
+    value: &Number,
+    full_accuracy_value: Option<&str>,
+    event_field: &str,
+    event_timestamp_ms: u64,
+) -> anyhow::Result<ValidatedPriceObservation> {
+    let value = price_from_json_number("value", value)?;
+    let full_accuracy_value = full_accuracy_value
+        .map(|value| price_from_str("full_accuracy_value", value))
+        .transpose()?
+        .unwrap_or(value);
+    let ts_event = unix_nanos_from_millis(event_field, event_timestamp_ms)?;
+    Ok(ValidatedPriceObservation {
+        value,
+        full_accuracy_value,
+        ts_event,
+    })
 }
 
 fn price_from_json_number(field: &str, number: &Number) -> anyhow::Result<Price> {
@@ -1770,11 +1781,11 @@ mod tests {
         update.to_string()
     }
 
-    fn collect_crypto_symbols(
+    fn collect_crypto_observations(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
         expected_count: usize,
-    ) -> Vec<String> {
-        let mut symbols = Vec::with_capacity(expected_count);
+    ) -> Vec<(String, u64)> {
+        let mut observations = Vec::with_capacity(expected_count);
         for _ in 0..expected_count {
             let event = rx.try_recv().expect("custom data event");
             let DataEvent::Data(NautilusData::Custom(custom)) = event else {
@@ -1785,10 +1796,20 @@ mod tests {
                 .as_any()
                 .downcast_ref::<PolymarketRtdsCryptoPrice>()
                 .expect("PolymarketRtdsCryptoPrice");
-            symbols.push(payload.symbol.clone());
+            observations.push((payload.symbol.clone(), payload.price_timestamp_ms));
         }
-        symbols.sort_unstable();
-        symbols
+        observations.sort_unstable();
+        observations
+    }
+
+    fn collect_crypto_symbols(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+        expected_count: usize,
+    ) -> Vec<String> {
+        collect_crypto_observations(rx, expected_count)
+            .into_iter()
+            .map(|(symbol, _)| symbol)
+            .collect()
     }
 
     async fn start_rtds_server(state: TestServerState) -> SocketAddr {
@@ -2500,10 +2521,10 @@ mod tests {
         feed.track_subscribe(data_type.clone())
             .expect("track 60-second TWAP");
 
-        let captured_data_types =
-            feed.matching_data_types(RtdsTopic::CryptoPricesTwapSixty, "btc/usd");
-        assert_eq!(captured_data_types.len(), 1);
-        assert_eq!(captured_data_types[0], data_type);
+        assert_eq!(
+            feed.tracked_data_type_count("crypto_prices_twap_sixty:btc/usd"),
+            1,
+        );
 
         assert!(
             feed.track_unsubscribe(&data_type)
@@ -2540,6 +2561,118 @@ mod tests {
         assert_eq!(payload.value, exact_value);
         assert_eq!(payload.observation_timestamp_ms, observation_timestamp_ms);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_price_inflight_tail_cannot_poison_resubscribe_replay() {
+        let (feed, mut rx) = make_feed();
+        let data_type = crypto_data_type("BTCUSDT");
+        let timestamp_ms = 1780726209000_u64;
+        feed.track_subscribe(data_type.clone())
+            .expect("track crypto price");
+        assert_eq!(feed.tracked_data_type_count("crypto_prices:btcusdt"), 1);
+
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(RTDS_CRYPTO_SUBSCRIBE_FIXTURE).expect("parse fixture");
+        snapshot["payload"]["data"] = json!([
+            {"timestamp": timestamp_ms, "value": 61164.12}
+        ]);
+        feed.handle_text_message(&snapshot.to_string())
+            .expect("seed replay state before unsubscribe");
+        rx.try_recv().expect("seed custom data event");
+        assert!(rx.try_recv().is_err());
+
+        assert!(
+            feed.track_unsubscribe(&data_type)
+                .expect("unsubscribe final crypto price reference")
+        );
+        let tail_admission = feed
+            .admit_price_observation(
+                RtdsTopic::CryptoPrices,
+                "btcusdt",
+                timestamp_ms,
+                TimestampGuard::Snapshot,
+                || {
+                    Ok(ValidatedPriceObservation {
+                        value: Price::from("61164.12"),
+                        full_accuracy_value: Price::from("61164.12"),
+                        ts_event: unix_nanos_from_millis("point.timestamp", timestamp_ms)
+                            .expect("valid point timestamp"),
+                    })
+                },
+            )
+            .expect("complete captured handler admission tail");
+        assert!(tail_admission.is_none());
+
+        assert!(
+            feed.track_subscribe(data_type.clone())
+                .expect("resubscribe crypto price")
+        );
+        feed.handle_text_message(&snapshot.to_string())
+            .expect("first replay after resubscribe");
+
+        let DataEvent::Data(NautilusData::Custom(custom)) = rx
+            .try_recv()
+            .expect("first replay must emit after resubscribe")
+        else {
+            panic!("expected custom data event");
+        };
+        assert_eq!(custom.data_type, data_type);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_price_admission_skips_validation_for_untracked_and_stale_observations() {
+        let (feed, _rx) = make_feed();
+        let timestamp_ms = 1780726209000_u64;
+        let validation_calls = std::cell::Cell::new(0_u8);
+        let validate = |timestamp_ms| {
+            validation_calls.set(validation_calls.get() + 1);
+            Ok(ValidatedPriceObservation {
+                value: Price::from("61164.12"),
+                full_accuracy_value: Price::from("61164.12"),
+                ts_event: unix_nanos_from_millis("point.timestamp", timestamp_ms)
+                    .expect("valid point timestamp"),
+            })
+        };
+
+        let untracked = feed
+            .admit_price_observation(
+                RtdsTopic::CryptoPrices,
+                "alpha/usd",
+                timestamp_ms,
+                TimestampGuard::Snapshot,
+                || validate(timestamp_ms),
+            )
+            .expect("untracked observation admission");
+        assert!(untracked.is_none());
+        assert_eq!(validation_calls.get(), 0);
+
+        feed.track_subscribe(crypto_data_type("alpha/usd"))
+            .expect("track crypto price");
+        let admitted = feed
+            .admit_price_observation(
+                RtdsTopic::CryptoPrices,
+                "alpha/usd",
+                timestamp_ms,
+                TimestampGuard::Snapshot,
+                || validate(timestamp_ms),
+            )
+            .expect("admit current observation");
+        assert!(admitted.is_some());
+        assert_eq!(validation_calls.get(), 1);
+
+        let stale = feed
+            .admit_price_observation(
+                RtdsTopic::CryptoPrices,
+                "alpha/usd",
+                timestamp_ms - 1,
+                TimestampGuard::Snapshot,
+                || validate(timestamp_ms - 1),
+            )
+            .expect("stale observation admission");
+        assert!(stale.is_none());
+        assert_eq!(validation_calls.get(), 1);
     }
 
     #[rstest]
@@ -2995,6 +3128,66 @@ mod tests {
     }
 
     #[rstest]
+    #[case::u64_range(u64::MAX)]
+    #[case::nanosecond_range(i64::MAX as u64)]
+    fn test_handle_crypto_price_update_rejects_timestamp_overflow_without_poisoning_replay(
+        #[case] invalid_timestamp_ms: u64,
+    ) {
+        let (feed, mut rx) = make_feed();
+        feed.track_subscribe(crypto_data_type("btcusdt"))
+            .expect("track subscribe");
+
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(RTDS_CRYPTO_UPDATE_FIXTURE).expect("parse fixture");
+        invalid["payload"]["timestamp"] = json!(invalid_timestamp_ms);
+
+        feed.handle_text_message(&invalid.to_string())
+            .expect("invalid timestamp should be rejected without failing the message loop");
+        assert!(rx.try_recv().is_err());
+
+        feed.handle_text_message(RTDS_CRYPTO_UPDATE_FIXTURE)
+            .expect("valid update after invalid timestamp");
+
+        let event = rx.try_recv().expect("valid custom data event");
+        let DataEvent::Data(NautilusData::Custom(custom)) = event else {
+            panic!("expected custom data event");
+        };
+        let payload = custom
+            .data
+            .as_any()
+            .downcast_ref::<PolymarketRtdsCryptoPrice>()
+            .expect("PolymarketRtdsCryptoPrice");
+
+        assert_eq!(payload.price_timestamp_ms, 1786179814000);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_handle_crypto_price_update_rejects_invalid_value_without_poisoning_replay() {
+        let (feed, mut rx) = make_feed();
+        feed.track_subscribe(crypto_data_type("btcusdt"))
+            .expect("track subscribe");
+
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(RTDS_CRYPTO_UPDATE_FIXTURE).expect("parse fixture");
+        invalid["payload"]["timestamp"] = json!(1786179815000_u64);
+        invalid["payload"]["value"] =
+            serde_json::from_str("1e100").expect("parse out-of-range JSON number");
+
+        feed.handle_text_message(&invalid.to_string())
+            .expect("invalid value should be rejected without failing the message loop");
+        assert!(rx.try_recv().is_err());
+
+        feed.handle_text_message(RTDS_CRYPTO_UPDATE_FIXTURE)
+            .expect("valid update after invalid value");
+        assert!(
+            rx.try_recv().is_ok(),
+            "valid lower-timestamp update must emit"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
     fn test_handle_crypto_price_update_emits_custom_data_for_new_symbol_on_shared_topic() {
         let (feed, mut rx) = make_feed();
         feed.track_subscribe(crypto_data_type("btcusdt"))
@@ -3068,6 +3261,120 @@ mod tests {
     }
 
     #[rstest]
+    fn test_handle_crypto_price_update_drops_strictly_older_point() {
+        let (feed, mut rx) = make_feed();
+        feed.track_subscribe(crypto_data_type("alpha/usd"))
+            .expect("track symbol");
+
+        feed.handle_text_message(&build_crypto_update(
+            "alpha/usd",
+            "65000.12",
+            1786179815000,
+            1786179815147,
+        ))
+        .expect("valid newer update");
+        feed.handle_text_message(&build_crypto_update(
+            "alpha/usd",
+            "64997.81",
+            1786179814000,
+            1786179814147,
+        ))
+        .expect("valid older update");
+
+        let observations = collect_crypto_observations(&mut rx, 1);
+        assert_eq!(observations, vec![("alpha/usd".to_string(), 1786179815000)]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_price_replay_high_water_is_isolated_by_symbol_on_shared_topic() {
+        let (feed, mut rx) = make_feed();
+        feed.track_subscribe(crypto_data_type("alpha/usd"))
+            .expect("track first symbol");
+        feed.track_subscribe(crypto_data_type("beta/usd"))
+            .expect("track second symbol");
+
+        feed.handle_text_message(&build_crypto_update(
+            "alpha/usd",
+            "65000.12",
+            1786179815000,
+            1786179815147,
+        ))
+        .expect("valid first-symbol update");
+        feed.handle_text_message(&build_crypto_update(
+            "beta/usd",
+            "2450.11",
+            1786179814000,
+            1786179814147,
+        ))
+        .expect("valid older second-symbol update");
+
+        assert_eq!(
+            collect_crypto_observations(&mut rx, 2),
+            vec![
+                ("alpha/usd".to_string(), 1786179815000),
+                ("beta/usd".to_string(), 1786179814000),
+            ]
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_price_replay_state_and_routing_survive_partial_unsubscribe() {
+        let (feed, mut rx) = make_feed();
+        let first_data_type = crypto_data_type("ALPHA/USD");
+        let remaining_data_type = crypto_data_type("alpha/usd");
+        let timestamp_ms = 1780726209000_u64;
+        feed.track_subscribe(first_data_type.clone())
+            .expect("track first consumer");
+        feed.track_subscribe(remaining_data_type.clone())
+            .expect("track second consumer");
+
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(RTDS_CRYPTO_SUBSCRIBE_FIXTURE).expect("parse fixture");
+        snapshot["payload"]["symbol"] = json!("alpha/usd");
+        snapshot["payload"]["data"] = json!([
+            {"timestamp": timestamp_ms, "value": 61164.12}
+        ]);
+        feed.handle_text_message(&snapshot.to_string())
+            .expect("seed shared replay state");
+
+        let mut routed_data_types = Vec::new();
+
+        for _ in 0..2 {
+            let DataEvent::Data(NautilusData::Custom(custom)) =
+                rx.try_recv().expect("fan-out custom data event")
+            else {
+                panic!("expected custom data event");
+            };
+            routed_data_types.push(custom.data_type.clone());
+        }
+        assert!(routed_data_types.contains(&first_data_type));
+        assert!(routed_data_types.contains(&remaining_data_type));
+        assert!(rx.try_recv().is_err());
+
+        assert!(
+            !feed
+                .track_unsubscribe(&first_data_type)
+                .expect("unsubscribe one consumer")
+        );
+        feed.handle_text_message(&snapshot.to_string())
+            .expect("replayed snapshot after partial unsubscribe");
+        assert!(rx.try_recv().is_err());
+
+        snapshot["payload"]["data"][0]["timestamp"] = json!(timestamp_ms + 1);
+        feed.handle_text_message(&snapshot.to_string())
+            .expect("new snapshot point for remaining consumer");
+        let DataEvent::Data(NautilusData::Custom(custom)) =
+            rx.try_recv().expect("remaining custom data event")
+        else {
+            panic!("expected custom data event");
+        };
+        assert_eq!(custom.data_type, remaining_data_type);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
     fn test_handle_crypto_price_subscribe_emits_snapshot_custom_data() {
         let (feed, mut rx) = make_feed();
         let data_type = crypto_data_type("BTCUSDT");
@@ -3101,6 +3408,34 @@ mod tests {
             assert_eq!(payload.price_timestamp_ms, expected_ts);
             assert_eq!(payload.message_timestamp_ms, 1780726213178);
         }
+    }
+
+    #[rstest]
+    fn test_handle_crypto_price_subscribe_skips_timestamp_overflow_without_poisoning_replay() {
+        let (feed, mut rx) = make_feed();
+        feed.track_subscribe(crypto_data_type("BTCUSDT"))
+            .expect("track subscribe");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(RTDS_CRYPTO_SUBSCRIBE_FIXTURE).expect("parse fixture");
+        snapshot["payload"]["data"] = json!([
+            {"timestamp": u64::MAX, "value": 65000.12},
+            {"timestamp": 1780726209000_u64, "value": 61164.12}
+        ]);
+
+        feed.handle_text_message(&snapshot.to_string())
+            .expect("invalid snapshot point should not fail the message loop");
+
+        let event = rx.try_recv().expect("valid snapshot point must emit");
+        let DataEvent::Data(NautilusData::Custom(custom)) = event else {
+            panic!("expected custom data event");
+        };
+        let payload = custom
+            .data
+            .as_any()
+            .downcast_ref::<PolymarketRtdsCryptoPrice>()
+            .expect("PolymarketRtdsCryptoPrice");
+        assert_eq!(payload.price_timestamp_ms, 1780726209000);
+        assert!(rx.try_recv().is_err());
     }
 
     #[rstest]
@@ -3146,6 +3481,51 @@ mod tests {
         assert_eq!(payload.full_accuracy_value, Price::from("198.4523"));
         assert_eq!(payload.received_at_ms, Some(1711382400005));
         assert!(!payload.is_carried_forward);
+    }
+
+    #[rstest]
+    fn test_handle_equity_price_update_rejects_invalid_evidence_without_poisoning_replay() {
+        let (feed, mut rx) = make_feed();
+        feed.track_subscribe(equity_data_type("AAPL"))
+            .expect("track subscribe");
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(RTDS_EQUITY_UPDATE_FIXTURE).expect("parse fixture");
+        invalid["payload"]["timestamp"] = json!(1711382401000_u64);
+        invalid["payload"]["full_accuracy_value"] = json!("not-a-price");
+
+        feed.handle_text_message(&invalid.to_string())
+            .expect("invalid exact value should not fail the message loop");
+        assert!(rx.try_recv().is_err());
+
+        feed.handle_text_message(RTDS_EQUITY_UPDATE_FIXTURE)
+            .expect("valid update after invalid exact value");
+        assert!(
+            rx.try_recv().is_ok(),
+            "valid lower-timestamp update must emit"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_handle_equity_price_update_rejects_timestamp_overflow_without_poisoning_replay() {
+        let (feed, mut rx) = make_feed();
+        feed.track_subscribe(equity_data_type("AAPL"))
+            .expect("track subscribe");
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(RTDS_EQUITY_UPDATE_FIXTURE).expect("parse fixture");
+        invalid["payload"]["timestamp"] = json!(u64::MAX);
+
+        feed.handle_text_message(&invalid.to_string())
+            .expect("invalid timestamp should not fail the message loop");
+        assert!(rx.try_recv().is_err());
+
+        feed.handle_text_message(RTDS_EQUITY_UPDATE_FIXTURE)
+            .expect("valid update after invalid timestamp");
+        assert!(
+            rx.try_recv().is_ok(),
+            "valid lower-timestamp update must emit"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[rstest]
@@ -3256,6 +3636,34 @@ mod tests {
             assert_eq!(payload.received_at_ms, None);
             assert!(!payload.is_carried_forward);
         }
+    }
+
+    #[rstest]
+    fn test_handle_equity_price_subscribe_skips_timestamp_overflow_without_poisoning_replay() {
+        let (feed, mut rx) = make_feed();
+        feed.track_subscribe(equity_data_type("AAPL"))
+            .expect("track subscribe");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(RTDS_EQUITY_SUBSCRIBE_FIXTURE).expect("parse fixture");
+        snapshot["payload"]["data"] = json!([
+            {"timestamp": u64::MAX, "value": 308.01},
+            {"timestamp": 1780907777000_u64, "value": 307.91499}
+        ]);
+
+        feed.handle_text_message(&snapshot.to_string())
+            .expect("invalid snapshot point should not fail the message loop");
+
+        let event = rx.try_recv().expect("valid snapshot point must emit");
+        let DataEvent::Data(NautilusData::Custom(custom)) = event else {
+            panic!("expected custom data event");
+        };
+        let payload = custom
+            .data
+            .as_any()
+            .downcast_ref::<PolymarketRtdsEquityPrice>()
+            .expect("PolymarketRtdsEquityPrice");
+        assert_eq!(payload.price_timestamp_ms, 1780907777000);
+        assert!(rx.try_recv().is_err());
     }
 
     #[rstest]
@@ -3779,10 +4187,10 @@ mod tests {
             tx,
         );
 
-        feed.track_subscribe(crypto_data_type("BTCUSDT"))
-            .expect("track BTC");
-        feed.track_subscribe(crypto_data_type("ETHUSDT"))
-            .expect("track ETH");
+        feed.track_subscribe(crypto_data_type("ALPHA/USD"))
+            .expect("track first symbol");
+        feed.track_subscribe(crypto_data_type("BETA/USD"))
+            .expect("track second symbol");
         feed.connect().await.expect("connect feed");
 
         wait_until_async(
@@ -3799,15 +4207,15 @@ mod tests {
 
         state
             .send_text_to_all(build_crypto_update(
-                "btcusdt",
-                "61035.86",
+                "alpha/usd",
+                "65000.12",
                 1780730269000,
                 1780730269142,
             ))
             .await;
         state
             .send_text_to_all(build_crypto_update(
-                "ethusdt",
+                "beta/usd",
                 "2450.11",
                 1780730270000,
                 1780730270142,
@@ -3817,7 +4225,7 @@ mod tests {
         wait_until_async(|| async { rx.len() >= 2 }, Duration::from_secs(2)).await;
         assert_eq!(
             collect_crypto_symbols(&mut rx, 2),
-            vec!["btcusdt".to_string(), "ethusdt".to_string()],
+            vec!["alpha/usd".to_string(), "beta/usd".to_string()],
             "both retained symbols should emit before disconnect",
         );
 
@@ -3838,15 +4246,31 @@ mod tests {
 
         state
             .send_text_to_all(build_crypto_update(
-                "btcusdt",
-                "61040.12",
+                "alpha/usd",
+                "64997.81",
+                1780730268000,
+                1780730268142,
+            ))
+            .await;
+        state
+            .send_text_to_all(build_crypto_update(
+                "beta/usd",
+                "2445.55",
+                1780730269000,
+                1780730269142,
+            ))
+            .await;
+        state
+            .send_text_to_all(build_crypto_update(
+                "alpha/usd",
+                "65001.12",
                 1780730271000,
                 1780730271142,
             ))
             .await;
         state
             .send_text_to_all(build_crypto_update(
-                "ethusdt",
+                "beta/usd",
                 "2455.55",
                 1780730272000,
                 1780730272142,
@@ -3855,10 +4279,14 @@ mod tests {
 
         wait_until_async(|| async { rx.len() >= 2 }, Duration::from_secs(2)).await;
         assert_eq!(
-            collect_crypto_symbols(&mut rx, 2),
-            vec!["btcusdt".to_string(), "ethusdt".to_string()],
-            "both retained symbols should resume after server-side reconnect",
+            collect_crypto_observations(&mut rx, 2),
+            vec![
+                ("alpha/usd".to_string(), 1780730271000),
+                ("beta/usd".to_string(), 1780730272000),
+            ],
+            "reconnect should retain each symbol's replay high-water mark",
         );
+        assert!(rx.try_recv().is_err());
 
         feed.disconnect().await;
     }
