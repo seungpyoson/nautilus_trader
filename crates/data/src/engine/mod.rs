@@ -40,6 +40,7 @@ mod streaming;
 
 mod commands;
 mod handlers;
+mod ingestion;
 mod requests;
 mod time_range;
 
@@ -73,15 +74,19 @@ use nautilus_common::{
     cache::Cache,
     clock::Clock,
     logging::{RECV, RES},
-    messages::data::{
-        BarsResponse, BookDeltasResponse, BookDepthResponse, CustomDataResponse, DataCommand,
-        DataResponse, ForwardPricesResponse, FundingRatesResponse, QuotesResponse, RequestBars,
-        RequestCommand, RequestForwardPrices, RequestJoin, RequestQuotes, RequestTrades,
-        SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeBookSnapshots,
-        SubscribeCommand, SubscribeOptionChain, SubscribeQuotes, SubscribeTrades, TradesResponse,
-        UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeBookSnapshots,
-        UnsubscribeCommand, UnsubscribeInstrumentStatus, UnsubscribeOptionChain,
-        UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades, is_parent_subscription,
+    messages::{
+        book::BookFeedEvent,
+        data::{
+            BarsResponse, BookDeltasResponse, BookDepthResponse, CustomDataResponse, DataCommand,
+            DataResponse, ForwardPricesResponse, FundingRatesResponse, QuotesResponse, RequestBars,
+            RequestCommand, RequestForwardPrices, RequestJoin, RequestQuotes, RequestTrades,
+            SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeBookSnapshots,
+            SubscribeCommand, SubscribeOptionChain, SubscribeQuotes, SubscribeTrades,
+            TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10,
+            UnsubscribeBookSnapshots, UnsubscribeCommand, UnsubscribeInstrumentStatus,
+            UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+            is_parent_subscription,
+        },
     },
     msgbus::{
         self, BusPayloadType, ShareableMessageHandler, TypedHandler, TypedIntoHandler,
@@ -159,6 +164,8 @@ pub struct DataEngine {
     book_deltas_counts: IndexMap<BookDeltasKey, usize>,
     book_depth10_subs: AHashSet<InstrumentId>,
     book_updaters: AHashMap<InstrumentId, Rc<BookUpdater>>,
+    book_feeds: AHashMap<UUID4, ingestion::IngestedBooks>,
+    book_feed_owners: AHashMap<InstrumentId, UUID4>,
     book_deltas_parent_expansions: AHashMap<InstrumentId, Vec<InstrumentId>>,
     book_depth10_parent_expansions: AHashMap<InstrumentId, Vec<InstrumentId>>,
     book_snapshotters: AHashMap<NonZeroUsize, Rc<BookSnapshotter>>,
@@ -243,6 +250,8 @@ impl DataEngine {
             book_deltas_counts: IndexMap::new(),
             book_depth10_subs: AHashSet::new(),
             book_updaters: AHashMap::new(),
+            book_feeds: AHashMap::new(),
+            book_feed_owners: AHashMap::new(),
             book_deltas_parent_expansions: AHashMap::new(),
             book_depth10_parent_expansions: AHashMap::new(),
             book_snapshotters: AHashMap::new(),
@@ -644,6 +653,7 @@ impl DataEngine {
         // keeps dispatching to abandoned updaters. `book_updaters` is keyed by
         // per-underlying id, so the literal per-underlying topic is the same
         // string the subscribe path used.
+        self.close_book_feeds();
         let book_updaters: Vec<(InstrumentId, Rc<BookUpdater>)> =
             self.book_updaters.drain().collect();
         for (instrument_id, updater) in book_updaters {
@@ -1715,7 +1725,9 @@ impl DataEngine {
         // Dynamically-typed entry point: `FundingRateUpdate`, `OptionGreeks`, `InstrumentStatus`,
         // and custom data are also `Data` enum variants handled in `process_data`, but can arrive
         // here as typed data, whereas `InstrumentAny` is not a `Data` variant.
-        if let Some(instrument) = data.downcast_ref::<InstrumentAny>() {
+        if let Some(event) = data.downcast_ref::<BookFeedEvent>() {
+            self.process_book_feed(event);
+        } else if let Some(instrument) = data.downcast_ref::<InstrumentAny>() {
             self.handle_instrument(instrument);
         } else if let Some(funding_rate) = data.downcast_ref::<FundingRateUpdate>() {
             self.handle_funding_rate(*funding_rate);
@@ -2446,6 +2458,10 @@ impl DataEngine {
     }
 
     fn handle_delta(&mut self, delta: OrderBookDelta) {
+        if self.book_feed_owners.contains_key(&delta.instrument_id) {
+            log::error!("Absolute deltas cannot replace an active signed book feed");
+            return;
+        }
         let mut deltas = if self.config.buffer_deltas {
             self.buffer_delta(delta);
 
@@ -2466,6 +2482,11 @@ impl DataEngine {
     }
 
     fn handle_deltas(&mut self, mut deltas: OrderBookDeltas) {
+        if self.book_feed_owners.contains_key(&deltas.instrument_id) {
+            log::error!("Absolute deltas cannot replace an active signed book feed");
+            return;
+        }
+
         if self.config.buffer_deltas {
             let instrument_id = deltas.instrument_id;
 
@@ -2491,6 +2512,10 @@ impl DataEngine {
     }
 
     fn handle_depth10(&self, depth: OrderBookDepth10) {
+        if self.book_feed_owners.contains_key(&depth.instrument_id) {
+            log::error!("Depth data cannot replace an active signed book feed");
+            return;
+        }
         let topic = switchboard::get_book_depth10_topic(depth.instrument_id);
         msgbus::publish_depth10(topic, &depth);
 
@@ -4163,11 +4188,14 @@ impl DataEngine {
             // entry per book and a single delta apply per publish.
             let deltas_topic = switchboard::get_book_deltas_topic(*target_id);
             let deltas_handler = TypedHandler::new(updater.clone());
-            msgbus::subscribe_book_deltas(
-                deltas_topic.into(),
-                deltas_handler,
-                Some(self.msgbus_priority),
-            );
+
+            if !self.book_feed_owners.contains_key(target_id) {
+                msgbus::subscribe_book_deltas(
+                    deltas_topic.into(),
+                    deltas_handler,
+                    Some(self.msgbus_priority),
+                );
+            }
 
             if !only_deltas {
                 let depth_topic = switchboard::get_book_depth10_topic(*target_id);

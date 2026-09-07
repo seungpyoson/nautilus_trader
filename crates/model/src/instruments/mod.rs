@@ -33,6 +33,7 @@ pub mod index_instrument;
 pub mod option_contract;
 pub mod option_spread;
 pub mod perpetual_contract;
+pub mod price_grid;
 pub mod synthetic;
 pub mod tick_scheme;
 pub mod tokenized_asset;
@@ -74,6 +75,7 @@ pub use crate::instruments::{
     option_contract::OptionContract,
     option_spread::OptionSpread,
     perpetual_contract::PerpetualContract,
+    price_grid::PriceGrid,
     synthetic::{SyntheticInstrument, SyntheticInstrumentError},
     tick_scheme::{
         FixedTickScheme, TickScheme, TickSchemeError, TickSchemeRule, TieredTickScheme,
@@ -195,6 +197,11 @@ fn is_usd_equivalent_currency(currency: Currency) -> bool {
 
 #[enum_dispatch]
 pub trait Instrument: 'static + Send {
+    /// Returns the instrument-owned grid, when defined by venue metadata.
+    fn price_grid(&self) -> Option<&PriceGrid> {
+        None
+    }
+
     fn tick_scheme(&self) -> Option<Ustr> {
         None
     }
@@ -412,11 +419,18 @@ pub trait Instrument: 'static + Send {
         }
 
         let increment_raw = increment.raw.abs();
-        if increment_raw != 0 && price.raw % increment_raw != 0 {
+        let on_grid = match self.price_grid() {
+            Some(grid) => grid.contains(price),
+            None => increment_raw == 0 || price.raw % increment_raw == 0,
+        };
+
+        if !on_grid {
+            let constraint = match self.price_grid() {
+                Some(_) => format!("instrument price grid (minimum increment {increment})"),
+                None => format!("price increment {increment}"),
+            };
             return Err(CorrectnessError::PredicateViolation {
-                message: format!(
-                    "`price` is not aligned to price increment {increment}, was {price}"
-                ),
+                message: format!("`price` is not aligned to {constraint}, was {price}"),
             });
         }
 

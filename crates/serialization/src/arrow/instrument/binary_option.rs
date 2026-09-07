@@ -104,6 +104,7 @@ impl ArrowSchemaProvider for BinaryOption {
             Field::new("info", DataType::Binary, true), // nullable
             Field::new("ts_event", DataType::UInt64, false),
             Field::new("ts_init", DataType::UInt64, false),
+            Field::new("price_grid", DataType::Utf8, true),
         ];
 
         let mut final_metadata = HashMap::new();
@@ -148,6 +149,7 @@ impl EncodeToRecordBatch for BinaryOption {
         let mut info_builder = BinaryBuilder::new();
         let mut ts_event_builder = UInt64Array::builder(data.len());
         let mut ts_init_builder = UInt64Array::builder(data.len());
+        let mut price_grid_builder = StringBuilder::new();
 
         for bo in data {
             id_builder.append_value(bo.id.to_string());
@@ -238,6 +240,13 @@ impl EncodeToRecordBatch for BinaryOption {
 
             ts_event_builder.append_value(bo.ts_event.as_u64());
             ts_init_builder.append_value(bo.ts_init.as_u64());
+            if let Some(grid) = &bo.price_grid {
+                let json = serde_json::to_string(grid)
+                    .map_err(|e| ArrowError::InvalidArgumentError(e.to_string()))?;
+                price_grid_builder.append_value(json);
+            } else {
+                price_grid_builder.append_null();
+            }
         }
 
         let mut final_metadata = metadata.clone();
@@ -272,6 +281,7 @@ impl EncodeToRecordBatch for BinaryOption {
                 Arc::new(info_builder.finish()),
                 Arc::new(ts_event_builder.finish()),
                 Arc::new(ts_init_builder.finish()),
+                Arc::new(price_grid_builder.finish()),
             ],
         )
     }
@@ -343,6 +353,7 @@ pub fn decode_binary_option_batch(
     let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 20, DataType::Utf8)?;
     let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 21, DataType::Utf8)?;
     let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
+    let price_grid_values = extract_optional_string_column_by_name(record_batch, "price_grid")?;
     let info_values =
         extract_column_by_name_or_index::<BinaryArray>(record_batch, "info", 23, DataType::Binary)?;
     let ts_event_values = extract_column_by_name_or_index::<UInt64Array>(
@@ -474,6 +485,11 @@ pub fn decode_binary_option_batch(
         let ts_init = nautilus_core::UnixNanos::from(ts_init_values.value(i));
 
         let tick_scheme = optional_ustr_value(tick_scheme_values, i);
+        let price_grid = price_grid_values
+            .filter(|values| !values.is_null(i))
+            .map(|values| serde_json::from_str(values.value(i)))
+            .transpose()
+            .map_err(|e| EncodingError::ParseError("price_grid", format!("row {i}: {e}")))?;
 
         let max_notional = match max_notional_values {
             Some(column) if !column.is_null(i) => {
@@ -525,6 +541,7 @@ pub fn decode_binary_option_batch(
             .maker_fee(maker_fee)
             .taker_fee(taker_fee)
             .maybe_tick_scheme(tick_scheme)
+            .maybe_price_grid(price_grid)
             .maybe_info(info)
             .ts_event(ts_event)
             .ts_init(ts_init)

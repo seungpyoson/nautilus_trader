@@ -13,12 +13,15 @@
 
 set -euo pipefail
 
-for tool in awk sort comm uniq diff; do
+for tool in awk sort comm uniq diff mktemp; do
   command -v "$tool" > /dev/null || {
     echo "Required tool not on PATH: $tool" >&2
     exit 2
   }
 done
+
+check_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/check-no-build-packages.XXXXXX")
+trap 'rm -rf "$check_tmp_dir"' EXIT
 
 # Emit the names of third-party packages in a uv.lock - i.e. every package
 # whose source is a registry/git/url. Workspace members (source.editable or
@@ -83,20 +86,21 @@ for pair in "${pairs[@]}"; do
     exit 2
   fi
 
-  locked=$(locked_third_party "$lock")
-  declared_raw=$(declared_packages "$manifest")
-  declared_sorted=$(printf '%s\n' "$declared_raw" | LC_ALL=C sort -u)
+  locked_third_party "$lock" > "$check_tmp_dir/locked"
+  declared_packages "$manifest" > "$check_tmp_dir/declared"
+  LC_ALL=C sort "$check_tmp_dir/declared" > "$check_tmp_dir/sorted"
+  uniq "$check_tmp_dir/sorted" > "$check_tmp_dir/unique"
 
-  missing=$(comm -23 <(printf '%s\n' "$locked") <(printf '%s\n' "$declared_sorted"))
-  stale=$(comm -13 <(printf '%s\n' "$locked") <(printf '%s\n' "$declared_sorted"))
-  duplicates=$(printf '%s\n' "$declared_raw" | LC_ALL=C sort | uniq -d)
+  missing=$(comm -23 "$check_tmp_dir/locked" "$check_tmp_dir/unique")
+  stale=$(comm -13 "$check_tmp_dir/locked" "$check_tmp_dir/unique")
+  duplicates=$(uniq -d "$check_tmp_dir/sorted")
   out_of_order=""
-  if ! diff -q <(printf '%s\n' "$declared_raw") <(printf '%s\n' "$declared_raw" | LC_ALL=C sort) > /dev/null 2>&1; then
+  if ! diff -q "$check_tmp_dir/declared" "$check_tmp_dir/sorted" > /dev/null; then
     out_of_order="yes"
   fi
 
   if [[ -z "$missing" && -z "$stale" && -z "$duplicates" && -z "$out_of_order" ]]; then
-    count=$(printf '%s\n' "$locked" | grep -c .)
+    count=$(grep -c . "$check_tmp_dir/locked")
     echo "OK  ${manifest}: ${count} packages, in sync with ${lock}"
     continue
   fi

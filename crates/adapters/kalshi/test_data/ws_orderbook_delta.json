@@ -1,0 +1,14 @@
+{
+  "type": "orderbook_delta",
+  "sid": 2,
+  "seq": 3,
+  "msg": {
+    "market_ticker": "FED-23DEC-T3.00",
+    "market_id": "9b0f6b43-5b68-4f9f-9f02-9a2d1b8ac1a1",
+    "price_dollars": "0.960",
+    "delta_fp": "-54.00",
+    "side": "yes",
+    "ts": "2022-11-22T20:44:01Z",
+    "ts_ms": 1669149841000
+  }
+}

@@ -37,8 +37,9 @@
 //!
 //! The underlying client enables `TCP_NODELAY`, pooled idle connections, HTTP/2 keepalive while
 //! idle, and adaptive HTTP/2 flow control. Responses retain only configured header fields and reject
-//! bodies larger than 100 MiB, including chunked bodies without a declared length. The redacted
-//! request path removes credential-bearing URLs from transport errors and logs.
+//! bodies larger than the configured limit (100 MiB by default), including chunked bodies without
+//! a declared length. The redacted request path removes credential-bearing URLs from transport
+//! errors and logs.
 //!
 //! `reqwest` owns the lifecycle of individual pooled connections, so this client exposes no socket
 //! state sink or explicit reconnect operation. Callers observe connection failure through each

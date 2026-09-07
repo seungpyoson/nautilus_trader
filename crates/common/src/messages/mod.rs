@@ -28,6 +28,7 @@ use nautilus_model::{
 };
 use strum::Display;
 
+pub mod book;
 pub mod data;
 pub mod execution;
 pub mod system;
@@ -46,6 +47,7 @@ pub use execution::ExecutionReport;
 )]
 #[derive(Debug, Display)]
 pub enum DataEvent {
+    BookFeed(book::BookFeedEvent),
     Response(DataResponse),
     Data(Data),
     // Kept separate from `Data` pending the decision on generic dispatch versus this routing enum

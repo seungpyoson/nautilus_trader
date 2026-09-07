@@ -15,7 +15,9 @@
 
 //! HTTP client implementation with rate limiting and timeout support.
 
-use std::{borrow::Cow, collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow, collections::HashMap, num::NonZeroUsize, str::FromStr, sync::Arc, time::Duration,
+};
 
 use nautilus_core::collections::into_ustr_vec;
 use nautilus_cryptography::providers::install_cryptographic_provider;
@@ -75,6 +77,9 @@ impl HttpClient {
     /// without a default quota ignores keys it does not own, allowing independent scopes such as
     /// per-IP and per-account limits to apply to one request.
     ///
+    /// Set `max_response_bytes` to bound response bodies before buffering them. When omitted,
+    /// the limit is 100 MiB. The limit also applies to chunked bodies without a declared length.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -92,6 +97,7 @@ impl HttpClient {
         rate_limiters: Option<Vec<Arc<RateLimiter<Ustr, MonotonicClock>>>>,
         #[builder(default)] redirect_policy: HttpRedirectPolicy,
         #[builder(default = true)] use_system_proxy: bool,
+        max_response_bytes: Option<NonZeroUsize>,
     ) -> Result<Self, HttpClientError> {
         let rate_limiters = if let Some(rate_limiters) = rate_limiters {
             if default_quota.is_some() || !keyed_quotas.is_empty() {
@@ -111,26 +117,6 @@ impl HttpClient {
             ))]
         };
 
-        Self::build(
-            headers,
-            header_keys,
-            timeout_secs,
-            proxy_url,
-            rate_limiters,
-            redirect_policy,
-            use_system_proxy,
-        )
-    }
-
-    fn build(
-        headers: HashMap<String, String>,
-        header_keys: Vec<String>,
-        timeout_secs: Option<u64>,
-        proxy_url: Option<String>,
-        rate_limiters: Vec<Arc<RateLimiter<Ustr, MonotonicClock>>>,
-        redirect_policy: HttpRedirectPolicy,
-        use_system_proxy: bool,
-    ) -> Result<Self, HttpClientError> {
         install_cryptographic_provider();
 
         // Build default headers
@@ -190,7 +176,8 @@ impl HttpClient {
         let client = InnerHttpClient {
             client,
             response_headers: Arc::from(response_headers),
-            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            max_response_bytes: max_response_bytes
+                .map_or(DEFAULT_MAX_RESPONSE_BYTES, NonZeroUsize::get),
         };
 
         Ok(Self {

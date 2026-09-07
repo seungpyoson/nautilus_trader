@@ -302,42 +302,31 @@ impl AsyncRunner {
         self.channels
     }
 
-    /// Flushes all pending data events and commands from the channels.
-    ///
-    /// Loops until both data channels are empty, processing each item
-    /// into the cache immediately. Used in `start()` where channels are
-    /// not extracted.
-    pub fn flush_pending_data(&mut self) {
-        let mut total = 0;
+    /// Borrows the data receivers for startup dispatch after connection borrows are released.
+    #[cfg(feature = "node")]
+    pub(crate) fn startup_data_receivers(
+        &mut self,
+    ) -> (
+        &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+        &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+    ) {
+        (
+            &mut self.channels.data_evt_rx,
+            &mut self.channels.data_cmd_rx,
+        )
+    }
 
-        loop {
-            let mut progressed = false;
-
-            // Events drain before commands here even though the runtime select
-            // prefers the opposite for everything-else: `LiveNode::start()`
-            // calls this after `connect_data_clients()` to push queued
-            // `DataEvent::Instrument` items into the cache. A pending
-            // subscription command (e.g. `SubscribeBars`) processed before the
-            // matching instrument lands would be rejected by the data engine.
-            while let Ok(evt) = self.channels.data_evt_rx.try_recv() {
-                Self::handle_data_event(evt);
-                progressed = true;
-                total += 1;
-            }
-
-            while let Ok(cmd) = self.channels.data_cmd_rx.try_recv() {
-                Self::handle_data_command(cmd);
-                progressed = true;
-                total += 1;
-            }
-
-            if !progressed {
+    /// Processes a bounded startup batch so readiness deadlines and stop signals remain observable.
+    #[cfg(feature = "node")]
+    pub(crate) fn flush_startup_data_batch(&mut self) {
+        for _ in 0..1024 {
+            if let Ok(event) = self.channels.data_evt_rx.try_recv() {
+                Self::handle_data_event(event);
+            } else if let Ok(command) = self.channels.data_cmd_rx.try_recv() {
+                Self::handle_data_command(command);
+            } else {
                 break;
             }
-        }
-
-        if total > 0 {
-            log::debug!("Flushed {total} pending data events/commands");
         }
     }
 
@@ -426,6 +415,9 @@ impl AsyncRunner {
     #[inline]
     pub fn handle_data_event(event: DataEvent) {
         match event {
+            DataEvent::BookFeed(event) => {
+                msgbus::send_any(MessagingSwitchboard::data_engine_process(), &event);
+            }
             DataEvent::Data(data) => {
                 msgbus::send_data(MessagingSwitchboard::data_engine_process_data(), data);
             }

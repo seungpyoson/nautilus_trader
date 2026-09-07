@@ -1,0 +1,41 @@
+{
+  "client": {
+    "market_tickers": [
+      "REPLACE_WITH_AN_OPEN_MARKET"
+    ],
+    "http": {
+      "base_url": "https://external-api.kalshi.com/trade-api/v2",
+      "request_timeout_ms": 5000,
+      "operation_timeout_ms": 10000,
+      "max_response_bytes": 1048576,
+      "max_pages": 1,
+      "max_markets": 1,
+      "page_size": 1,
+      "request_spacing_ms": 1000,
+      "max_retries": 1
+    },
+    "websocket": {
+      "transport": {
+        "url": "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+        "backend": "tungstenite",
+        "connect_timeout_ms": 10000,
+        "reconnect_delay_initial_ms": 1000,
+        "reconnect_delay_max_ms": 30000,
+        "reconnect_backoff_factor": 2,
+        "reconnect_jitter_ms": 250,
+        "reconnect_max_attempts": null,
+        "heartbeat_interval_secs": 10,
+        "heartbeat_timeout_secs": 30
+      },
+      "connect_deadline_ms": 15000,
+      "bootstrap_timeout_ms": 15000,
+      "max_frame_bytes": 1048576,
+      "max_pending_frames": 64,
+      "connection_spacing_ms": 1000,
+      "command_spacing_ms": 1000
+    },
+    "bootstrap_timeout_ms": 30000,
+    "shutdown_timeout_ms": 5000
+  },
+  "observation_seconds": 60
+}

@@ -29,7 +29,7 @@ use ustr::Ustr;
 use crate::{
     enums::AssetClass,
     identifiers::{InstrumentId, Symbol},
-    instruments::BinaryOption,
+    instruments::{BinaryOption, PriceGrid},
     types::{Currency, Money, Price, Quantity},
 };
 
@@ -39,7 +39,7 @@ impl BinaryOption {
     /// Represents a generic binary option instrument.
     #[expect(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (instrument_id, raw_symbol, asset_class, currency, activation_ns, expiration_ns, price_precision, size_precision, price_increment, size_increment, ts_event, ts_init, outcome=None, description=None, max_quantity=None, min_quantity=None, max_notional=None, min_notional=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, maker_fee=None, taker_fee=None, tick_scheme=None, info=None))]
+    #[pyo3(signature = (instrument_id, raw_symbol, asset_class, currency, activation_ns, expiration_ns, price_precision, size_precision, price_increment, size_increment, ts_event, ts_init, outcome=None, description=None, max_quantity=None, min_quantity=None, max_notional=None, min_notional=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, maker_fee=None, taker_fee=None, tick_scheme=None, info=None, price_grid=None))]
     fn py_new(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -67,6 +67,7 @@ impl BinaryOption {
         taker_fee: Option<Decimal>,
         tick_scheme: Option<String>,
         info: Option<Py<PyDict>>,
+        price_grid: Option<Vec<(Price, Price, Price)>>,
     ) -> PyResult<Self> {
         // Convert Python dict to Params
         let info_map = if let Some(info_dict) = info {
@@ -99,6 +100,12 @@ impl BinaryOption {
             .maybe_maker_fee(maker_fee)
             .maybe_taker_fee(taker_fee)
             .maybe_tick_scheme(tick_scheme.map(|name| ustr::Ustr::from(name.as_str())))
+            .maybe_price_grid(
+                price_grid
+                    .map(PriceGrid::new)
+                    .transpose()
+                    .map_err(to_pyvalue_err)?,
+            )
             .maybe_info(info_map)
             .ts_event(ts_event.into())
             .ts_init(ts_init.into())
@@ -301,6 +308,12 @@ impl BinaryOption {
         crate::python::instruments::from_dict_instrument_pyo3(py, values)
     }
 
+    #[getter]
+    #[pyo3(name = "price_grid")]
+    fn py_price_grid(&self) -> Option<Vec<(Price, Price, Price)>> {
+        self.price_grid.as_ref().map(|grid| grid.ranges().to_vec())
+    }
+
     #[pyo3(name = "to_dict")]
     fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
@@ -379,6 +392,12 @@ impl BinaryOption {
             "tick_scheme",
             crate::python::instruments::tick_scheme_to_py(self),
         )?;
+
+        if let Some(grid) = &self.price_grid {
+            let json = serde_json::to_string(grid).map_err(to_pyvalue_err)?;
+            let values = PyModule::import(py, "json")?.call_method1("loads", (json,))?;
+            dict.set_item("price_grid", values)?;
+        }
         Ok(dict.into())
     }
 }
@@ -388,7 +407,7 @@ mod tests {
     use pyo3::{prelude::*, types::PyDict};
     use rstest::rstest;
 
-    use crate::instruments::{BinaryOption, stubs::*};
+    use crate::instruments::{BinaryOption, Instrument, PriceGrid, stubs::*};
 
     #[rstest]
     fn test_dict_round_trip(binary_option: BinaryOption) {
@@ -398,6 +417,29 @@ mod tests {
             let values: Py<PyDict> = values.extract(py).unwrap();
             let new_binary_option = BinaryOption::py_from_dict(py, values).unwrap();
             assert_eq!(binary_option, new_binary_option);
+        });
+    }
+
+    #[rstest]
+    fn test_price_grid_dict_round_trip(mut binary_option: BinaryOption) {
+        binary_option.price_grid = Some(
+            PriceGrid::new(vec![
+                ("0.000".into(), "0.009".into(), "0.001".into()),
+                ("0.010".into(), "1.000".into(), "0.010".into()),
+            ])
+            .unwrap(),
+        );
+        Python::initialize();
+        Python::attach(|py| {
+            let values = binary_option
+                .py_to_dict(py)
+                .unwrap()
+                .extract::<Py<PyDict>>(py)
+                .unwrap();
+            let restored = BinaryOption::py_from_dict(py, values).unwrap();
+            assert_eq!(restored.price_grid, binary_option.price_grid);
+            assert_eq!(restored.py_price_grid(), binary_option.py_price_grid());
+            assert_eq!(restored.next_ask_price(0.01, 1), Some("0.020".into()));
         });
     }
 }

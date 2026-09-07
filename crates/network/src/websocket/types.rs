@@ -30,7 +30,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 
 use crate::{
     error::SendError,
-    transport::{BoxedWsTransport, Message},
+    transport::{BoxedWsTransport, Message, TransportError},
 };
 
 /// Sink half of the active WebSocket transport.
@@ -64,6 +64,14 @@ pub type PingHandler = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 
 /// Function type for handling WebSocket ping messages with connection ownership.
 pub type EpochPingHandler = Arc<dyn Fn(u64, Vec<u8>) + Send + Sync>;
+
+/// Generates a complete header set immediately before a WebSocket connection attempt.
+///
+/// Called after the connection quota wait for the initial connection and every reconnect.
+/// Return an error to prevent the attempt; previously generated headers are never reused.
+/// Providers must perform bounded local work, such as signing with an already loaded key.
+pub type HeadersProvider =
+    Arc<dyn Fn() -> Result<Vec<(String, String)>, TransportError> + Send + Sync>;
 
 /// Creates a channel-based message handler.
 ///

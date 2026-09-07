@@ -50,7 +50,8 @@ bytes = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
-log = { workspace = true }
+# Tungstenite TRACE serializes authenticated handshake bytes, including in debug builds.
+log = { workspace = true, features = ["max_level_debug"] }
 rand = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }

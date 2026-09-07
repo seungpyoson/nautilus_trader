@@ -15,6 +15,7 @@ members = [
   "crates/adapters/dydx",
   "crates/adapters/hyperliquid",
   "crates/adapters/interactive_brokers",
+  "crates/adapters/kalshi",
   "crates/adapters/kraken",
   "crates/adapters/lighter",
   "crates/adapters/okx",
@@ -200,6 +201,7 @@ parquet = { version = "59.2.0", default-features = false, features = [
   "async",
 ] }
 pem = "4.0.0"
+pkcs8 = { version = "0.10.2", default-features = false }
 pyo3 = { version = "0.29.2", default-features = false, features = [
   "hashbrown",
   "indexmap",

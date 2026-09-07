@@ -17,13 +17,17 @@ use std::hash::{Hash, Hasher};
 
 use nautilus_core::{
     Params, UnixNanos,
-    correctness::{CorrectnessResult, check_equal_u8},
+    correctness::{CorrectnessResult, check_equal_u8, check_predicate_true},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{Instrument, any::InstrumentAny, tick_scheme::check_tick_scheme};
+use super::{
+    Instrument, PriceGrid, TickSchemeRule,
+    any::InstrumentAny,
+    tick_scheme::{check_tick_scheme, tick_scheme_rule_from_name},
+};
 use crate::{
     enums::{AssetClass, InstrumentClass, OptionKind},
     identifiers::{InstrumentId, Symbol},
@@ -38,6 +42,7 @@ use crate::{
 /// Represents a generic binary option instrument.
 #[repr(C)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
@@ -93,6 +98,9 @@ pub struct BinaryOption {
     pub min_price: Option<Price>,
     /// The registered variable tick scheme name.
     pub tick_scheme: Option<Ustr>,
+    /// The exact price grid supplied by venue metadata, exclusive with `tick_scheme`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_grid: Option<PriceGrid>,
     /// Additional instrument metadata as a JSON-serializable dictionary.
     pub info: Option<Params>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
@@ -128,6 +136,7 @@ impl BinaryOption {
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
         tick_scheme: Option<Ustr>,
+        price_grid: Option<PriceGrid>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
@@ -148,7 +157,7 @@ impl BinaryOption {
         check_positive_quantity(size_increment, stringify!(size_increment))?;
         check_tick_scheme(tick_scheme)?;
 
-        Ok(Self {
+        let instrument = Self {
             id: instrument_id,
             raw_symbol,
             asset_class,
@@ -172,10 +181,13 @@ impl BinaryOption {
             max_price,
             min_price,
             tick_scheme,
+            price_grid,
             info,
             ts_event,
             ts_init,
-        })
+        };
+        instrument.validate_price_grid()?;
+        Ok(instrument)
     }
 
     /// Returns a fluent builder for a [`BinaryOption`] instance.
@@ -211,6 +223,7 @@ impl BinaryOption {
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
         tick_scheme: Option<Ustr>,
+        price_grid: Option<PriceGrid>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
@@ -239,10 +252,48 @@ impl BinaryOption {
             maker_fee,
             taker_fee,
             tick_scheme,
+            price_grid,
             info,
             ts_event,
             ts_init,
         )
+    }
+
+    fn validate_price_grid(&self) -> CorrectnessResult<()> {
+        if let Some(grid) = &self.price_grid {
+            check_predicate_true(
+                self.tick_scheme.is_none(),
+                "price_grid and tick_scheme cannot both be set",
+            )?;
+            check_equal_u8(
+                self.price_precision,
+                grid.precision(),
+                "price_precision",
+                "price_grid precision",
+            )?;
+            check_predicate_true(
+                self.price_increment == grid.min_increment()
+                    && self.price_increment.precision == grid.precision(),
+                "price_increment must match the smallest price grid step",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for BinaryOption {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BinaryOption {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let instrument = Self::deserialize(deserializer)?;
+        instrument
+            .validate_price_grid()
+            .map_err(serde::de::Error::custom)?;
+        Ok(instrument)
     }
 }
 
@@ -261,6 +312,20 @@ impl Hash for BinaryOption {
 }
 
 impl Instrument for BinaryOption {
+    fn price_grid(&self) -> Option<&PriceGrid> {
+        self.price_grid.as_ref()
+    }
+
+    fn tick_scheme_rule(&self) -> Option<&dyn TickSchemeRule> {
+        self.price_grid
+            .as_ref()
+            .map(|grid| grid as &dyn TickSchemeRule)
+            .or_else(|| {
+                self.tick_scheme
+                    .and_then(|name| tick_scheme_rule_from_name(name.as_str()))
+            })
+    }
+
     fn tick_scheme(&self) -> Option<Ustr> {
         self.tick_scheme
     }
@@ -409,7 +474,7 @@ mod tests {
     use crate::{
         enums::{AssetClass, InstrumentClass},
         identifiers::{InstrumentId, Symbol},
-        instruments::{BinaryOption, Instrument, stubs::*},
+        instruments::{BinaryOption, Instrument, InstrumentAny, PriceGrid, stubs::*},
         types::{Currency, Money, Price, Quantity},
     };
 
@@ -455,6 +520,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.into(),
             0.into(),
         );
@@ -466,6 +532,90 @@ mod tests {
         let json = serde_json::to_string(&binary_option).unwrap();
         let deserialized: BinaryOption = serde_json::from_str(&json).unwrap();
         assert_eq!(binary_option, deserialized);
+    }
+
+    #[rstest]
+    fn test_price_grid_survives_instrument_any_serialization(mut binary_option: BinaryOption) {
+        binary_option.price_grid = Some(
+            PriceGrid::new(vec![
+                ("0.000".into(), "0.009".into(), "0.001".into()),
+                ("0.010".into(), "1.000".into(), "0.010".into()),
+            ])
+            .unwrap(),
+        );
+        let original = InstrumentAny::BinaryOption(binary_option);
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: InstrumentAny = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.price_grid(), original.price_grid());
+        assert_eq!(restored.next_bid_price(0.01, 1), Some("0.009".into()));
+        assert_eq!(restored.next_ask_price(0.01, 1), Some("0.020".into()));
+        assert_eq!(restored.next_ask_price(0.01, -1), None);
+    }
+
+    #[rstest]
+    #[case("0.016", false)]
+    #[case("0.105", true)]
+    #[case("0.002", true)]
+    #[case("0.0151", false)]
+    fn test_instrument_any_normalization_uses_full_price_grid(
+        mut binary_option: BinaryOption,
+        #[case] value: &str,
+        #[case] accepted: bool,
+    ) {
+        binary_option.price_increment = "0.002".into();
+        binary_option.price_grid = Some(
+            PriceGrid::new(vec![
+                ("0.002".into(), "0.008".into(), "0.002".into()),
+                ("0.015".into(), "0.995".into(), "0.010".into()),
+            ])
+            .unwrap(),
+        );
+        let json = serde_json::to_string(&InstrumentAny::BinaryOption(binary_option)).unwrap();
+        let instrument: InstrumentAny = serde_json::from_str(&json).unwrap();
+        let result = instrument.try_normalize_price(value.into());
+        assert_eq!(result.is_ok(), accepted);
+        if let Ok(price) = result {
+            assert_eq!(price, Price::from(value));
+            assert_eq!(price.precision, instrument.price_precision());
+        }
+    }
+
+    #[rstest]
+    #[case("tick_scheme", serde_json::json!("FIXED_PRECISION_3"))]
+    #[case("price_precision", serde_json::json!(4))]
+    #[case("price_increment", serde_json::json!("0.010"))]
+    fn test_deserialization_rejects_conflicting_grid_fields(
+        binary_option: BinaryOption,
+        #[case] field: &str,
+        #[case] value: serde_json::Value,
+    ) {
+        let mut json = serde_json::to_value(binary_option).unwrap();
+        json["price_grid"] = serde_json::json!([["0.000", "1.000", "0.001"]]);
+        json[field] = value;
+        assert!(serde_json::from_value::<BinaryOption>(json).is_err());
+    }
+
+    #[rstest]
+    fn test_builder_rejects_conflicting_named_scheme(binary_option: BinaryOption) {
+        let result = BinaryOption::builder()
+            .instrument_id(binary_option.id)
+            .raw_symbol(binary_option.raw_symbol)
+            .asset_class(binary_option.asset_class)
+            .currency(binary_option.currency)
+            .activation_ns(binary_option.activation_ns)
+            .expiration_ns(binary_option.expiration_ns)
+            .price_precision(3)
+            .size_precision(2)
+            .price_increment("0.001".into())
+            .size_increment("0.01".into())
+            .tick_scheme("FIXED_PRECISION_3".into())
+            .price_grid(
+                PriceGrid::new(vec![("0.000".into(), "1.000".into(), "0.001".into())]).unwrap(),
+            )
+            .ts_event(0.into())
+            .ts_init(0.into())
+            .build();
+        assert!(result.is_err());
     }
 
     #[rstest]
@@ -493,6 +643,7 @@ mod tests {
             Some(dec!(0.02)),
             Some(dec!(0.0002)),
             Some(dec!(0.0004)),
+            None,
             None,
             None,
             3.into(),

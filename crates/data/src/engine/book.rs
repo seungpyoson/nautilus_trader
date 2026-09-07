@@ -144,7 +144,7 @@ impl Handler<OrderBookDepth10> for BookUpdater {
     }
 }
 
-fn derive_quote_from_book(book: &OrderBook) -> Option<QuoteTick> {
+pub(crate) fn derive_quote_from_book(book: &OrderBook) -> Option<QuoteTick> {
     let bid_price = book.best_bid_price()?;
     let ask_price = book.best_ask_price()?;
     let bid_size = book.best_bid_size()?;

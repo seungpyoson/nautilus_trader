@@ -1,0 +1,68 @@
+[package]
+name = "nautilus-kalshi"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Kalshi protocol contracts for the Nautilus trading engine"
+categories.workspace = true
+keywords.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "nautilus_kalshi"
+crate-type = ["rlib"]
+
+[features]
+turmoil = ["nautilus-network/turmoil"]
+
+[dependencies]
+nautilus-common = { workspace = true, features = ["live"] }
+nautilus-core = { workspace = true }
+nautilus-model = { workspace = true }
+nautilus-network = { workspace = true }
+
+ahash = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+aws-lc-rs = { workspace = true }
+base64 = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+jiff = { workspace = true }
+log = { workspace = true }
+pem = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+ustr = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+nautilus-data = { workspace = true }
+nautilus-live = { workspace = true, features = ["node"] }
+
+axum = { workspace = true }
+futures-util = { workspace = true }
+pkcs8 = { workspace = true }
+rstest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+turmoil = { workspace = true }
+
+[[example]]
+name = "kalshi-data-reader"
+path = "examples/data_reader.rs"
+doc = false

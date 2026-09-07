@@ -673,7 +673,9 @@ mod tests {
     use nautilus_model::{
         enums::{AssetClass, CurrencyType, OptionKind},
         identifiers::{InstrumentId, Symbol},
-        instruments::{Instrument, InstrumentAny, currency_pair::CurrencyPair, stubs::betting},
+        instruments::{
+            Instrument, InstrumentAny, PriceGrid, currency_pair::CurrencyPair, stubs::betting,
+        },
         types::{Currency, Money, Price, Quantity},
     };
     use rstest::rstest;
@@ -1033,6 +1035,13 @@ mod tests {
             .margin_maint(dec!(0.02))
             .maker_fee(dec!(0.0002))
             .taker_fee(dec!(0.0004))
+            .price_grid(
+                PriceGrid::new(vec![
+                    ("0.01".into(), "0.09".into(), "0.01".into()),
+                    ("0.10".into(), "0.90".into(), "0.10".into()),
+                ])
+                .unwrap(),
+            )
             .ts_event(1.into())
             .ts_init(2.into())
             .build()
@@ -1047,6 +1056,38 @@ mod tests {
             serde_json::to_value(&decoded).unwrap(),
             serde_json::to_value(&option).unwrap(),
         );
+    }
+
+    #[rstest]
+    fn test_binary_option_legacy_batch_without_price_grid() {
+        let instrument =
+            InstrumentAny::BinaryOption(nautilus_model::instruments::stubs::binary_option());
+        let metadata = instrument.metadata();
+        let batch =
+            InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+        let batch = batch_without_column(&batch, "price_grid");
+        let restored = decode_instrument_any_batch(&metadata, &batch).unwrap();
+        assert_eq!(restored[0].price_grid(), None);
+        assert_eq!(
+            serde_json::to_value(&restored[0]).unwrap(),
+            serde_json::to_value(instrument).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case(r#"[["0.000","1.000","0.003"]]"#)]
+    #[case(r#"[["0.00","1.00","0.01"]]"#)]
+    fn test_binary_option_rejects_invalid_persisted_grid(#[case] json: &str) {
+        let instrument =
+            InstrumentAny::BinaryOption(nautilus_model::instruments::stubs::binary_option());
+        let metadata = instrument.metadata();
+        let batch =
+            InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+        let mut columns = batch.columns().to_vec();
+        columns[batch.schema().index_of("price_grid").unwrap()] =
+            std::sync::Arc::new(arrow::array::StringArray::from(vec![json]));
+        let batch = arrow::record_batch::RecordBatch::try_new(batch.schema(), columns).unwrap();
+        assert!(decode_instrument_any_batch(&metadata, &batch).is_err());
     }
 
     // The `betting` stub populates every bound, margin, and fee, so this covers the whole struct

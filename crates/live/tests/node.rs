@@ -18,6 +18,9 @@
 //! These tests use global logging state (one logger per process).
 //! Run with cargo-nextest for process isolation, or use --test-threads=1.
 
+#[path = "node/book_feed.rs"]
+mod book_feed;
+
 use std::{
     cell::{Cell, RefCell},
     fmt::Debug,

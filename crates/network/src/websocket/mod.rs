@@ -60,6 +60,12 @@
 //! reader and on its reconnect notification. Epochs identify transport ownership; they do not
 //! order application authentication or subscription recovery.
 //!
+//! Handler builders accept a [`HeadersProvider`] for authentication that must be regenerated on
+//! each connection attempt. It runs after connection quota waits and reconnect backoff. The provider
+//! supplies the entire header set and cannot be combined with stored headers; an error prevents the
+//! attempt without reusing previous headers. [`ReconnectHeaders::update`] remains available when
+//! headers are stored instead.
+//!
 //! # Transport backends
 //!
 //! The backend-neutral [`Message`](crate::transport::Message) and
@@ -86,6 +92,6 @@ pub use config::{TransportBackend, WebSocketConfig};
 pub use consts::{AUTHENTICATION_TIMEOUT_SECS, TEXT_PING, TEXT_PONG};
 pub use subscription::{SubscriptionSnapshot, SubscriptionState, split_topic};
 pub use types::{
-    EpochMessageHandler, EpochPingHandler, MessageHandler, MessageReader, PingHandler,
-    channel_epoch_message_handler, channel_message_handler,
+    EpochMessageHandler, EpochPingHandler, HeadersProvider, MessageHandler, MessageReader,
+    PingHandler, channel_epoch_message_handler, channel_message_handler,
 };

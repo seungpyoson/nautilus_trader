@@ -23,9 +23,9 @@
 //!
 //! The core types (`ExecutionManager`, `ExecutionEngine`, `Cache`) use
 //! `Rc<RefCell<..>>` and are `!Send`. All access happens on the same thread.
-//! The `select!` macro runs one branch to completion (including inner awaits)
-//! before polling the next, so `RefCell` borrows held across `.await` points
-//! within a single branch cannot conflict with borrows in other branches.
+//! Main-loop handlers execute serially. Startup also polls connection futures
+//! that retain engine borrows across `.await`, so data dispatch is deferred
+//! until those futures finish to avoid synchronous subscriber re-entry.
 //!
 //! # Startup sequencing
 //!
@@ -33,15 +33,17 @@
 //! cache before execution clients read them:
 //!
 //! 1. Connect data clients (instruments arrive as buffered `DataEvent`s).
-//! 2. Flush all pending data events and commands into the cache via
-//!    `flush_pending_data`, which loops `try_recv` on the channel receivers
-//!    until no items remain.
+//! 2. Flush buffered and already queued data in bounded batches, yielding to
+//!    startup stop and deadline checks. Later arrivals remain in the receivers.
 //! 3. Connect execution clients (`load_instruments_from_cache` now finds
-//!    populated instruments).
-//! 4. Drain remaining events, then run reconciliation.
+//!    populated instruments), buffering data until the engine borrow is released.
+//! 4. Drain buffered data and await readiness while processing new data.
+//! 5. Drain remaining events, then run reconciliation.
 //!
 //! Both `run()` (integrated event loop) and `start()` (manual lifecycle)
-//! follow this sequence.
+//! follow this sequence. During the readiness wait, `run()` processes data
+//! events and commands so replacement books can restore readiness. Manual
+//! `start()` drains its runner before each readiness poll.
 //!
 //! # Reconciliation
 //!
@@ -77,7 +79,7 @@
 //! maintenance below 100ms (defaults are seconds to minutes). Cadence drifts
 //! by at most one body duration per fire.
 
-use std::{collections::HashSet, fmt::Debug, future::Future, pin::Pin, time::Duration};
+use std::{cell::Cell, collections::HashSet, fmt::Debug, future::Future, pin::Pin, time::Duration};
 
 use anyhow::Context;
 use indexmap::IndexSet;
@@ -395,7 +397,20 @@ impl LiveNode {
 
         let (startup_system_events, startup_system_commands) =
             if let Some(runner) = self.runner.as_mut() {
-                runner.flush_pending_data();
+                let shutdown_requested = self.kernel.shutdown_flag();
+                let (data_evt_rx, data_cmd_rx) = runner.startup_data_receivers();
+                let drain_result = flush_pending_data(
+                    &mut PendingEvents::default(),
+                    data_evt_rx,
+                    data_cmd_rx,
+                    connection_deadline,
+                    || check_startup_drain_control(&self.handle, &shutdown_requested),
+                )
+                .await;
+
+                if let Err(status) = drain_result {
+                    return self.abort_startup_drain(status).await;
+                }
                 (
                     runner.drain_pending_system_events(),
                     runner.drain_pending_system_commands(),
@@ -676,7 +691,7 @@ impl LiveNode {
     ///
     /// Returns the final connection wait status.
     async fn await_engines_connected(
-        &self,
+        &mut self,
         deadline: dst::time::Instant,
     ) -> EngineConnectionStatus {
         log::info!(
@@ -687,6 +702,10 @@ impl LiveNode {
         let interval = Duration::from_millis(100);
 
         loop {
+            if let Some(runner) = self.runner.as_mut() {
+                runner.flush_startup_data_batch();
+            }
+
             if self.handle.should_stop() {
                 log::warn!("Stop signal received, aborting connection wait");
                 return EngineConnectionStatus::StopRequested;
@@ -1047,6 +1066,7 @@ impl LiveNode {
         };
 
         let stop_handle = self.handle.clone();
+        let shutdown_requested = self.kernel.shutdown_flag();
         let mut pending = PendingEvents::default();
         let mut startup_system_events = Vec::new();
         let mut startup_system_commands = Vec::new();
@@ -1056,6 +1076,7 @@ impl LiveNode {
         // This ensures the cache is populated before execution clients connect.
         let data_connect_result = drive_with_event_buffering(
             self.connect_data_phase(connection_deadline),
+            StartupPhase::Connecting,
             &mut pending,
             &mut time_evt_rx,
             &mut system_evt_rx,
@@ -1094,10 +1115,30 @@ impl LiveNode {
             return result;
         }
 
-        // Flush any data events still queued in the channel receivers that the
-        // select loop did not capture before the connect future resolved, then
-        // drain everything into cache.
-        flush_pending_data(&mut pending, &mut data_evt_rx, &mut data_cmd_rx);
+        // Apply the connection backlog before execution clients read instruments.
+        let drain_result = flush_pending_data(
+            &mut pending,
+            &mut data_evt_rx,
+            &mut data_cmd_rx,
+            connection_deadline,
+            || check_startup_drain_control(&stop_handle, &shutdown_requested),
+        )
+        .await;
+
+        if let Err(status) = drain_result {
+            let result = self.abort_startup_drain(status).await;
+            pending.drain();
+            Self::drain_channels(
+                &mut time_evt_rx,
+                &mut system_evt_rx,
+                &mut system_cmd_rx,
+                &mut exec_evt_rx,
+                &mut exec_cmd_rx,
+                &mut data_evt_rx,
+                &mut data_cmd_rx,
+            );
+            return result;
+        }
         startup_system_events.extend(pending.take_system_events());
         startup_system_commands.extend(pending.take_system_commands());
         debug_assert!(
@@ -1106,8 +1147,9 @@ impl LiveNode {
         );
 
         // Startup phase 2: Connect execution clients (instruments now in cache)
-        let engine_connection_result = drive_with_event_buffering(
-            self.connect_exec_phase(connection_deadline),
+        let exec_connect_result = drive_with_event_buffering(
+            self.connect_exec_clients(connection_deadline),
+            StartupPhase::Connecting,
             &mut pending,
             &mut time_evt_rx,
             &mut system_evt_rx,
@@ -1119,23 +1161,39 @@ impl LiveNode {
         )
         .await;
 
-        // Flush channel receivers and drain all remaining pending events
-        flush_all_pending(
-            &mut pending,
-            &mut time_evt_rx,
-            &mut system_evt_rx,
-            &mut system_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-        );
-        startup_system_events.extend(pending.take_system_events());
-        startup_system_commands.extend(pending.take_system_commands());
-        debug_assert!(
-            pending.is_empty(),
-            "all startup events must be processed before reconciliation",
-        );
+        // Instrument publication can synchronously re-enter the execution engine.
+        // Release its connection borrow before dispatching buffered data, then
+        // continue processing new data while waiting for client readiness.
+        let engine_connection_result = match exec_connect_result {
+            Ok(()) => {
+                let drain_result = flush_pending_data(
+                    &mut pending,
+                    &mut data_evt_rx,
+                    &mut data_cmd_rx,
+                    connection_deadline,
+                    || check_startup_drain_control(&stop_handle, &shutdown_requested),
+                )
+                .await;
+
+                match drain_result {
+                    Ok(()) => Ok(drive_with_event_buffering(
+                        self.await_engines_connected(connection_deadline),
+                        StartupPhase::Readiness,
+                        &mut pending,
+                        &mut time_evt_rx,
+                        &mut system_evt_rx,
+                        &mut system_cmd_rx,
+                        &mut exec_evt_rx,
+                        &mut exec_cmd_rx,
+                        &mut data_evt_rx,
+                        &mut data_cmd_rx,
+                    )
+                    .await),
+                    Err(status) => Ok(status),
+                }
+            }
+            Err(e) => Err(e),
+        };
 
         let engine_connection_status = match engine_connection_result {
             Ok(status) => status,
@@ -1143,6 +1201,7 @@ impl LiveNode {
                 let result = self
                     .abort_startup_with_error("Execution client connection timed out", e)
                     .await;
+                pending.drain();
                 Self::drain_channels(
                     &mut time_evt_rx,
                     &mut system_evt_rx,
@@ -1164,6 +1223,7 @@ impl LiveNode {
                     anyhow::anyhow!("readiness timeout while waiting for engine connections"),
                 )
                 .await;
+            pending.drain();
             Self::drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
@@ -1182,6 +1242,7 @@ impl LiveNode {
             .or_else(|| self.startup_abort_reason())
         {
             self.abort_startup(reason).await?;
+            pending.drain();
             Self::drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
@@ -1196,6 +1257,21 @@ impl LiveNode {
         }
 
         debug_assert_eq!(engine_connection_status, EngineConnectionStatus::Connected);
+
+        // Capture a bounded batch of later arrivals only after startup succeeds.
+        flush_all_pending(
+            &mut pending,
+            &mut time_evt_rx,
+            &mut system_evt_rx,
+            &mut system_cmd_rx,
+            &mut exec_evt_rx,
+            &mut exec_cmd_rx,
+            &mut data_evt_rx,
+            &mut data_cmd_rx,
+        );
+        startup_system_events.extend(pending.take_system_events());
+        startup_system_commands.extend(pending.take_system_commands());
+        debug_assert!(pending.is_empty());
 
         // Run reconciliation now that instruments are in cache and start trader
         if let Err(e) = self.perform_startup_reconciliation().await {
@@ -2046,18 +2122,6 @@ impl LiveNode {
             .map_err(|_| anyhow::anyhow!("exec-connect timeout"))
     }
 
-    /// Connects execution clients and checks all engines are connected.
-    ///
-    /// Returns the final connection wait status.
-    /// Must be called after data clients are connected and instrument events drained.
-    async fn connect_exec_phase(
-        &mut self,
-        deadline: dst::time::Instant,
-    ) -> anyhow::Result<EngineConnectionStatus> {
-        self.connect_exec_clients(deadline).await?;
-        Ok(self.await_engines_connected(deadline).await)
-    }
-
     fn startup_abort_reason(&self) -> Option<&'static str> {
         if self.handle.should_stop() {
             Some("Stop signal received during startup")
@@ -2065,6 +2129,27 @@ impl LiveNode {
             Some("Shutdown signal received during startup")
         } else {
             None
+        }
+    }
+
+    async fn abort_startup_drain(&mut self, status: EngineConnectionStatus) -> anyhow::Result<()> {
+        match status {
+            EngineConnectionStatus::TimedOut => {
+                self.abort_startup_with_error(
+                    "Startup data drain timed out",
+                    anyhow::anyhow!("readiness timeout while draining startup data"),
+                )
+                .await
+            }
+            EngineConnectionStatus::StopRequested => {
+                self.abort_startup("Stop signal received during startup")
+                    .await
+            }
+            EngineConnectionStatus::ShutdownRequested => {
+                self.abort_startup("Shutdown signal received during startup")
+                    .await
+            }
+            EngineConnectionStatus::Connected => unreachable!("completed drains do not abort"),
         }
     }
 
@@ -2314,6 +2399,7 @@ impl LiveNode {
         self.handle.set_stopped();
 
         let mut errors = Vec::new();
+
         if let Err(e) = disconnect_result {
             errors.push(e.to_string());
         }
@@ -3241,41 +3327,85 @@ struct RunnerReceivers<'a> {
     data_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
 }
 
-/// Flushes data events and commands from both `pending` and the channel receivers
-/// into the cache, looping until no progress is made.
+/// Flushes the data queued at a startup boundary in bounded, interruptible batches.
 ///
-/// This closes the gap where `drive_with_event_buffering` exits as soon as its
-/// driven future resolves (biased select), leaving items in the channel receivers
-/// that were not captured into `pending`.
-fn flush_pending_data(
+/// Receiver lengths are captured before dispatch so replenishing producers cannot
+/// extend the drain indefinitely. Buffered events precede received events, and
+/// all captured events precede commands so required instruments reach the cache.
+/// Later arrivals remain queued for readiness or the running event loop.
+async fn flush_pending_data(
     pending: &mut PendingEvents,
     data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
     data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
-) {
-    loop {
-        let mut progressed = pending.drain_data();
+    deadline: dst::time::Instant,
+    check_control: impl Fn() -> Result<(), EngineConnectionStatus>,
+) -> Result<(), EngineConnectionStatus> {
+    let received_events = (0..data_evt_rx.len()).map_while(|_| data_evt_rx.try_recv().ok());
+    let received_commands = (0..data_cmd_rx.len()).map_while(|_| data_cmd_rx.try_recv().ok());
 
-        while let Ok(evt) = data_evt_rx.try_recv() {
-            AsyncRunner::handle_data_event(evt);
-            progressed = true;
-        }
+    dispatch_startup_items(
+        pending.data_evts.drain(..).chain(received_events),
+        AsyncRunner::handle_data_event,
+        deadline,
+        &check_control,
+    )
+    .await?;
+    dispatch_startup_items(
+        pending.data_cmds.drain(..).chain(received_commands),
+        AsyncRunner::handle_data_command,
+        deadline,
+        &check_control,
+    )
+    .await
+}
 
-        while let Ok(cmd) = data_cmd_rx.try_recv() {
-            AsyncRunner::handle_data_command(cmd);
-            progressed = true;
-        }
+/// Dispatches a finite startup backlog, giving control work a turn between batches.
+/// Like client connection, one immediately-ready batch can finish with no time
+/// remaining. More work yields and checks the deadline; stop and shutdown always apply.
+/// Cancellation discards the unfinished startup backlog; callers must abort startup.
+async fn dispatch_startup_items<T>(
+    items: impl Iterator<Item = T>,
+    dispatch: impl Fn(T),
+    deadline: dst::time::Instant,
+    check_control: impl Fn() -> Result<(), EngineConnectionStatus>,
+) -> Result<(), EngineConnectionStatus> {
+    let mut items = items.peekable();
 
-        if !progressed {
-            break;
+    while items.peek().is_some() {
+        check_control()?;
+
+        for item in items.by_ref().take(1024) {
+            dispatch(item);
         }
+        check_control()?;
+
+        if items.peek().is_some() {
+            dst::task::yield_now().await;
+            check_control()?;
+
+            if dst::time::Instant::now() >= deadline {
+                return Err(EngineConnectionStatus::TimedOut);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_startup_drain_control(
+    handle: &LiveNodeHandle,
+    shutdown_requested: &Cell<bool>,
+) -> Result<(), EngineConnectionStatus> {
+    if handle.should_stop() {
+        Err(EngineConnectionStatus::StopRequested)
+    } else if shutdown_requested.get() {
+        Err(EngineConnectionStatus::ShutdownRequested)
+    } else {
+        Ok(())
     }
 }
 
-/// Flushes all channel receivers into `pending`, then drains everything.
-///
-/// Unlike [`flush_pending_data`] this is a single pass, not a drain-until-quiet
-/// loop. Sufficient for phase 2 where the goal is to capture items the biased
-/// select did not poll before the connect future resolved.
+/// Captures one bounded batch per receiver, then dispatches the finite backlog.
+/// Later arrivals remain queued for the running event loop or shutdown drain.
 #[expect(
     clippy::too_many_arguments,
     reason = "all runner receivers are drained together"
@@ -3291,27 +3421,27 @@ fn flush_all_pending(
     data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
 ) {
     // Flush channel receivers into pending
-    while let Ok(handler) = time_evt_rx.try_recv() {
+    for handler in (0..1024).map_while(|_| time_evt_rx.try_recv().ok()) {
         let _ = AsyncRunner::handle_time_event(handler);
     }
 
-    while let Ok(event) = system_evt_rx.try_recv() {
+    for event in (0..1024).map_while(|_| system_evt_rx.try_recv().ok()) {
         pending.system_events.push(event);
     }
 
-    while let Ok(command) = system_cmd_rx.try_recv() {
+    for command in (0..1024).map_while(|_| system_cmd_rx.try_recv().ok()) {
         pending.system_commands.push(command);
     }
 
-    while let Ok(evt) = data_evt_rx.try_recv() {
+    for evt in (0..1024).map_while(|_| data_evt_rx.try_recv().ok()) {
         pending.data_evts.push(evt);
     }
 
-    while let Ok(cmd) = data_cmd_rx.try_recv() {
+    for cmd in (0..1024).map_while(|_| data_cmd_rx.try_recv().ok()) {
         pending.data_cmds.push(cmd);
     }
 
-    while let Ok(evt) = exec_evt_rx.try_recv() {
+    for evt in (0..1024).map_while(|_| exec_evt_rx.try_recv().ok()) {
         match evt {
             ExecutionEvent::Account(_) => {
                 AsyncRunner::handle_exec_event(evt);
@@ -3340,23 +3470,34 @@ fn flush_all_pending(
         }
     }
 
-    while let Ok(cmd) = exec_cmd_rx.try_recv() {
+    for cmd in (0..1024).map_while(|_| exec_cmd_rx.try_recv().ok()) {
         pending.exec_cmds.push(cmd);
     }
 
     pending.drain();
 }
 
-/// Drives a future to completion while buffering channel events.
+#[derive(Clone, Copy)]
+enum StartupPhase {
+    Connecting,
+    Readiness,
+}
+
+/// Drives a startup future while processing events safe for its engine borrow.
 ///
 /// Time events are handled immediately. Account events are forwarded directly.
-/// All other events are buffered in `pending` for later processing.
+/// Data events and commands are buffered while either engine is borrowed for
+/// client connection, since data publication can synchronously call execution
+/// subscribers. During readiness they are processed immediately so replacement
+/// books can restore client readiness. Execution reports, orders and commands
+/// remain buffered until the startup futures have completed.
 #[expect(
     clippy::too_many_arguments,
     reason = "startup buffering owns one future plus the pending state and all runner receivers"
 )]
 async fn drive_with_event_buffering<F: std::future::Future>(
     future: F,
+    phase: StartupPhase,
     pending: &mut PendingEvents,
     time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
     system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
@@ -3419,10 +3560,16 @@ async fn drive_with_event_buffering<F: std::future::Future>(
                 pending.exec_cmds.push(cmd);
             }
             Some(evt) = data_evt_rx.recv() => {
-                pending.data_evts.push(evt);
+                match phase {
+                    StartupPhase::Connecting => pending.data_evts.push(evt),
+                    StartupPhase::Readiness => AsyncRunner::handle_data_event(evt),
+                }
             }
             Some(cmd) = data_cmd_rx.recv() => {
-                pending.data_cmds.push(cmd);
+                match phase {
+                    StartupPhase::Connecting => pending.data_cmds.push(cmd),
+                    StartupPhase::Readiness => AsyncRunner::handle_data_command(cmd),
+                }
             }
         }
     }
@@ -3496,13 +3643,7 @@ impl PendingEvents {
             );
         }
 
-        for evt in self.data_evts.drain(..) {
-            AsyncRunner::handle_data_event(evt);
-        }
-
-        for cmd in self.data_cmds.drain(..) {
-            AsyncRunner::handle_data_command(cmd);
-        }
+        self.drain_data();
 
         for report in self.exec_reports.drain(..) {
             AsyncRunner::handle_exec_event(ExecutionEvent::Report(report));
@@ -5709,7 +5850,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_await_engines_connected_returns_stop_requested() {
-        let node = LiveNode::build("TestNode".to_string(), None).unwrap();
+        let mut node = LiveNode::build("TestNode".to_string(), None).unwrap();
         let handle = node.handle();
 
         handle.stop();
@@ -5724,7 +5865,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_await_engines_connected_returns_shutdown_requested() {
-        let node = LiveNode::build("TestNode".to_string(), None).unwrap();
+        let mut node = LiveNode::build("TestNode".to_string(), None).unwrap();
 
         node.kernel().shutdown_flag().set(true);
 
@@ -6842,7 +6983,76 @@ mod tests {
     }
 
     #[rstest]
-    fn test_flush_pending_data_drains_events_and_commands() {
+    #[case::ready_batch(1, true)]
+    #[case::additional_batch(1_025, false)]
+    #[tokio::test]
+    async fn test_startup_drain_with_exhausted_budget(
+        #[case] item_count: usize,
+        #[case] succeeds: bool,
+    ) {
+        let delivered = RefCell::new(Vec::new());
+        let deadline = dst::time::Instant::now() - Duration::from_secs(1);
+
+        let result = dispatch_startup_items(
+            0..item_count,
+            |item| delivered.borrow_mut().push(item),
+            deadline,
+            || Ok(()),
+        )
+        .await;
+
+        assert_eq!(result.is_ok(), succeeds);
+        assert_eq!(
+            *delivered.borrow(),
+            (0..item_count.min(1_024)).collect::<Vec<_>>()
+        );
+
+        if !succeeds {
+            assert_eq!(result, Err(EngineConnectionStatus::TimedOut));
+        }
+    }
+
+    #[rstest]
+    #[case::stop_before_dispatch(EngineConnectionStatus::StopRequested, true)]
+    #[case::shutdown_before_dispatch(EngineConnectionStatus::ShutdownRequested, true)]
+    #[case::stop_during_final_batch(EngineConnectionStatus::StopRequested, false)]
+    #[case::shutdown_during_final_batch(EngineConnectionStatus::ShutdownRequested, false)]
+    #[tokio::test]
+    async fn test_zero_budget_drain_preserves_cancellation(
+        #[case] expected: EngineConnectionStatus,
+        #[case] before_dispatch: bool,
+    ) {
+        let handle = LiveNodeHandle::new();
+        let shutdown_requested = Cell::new(false);
+        let delivered = Cell::new(0);
+        let request_cancellation = || match expected {
+            EngineConnectionStatus::StopRequested => handle.stop(),
+            EngineConnectionStatus::ShutdownRequested => shutdown_requested.set(true),
+            _ => unreachable!(),
+        };
+
+        if before_dispatch {
+            request_cancellation();
+        }
+
+        let result = dispatch_startup_items(
+            0..1,
+            |_| {
+                delivered.set(delivered.get() + 1);
+                request_cancellation();
+            },
+            dst::time::Instant::now(),
+            || check_startup_drain_control(&handle, &shutdown_requested),
+        )
+        .await;
+
+        assert_eq!(result, Err(expected));
+        assert_eq!(delivered.get(), usize::from(!before_dispatch));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_flush_pending_data_drains_events_and_commands() {
         let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
 
@@ -6856,7 +7066,15 @@ mod tests {
         evt_tx.send(stub_data_event()).unwrap();
         cmd_tx.send(stub_data_command()).unwrap();
 
-        flush_pending_data(&mut pending, &mut evt_rx, &mut cmd_rx);
+        flush_pending_data(
+            &mut pending,
+            &mut evt_rx,
+            &mut cmd_rx,
+            dst::time::Instant::now(),
+            || Ok(()),
+        )
+        .await
+        .unwrap();
 
         assert!(pending.data_evts.is_empty());
         assert!(pending.data_cmds.is_empty());
@@ -6865,7 +7083,8 @@ mod tests {
     }
 
     #[rstest]
-    fn test_flush_pending_data_drains_mixed_sources() {
+    #[tokio::test]
+    async fn test_flush_pending_data_drains_mixed_sources() {
         let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
 
@@ -6880,7 +7099,15 @@ mod tests {
         evt_tx.send(stub_data_event()).unwrap();
         cmd_tx.send(stub_data_command()).unwrap();
 
-        flush_pending_data(&mut pending, &mut evt_rx, &mut cmd_rx);
+        flush_pending_data(
+            &mut pending,
+            &mut evt_rx,
+            &mut cmd_rx,
+            dst::time::Instant::now(),
+            || Ok(()),
+        )
+        .await
+        .unwrap();
 
         assert!(pending.data_evts.is_empty());
         assert!(pending.data_cmds.is_empty());
