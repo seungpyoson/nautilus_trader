@@ -1,0 +1,86 @@
+name: Kalshi advisory tests
+
+# Fork infrastructure only. Keep this file off the contribution branch.
+on:
+  push:
+    branches: [ci/kalshi-advisory]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kalshi-advisory-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    if: github.repository == 'seungpyoson/nautilus_trader'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      REVIEWED_SHA: e174161eb79fe5f54f5947aa07c7d3c3781b9d74
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
+          allowed-endpoints: >-
+            ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
+            ${{ vars.CI_ALLOWED_ENDPOINTS }}
+
+      - name: Check out reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: e174161eb79fe5f54f5947aa07c7d3c3781b9d74
+          persist-credentials: false
+
+      - name: Verify reviewed commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+
+      - name: Common setup
+        uses: ./.github/actions/common-setup
+        with:
+          python-version: "3.13"
+          build-type: test
+          free-disk-space: "true"
+          rust-cache-key: kalshi-advisory-ci-pr
+
+      - name: Kalshi and shared transport tests
+        shell: bash
+        run: |
+          cargo test --locked --profile ci-pr -p nautilus-kalshi
+          cargo test --locked --profile ci-pr -p nautilus-network \
+            --test websocket_handshake_logging \
+            --test websocket_headers_provider --test http_response_limit
+          cargo test --locked --profile ci-pr -p nautilus-common --lib messages::book::tests
+          cargo test --locked --profile ci-pr -p nautilus-data --test engine
+
+      - name: LiveNode library and integration tests
+        shell: bash
+        run: |
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci \
+            -p nautilus-live --features node --lib --test node
+
+      - name: Instrument grid and Arrow tests
+        shell: bash
+        run: |
+          cargo test --locked --profile ci-pr -p nautilus-model --lib instruments::price_grid
+          cargo test --locked --profile ci-pr -p nautilus-model --lib instruments::binary_option
+          cargo test --locked --profile ci-pr -p nautilus-serialization \
+            --features arrow --lib binary_option
+          cargo test --locked --profile ci-pr -p nautilus-model \
+            --features high-precision --lib instruments::price_grid
+          cargo test --locked --profile ci-pr -p nautilus-model \
+            --features python --lib binary_option
+
+      - name: Verify source remained unchanged
+        shell: bash
+        run: |-
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
