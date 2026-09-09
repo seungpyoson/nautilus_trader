@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: ec41455df41b3d48ea0bb890540228ad2dcdc15b
+      REVIEWED_SHA: 928b987355d76ba4380076783a1882643187e668
       CARGO_BUILD_JOBS: "2"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -31,7 +31,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ec41455df41b3d48ea0bb890540228ad2dcdc15b
+          ref: 928b987355d76ba4380076783a1882643187e668
           persist-credentials: false
 
       - name: Verify reviewed commit
@@ -39,6 +39,7 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
 
       - name: Common setup
+        id: setup
         uses: ./.github/actions/common-setup
         with:
           python-version: "3.13"
@@ -47,24 +48,28 @@ jobs:
           rust-cache-key: reconciliation-application-ci-pr
 
       - name: Execution engine tests
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
         run: >-
           cargo nextest run --locked --cargo-profile ci-pr --profile ci
           -p nautilus-execution --lib --tests --no-fail-fast
 
       - name: Live reconciliation and lifecycle tests
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
         run: >-
           cargo nextest run --locked --cargo-profile ci-pr --profile ci
           -p nautilus-live --lib --tests --no-fail-fast
 
       - name: Common and Polymarket collection tests
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
         run: >-
           cargo nextest run --locked --cargo-profile ci-pr --profile ci
           -p nautilus-common -p nautilus-polymarket --lib --tests --no-fail-fast
 
       - name: Model common execution live and Polymarket Clippy
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
         run: >-
           cargo clippy --locked --profile ci-pr
@@ -73,6 +78,7 @@ jobs:
           --lib --tests -- -D warnings
 
       - name: Verify source remained unchanged
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
         run: |
           test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
