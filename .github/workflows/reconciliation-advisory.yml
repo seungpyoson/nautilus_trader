@@ -47,59 +47,24 @@ jobs:
           free-disk-space: "true"
           rust-cache-key: reconciliation-application-ci-pr
 
-      - name: Execution engine tests
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        shell: bash
-        run: >-
-          cargo nextest run --locked --cargo-profile ci-pr --profile ci
-          -p nautilus-execution --lib --tests --no-fail-fast
-
+      # The preceding broad run lost its runner before uploading any logs.
+      # Isolate the failed live suite; this run makes no claim about consumers.
       - name: Live reconciliation and lifecycle tests
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
-        run: >-
-          cargo nextest run --locked --cargo-profile ci-pr --profile ci
-          -p nautilus-live --lib --tests --no-fail-fast
+        run: |
+          set -o pipefail
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci \
+            -p nautilus-live --lib --tests --no-fail-fast \
+            2>&1 | tee "$RUNNER_TEMP/live-reconciliation-tests.log"
 
-      - name: Common and Polymarket collection tests
+      - name: Preserve live suite output
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        shell: bash
-        run: >-
-          cargo nextest run --locked --cargo-profile ci-pr --profile ci
-          -p nautilus-common -p nautilus-polymarket --lib --tests --no-fail-fast
-
-      - name: Account risk backtest and sandbox consumers
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        shell: bash
-        run: >-
-          cargo nextest run --locked --cargo-profile ci-pr --profile ci
-          -p nautilus-portfolio -p nautilus-risk -p nautilus-backtest -p nautilus-sandbox
-          --lib --tests --no-fail-fast
-
-      - name: Model report serialization including Python dictionary roundtrip
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        shell: bash
-        run: >-
-          cargo nextest run --locked --cargo-profile ci-pr --profile ci
-          -p nautilus-model --features python --lib
-          -E 'test(reports::mass_status::)' --no-fail-fast
-
-      - name: Affected native components Clippy
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        shell: bash
-        run: >-
-          cargo clippy --locked --profile ci-pr
-          -p nautilus-model -p nautilus-common -p nautilus-execution
-          -p nautilus-live -p nautilus-polymarket -p nautilus-portfolio
-          -p nautilus-risk -p nautilus-backtest -p nautilus-sandbox
-          --features nautilus-model/python --lib --tests -- -D warnings
-
-      - name: Standalone live runner Clippy
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        shell: bash
-        run: >-
-          cargo clippy --locked --profile ci-pr -p nautilus-live
-          --no-default-features --lib -- -D warnings
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: live-reconciliation-${{ env.REVIEWED_SHA }}
+          path: ${{ runner.temp }}/live-reconciliation-tests.log
+          if-no-files-found: error
 
       - name: Verify source remained unchanged
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
