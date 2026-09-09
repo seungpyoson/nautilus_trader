@@ -2566,9 +2566,10 @@ impl LiveNode {
         data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
     ) {
         let mut drained = 0;
+        self.process_pending_settlements();
 
         while let Ok(handler) = time_evt_rx.try_recv() {
-            let _ = AsyncRunner::handle_time_event(handler);
+            self.process_runner_event(PendingRunnerEvent::TimeEvent(handler));
             drained += 1;
         }
 
@@ -2581,22 +2582,22 @@ impl LiveNode {
         }
 
         while let Ok(evt) = data_evt_rx.try_recv() {
-            AsyncRunner::handle_data_event(evt);
+            self.process_runner_event(PendingRunnerEvent::DataEvent(evt));
             drained += 1;
         }
 
         while let Ok(cmd) = data_cmd_rx.try_recv() {
-            AsyncRunner::handle_data_command(cmd);
+            self.process_runner_event(PendingRunnerEvent::DataCommand(cmd));
             drained += 1;
         }
 
         while let Ok(evt) = exec_evt_rx.try_recv() {
-            AsyncRunner::handle_exec_event(evt);
+            self.process_runner_event(PendingRunnerEvent::ExecEvent(evt));
             drained += 1;
         }
 
         while let Ok(cmd) = exec_cmd_rx.try_recv() {
-            AsyncRunner::handle_trading_command(cmd);
+            self.process_runner_event(PendingRunnerEvent::ExecCommand(cmd));
             drained += 1;
         }
 

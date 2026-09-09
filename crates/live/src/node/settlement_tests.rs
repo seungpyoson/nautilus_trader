@@ -681,6 +681,73 @@ async fn contract_settlement_failure_blocks_queued_trading_and_returns_error(
 }
 
 #[rstest]
+#[case::healthy("1.000", None)]
+#[case::conflicting("0.000", Some("Conflicting contract close"))]
+#[tokio::test]
+async fn contract_settlement_final_drain_gates_queued_trading(
+    #[case] price: &str,
+    #[case] expected_error: Option<&str>,
+    #[values(false, true)] already_pending: bool,
+) {
+    let mut f = Fixture::new();
+    f.fill("OWNER-001", "OPEN", OrderSide::Buy, "10.00", "0.400");
+    f.close("1.000", InstrumentCloseType::ContractExpired);
+    f.node.runner.as_ref().unwrap().bind_senders();
+    let event = DataEvent::Data(Data::InstrumentClose(InstrumentClose::new(
+        f.instrument.id(),
+        Price::from(price),
+        InstrumentCloseType::ContractExpired,
+        f.instrument.expiration_ns().unwrap(),
+        f.instrument.expiration_ns().unwrap(),
+    )));
+    if already_pending {
+        AsyncRunner::handle_data_event(event);
+    } else {
+        nautilus_common::live::runner::get_data_event_sender()
+            .send(event)
+            .unwrap();
+    }
+    let sender = nautilus_common::runner::try_get_trading_cmd_sender().unwrap();
+    for command in f.trading_commands() {
+        sender.execute(command);
+    }
+    assert!(f.node.check_execution_health().is_ok());
+
+    // Finalization stops clients before draining; the shared halt must still gate dispatch
+    f.node.kernel.exec_engine.borrow_mut().stop();
+    let AsyncRunnerChannels {
+        mut time_evt_rx,
+        mut system_evt_rx,
+        mut system_cmd_rx,
+        mut exec_evt_rx,
+        mut exec_cmd_rx,
+        mut data_evt_rx,
+        mut data_cmd_rx,
+    } = f.node.runner.take().unwrap().take_channels();
+    f.node.drain_channels(
+        &mut time_evt_rx,
+        &mut system_evt_rx,
+        &mut system_cmd_rx,
+        &mut exec_evt_rx,
+        &mut exec_cmd_rx,
+        &mut data_evt_rx,
+        &mut data_cmd_rx,
+    );
+    let expected_dispatches = if expected_error.is_some() { 0 } else { 2 };
+    assert_eq!(f.submitted.borrow().len(), expected_dispatches);
+    assert_eq!(f.modified.borrow().len(), expected_dispatches);
+    assert_eq!(f.cancels.borrow().len(), 1);
+    let result = f.node.finalize_stop().await;
+    match expected_error {
+        Some(expected) => {
+            let error = result.unwrap_err();
+            assert!(format!("{error:#}").contains(expected));
+        }
+        None => result.unwrap(),
+    }
+}
+
+#[rstest]
 fn contract_settlement_partial_exit_and_multiple_owners() {
     let mut f = Fixture::new();
     f.fill("OWNER-001", "OPEN-A", OrderSide::Buy, "10.00", "0.400");
