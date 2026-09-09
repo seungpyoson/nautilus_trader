@@ -6211,8 +6211,8 @@ mod tests {
         handle.publish_startup_reconciliation(StartupReconciliationSummary {
             outcome: StartupReconciliationOutcome::Failed,
             requested_lookback_mins: None,
-            ts_started: Default::default(),
-            ts_finished: Default::default(),
+            ts_started: UnixNanos::default(),
+            ts_finished: UnixNanos::default(),
             clients: Vec::new(),
         });
         handle.set_stopped();
