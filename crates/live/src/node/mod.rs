@@ -381,7 +381,11 @@ impl LiveNode {
         self.handle.set_starting();
 
         self.kernel.reset_shutdown_flag();
-        self.kernel.start_async().await;
+        if let Err(e) = self.kernel.start_async().await {
+            return self
+                .abort_startup_with_error("Kernel startup failed", e)
+                .await;
+        }
 
         if self.kernel.is_event_store_replay() {
             log::info!(
@@ -391,12 +395,6 @@ impl LiveNode {
             if !self.finish_startup_replay().await? {
                 return Ok(());
             }
-            return Ok(());
-        }
-
-        if self.kernel.is_event_store_replay_configured() {
-            self.abort_startup("Event-store replay did not start")
-                .await?;
             return Ok(());
         }
 
@@ -1168,7 +1166,11 @@ impl LiveNode {
 
         self.handle.set_starting();
         self.kernel.reset_shutdown_flag();
-        self.kernel.start_async().await;
+        if let Err(e) = self.kernel.start_async().await {
+            return self
+                .abort_startup_with_error("Kernel startup failed", e)
+                .await;
+        }
 
         if self.kernel.is_event_store_replay() {
             log::info!(
@@ -1178,12 +1180,6 @@ impl LiveNode {
             if !self.finish_startup_replay().await? {
                 return Ok(());
             }
-            return Ok(());
-        }
-
-        if self.kernel.is_event_store_replay_configured() {
-            self.abort_startup("Event-store replay did not start")
-                .await?;
             return Ok(());
         }
 
@@ -2318,7 +2314,7 @@ impl LiveNode {
         match self.abort_startup(reason).await {
             Ok(()) => Err(startup_err),
             Err(finalize_err) => {
-                anyhow::bail!("{startup_err}; failed to finalize startup abort: {finalize_err}")
+                anyhow::bail!("{startup_err:#}; failed to finalize startup abort: {finalize_err:#}")
             }
         }
     }
@@ -6163,7 +6159,12 @@ mod tests {
         let mut node = live_node_with_replay_store(true);
         let handle = node.handle();
 
-        node.start().await.unwrap();
+        let e = node
+            .start()
+            .await
+            .expect_err("restore failure must propagate");
+
+        assert!(format!("{e:#}").contains("replay restore failed"));
 
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!handle.is_running());
@@ -6207,7 +6208,12 @@ mod tests {
         let mut node = live_node_with_replay_store(true);
         let handle = node.handle();
 
-        node.run().await.unwrap();
+        let e = node
+            .run()
+            .await
+            .expect_err("restore failure must propagate");
+
+        assert!(format!("{e:#}").contains("replay restore failed"));
 
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!handle.is_running());

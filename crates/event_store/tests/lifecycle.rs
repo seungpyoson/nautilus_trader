@@ -267,7 +267,7 @@ fn kernel_drop_after_start_seals_run_as_ended() {
             .build()
             .expect("kernel");
 
-        kernel.start();
+        kernel.start().expect("start kernel");
 
         // Advance the kernel's TestClock so the drop-seal ts is distinguishable from 0.
         {
@@ -351,7 +351,7 @@ fn kernel_start_installs_snapshot_anchorer_for_execution_snapshots() {
         setup_netting_snapshot_engine(&mut exec_engine, &instrument);
     }
 
-    kernel.start();
+    kernel.start().expect("start kernel");
     let run_id = kernel
         .event_store()
         .expect("event store")
@@ -496,7 +496,7 @@ fn kernel_start_restores_parent_cache_snapshot_and_replays_tail() {
         .add(&snapshot_ref.blob_ref, snapshot_ref.blob.clone())
         .expect("seed cache-owned snapshot blob");
 
-    kernel.start();
+    kernel.start().expect("start kernel");
 
     {
         let cache = kernel.cache.borrow();
@@ -586,7 +586,7 @@ fn kernel_start_replays_configured_run_without_recovered_parent() {
         .add(&snapshot_ref.blob_ref, snapshot_ref.blob.clone())
         .expect("seed cache-owned snapshot blob");
 
-    kernel.start();
+    kernel.start().expect("start kernel");
 
     {
         let cache = kernel.cache.borrow();
@@ -670,7 +670,7 @@ fn kernel_start_configured_replay_does_not_start_execution_clients() {
         "stub client must start disconnected",
     );
 
-    kernel.start();
+    kernel.start().expect("start kernel");
 
     {
         let cache = kernel.cache.borrow();
@@ -724,7 +724,9 @@ fn kernel_start_configured_replay_requires_load_state() {
         .build()
         .expect("kernel");
 
-    kernel.start();
+    kernel
+        .start()
+        .expect_err("startup must reject invalid persisted state");
 
     let manifests =
         RedbBackend::list_runs(&config.base_dir, &instance_id.to_string()).expect("list runs");
@@ -793,7 +795,7 @@ fn kernel_start_configured_replay_overrides_recovered_parent() {
         .build()
         .expect("kernel");
 
-    kernel.start();
+    kernel.start().expect("start kernel");
 
     {
         let cache = kernel.cache.borrow();
@@ -848,7 +850,9 @@ fn kernel_start_missing_configured_replay_run_does_not_open_new_run() {
         .build()
         .expect("kernel");
 
-    kernel.start();
+    kernel
+        .start()
+        .expect_err("startup must reject invalid persisted state");
 
     let manifests =
         RedbBackend::list_runs(&config.base_dir, &instance_id.to_string()).expect("list runs");
@@ -897,7 +901,9 @@ fn kernel_start_quarantined_configured_replay_run_does_not_open_new_run(#[case] 
         .build()
         .expect("kernel");
 
-    kernel.start();
+    kernel
+        .start()
+        .expect_err("startup must reject invalid persisted state");
 
     let manifests =
         RedbBackend::list_runs(&config.base_dir, &instance_id.to_string()).expect("list runs");
@@ -997,7 +1003,9 @@ fn kernel_start_restore_failure_does_not_open_new_run(
             .expect("seed cache-owned snapshot blob");
     }
 
-    kernel.start();
+    kernel
+        .start()
+        .expect_err("startup must reject invalid persisted state");
 
     let manifests =
         RedbBackend::list_runs(&config.base_dir, &instance_id.to_string()).expect("list runs");
@@ -1096,7 +1104,7 @@ fn kernel_start_restores_parent_cache_from_injected_database() {
         "cache must not be pre-seeded with the snapshot blob",
     );
 
-    kernel.start();
+    kernel.start().expect("start kernel");
 
     {
         let cache = kernel.cache.borrow();
@@ -1185,7 +1193,9 @@ fn kernel_start_db_load_error_leaves_run_unopened() {
         .build()
         .expect("kernel");
 
-    kernel.start();
+    kernel
+        .start()
+        .expect_err("startup must reject invalid persisted state");
 
     let manifests =
         RedbBackend::list_runs(&config.base_dir, &instance_id.to_string()).expect("list runs");

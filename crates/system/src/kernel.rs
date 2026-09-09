@@ -43,7 +43,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "streaming")]
 use anyhow::Context;
 #[cfg(feature = "streaming")]
 use jiff::tz::TimeZone;
@@ -678,7 +677,11 @@ impl NautilusKernel {
     }
 
     /// Starts the Nautilus system kernel synchronously (for backtest use).
-    pub fn start(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if event-store restoration, run creation, or trader initialization fails.
+    pub fn start(&mut self) -> anyhow::Result<()> {
         arm_shutdown_on_error(self.config.shutdown_on_error());
         log::info!("Starting");
 
@@ -691,23 +694,20 @@ impl NautilusKernel {
             let environment = self.config.environment();
             let event_store_replay_configured = event_store.is_event_store_replay_configured();
 
-            if event_store_replay_configured && !self.config.load_state() {
-                log::error!("Event-store replay requires load_state=true");
-                return;
+            anyhow::ensure!(
+                !event_store_replay_configured || self.config.load_state(),
+                "Event-store replay requires load_state=true"
+            );
+
+            if self.config.load_state() {
+                event_store
+                    .restore_parent_cache(self.instance_id, &mut self.cache.borrow_mut())
+                    .context("failed to restore cache from event-store source")?;
             }
 
-            if self.config.load_state()
-                && let Err(e) =
-                    event_store.restore_parent_cache(self.instance_id, &mut self.cache.borrow_mut())
-            {
-                log::error!("Failed to restore cache from event-store replay source: {e}");
-                return;
-            }
-
-            if let Err(e) = event_store.open(self.instance_id, &components, environment) {
-                log::error!("Failed to open event-store run: {e}");
-                return;
-            }
+            event_store
+                .open(self.instance_id, &components, environment)
+                .context("failed to open event-store run")?;
 
             let anchorer = event_store.snapshot_anchorer();
             self.exec_engine
@@ -722,21 +722,29 @@ impl NautilusKernel {
             );
             self.ts_started = Some(self.clock.borrow().timestamp_ns());
             log::info!("Started");
-            return;
+            return Ok(());
         }
 
         self.start_engines();
 
         log::info!("Initializing trader");
-        if let Err(e) = self.trader.borrow_mut().initialize() {
-            log::error!("Error initializing trader: {e:?}");
-            return;
+        {
+            let mut trader = self.trader.borrow_mut();
+
+            match trader.state() {
+                ComponentState::PreInitialized => {
+                    trader.initialize().context("failed to initialize trader")?
+                }
+                ComponentState::Ready => {}
+                state => anyhow::bail!("Cannot start kernel with trader in {state} state"),
+            }
         }
 
         // Execution and data clients are started by their engines via `start_engines` above
 
         self.ts_started = Some(self.clock.borrow().timestamp_ns());
         log::info!("Started");
+        Ok(())
     }
 
     fn collect_registered_components(trader: &Rc<RefCell<Trader>>) -> RegisteredComponents {
@@ -763,12 +771,16 @@ impl NautilusKernel {
     }
 
     /// Starts the Nautilus system kernel asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if event-store restoration, run creation, or trader initialization fails.
     #[expect(
         clippy::unused_async,
         reason = "keeps the public async kernel API shape stable"
     )]
-    pub async fn start_async(&mut self) {
-        self.start();
+    pub async fn start_async(&mut self) -> anyhow::Result<()> {
+        self.start()
     }
 
     /// Starts the trader (strategies and actors).
@@ -1561,6 +1573,19 @@ mod lifecycle_tests {
     }
 
     #[rstest]
+    fn test_start_rejects_disposed_trader() {
+        let mut kernel = NautilusKernelBuilder::default().build().unwrap();
+        kernel.trader.borrow_mut().initialize().unwrap();
+        kernel.trader.borrow_mut().dispose().unwrap();
+
+        let e = kernel.start().expect_err("trader is disposed");
+
+        assert!(e.to_string().contains("Cannot start kernel with trader"));
+        assert!(kernel.ts_started.is_none());
+        kernel.dispose();
+    }
+
+    #[rstest]
     fn test_state_persistence_orders_restore_load_start_stop_save_seal_and_dispose() {
         let actor_id = ActorId::from("STATE-ACTOR");
         let strategy_id = StrategyId::from("STATE-STRATEGY-001");
@@ -1588,7 +1613,7 @@ mod lifecycle_tests {
         let strategy = StateStrategy::new(strategy_id, control.clone(), strategy_save.clone());
         add_state_components(&kernel, &control, actor, strategy);
 
-        kernel.start();
+        kernel.start().unwrap();
         kernel.start_trader().unwrap();
 
         let actor_state = get_actor_unchecked::<StateActor>(&actor_id.inner())
@@ -1642,7 +1667,7 @@ mod lifecycle_tests {
         let strategy = StateStrategy::new(strategy_id, control.clone(), state("strategy", b"save"));
         add_state_components(&kernel, &control, actor, strategy);
 
-        kernel.start();
+        kernel.start().unwrap();
         kernel.start_trader().unwrap();
         kernel.stop_trader();
         finalize(&mut kernel).unwrap();
@@ -1673,7 +1698,7 @@ mod lifecycle_tests {
         let strategy = StateStrategy::new(strategy_id, control.clone(), IndexMap::new());
         add_state_components(&kernel, &control, actor, strategy);
 
-        kernel.start();
+        kernel.start().unwrap();
         kernel.start_trader().unwrap();
         kernel.stop_trader();
         finalize(&mut kernel).unwrap();
@@ -1720,7 +1745,7 @@ mod lifecycle_tests {
             StateStrategy::new(strategy_id, control.clone(), IndexMap::new()).with_fail_save();
         add_state_components(&kernel, &control, actor, strategy);
 
-        kernel.start();
+        kernel.start().unwrap();
         kernel.start_trader().unwrap();
         kernel.stop_trader();
         let expected_shutdown = kernel.clock.borrow().timestamp_ns();
@@ -1768,7 +1793,7 @@ mod lifecycle_tests {
         let strategy = StateStrategy::new(strategy_id, control.clone(), IndexMap::new());
         add_state_components(&kernel, &control, actor, strategy);
 
-        kernel.start();
+        kernel.start().unwrap();
         let error = kernel.start_trader().unwrap_err();
         kernel.dispose();
 
@@ -1803,7 +1828,7 @@ mod lifecycle_tests {
         let strategy = StateStrategy::new(strategy_id, control.clone(), state("strategy", b"save"));
         add_state_components(&kernel, &control, actor, strategy);
 
-        kernel.start();
+        kernel.start().unwrap();
         kernel.start_trader().unwrap();
         kernel.stop_trader();
         let error = finalize(&mut kernel).unwrap_err();
@@ -1849,7 +1874,7 @@ mod lifecycle_tests {
                 .with_fail_start();
         add_state_components(&kernel, &control, actor, strategy);
 
-        kernel.start();
+        kernel.start().unwrap();
         let error = kernel.start_trader().unwrap_err();
         kernel.dispose();
 
@@ -1898,7 +1923,7 @@ mod lifecycle_tests {
             StateStrategy::new(strategy_id, control.clone(), state("strategy", b"forced"));
         add_state_components(&kernel, &control, actor, strategy);
 
-        kernel.start();
+        kernel.start().unwrap();
         kernel.start_trader().unwrap();
         kernel.dispose();
 
@@ -1947,7 +1972,7 @@ mod lifecycle_tests {
             .add_order(second_order, None, None, false)
             .unwrap();
 
-        kernel.start();
+        kernel.start().unwrap();
         assert!(
             kernel
                 .order_emulator
@@ -2007,7 +2032,7 @@ mod lifecycle_tests {
             .add_order(order, None, None, false)
             .unwrap();
 
-        kernel.start();
+        kernel.start().unwrap();
         kernel.start_trader().unwrap();
         assert!(
             kernel
