@@ -3058,12 +3058,43 @@ mod serial_tests {
         assert_eq!(inventory.all_inventory_reconciled(), position_count == 0);
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RetainedFillFixture {
+        Complete,
+        CompleteWithOrderReport,
+        FilledBeforeAccepted,
+        MissingOrderEffect,
+        MissingPositionEffect,
+        ChangedCommission,
+        ChangedCommissionWithOrderReport,
+        ChangedPrice,
+        ChangedAccount,
+        ChangedPositionPrice,
+        PartialPositionEffect,
+        ConflictingPositionBinding,
+    }
+
     #[rstest]
-    #[case::same_source(false)]
-    #[case::changed_closed_order_source(true)]
+    #[case::same_source(false, RetainedFillFixture::Complete)]
+    #[case::same_source_with_order_report(false, RetainedFillFixture::CompleteWithOrderReport)]
+    #[case::filled_before_accepted(false, RetainedFillFixture::FilledBeforeAccepted)]
+    #[case::changed_closed_order_source(true, RetainedFillFixture::Complete)]
+    #[case::position_only_reconstructs_order(false, RetainedFillFixture::MissingOrderEffect)]
+    #[case::order_only_is_incomplete(false, RetainedFillFixture::MissingPositionEffect)]
+    #[case::changed_commission(false, RetainedFillFixture::ChangedCommission)]
+    #[case::changed_commission_with_order_report(
+        false,
+        RetainedFillFixture::ChangedCommissionWithOrderReport
+    )]
+    #[case::changed_price(false, RetainedFillFixture::ChangedPrice)]
+    #[case::changed_account(false, RetainedFillFixture::ChangedAccount)]
+    #[case::changed_position_price(false, RetainedFillFixture::ChangedPositionPrice)]
+    #[case::partial_position_effect(false, RetainedFillFixture::PartialPositionEffect)]
+    #[case::conflicting_position_binding(false, RetainedFillFixture::ConflictingPositionBinding)]
     #[tokio::test(flavor = "current_thread")]
     async fn test_startup_final_inventory_rechecks_fill_only_closed_order_sources(
         #[case] change_source: bool,
+        #[case] fixture: RetainedFillFixture,
         #[values(false, true)] run: bool,
     ) {
         let config = LiveNodeConfig {
@@ -3080,7 +3111,7 @@ mod serial_tests {
         let client_id = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let position_id = PositionId::from("RETAINED-FILL-POSITION");
-        let make_order = |id, venue_id| {
+        let make_order = |id, venue_id, accepted| {
             let mut order = OrderTestBuilder::new(OrderType::Limit)
                 .trader_id(node.kernel().trader_id())
                 .instrument_id(instrument.id())
@@ -3092,18 +3123,22 @@ mod serial_tests {
             order
                 .apply(TestOrderEventStubs::submitted(&order, account_id))
                 .unwrap();
-            order
-                .apply(TestOrderEventStubs::accepted(&order, account_id, venue_id))
-                .unwrap();
+            if accepted {
+                order
+                    .apply(TestOrderEventStubs::accepted(&order, account_id, venue_id))
+                    .unwrap();
+            }
             order
         };
         let mut historical = make_order(
             ClientOrderId::from("O-FILL-HISTORY"),
             VenueOrderId::from("V-FILL-HISTORY"),
+            fixture != RetainedFillFixture::FilledBeforeAccepted,
         );
         let trigger = make_order(
             ClientOrderId::from("O-FILL-SOURCE-TRIGGER"),
             VenueOrderId::from("V-FILL-SOURCE-TRIGGER"),
+            true,
         );
         let canceled =
             TestOrderEventStubs::canceled(&trigger, account_id, trigger.venue_order_id());
@@ -3121,7 +3156,7 @@ mod serial_tests {
         ) else {
             unreachable!()
         };
-        let fill_report = FillReport::new(
+        let mut fill_report = FillReport::new(
             fill.account_id,
             fill.instrument_id,
             fill.venue_order_id,
@@ -3137,10 +3172,29 @@ mod serial_tests {
             fill.ts_init,
             None,
         );
-        historical
-            .apply(OrderEventAny::Filled(fill.clone()))
-            .unwrap();
-        let position = Position::new(&instrument, fill);
+        if fixture != RetainedFillFixture::MissingOrderEffect {
+            historical
+                .apply(OrderEventAny::Filled(fill.clone()))
+                .unwrap();
+        }
+        match fixture {
+            RetainedFillFixture::ChangedCommission
+            | RetainedFillFixture::ChangedCommissionWithOrderReport => {
+                fill_report.commission = Money::new(3.0, fill_report.commission.currency);
+            }
+            RetainedFillFixture::ChangedPrice => fill_report.last_px = Price::from("101.0"),
+            RetainedFillFixture::ChangedAccount => {
+                fill_report.account_id = AccountId::from("OTHER-001");
+            }
+            _ => {}
+        }
+        let mut position_fill = fill;
+        if fixture == RetainedFillFixture::ChangedPositionPrice {
+            position_fill.last_px = Price::from("101.0");
+        } else if fixture == RetainedFillFixture::PartialPositionEffect {
+            position_fill.last_qty = Quantity::from("0.5");
+        }
+        let position = Position::new(&instrument, position_fill);
         let cache = node.kernel().cache();
         {
             let mut cache = cache.borrow_mut();
@@ -3151,9 +3205,24 @@ mod serial_tests {
             cache
                 .add_order(trigger, None, Some(client_id), false)
                 .unwrap();
-            cache.add_position(&position, OmsType::Hedging).unwrap();
+            if fixture != RetainedFillFixture::MissingPositionEffect {
+                cache.add_position(&position, OmsType::Hedging).unwrap();
+            }
             cache.build_index();
-            assert!(cache.is_order_closed(&historical.client_order_id()));
+            if fixture == RetainedFillFixture::ConflictingPositionBinding {
+                cache
+                    .add_position_id(
+                        &PositionId::from("OTHER-POSITION"),
+                        &instrument.id().venue,
+                        &historical.client_order_id(),
+                        &historical.strategy_id(),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                cache.is_order_closed(&historical.client_order_id()),
+                fixture != RetainedFillFixture::MissingOrderEffect
+            );
         }
         let mut mass_status = ExecutionMassStatus::new(
             client_id,
@@ -3163,6 +3232,23 @@ mod serial_tests {
             None,
         );
         mass_status.add_fill_reports(vec![fill_report]);
+        if matches!(
+            fixture,
+            RetainedFillFixture::CompleteWithOrderReport
+                | RetainedFillFixture::ChangedCommissionWithOrderReport
+        ) {
+            let mut report = test_order_report(
+                account_id,
+                historical.client_order_id(),
+                historical.venue_order_id().unwrap(),
+                OrderStatus::Filled,
+            );
+            report.quantity = historical.quantity();
+            report.filled_qty = historical.filled_qty();
+            report.avg_px = historical.avg_px();
+            report.venue_position_id = Some(position_id);
+            mass_status.add_order_reports(vec![report]);
+        }
         mass_status.add_position_reports(vec![PositionStatusReport::new(
             account_id,
             instrument.id(),
@@ -3189,9 +3275,13 @@ mod serial_tests {
                 } else {
                     client_id
                 };
+                let current = cache
+                    .borrow()
+                    .order_owned(&historical.client_order_id())
+                    .unwrap();
                 cache
                     .borrow_mut()
-                    .add_order(historical.clone(), None, Some(source), true)
+                    .add_order(current, None, Some(source), true)
                     .unwrap();
                 callback_count.set(callback_count.get() + 1);
             }
@@ -3225,11 +3315,28 @@ mod serial_tests {
             .expect("actor must observe final evidence");
         assert!(summary.pending_execution.all_applications_confirmed());
         let report = summary.clients[0].report.as_ref().unwrap();
-        assert!(report.application.all_received_reports_reconciled());
-        assert_eq!(report.application.fills.reconciled, 1);
+        let complete = matches!(
+            fixture,
+            RetainedFillFixture::Complete
+                | RetainedFillFixture::CompleteWithOrderReport
+                | RetainedFillFixture::FilledBeforeAccepted
+                | RetainedFillFixture::MissingOrderEffect
+        );
+        assert_eq!(
+            report.application.all_received_reports_reconciled(),
+            complete,
+            "{:#?}",
+            report.application
+        );
+        assert_eq!(report.application.fills.reconciled, usize::from(complete));
         let inventory = report.final_inventory.unwrap();
-        assert_eq!(inventory.source_valid, !change_source);
-        assert_eq!(inventory.all_inventory_reconciled(), !change_source);
+        assert_eq!(
+            inventory.source_valid,
+            !change_source && fixture != RetainedFillFixture::ChangedAccount
+        );
+        if complete {
+            assert_eq!(inventory.all_inventory_reconciled(), !change_source);
+        }
     }
 
     #[rstest]

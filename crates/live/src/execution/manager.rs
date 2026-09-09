@@ -714,18 +714,22 @@ impl ExecutionManager {
         clippy::unused_async_trait_impl,
         reason = "public reconciliation API stays async; live node and test callers await it"
     )]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the public async API owns the engine for the lifetime of its returned future"
+    )]
     pub async fn reconcile_execution_mass_status(
         &mut self,
         mass_status: ExecutionMassStatus,
         exec_engine: Rc<RefCell<ExecutionEngine>>,
     ) -> ReconciliationResult {
-        self.reconcile_execution_mass_status_ref(&mass_status, exec_engine)
+        self.reconcile_execution_mass_status_ref(&mass_status, &exec_engine)
     }
 
     pub(crate) fn reconcile_execution_mass_status_ref(
         &mut self,
         mass_status: &ExecutionMassStatus,
-        exec_engine: Rc<RefCell<ExecutionEngine>>,
+        exec_engine: &RefCell<ExecutionEngine>,
     ) -> ReconciliationResult {
         let mut summary = ReconciliationSummary {
             orders: ReconciliationReportCounts {
@@ -1489,24 +1493,20 @@ impl ExecutionManager {
 
             if excluded {
                 summary.fills.excluded += 1;
-            } else if retained.fill_keys.contains(&fill_key)
-                || applied_fill_keys.contains(&fill_key)
-                || order.is_some_and(|order| {
-                    order.account_id() == Some(fill.account_id)
-                        && order.instrument_id() == fill.instrument_id
-                        && order.venue_order_id() == Some(fill.venue_order_id)
-                        && fill
-                            .client_order_id
-                            .is_none_or(|id| id == order.client_order_id())
-                        && retained.predates_netting_lifecycle(
-                            fill.account_id,
-                            fill.instrument_id,
-                            order.strategy_id(),
-                            fill.ts_event,
-                        )
-                        && order.trade_ids_ref().contains(&fill.trade_id)
-                })
-            {
+            } else if order.is_some_and(|order| {
+                if retained.fill_keys.contains(&fill_key) {
+                    Self::retained_fill_matches_report(&cache, &order, fill)
+                } else {
+                    Self::order_fill_matches_report(&cache, &order, fill)
+                        && (applied_fill_keys.contains(&fill_key)
+                            || retained.predates_netting_lifecycle(
+                                fill.account_id,
+                                fill.instrument_id,
+                                order.strategy_id(),
+                                fill.ts_event,
+                            ))
+                }
+            }) {
                 summary.fills.reconciled += 1;
             } else {
                 summary.fills.unresolved += 1;
@@ -5512,7 +5512,10 @@ impl ExecutionManager {
         pending_fill_keys: &IndexSet<FillKey>,
     ) -> Option<(OrderEventAny, FillKey)> {
         let fill_key = (fill.account_id, fill.instrument_id, fill.trade_id);
-        if self.processed_fills.contains_key(&fill_key) || pending_fill_keys.contains(&fill_key) {
+        if self.processed_fills.contains_key(&fill_key)
+            || pending_fill_keys.contains(&fill_key)
+            || Self::retained_fill_matches_report(&self.cache.borrow(), order, fill)
+        {
             return None;
         }
 
@@ -5540,6 +5543,73 @@ impl ExecutionManager {
         ));
 
         Some((event, fill_key))
+    }
+
+    fn order_fill_matches_report(cache: &Cache, order: &OrderAny, report: &FillReport) -> bool {
+        order.account_id() == Some(report.account_id)
+            && order.instrument_id() == report.instrument_id
+            && (order.venue_order_id() == Some(report.venue_order_id)
+                || order.venue_order_ids().contains(&&report.venue_order_id))
+            && report
+                .client_order_id
+                .is_none_or(|id| id == order.client_order_id())
+            && order.events().into_iter().any(|event| {
+                matches!(event, OrderEventAny::Filled(fill)
+                    if Self::fill_matches_report(cache, order, fill, report))
+            })
+    }
+
+    fn fill_matches_report(
+        cache: &Cache,
+        order: &OrderAny,
+        fill: &OrderFilled,
+        report: &FillReport,
+    ) -> bool {
+        fill.account_id == report.account_id
+            && fill.instrument_id == report.instrument_id
+            && fill.client_order_id == order.client_order_id()
+            && fill.trader_id == order.trader_id()
+            && fill.strategy_id == order.strategy_id()
+            && (fill.venue_order_id == report.venue_order_id
+                || order.venue_order_id() == Some(fill.venue_order_id)
+                || order.venue_order_ids().contains(&&fill.venue_order_id))
+            && fill.trade_id == report.trade_id
+            && fill.order_side == report.order_side
+            && fill.last_qty == report.last_qty
+            && fill.last_px == report.last_px
+            && fill.commission == Some(report.commission)
+            && fill.liquidity_side == report.liquidity_side
+            && fill.ts_event == report.ts_event
+            && report
+                .venue_position_id
+                .is_none_or(|id| fill.position_id == Some(id))
+            && cache
+                .instrument(&report.instrument_id)
+                .is_some_and(|instrument| fill.currency == instrument.quote_currency())
+    }
+
+    fn retained_fill_matches_report(cache: &Cache, order: &OrderAny, report: &FillReport) -> bool {
+        if !Self::order_fill_matches_report(cache, order, report) {
+            return false;
+        }
+        let bound_position_id = cache.position_id(&order.client_order_id()).copied();
+        if let (Some(bound), Some(reported)) = (bound_position_id, report.venue_position_id)
+            && bound != reported
+        {
+            return false;
+        }
+        let Some(position_id) = bound_position_id.or(report.venue_position_id) else {
+            return false;
+        };
+        cache.position_ref(&position_id).is_some_and(|position| {
+            position.account_id == report.account_id
+                && position.instrument_id == report.instrument_id
+                && position.strategy_id == order.strategy_id()
+                && position
+                    .events
+                    .iter()
+                    .any(|fill| Self::fill_matches_report(cache, order, fill, report))
+        })
     }
 }
 

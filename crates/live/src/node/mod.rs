@@ -1021,11 +1021,10 @@ impl LiveNode {
                         color = LogColor::Blue
                     );
 
-                    let exec_engine_rc = self.kernel.exec_engine.clone();
-
-                    let result = self
-                        .exec_manager
-                        .reconcile_execution_mass_status_ref(&mass_status, exec_engine_rc);
+                    let result = self.exec_manager.reconcile_execution_mass_status_ref(
+                        &mass_status,
+                        &self.kernel.exec_engine,
+                    );
                     report.application = result.summary;
                     client.report = Some(report);
                     reports.push((client_index, mass_status));
