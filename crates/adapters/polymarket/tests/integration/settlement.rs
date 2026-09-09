@@ -236,7 +236,7 @@ fn execution_config(base_url: &str) -> PolymarketExecutionClientConfig {
 struct NodeProbe {
     resolution_count: AtomicUsize,
     position_closed_count: AtomicUsize,
-    close_price: std::sync::Mutex<Option<Price>>,
+    instrument_closes: std::sync::Mutex<Vec<InstrumentClose>>,
 }
 
 #[derive(Debug)]
@@ -253,8 +253,7 @@ impl DataActor for ObserveRecon {
     }
 
     fn on_instrument_close(&mut self, close: &InstrumentClose) -> anyhow::Result<()> {
-        assert_eq!(close.instrument_id, self.instrument_id);
-        *self.probe.close_price.lock().unwrap() = Some(close.close_price);
+        self.probe.instrument_closes.lock().unwrap().push(*close);
         self.probe.resolution_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -526,6 +525,7 @@ async fn run_recon_case(case: &str, winner: bool, claim: bool, mode: NodeRunMode
         .unwrap()
         .balance_total(Some(currency));
     let order_submissions = venue.order_submissions.load(Ordering::SeqCst);
+    let instrument_closes = probe.instrument_closes.lock().unwrap().clone();
     println!(
         "{}",
         json!({
@@ -533,7 +533,7 @@ async fn run_recon_case(case: &str, winner: bool, claim: bool, mode: NodeRunMode
             "winner": winner, "claim_registered": claim,
             "reconciliation_enabled": true, "position_check_interval_secs": 1.0,
             "position_check_threshold_ms": 0,
-            "resolution_seen": observed.0, "adapter_close_price": probe.close_price.lock().unwrap().map(|p| p.to_string()),
+            "resolution_seen": observed.0, "adapter_close_price": instrument_closes.last().map(|close| close.close_price.to_string()),
             "venue_reads_at_resolution": observed.1,
             "holding_still_reported_and_read_after_resolution": observed.2,
             "position_events_before_venue_flat": observed.3,
@@ -556,6 +556,12 @@ async fn run_recon_case(case: &str, winner: bool, claim: bool, mode: NodeRunMode
     run.expect("LiveNode deadline").expect("LiveNode run");
     // Correctness assertions: settle at resolution and retain that result across redemption
     assert!(observed.0, "resolution must reach the strategy");
+    assert!(
+        instrument_closes
+            .iter()
+            .all(|close| close.instrument_id == instrument_id),
+        "every contract close must identify the subscribed instrument"
+    );
     assert!(
         observed.2,
         "venue must have been read again while still reporting the holding"

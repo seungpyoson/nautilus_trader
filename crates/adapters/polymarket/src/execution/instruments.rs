@@ -67,7 +67,7 @@ mod tests {
     // Static parser fixtures provide only the definitions used by that decoding case
     impl TokenInstrumentLookup for AtomicMap<Ustr, InstrumentAny> {
         fn get_cloned(&self, token: &Ustr) -> Option<InstrumentAny> {
-            AtomicMap::get_cloned(self, token)
+            Self::get_cloned(self, token)
         }
     }
 }
