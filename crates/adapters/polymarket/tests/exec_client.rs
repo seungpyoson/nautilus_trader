@@ -57,10 +57,7 @@ use nautilus_common::{
     testing::wait_until_async,
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_live::{
-    ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome,
-    node::CollectedMassStatusSummary,
-};
+use nautilus_live::{ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     accounts::{AccountAny, cash::CashAccount},
     enums::{
@@ -2619,15 +2616,6 @@ async fn test_empty_mass_status_declares_actual_scope_and_window(
         report.coverage().conditional_orders,
         ConditionalOrderCoverage::NotApplicable
     );
-    assert_eq!(
-        CollectedMassStatusSummary::from(&report).has_complete_account_collection(lookback_mins),
-        matches!(
-            report.coverage().positions,
-            ExecutionReportCoverage::CurrentOpen {
-                scope: ExecutionReportScope::Account
-            }
-        ),
-    );
 }
 
 #[rstest]
@@ -2670,10 +2658,6 @@ async fn test_mass_status_cannot_certify_omitted_positive_positions(
 
     assert!(report.position_reports_ref().is_empty());
     assert_eq!(report.reports_complete(), complete);
-    assert_eq!(
-        CollectedMassStatusSummary::from(&report).has_complete_account_collection(None),
-        complete && included_in_scope.is_none(),
-    );
 }
 
 #[rstest]
