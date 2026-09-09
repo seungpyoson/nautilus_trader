@@ -1,0 +1,106 @@
+name: Contract settlement advisory
+
+# Fork infrastructure only; excluded from the NT contribution branch.
+on:
+  push:
+    branches: [ci/live-contract-settlement-20260910]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    if: github.repository == 'seungpyoson/nautilus_trader'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      REVIEWED_SHA: bb57d0af7a225891c96c213511149f792b842181
+      CONTROL_SHA: 0bfa8b4b9380fb95664d800f5275e9eac040c367
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
+          allowed-endpoints: >-
+            ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
+            ${{ vars.CI_ALLOWED_ENDPOINTS }}
+
+      - name: Check out reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: bb57d0af7a225891c96c213511149f792b842181
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify reviewed commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+
+      - name: Common setup
+        uses: ./.github/actions/common-setup
+        with:
+          python-version: "3.13"
+          build-type: test
+          free-disk-space: "true"
+          rust-cache-key: live-contract-settlement-advisory
+
+      - name: Verify corrected final drain
+        shell: bash
+        run: |
+          cargo test --locked --profile ci-pr -p nautilus-live --lib \
+            contract_settlement_final_drain_gates_queued_trading \
+            -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/settlement-fixed.log"
+          rg -F '4 passed; 0 failed;' "$RUNNER_TEMP/settlement-fixed.log"
+
+      - name: Prove old final drain fails the same regression
+        shell: bash
+        run: |
+          source_path=crates/live/src/node/mod.rs
+          trap 'git show "$REVIEWED_SHA:$source_path" > "$source_path"' EXIT
+          git show "$CONTROL_SHA:$source_path" > "$source_path"
+          set +e
+          cargo test --locked --profile ci-pr -p nautilus-live --lib \
+            contract_settlement_final_drain_gates_queued_trading \
+            -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/settlement-control.log"
+          control_status=${PIPESTATUS[0]}
+          set -e
+          test "$control_status" -eq 101
+          rg -F '2 passed; 2 failed;' "$RUNNER_TEMP/settlement-control.log"
+
+      - name: Affected native components and Polymarket tests
+        shell: bash
+        run: |
+          git diff --exit-code
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci \
+            -p nautilus-live -p nautilus-execution -p nautilus-common \
+            -p nautilus-portfolio -p nautilus-polymarket \
+            --lib --tests --no-fail-fast \
+            2>&1 | tee "$RUNNER_TEMP/settlement-tests.log"
+
+      - name: Affected native components Clippy
+        shell: bash
+        run: |
+          cargo clippy --locked --profile ci-pr \
+            -p nautilus-live -p nautilus-execution -p nautilus-common \
+            -p nautilus-portfolio -p nautilus-polymarket \
+            --lib --tests -- -D warnings \
+            2>&1 | tee "$RUNNER_TEMP/settlement-clippy.log"
+
+      - name: Verify final source identity
+        if: always()
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+
+      - name: Retain verification logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: contract-settlement-verification
+          path: ${{ runner.temp }}/settlement-*.log
+          if-no-files-found: warn
