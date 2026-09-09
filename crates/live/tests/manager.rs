@@ -732,6 +732,42 @@ async fn test_mass_status_summary_records_invalid_source_without_application(
 
 #[rstest]
 #[tokio::test]
+async fn test_mass_status_rejects_wrong_envelope_venue_without_indexing_orders() {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let venue_order_id = VenueOrderId::from("V-WRONG-VENUE");
+    let report = create_order_status_report(
+        None,
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Accepted,
+        Quantity::from("1.0"),
+        Quantity::from("0"),
+    );
+    let mut mass_status = create_mass_status(vec![report], vec![]);
+    mass_status.venue = Venue::from("SIM");
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert!(result.events.is_empty());
+    assert!(!result.summary.source_valid);
+    assert_eq!(result.summary.orders.received, 1);
+    assert_eq!(result.summary.orders.unresolved, 1);
+    assert_eq!(result.summary.orders.reconciled, 0);
+    assert!(!result.summary.all_received_reports_reconciled());
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_received_report_summary_does_not_certify_unreported_cached_inventory() {
     let mut ctx = TestContext::new();
     ctx.add_instrument(test_instrument());
@@ -6882,7 +6918,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_accepted_orders()
     order.apply(accepted).unwrap();
     ctx.add_order(order.clone());
 
-    let report = create_order_status_report(
+    let mut report = create_order_status_report(
         Some(client_order_id),
         venue_order_id,
         instrument_id,
@@ -6891,19 +6927,31 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_accepted_orders()
         Quantity::from("0.0"),
     );
 
+    report.order_type = OrderType::Market;
+    report.price = None;
+
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![report]);
 
-    let _events = ctx
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+
+    let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     assert_eq!(
         ctx.cache.borrow().client_order_id(&venue_order_id),
@@ -6935,16 +6983,25 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_external_orders()
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![report]);
 
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+
     let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     assert!(
         !result.events.is_empty(),
@@ -7000,7 +7057,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_filled_orders() {
     order.apply(filled).unwrap();
     ctx.add_order(order.clone());
 
-    let report = create_order_status_report(
+    let mut report = create_order_status_report(
         Some(client_order_id),
         venue_order_id,
         instrument_id,
@@ -7009,19 +7066,31 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_filled_orders() {
         Quantity::from("1.0"),
     );
 
+    report.order_type = OrderType::Market;
+    report.price = None;
+
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![report]);
 
-    let _events = ctx
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+
+    let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     let cache_borrow = ctx.cache.borrow();
     assert_eq!(
@@ -7040,7 +7109,7 @@ async fn test_reconcile_mass_status_skips_orders_without_loaded_instruments() {
     let loaded_instrument = test_instrument();
     ctx.add_instrument(loaded_instrument.clone());
 
-    let unloaded_instrument_id = InstrumentId::from("BTCUSDT.SIM");
+    let unloaded_instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
 
     let loaded_venue_order_id = VenueOrderId::from("V-LOADED");
     let unloaded_venue_order_id = VenueOrderId::from("V-UNLOADED");
@@ -7066,16 +7135,18 @@ async fn test_reconcile_mass_status_skips_orders_without_loaded_instruments() {
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![loaded_report, unloaded_report]);
 
-    let _events = ctx
+    let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     let cache_borrow = ctx.cache.borrow();
     let loaded_client_id = cache_borrow.client_order_id(&loaded_venue_order_id);
