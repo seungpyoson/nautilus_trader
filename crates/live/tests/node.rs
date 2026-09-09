@@ -2702,6 +2702,8 @@ mod serial_tests {
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         let summary = handle.startup_reconciliation_summary().unwrap();
         assert_eq!(summary.outcome, StartupReconciliationOutcome::Interrupted);
+        assert_eq!(summary.instance_id, node.instance_id());
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
 
         if stop_before_pending {
             let (unpublished, ts_reconciliation) = during_reconciliation.lock().unwrap().unwrap();
@@ -2867,6 +2869,8 @@ mod serial_tests {
             .clone()
             .expect("summary must be available during actor startup");
         assert_eq!(handle.state(), NodeState::Stopped);
+        assert_eq!(summary.instance_id, node.instance_id());
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
         assert_eq!(summary.requested_lookback_mins, Some(42));
         assert_eq!(summary.clients.len(), 1);
         assert_eq!(summary.clients[0].client_id, client_id);
@@ -3543,6 +3547,8 @@ mod serial_tests {
         assert!(!state.connected.load(Ordering::Relaxed));
         let summary = handle.startup_reconciliation_summary().unwrap();
         assert_eq!(summary.outcome, StartupReconciliationOutcome::Failed);
+        assert_eq!(summary.instance_id, node.instance_id());
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
         assert_eq!(summary.clients[0].collection, MassStatusCollection::Failed);
         assert!(summary.clients[0].report.is_none());
     }
@@ -3577,6 +3583,8 @@ mod serial_tests {
         assert!(!state.connected.load(Ordering::Relaxed));
         let summary = handle.startup_reconciliation_summary().unwrap();
         assert_eq!(summary.outcome, StartupReconciliationOutcome::Failed);
+        assert_eq!(summary.instance_id, node.instance_id());
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
         assert_eq!(summary.clients[0].collection, MassStatusCollection::Failed);
         assert!(summary.clients[0].report.is_none());
     }
@@ -3623,6 +3631,8 @@ mod serial_tests {
         assert!(!state.connected.load(Ordering::Relaxed));
         let summary = handle.startup_reconciliation_summary().unwrap();
         assert_eq!(summary.outcome, StartupReconciliationOutcome::Failed);
+        assert_eq!(summary.instance_id, node.instance_id());
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
         assert_eq!(
             summary.clients[0].collection,
             MassStatusCollection::TimedOut

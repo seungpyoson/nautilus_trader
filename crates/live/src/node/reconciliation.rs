@@ -15,6 +15,8 @@
 
 //! Bounded diagnostics from the latest native startup reconciliation attempt.
 
+use std::num::NonZeroU64;
+
 use nautilus_core::{UUID4, UnixNanos, datetime::NANOSECONDS_IN_SECOND};
 use nautilus_model::{
     identifiers::{AccountId, ClientId, Venue},
@@ -187,6 +189,17 @@ pub struct ClientReconciliationSummary {
 /// retained inventory, complete historical economics, persistence, or fresh valuation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartupReconciliationSummary {
+    /// Kernel instance identity for this attempt.
+    ///
+    /// A configured identity can be reused by another node; it is not a process-lifetime nonce.
+    pub instance_id: UUID4,
+    /// Monotonic publication sequence within this node handle's lifetime, including failures.
+    ///
+    /// Assigned when publishing the terminal attempt and preserved across stop/start. `None`
+    /// means the sequence was exhausted or the summary has not been published. A sequence is
+    /// not proof of successful reconciliation or fresh prices, and is not comparable across
+    /// independently constructed nodes, even when they use the same configured instance ID.
+    pub completion_sequence: Option<NonZeroU64>,
     /// How the native attempt ended, distinct from individual report reconciliation.
     pub outcome: StartupReconciliationOutcome,
     /// Configured historical lookback requested from clients.

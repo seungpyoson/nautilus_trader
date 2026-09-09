@@ -876,6 +876,8 @@ impl LiveNode {
                 .collect()
         };
         let mut summary = StartupReconciliationSummary {
+            instance_id: self.kernel.instance_id(),
+            completion_sequence: None,
             outcome: StartupReconciliationOutcome::Failed,
             requested_lookback_mins: self
                 .config
@@ -6252,6 +6254,8 @@ mod tests {
         handle.set_starting();
         let observer = handle.clone();
         handle.publish_startup_reconciliation(StartupReconciliationSummary {
+            instance_id: UUID4::new(),
+            completion_sequence: None,
             outcome: StartupReconciliationOutcome::Failed,
             requested_lookback_mins: None,
             ts_started: UnixNanos::default(),
@@ -6262,6 +6266,7 @@ mod tests {
         handle.set_stopped();
         let previous = observer.startup_reconciliation_summary().unwrap();
         assert_eq!(previous.outcome, StartupReconciliationOutcome::Failed);
+        assert_eq!(previous.completion_sequence.unwrap().get(), 1);
 
         handle.set_starting();
 
@@ -6269,6 +6274,16 @@ mod tests {
         assert!(observer.startup_reconciliation_summary().is_none());
         // Already retrieved snapshots remain inert diagnostics.
         assert_eq!(previous.outcome, StartupReconciliationOutcome::Failed);
+        let mut next = (*previous).clone();
+        next.outcome = StartupReconciliationOutcome::Finished;
+        // Publication owns the sequence even when the supplied diagnostic carries an old one.
+        handle.publish_startup_reconciliation(next);
+        let current = observer.startup_reconciliation_summary().unwrap();
+        assert_eq!(current.completion_sequence.unwrap().get(), 2);
+        assert_eq!(current.instance_id, previous.instance_id);
+        assert_eq!(current.ts_finished, previous.ts_finished);
+        assert_eq!(current.outcome, StartupReconciliationOutcome::Finished);
+        assert_eq!(previous.completion_sequence.unwrap().get(), 1);
     }
 
     #[rstest]
