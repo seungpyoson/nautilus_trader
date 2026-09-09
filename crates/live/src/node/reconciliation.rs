@@ -15,10 +15,16 @@
 
 //! Bounded diagnostics from the latest native startup reconciliation attempt.
 
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{UUID4, UnixNanos, datetime::NANOSECONDS_IN_SECOND};
 use nautilus_model::{
     identifiers::{AccountId, ClientId, Venue},
-    reports::ExecutionMassStatus,
+    reports::{
+        ExecutionMassStatus,
+        mass_status::{
+            ConditionalOrderCoverage, ExecutionMassStatusCoverage, ExecutionReportCoverage,
+            ExecutionReportScope,
+        },
+    },
 };
 
 use crate::execution::manager::ReconciliationSummary;
@@ -57,7 +63,7 @@ pub enum MassStatusCollection {
 }
 
 /// Metadata and application evidence for a returned mass status, without report histories.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectedMassStatusSummary {
     /// Source identity declared by the returned report.
     pub client_id: ClientId,
@@ -73,6 +79,8 @@ pub struct CollectedMassStatusSummary {
     pub lookback_start: Option<UnixNanos>,
     /// The adapter's completeness declaration, not independent query-class coverage proof.
     pub reports_complete: bool,
+    /// Explicit source scope and selection; unknown declarations do not establish coverage.
+    pub coverage: ExecutionMassStatusCoverage,
     /// Native application evidence when this report was reconciled.
     ///
     /// Later reports and queued events can change the cache before summary publication.
@@ -89,8 +97,66 @@ impl From<&ExecutionMassStatus> for CollectedMassStatusSummary {
             ts_init: report.ts_init,
             lookback_start: report.lookback_start(),
             reports_complete: report.reports_complete(),
+            coverage: report.coverage().clone(),
             application: ReconciliationSummary::default(),
         }
+    }
+}
+
+impl CollectedMassStatusSummary {
+    /// Returns whether the source declares complete account-wide collection for this request.
+    ///
+    /// Requires current orders (including applicable conditional orders), current positions and
+    /// fill history covering the requested lookback through report initialization. The adapter
+    /// must also declare successful collection. Unknown or instrument-scoped declarations fail.
+    /// This does not establish valid source identity, native application or startup readiness.
+    #[must_use]
+    pub fn has_complete_account_collection(&self, lookback_mins: Option<u64>) -> bool {
+        if !self.reports_complete
+            || !matches!(
+                self.coverage.orders,
+                ExecutionReportCoverage::CurrentOpen {
+                    scope: ExecutionReportScope::Account
+                }
+            )
+            || !matches!(
+                self.coverage.positions,
+                ExecutionReportCoverage::CurrentOpen {
+                    scope: ExecutionReportScope::Account
+                }
+            )
+            || self.coverage.conditional_orders == ConditionalOrderCoverage::Unknown
+        {
+            return false;
+        }
+        let ExecutionReportCoverage::History {
+            scope: ExecutionReportScope::Account,
+            start,
+            end,
+        } = &self.coverage.fills
+        else {
+            return false;
+        };
+        let requested_start = match lookback_mins {
+            Some(mins) => {
+                let Some(duration) = mins
+                    .checked_mul(60)
+                    .and_then(|secs| secs.checked_mul(NANOSECONDS_IN_SECOND))
+                else {
+                    return false;
+                };
+                Some(UnixNanos::from(
+                    self.ts_init.as_u64().saturating_sub(duration),
+                ))
+            }
+            None => None,
+        };
+        let start_covered = match (*start, requested_start) {
+            (None, _) => true,
+            (Some(actual), Some(requested)) => actual <= requested,
+            (Some(_), None) => false,
+        };
+        start_covered && end.is_none_or(|actual| actual >= self.ts_init)
     }
 }
 
@@ -131,4 +197,120 @@ pub struct StartupReconciliationSummary {
     pub ts_finished: UnixNanos,
     /// One result per client registered at the beginning of this attempt.
     pub clients: Vec<ClientReconciliationSummary>,
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::identifiers::InstrumentId;
+    use rstest::rstest;
+
+    use super::*;
+
+    fn account_collection() -> CollectedMassStatusSummary {
+        let mut report = ExecutionMassStatus::new(
+            ClientId::from("SIM"),
+            AccountId::from("SIM-001"),
+            Venue::from("SIM"),
+            UnixNanos::from(10_000_000_000_000),
+            None,
+        );
+        report.set_coverage(ExecutionMassStatusCoverage {
+            orders: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            positions: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            fills: ExecutionReportCoverage::History {
+                scope: ExecutionReportScope::Account,
+                start: None,
+                end: None,
+            },
+            conditional_orders: ConditionalOrderCoverage::Included,
+        });
+        CollectedMassStatusSummary::from(&report)
+    }
+
+    #[rstest]
+    #[case::unbounded(None)]
+    #[case::bounded(Some(60))]
+    fn test_complete_empty_account_collection(#[case] lookback: Option<u64>) {
+        let summary = account_collection();
+        assert!(summary.has_complete_account_collection(lookback));
+        // A collection declaration does not manufacture application evidence.
+        assert!(!summary.application.all_received_reports_reconciled());
+    }
+
+    #[rstest]
+    fn test_complete_account_collection_requires_success_and_declared_coverage() {
+        let mut summary = account_collection();
+        summary.reports_complete = false;
+        assert!(!summary.has_complete_account_collection(None));
+        summary.reports_complete = true;
+        summary.coverage = ExecutionMassStatusCoverage::default();
+        assert!(!summary.has_complete_account_collection(None));
+    }
+
+    #[rstest]
+    #[case::unknown(ExecutionReportCoverage::Unknown)]
+    #[case::instrument(ExecutionReportCoverage::CurrentOpen { scope: ExecutionReportScope::Instruments(vec![InstrumentId::from("TEST.SIM")]) })]
+    #[case::empty_instruments(ExecutionReportCoverage::CurrentOpen { scope: ExecutionReportScope::Instruments(Vec::new()) })]
+    #[case::history_only(ExecutionReportCoverage::History { scope: ExecutionReportScope::Account, start: None, end: None })]
+    fn test_current_account_inventory_requires_each_source(
+        #[case] incomplete: ExecutionReportCoverage,
+    ) {
+        let mut summary = account_collection();
+        summary.coverage.orders = incomplete.clone();
+        assert!(!summary.has_complete_account_collection(None));
+        let mut summary = account_collection();
+        summary.coverage.positions = incomplete;
+        assert!(!summary.has_complete_account_collection(None));
+    }
+
+    #[rstest]
+    #[case::unknown(ConditionalOrderCoverage::Unknown, false)]
+    #[case::included(ConditionalOrderCoverage::Included, true)]
+    #[case::not_applicable(ConditionalOrderCoverage::NotApplicable, true)]
+    fn test_conditional_order_coverage(
+        #[case] coverage: ConditionalOrderCoverage,
+        #[case] complete: bool,
+    ) {
+        let mut summary = account_collection();
+        summary.coverage.conditional_orders = coverage;
+        assert_eq!(summary.has_complete_account_collection(None), complete);
+    }
+
+    #[rstest]
+    #[case::exact(Some(6_400_000_000_000), Some(10_000_000_000_000), Some(60), true)]
+    #[case::narrow_start(Some(6_400_000_000_001), None, Some(60), false)]
+    #[case::narrow_end(None, Some(9_999_999_999_999), Some(60), false)]
+    #[case::bounded_for_unbounded(Some(0), None, None, false)]
+    #[case::invalid_interval(Some(10_000_000_000_001), Some(10_000_000_000_000), Some(0), false)]
+    #[case::overflow(None, None, Some(u64::MAX), false)]
+    fn test_fill_window_covers_requested_history(
+        #[case] start: Option<u64>,
+        #[case] end: Option<u64>,
+        #[case] lookback: Option<u64>,
+        #[case] complete: bool,
+    ) {
+        let mut summary = account_collection();
+        summary.coverage.fills = ExecutionReportCoverage::History {
+            scope: ExecutionReportScope::Account,
+            start: start.map(UnixNanos::from),
+            end: end.map(UnixNanos::from),
+        };
+        assert_eq!(summary.has_complete_account_collection(lookback), complete);
+    }
+
+    #[rstest]
+    #[case::unknown(ExecutionReportCoverage::Unknown)]
+    #[case::current_only(ExecutionReportCoverage::CurrentOpen { scope: ExecutionReportScope::Account })]
+    #[case::scoped(ExecutionReportCoverage::History { scope: ExecutionReportScope::Instruments(vec![InstrumentId::from("TEST.SIM")]), start: None, end: None })]
+    fn test_fill_history_requires_explicit_account_scope(
+        #[case] coverage: ExecutionReportCoverage,
+    ) {
+        let mut summary = account_collection();
+        summary.coverage.fills = coverage;
+        assert!(!summary.has_complete_account_collection(None));
+    }
 }

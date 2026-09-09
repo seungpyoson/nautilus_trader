@@ -2865,6 +2865,7 @@ mod serial_tests {
                 assert_eq!(received.ts_init, UnixNanos::from(8));
                 assert_eq!(received.reports_complete, reports_complete);
                 assert!(received.application.all_received_reports_reconciled());
+                assert!(!received.has_complete_account_collection(Some(42)));
             } else {
                 assert_eq!(
                     summary.clients[0].collection,

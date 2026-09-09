@@ -24,6 +24,66 @@ use crate::{
     reports::{fill::FillReport, order::OrderStatusReport, position::PositionStatusReport},
 };
 
+/// Account inventory included by a report source, independently of the returned rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionReportScope {
+    /// All instruments owned by the account identified by the mass status.
+    Account,
+    /// Only the declared instruments. An empty list does not mean account-wide coverage.
+    Instruments(Vec<InstrumentId>),
+}
+
+/// Selection performed by one report source.
+///
+/// A declaration describes collection scope, not successful collection, application, or freshness.
+/// Historical bounds describe the actual request and filtering, not timestamps inferred from rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionReportCoverage {
+    /// The source has not declared its coverage.
+    #[default]
+    Unknown,
+    /// All currently open records in the declared scope.
+    CurrentOpen { scope: ExecutionReportScope },
+    /// Historical records in the declared scope and requested interval.
+    ///
+    /// A missing bound means the source applied no such bound; it does not promise future data.
+    History {
+        scope: ExecutionReportScope,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    },
+}
+
+/// Whether the order source includes venue-held conditional and algorithmic orders.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConditionalOrderCoverage {
+    /// Their coverage or applicability has not been established.
+    #[default]
+    Unknown,
+    /// The declared order coverage includes these orders.
+    Included,
+    /// The provider has no separate venue-held conditional or algorithmic order class.
+    ///
+    /// This must follow the provider contract, never an empty response or unsupported query.
+    NotApplicable,
+}
+
+/// Explicit collection coverage for the three report classes in a mass status.
+///
+/// Unknown is conservative for legacy adapters and serialized reports. This is separate from
+/// `ExecutionMassStatus::reports_complete`, which records whether required collection succeeded.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionMassStatusCoverage {
+    /// Current or historical order selection.
+    pub orders: ExecutionReportCoverage,
+    /// Historical fill selection.
+    pub fills: ExecutionReportCoverage,
+    /// Current or historical position selection.
+    pub positions: ExecutionReportCoverage,
+    /// Applicability of conditional orders within the declared order coverage.
+    pub conditional_orders: ConditionalOrderCoverage,
+}
+
 /// Represents an execution mass status report for an execution client - including
 /// status of all orders, trades for those orders and open positions.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -53,6 +113,9 @@ pub struct ExecutionMassStatus {
     /// Whether every report source required for this mass status completed.
     #[serde(default = "default_true")]
     reports_complete: bool,
+    /// Explicit source scope and selection, independently of collection success.
+    #[serde(default)]
+    coverage: ExecutionMassStatusCoverage,
     /// The order status reports.
     order_reports: IndexMap<VenueOrderId, OrderStatusReport>,
     /// The fill reports.
@@ -79,6 +142,7 @@ impl ExecutionMassStatus {
             ts_init,
             lookback_start: None,
             reports_complete: true,
+            coverage: ExecutionMassStatusCoverage::default(),
             order_reports: IndexMap::new(),
             fill_reports: IndexMap::new(),
             position_reports: IndexMap::new(),
@@ -131,6 +195,19 @@ impl ExecutionMassStatus {
     #[must_use]
     pub const fn reports_complete(&self) -> bool {
         self.reports_complete
+    }
+
+    /// Borrows the source's coverage declaration without copying instrument lists.
+    #[must_use]
+    pub const fn coverage(&self) -> &ExecutionMassStatusCoverage {
+        &self.coverage
+    }
+
+    /// Declares the scope and selection of the sources used to construct this mass status.
+    ///
+    /// Collection success must still be declared through `set_report_window`.
+    pub fn set_coverage(&mut self, coverage: ExecutionMassStatusCoverage) {
+        self.coverage = coverage;
     }
 
     /// Sets the bounded historical report contract.
@@ -281,6 +358,10 @@ mod tests {
         assert_eq!(mass_status.ts_init, UnixNanos::from(1_000_000_000));
         assert_eq!(mass_status.lookback_start(), None);
         assert!(mass_status.reports_complete());
+        assert_eq!(
+            mass_status.coverage(),
+            &ExecutionMassStatusCoverage::default()
+        );
         assert!(mass_status.order_reports().is_empty());
         assert!(mass_status.fill_reports().is_empty());
         assert!(mass_status.position_reports().is_empty());
@@ -530,6 +611,20 @@ mod tests {
     fn test_serialization_roundtrip() {
         let mut original = test_execution_mass_status();
         original.set_report_window(Some(UnixNanos::from(500_000_000)), false);
+        original.set_coverage(ExecutionMassStatusCoverage {
+            orders: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            fills: ExecutionReportCoverage::History {
+                scope: ExecutionReportScope::Instruments(vec![InstrumentId::from("AAPL.NASDAQ")]),
+                start: Some(UnixNanos::from(500_000_000)),
+                end: Some(UnixNanos::from(1_000_000_000)),
+            },
+            positions: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            conditional_orders: ConditionalOrderCoverage::Included,
+        });
 
         // Test JSON serialization
         let json = serde_json::to_string(&original).unwrap();
@@ -544,11 +639,16 @@ mod tests {
         let object = value.as_object_mut().unwrap();
         object.remove("lookback_start");
         object.remove("reports_complete");
+        object.remove("coverage");
 
         let deserialized: ExecutionMassStatus = serde_json::from_value(value).unwrap();
 
         assert_eq!(deserialized.lookback_start(), None);
         assert!(deserialized.reports_complete());
+        assert_eq!(
+            deserialized.coverage(),
+            &ExecutionMassStatusCoverage::default()
+        );
     }
 
     #[rstest]

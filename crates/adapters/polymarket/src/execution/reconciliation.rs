@@ -26,7 +26,13 @@ use nautilus_model::{
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TradeId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
-    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
+    reports::{
+        ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport,
+        mass_status::{
+            ConditionalOrderCoverage, ExecutionMassStatusCoverage, ExecutionReportCoverage,
+            ExecutionReportScope,
+        },
+    },
     types::{Currency, Price, Quantity, fixed::FIXED_PRECISION},
 };
 use rust_decimal::Decimal;
@@ -1355,6 +1361,7 @@ fn build_position_report_from_reportable_position(
     ))
 }
 
+/// Builds position reports and records whether every in-scope positive position was included.
 pub(crate) fn build_reconciliation_position_reports(
     positions: &[DataApiPosition],
     account_id: AccountId,
@@ -1362,24 +1369,28 @@ pub(crate) fn build_reconciliation_position_reports(
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     instrument_filter: Option<InstrumentId>,
     load_ids: Option<&[InstrumentId]>,
-) -> anyhow::Result<Vec<PositionStatusReport>> {
+) -> anyhow::Result<(Vec<PositionStatusReport>, bool)> {
     let collection_load_ids = instrument_filter.is_none().then_some(load_ids).flatten();
     let mut reports = Vec::with_capacity(positions.len());
+    let mut complete = true;
 
     for position in positions {
-        if let Some(report) = build_reconciliation_position_report(
+        let (report, included_all_positive) = build_reconciliation_position_report(
             position,
             account_id,
             ts,
             instruments,
             instrument_filter,
             collection_load_ids,
-        )? {
+        )?;
+        complete &= included_all_positive;
+
+        if let Some(report) = report {
             reports.push(report);
         }
     }
 
-    Ok(reports)
+    Ok((reports, complete))
 }
 
 fn build_reconciliation_position_report(
@@ -1389,18 +1400,18 @@ fn build_reconciliation_position_report(
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     instrument_filter: Option<InstrumentId>,
     collection_load_ids: Option<&[InstrumentId]>,
-) -> anyhow::Result<Option<PositionStatusReport>> {
+) -> anyhow::Result<(Option<PositionStatusReport>, bool)> {
     let instrument_id = instrument_id_from_market_token(&position.condition_id, &position.asset);
 
     if instrument_filter
         .is_some_and(|filter_id| !polymarket_instrument_ids_equivalent(filter_id, instrument_id))
     {
-        return Ok(None);
+        return Ok((None, true));
     }
 
     if !instrument_in_load_ids_scope(instrument_id, collection_load_ids) {
         log::debug!("Dropping out-of-scope position instrument {instrument_id}");
-        return Ok(None);
+        return Ok((None, true));
     }
 
     anyhow::ensure!(
@@ -1412,7 +1423,7 @@ fn build_reconciliation_position_report(
     );
 
     if position_is_dust(position) {
-        return Ok(None);
+        return Ok((None, position.size.is_zero()));
     }
 
     if !position_instrument_loaded(&position.asset, instrument_id, instruments) {
@@ -1424,7 +1435,8 @@ fn build_reconciliation_position_report(
         ));
     }
 
-    build_position_report_from_reportable_position(position, account_id, ts).map(Some)
+    build_position_report_from_reportable_position(position, account_id, ts)
+        .map(|report| (Some(report), true))
 }
 
 /// Full reconciliation mass status generation.
@@ -1449,6 +1461,7 @@ pub(crate) async fn generate_mass_status(
             ),
         )
     });
+    let lookback_end = lookback_start.map(|_| ts_init);
 
     let orders = http_client
         .get_orders(GetOrdersParams::default())
@@ -1459,10 +1472,7 @@ pub(crate) async fn generate_mass_status(
         build_order_reports_from_orders(&orders, instruments, ctx, None, ts_init, load_ids)?;
 
     let trades = http_client
-        .get_trades(trades_params_for_window(
-            lookback_start,
-            lookback_start.map(|_| ts_init),
-        ))
+        .get_trades(trades_params_for_window(lookback_start, lookback_end))
         .await
         .context("failed to fetch trades for mass status")?;
 
@@ -1470,8 +1480,7 @@ pub(crate) async fn generate_mass_status(
         &trades,
         ctx,
         instruments,
-        FillReportScope::new(None, None)
-            .with_time_window(lookback_start, lookback_start.map(|_| ts_init)),
+        FillReportScope::new(None, None).with_time_window(lookback_start, lookback_end),
         ts_init,
         load_ids,
     )?;
@@ -1491,7 +1500,7 @@ pub(crate) async fn generate_mass_status(
         .await
         .context("failed to fetch positions for mass status")?;
 
-    let position_reports = build_reconciliation_position_reports(
+    let (position_reports, positions_complete) = build_reconciliation_position_reports(
         &positions,
         ctx.account_id,
         ts_init,
@@ -1520,7 +1529,8 @@ pub(crate) async fn generate_mass_status(
 
     let mut mass_status = ExecutionMassStatus::new(client_id, ctx.account_id, venue, ts_init, None);
 
-    let reports_complete = fill_discards.reports_complete()
+    let reports_complete = positions_complete
+        && fill_discards.reports_complete()
         && (lookback_start.is_none() || {
             let reported_orders: AHashSet<VenueOrderId> = order_reports
                 .iter()
@@ -1531,6 +1541,24 @@ pub(crate) async fn generate_mass_status(
                 .all(|report| reported_orders.contains(&report.venue_order_id))
         });
     mass_status.set_report_window(lookback_start, reports_complete);
+    let scope = match load_ids {
+        Some(ids) if !ids.is_empty() => ExecutionReportScope::Instruments(ids.to_vec()),
+        _ => ExecutionReportScope::Account,
+    };
+    mass_status.set_coverage(ExecutionMassStatusCoverage {
+        orders: ExecutionReportCoverage::CurrentOpen {
+            scope: scope.clone(),
+        },
+        fills: ExecutionReportCoverage::History {
+            scope: scope.clone(),
+            start: lookback_start,
+            end: lookback_end,
+        },
+        positions: ExecutionReportCoverage::CurrentOpen { scope },
+        // CLOB order types are GTC/GTD/FOK/FAK; it has no venue-held trigger-order class.
+        // https://docs.polymarket.com/concepts/order-lifecycle
+        conditional_orders: ConditionalOrderCoverage::NotApplicable,
+    });
 
     mass_status.add_order_reports(order_reports);
     mass_status.add_position_reports(position_reports);
@@ -1544,9 +1572,9 @@ pub(crate) fn trades_params_for_window(
     end: Option<UnixNanos>,
 ) -> GetTradesParams {
     GetTradesParams {
-        // CLOB `after` is exclusive of the given Unix second
-        after: start.map(|ts| unix_secs(ts).saturating_sub(1)),
-        before: end.map(unix_secs),
+        // Overscan boundary seconds, then apply the exact inclusive window in the report builder.
+        after: start.and_then(|ts| unix_secs(ts).checked_sub(1)),
+        before: end.map(|ts| unix_secs(ts) + 1),
         ..Default::default()
     }
 }
@@ -2176,14 +2204,14 @@ mod tests {
     }
 
     #[rstest]
-    fn trades_params_for_window_uses_exclusive_after_unix_seconds() {
+    fn trades_params_for_window_overscans_boundary_seconds() {
         let start = UnixNanos::from(100 * NANOSECONDS_IN_SECOND);
         let end = UnixNanos::from(250 * NANOSECONDS_IN_SECOND);
 
         let params = trades_params_for_window(Some(start), Some(end));
 
         assert_eq!(params.after, Some(99));
-        assert_eq!(params.before, Some(250));
+        assert_eq!(params.before, Some(251));
     }
 
     fn unmapped_open_order() -> crate::http::models::PolymarketOpenOrder {

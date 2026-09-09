@@ -57,7 +57,10 @@ use nautilus_common::{
     testing::wait_until_async,
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_live::{ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome};
+use nautilus_live::{
+    ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome,
+    node::CollectedMassStatusSummary,
+};
 use nautilus_model::{
     accounts::{AccountAny, cash::CashAccount},
     enums::{
@@ -73,6 +76,9 @@ use nautilus_model::{
     orders::{
         LimitOrder, MarketOrder, Order, OrderAny, OrderList, OrderTestBuilder,
         stubs::TestOrderEventStubs,
+    },
+    reports::mass_status::{
+        ConditionalOrderCoverage, ExecutionReportCoverage, ExecutionReportScope,
     },
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
@@ -236,6 +242,7 @@ struct TestServerState {
     single_order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     single_order_get_count: Arc<AtomicUsize>,
     trades_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
+    filter_trade_time_bounds: Arc<AtomicBool>,
     positions_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
 }
 
@@ -304,6 +311,7 @@ impl Default for TestServerState {
             single_order_response: Arc::new(tokio::sync::Mutex::new(None)),
             single_order_get_count: Arc::new(AtomicUsize::new(0)),
             trades_response_override: Arc::new(tokio::sync::Mutex::new(None)),
+            filter_trade_time_bounds: Arc::new(AtomicBool::new(false)),
             positions_response_override: Arc::new(tokio::sync::Mutex::new(None)),
             book_response: Arc::new(tokio::sync::Mutex::new(Some(json!({
                 "bids": [
@@ -491,11 +499,32 @@ async fn handle_get_trades(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     *state.last_path.lock().await = uri.path().to_string();
-    *state.last_query.lock().await = query;
-    if let Some(override_value) = state.trades_response_override.lock().await.as_ref() {
-        return Json(override_value.clone()).into_response();
+    let mut response = state
+        .trades_response_override
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| load_json("http_trades_page.json"));
+
+    if state.filter_trade_time_bounds.load(Ordering::Relaxed) {
+        let before = query
+            .get("before")
+            .map(|value| value.parse::<u64>().unwrap());
+        let after = query
+            .get("after")
+            .map(|value| value.parse::<u64>().unwrap());
+        response["data"].as_array_mut().unwrap().retain(|trade| {
+            let timestamp = trade["match_time"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            before.is_none_or(|bound| timestamp < bound)
+                && after.is_none_or(|bound| timestamp > bound)
+        });
     }
-    Json(load_json("http_trades_page.json")).into_response()
+    *state.last_query.lock().await = query;
+    Json(response).into_response()
 }
 
 async fn handle_get_balance(
@@ -2515,6 +2544,136 @@ async fn test_generate_mass_status_applies_load_ids_to_all_report_types() {
     assert!(mass_status.fill_reports().is_empty());
     assert!(mass_status.position_reports().is_empty());
     assert!(!client.provides_bulk_position_coverage(loaded_instrument_id));
+    assert_eq!(
+        mass_status.coverage().positions,
+        ExecutionReportCoverage::CurrentOpen {
+            scope: ExecutionReportScope::Instruments(vec![InstrumentId::from(
+                "OTHER-TOKEN.POLYMARKET"
+            )]),
+        },
+    );
+}
+
+#[rstest]
+#[case::unconfigured(None)]
+#[case::empty(Some(Vec::new()))]
+#[case::scoped(Some(vec![InstrumentId::from("TEST-TOKEN.POLYMARKET")]))]
+#[tokio::test]
+async fn test_empty_mass_status_declares_actual_scope_and_window(
+    #[case] load_ids: Option<Vec<InstrumentId>>,
+    #[values(None, Some(60))] lookback_mins: Option<u64>,
+) {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.positions_response_override.lock().await = Some(json!([]));
+    let addr = start_mock_server(state).await;
+    let mut config = create_test_exec_config(addr);
+    config.instrument_config = Some(PolymarketInstrumentProviderConfig {
+        load_ids: load_ids.clone(),
+        ..Default::default()
+    });
+    let (client, _rx, _cache) = create_test_execution_client_from_config(config);
+
+    let report = client
+        .generate_mass_status(lookback_mins)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(report.order_reports_ref().is_empty());
+    assert!(report.fill_reports_ref().is_empty());
+    assert!(report.position_reports_ref().is_empty());
+    assert!(report.reports_complete());
+    let expected_scope = match load_ids {
+        Some(ids) if !ids.is_empty() => ExecutionReportScope::Instruments(ids),
+        _ => ExecutionReportScope::Account,
+    };
+    assert_eq!(
+        report.coverage().orders,
+        ExecutionReportCoverage::CurrentOpen {
+            scope: expected_scope.clone()
+        }
+    );
+    assert_eq!(
+        report.coverage().positions,
+        ExecutionReportCoverage::CurrentOpen {
+            scope: expected_scope.clone()
+        }
+    );
+    assert_eq!(
+        report.coverage().fills,
+        ExecutionReportCoverage::History {
+            scope: expected_scope,
+            start: report.lookback_start(),
+            end: lookback_mins.map(|_| report.ts_init),
+        }
+    );
+    assert_eq!(
+        report.coverage().conditional_orders,
+        ConditionalOrderCoverage::NotApplicable
+    );
+    assert_eq!(
+        CollectedMassStatusSummary::from(&report).has_complete_account_collection(lookback_mins),
+        matches!(
+            report.coverage().positions,
+            ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account
+            }
+        ),
+    );
+}
+
+#[rstest]
+#[case::owned_dust("0.005", None, false)]
+#[case::included_dust("0.005", Some(true), false)]
+#[case::excluded_dust("0.005", Some(false), true)]
+#[case::zero("0", None, true)]
+#[tokio::test]
+async fn test_mass_status_cannot_certify_omitted_positive_positions(
+    #[case] size: &str,
+    #[case] included_in_scope: Option<bool>,
+    #[case] complete: bool,
+) {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await =
+        Some(json!({ "data": [], "next_cursor": "LTE=" }));
+    *state.trades_response_override.lock().await =
+        Some(json!({ "data": [], "next_cursor": "LTE=" }));
+    *state.positions_response_override.lock().await = Some(json!([{
+        "asset": TEST_TOKEN_ID, "conditionId": TEST_CONDITION_ID,
+        "size": size, "avgPrice": "0.5000",
+    }]));
+    let addr = start_mock_server(state).await;
+    let mut config = create_test_exec_config(addr);
+    config.instrument_config = Some(PolymarketInstrumentProviderConfig {
+        load_ids: included_in_scope.map(|included| {
+            vec![if included {
+                InstrumentId::from(
+                    format!("{TEST_CONDITION_ID}-{TEST_TOKEN_ID}.POLYMARKET").as_str(),
+                )
+            } else {
+                InstrumentId::from("OTHER-TOKEN.POLYMARKET")
+            }]
+        }),
+        ..Default::default()
+    });
+    let (client, _rx, _cache) = create_test_execution_client_from_config(config);
+
+    let report = client.generate_mass_status(None).await.unwrap().unwrap();
+
+    assert!(report.position_reports_ref().is_empty());
+    assert_eq!(report.reports_complete(), complete);
+    assert_eq!(
+        CollectedMassStatusSummary::from(&report).has_complete_account_collection(None),
+        complete && included_in_scope.is_none(),
+    );
 }
 
 #[rstest]
@@ -4404,6 +4563,9 @@ async fn test_generate_fill_reports_applies_time_window_to_loaded_trades(
 ) {
     let target_order_id = "0x1111111111111111111111111111111111111111111111111111111111111111";
     let state = TestServerState::default();
+    state
+        .filter_trade_time_bounds
+        .store(true, Ordering::Relaxed);
     let mut trades = recovery_trades_response(target_order_id, "10.0000", "0.5000");
     trades["data"][0]["match_time"] = json!(match_time);
     *state.trades_response_override.lock().await = Some(trades);
