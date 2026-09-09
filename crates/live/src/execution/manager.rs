@@ -576,7 +576,7 @@ impl ExecutionManager {
     /// Records a contract close and prepares settlement events for its open positions.
     #[cfg(feature = "node")]
     pub(crate) fn process_instrument_close(
-        &mut self,
+        &self,
         close: InstrumentClose,
     ) -> anyhow::Result<Vec<ContractSettlement>> {
         if close.close_type != InstrumentCloseType::ContractExpired {

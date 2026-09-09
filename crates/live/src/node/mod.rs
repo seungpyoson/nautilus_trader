@@ -172,7 +172,7 @@ type StreamProcessorCallback = dyn Fn(&dyn Any, &serde_json::Value) -> anyhow::R
 
 struct StreamProcessor(Box<StreamProcessorCallback>);
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum SettlementInput {
     Close(InstrumentClose),
     Position(InstrumentId),
@@ -1142,15 +1142,15 @@ impl LiveNode {
                 let result = self
                     .abort_startup("External message bus ingress failed to start")
                     .await;
-                self.drain_channels(
-                    &mut time_evt_rx,
-                    &mut system_evt_rx,
-                    &mut system_cmd_rx,
-                    &mut exec_evt_rx,
-                    &mut exec_cmd_rx,
-                    &mut data_evt_rx,
-                    &mut data_cmd_rx,
-                );
+                self.drain_channels(&mut RunnerReceivers {
+                    time_evt: &mut time_evt_rx,
+                    system_evt: &mut system_evt_rx,
+                    system_cmd: &mut system_cmd_rx,
+                    exec_evt: &mut exec_evt_rx,
+                    exec_cmd: &mut exec_cmd_rx,
+                    data_evt: &mut data_evt_rx,
+                    data_cmd: &mut data_cmd_rx,
+                });
                 log::info!("Event loop stopped");
 
                 if let Err(finalize_err) = result {
@@ -1198,15 +1198,15 @@ impl LiveNode {
             let result = self
                 .abort_startup_with_error("Data client connection timed out", e)
                 .await;
-            self.drain_channels(
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
+            self.drain_channels(&mut RunnerReceivers {
+                time_evt: &mut time_evt_rx,
+                system_evt: &mut system_evt_rx,
+                system_cmd: &mut system_cmd_rx,
+                exec_evt: &mut exec_evt_rx,
+                exec_cmd: &mut exec_cmd_rx,
+                data_evt: &mut data_evt_rx,
+                data_cmd: &mut data_cmd_rx,
+            });
             log::info!("Event loop stopped");
             return result;
         }
@@ -1260,15 +1260,15 @@ impl LiveNode {
                 let result = self
                     .abort_startup_with_error("Execution client connection timed out", e)
                     .await;
-                self.drain_channels(
-                    &mut time_evt_rx,
-                    &mut system_evt_rx,
-                    &mut system_cmd_rx,
-                    &mut exec_evt_rx,
-                    &mut exec_cmd_rx,
-                    &mut data_evt_rx,
-                    &mut data_cmd_rx,
-                );
+                self.drain_channels(&mut RunnerReceivers {
+                    time_evt: &mut time_evt_rx,
+                    system_evt: &mut system_evt_rx,
+                    system_cmd: &mut system_cmd_rx,
+                    exec_evt: &mut exec_evt_rx,
+                    exec_cmd: &mut exec_cmd_rx,
+                    data_evt: &mut data_evt_rx,
+                    data_cmd: &mut data_cmd_rx,
+                });
                 log::info!("Event loop stopped");
                 return result;
             }
@@ -1281,15 +1281,15 @@ impl LiveNode {
                     anyhow::anyhow!("readiness timeout while waiting for engine connections"),
                 )
                 .await;
-            self.drain_channels(
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
+            self.drain_channels(&mut RunnerReceivers {
+                time_evt: &mut time_evt_rx,
+                system_evt: &mut system_evt_rx,
+                system_cmd: &mut system_cmd_rx,
+                exec_evt: &mut exec_evt_rx,
+                exec_cmd: &mut exec_cmd_rx,
+                data_evt: &mut data_evt_rx,
+                data_cmd: &mut data_cmd_rx,
+            });
             log::info!("Event loop stopped");
             return result;
         }
@@ -1299,15 +1299,15 @@ impl LiveNode {
             .or_else(|| self.startup_abort_reason())
         {
             self.abort_startup(reason).await?;
-            self.drain_channels(
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
+            self.drain_channels(&mut RunnerReceivers {
+                time_evt: &mut time_evt_rx,
+                system_evt: &mut system_evt_rx,
+                system_cmd: &mut system_cmd_rx,
+                exec_evt: &mut exec_evt_rx,
+                exec_cmd: &mut exec_cmd_rx,
+                data_evt: &mut data_evt_rx,
+                data_cmd: &mut data_cmd_rx,
+            });
             log::info!("Event loop stopped");
             return Ok(());
         }
@@ -1317,15 +1317,15 @@ impl LiveNode {
         // Run reconciliation now that instruments are in cache and start trader
         if let Err(e) = self.perform_startup_reconciliation().await {
             let result = self.abort_startup("Startup reconciliation failed").await;
-            self.drain_channels(
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
+            self.drain_channels(&mut RunnerReceivers {
+                time_evt: &mut time_evt_rx,
+                system_evt: &mut system_evt_rx,
+                system_cmd: &mut system_cmd_rx,
+                exec_evt: &mut exec_evt_rx,
+                exec_cmd: &mut exec_cmd_rx,
+                data_evt: &mut data_evt_rx,
+                data_cmd: &mut data_cmd_rx,
+            });
             log::info!("Event loop stopped");
 
             if let Err(finalize_err) = result {
@@ -1339,45 +1339,45 @@ impl LiveNode {
 
         if let Some(reason) = self.startup_abort_reason() {
             let result = self.abort_startup(reason).await;
-            self.drain_channels(
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
+            self.drain_channels(&mut RunnerReceivers {
+                time_evt: &mut time_evt_rx,
+                system_evt: &mut system_evt_rx,
+                system_cmd: &mut system_cmd_rx,
+                exec_evt: &mut exec_evt_rx,
+                exec_cmd: &mut exec_cmd_rx,
+                data_evt: &mut data_evt_rx,
+                data_cmd: &mut data_cmd_rx,
+            });
             log::info!("Event loop stopped");
             return result;
         }
 
         if let Err(e) = self.kernel.start_trader() {
             let result = self.abort_after_trader_start_failure(e).await;
-            self.drain_channels(
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
+            self.drain_channels(&mut RunnerReceivers {
+                time_evt: &mut time_evt_rx,
+                system_evt: &mut system_evt_rx,
+                system_cmd: &mut system_cmd_rx,
+                exec_evt: &mut exec_evt_rx,
+                exec_cmd: &mut exec_cmd_rx,
+                data_evt: &mut data_evt_rx,
+                data_cmd: &mut data_cmd_rx,
+            });
             log::info!("Event loop stopped");
             return result;
         }
         #[cfg(feature = "plugin")]
         if let Err(e) = self.plugins.start_controllers() {
             let result = self.abort_after_trader_start_failure(e).await;
-            self.drain_channels(
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
+            self.drain_channels(&mut RunnerReceivers {
+                time_evt: &mut time_evt_rx,
+                system_evt: &mut system_evt_rx,
+                system_cmd: &mut system_cmd_rx,
+                exec_evt: &mut exec_evt_rx,
+                exec_cmd: &mut exec_cmd_rx,
+                data_evt: &mut data_evt_rx,
+                data_cmd: &mut data_cmd_rx,
+            });
             log::info!("Event loop stopped");
             return result;
         }
@@ -1941,15 +1941,15 @@ impl LiveNode {
         let stop_result = self.finalize_stop().await;
 
         // Handle events that arrived during finalize_stop
-        self.drain_channels(
-            &mut time_evt_rx,
-            &mut system_evt_rx,
-            &mut system_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-        );
+        self.drain_channels(&mut RunnerReceivers {
+            time_evt: &mut time_evt_rx,
+            system_evt: &mut system_evt_rx,
+            system_cmd: &mut system_cmd_rx,
+            exec_evt: &mut exec_evt_rx,
+            exec_cmd: &mut exec_cmd_rx,
+            data_evt: &mut data_evt_rx,
+            data_cmd: &mut data_cmd_rx,
+        });
 
         log::info!("Event loop stopped");
 
@@ -2386,15 +2386,7 @@ impl LiveNode {
         let finalize_result = self.finalize_stop().await;
 
         if let Some(receivers) = receivers {
-            self.drain_channels(
-                receivers.time_evt,
-                receivers.system_evt,
-                receivers.system_cmd,
-                receivers.exec_evt,
-                receivers.exec_cmd,
-                receivers.data_evt,
-                receivers.data_cmd,
-            );
+            self.drain_channels(receivers);
         } else {
             let drained_events = self.drain_runner_pending();
             if drained_events > 0 {
@@ -2560,48 +2552,39 @@ impl LiveNode {
         }
     }
 
-    fn drain_channels(
-        &mut self,
-        time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-        system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-        system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
-        exec_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-        exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
-        data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-        data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
-    ) {
+    fn drain_channels(&mut self, receivers: &mut RunnerReceivers<'_>) {
         let mut drained = 0;
         self.process_pending_settlements();
 
-        while let Ok(handler) = time_evt_rx.try_recv() {
+        while let Ok(handler) = receivers.time_evt.try_recv() {
             self.process_runner_event(PendingRunnerEvent::TimeEvent(handler));
             drained += 1;
         }
 
-        while system_evt_rx.try_recv().is_ok() {
+        while receivers.system_evt.try_recv().is_ok() {
             drained += 1;
         }
 
-        while system_cmd_rx.try_recv().is_ok() {
+        while receivers.system_cmd.try_recv().is_ok() {
             drained += 1;
         }
 
-        while let Ok(evt) = data_evt_rx.try_recv() {
+        while let Ok(evt) = receivers.data_evt.try_recv() {
             self.process_runner_event(PendingRunnerEvent::DataEvent(evt));
             drained += 1;
         }
 
-        while let Ok(cmd) = data_cmd_rx.try_recv() {
+        while let Ok(cmd) = receivers.data_cmd.try_recv() {
             self.process_runner_event(PendingRunnerEvent::DataCommand(cmd));
             drained += 1;
         }
 
-        while let Ok(evt) = exec_evt_rx.try_recv() {
+        while let Ok(evt) = receivers.exec_evt.try_recv() {
             self.process_runner_event(PendingRunnerEvent::ExecEvent(evt));
             drained += 1;
         }
 
-        while let Ok(cmd) = exec_cmd_rx.try_recv() {
+        while let Ok(cmd) = receivers.exec_cmd.try_recv() {
             self.process_runner_event(PendingRunnerEvent::ExecCommand(cmd));
             drained += 1;
         }

@@ -725,15 +725,15 @@ async fn contract_settlement_final_drain_gates_queued_trading(
         mut data_evt_rx,
         mut data_cmd_rx,
     } = f.node.runner.take().unwrap().take_channels();
-    f.node.drain_channels(
-        &mut time_evt_rx,
-        &mut system_evt_rx,
-        &mut system_cmd_rx,
-        &mut exec_evt_rx,
-        &mut exec_cmd_rx,
-        &mut data_evt_rx,
-        &mut data_cmd_rx,
-    );
+    f.node.drain_channels(&mut RunnerReceivers {
+        time_evt: &mut time_evt_rx,
+        system_evt: &mut system_evt_rx,
+        system_cmd: &mut system_cmd_rx,
+        exec_evt: &mut exec_evt_rx,
+        exec_cmd: &mut exec_cmd_rx,
+        data_evt: &mut data_evt_rx,
+        data_cmd: &mut data_cmd_rx,
+    });
     let expected_dispatches = if expected_error.is_some() { 0 } else { 2 };
     assert_eq!(f.submitted.borrow().len(), expected_dispatches);
     assert_eq!(f.modified.borrow().len(), expected_dispatches);
