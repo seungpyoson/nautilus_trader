@@ -258,52 +258,61 @@ pub trait ExecutionClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if report generation fails.
+    /// Returns an error if report generation is unsupported or fails.
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
         log_not_implemented(cmd);
-        Ok(None)
+        anyhow::bail!(
+            "single order status reports are unsupported by {}",
+            self.client_id()
+        )
     }
 
     /// Generates multiple order status reports.
     ///
     /// # Errors
     ///
-    /// Returns an error if report generation fails.
+    /// Returns an error if report generation is unsupported or fails.
     async fn generate_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
         log_not_implemented(cmd);
-        Ok(Vec::new())
+        anyhow::bail!(
+            "order status reports are unsupported by {}",
+            self.client_id()
+        )
     }
 
     /// Generates fill reports based on execution results.
     ///
     /// # Errors
     ///
-    /// Returns an error if fill report generation fails.
+    /// Returns an error if fill report generation is unsupported or fails.
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
         log_not_implemented(&cmd);
-        Ok(Vec::new())
+        anyhow::bail!("fill reports are unsupported by {}", self.client_id())
     }
 
     /// Generates position status reports.
     ///
     /// # Errors
     ///
-    /// Returns an error if generation fails.
+    /// Returns an error if generation is unsupported or fails.
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
         log_not_implemented(cmd);
-        Ok(Vec::new())
+        anyhow::bail!(
+            "position status reports are unsupported by {}",
+            self.client_id()
+        )
     }
 
     /// Generates mass status for executions.
@@ -311,6 +320,9 @@ pub trait ExecutionClient {
     /// The default composes the granular report generators using the realtime atomic clock.
     /// This is clock-correct only for live/realtime clients; clients using a mocked or backtest
     /// clock must override this method to compose reports with their own clock.
+    /// The composed report records the requested lower bound; granular implementations must
+    /// honor their command filters and return errors for unsupported or failed queries. Successful
+    /// composition is their completeness declaration, not independent provider coverage proof.
     ///
     /// # Errors
     ///
@@ -375,6 +387,7 @@ pub trait ExecutionClient {
         mass_status.add_order_reports(order_reports);
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
+        mass_status.set_report_window(start, true);
 
         Ok(Some(mass_status))
     }
@@ -515,6 +528,7 @@ mod tests {
         fill_requests: RefCell<Vec<GenerateFillReports>>,
         position_queries: RefCell<Vec<GeneratePositionStatusReports>>,
         fail_fill: bool,
+        empty_reports: bool,
     }
 
     impl MassStatusExecutionClient {
@@ -524,6 +538,7 @@ mod tests {
                 fill_requests: RefCell::new(Vec::new()),
                 position_queries: RefCell::new(Vec::new()),
                 fail_fill,
+                empty_reports: false,
             }
         }
     }
@@ -578,7 +593,11 @@ mod tests {
             cmd: &GenerateOrderStatusReports,
         ) -> anyhow::Result<Vec<OrderStatusReport>> {
             self.order_commands.borrow_mut().push(cmd.clone());
-            Ok(vec![test_order_report()])
+            Ok(if self.empty_reports {
+                vec![]
+            } else {
+                vec![test_order_report()]
+            })
         }
 
         async fn generate_fill_reports(
@@ -590,7 +609,11 @@ mod tests {
             if self.fail_fill {
                 anyhow::bail!("sentinel fill report failure");
             }
-            Ok(vec![test_fill_report()])
+            Ok(if self.empty_reports {
+                vec![]
+            } else {
+                vec![test_fill_report()]
+            })
         }
 
         async fn generate_position_status_reports(
@@ -598,7 +621,11 @@ mod tests {
             cmd: &GeneratePositionStatusReports,
         ) -> anyhow::Result<Vec<PositionStatusReport>> {
             self.position_queries.borrow_mut().push(cmd.clone());
-            Ok(vec![test_position_report()])
+            Ok(if self.empty_reports {
+                vec![]
+            } else {
+                vec![test_position_report()]
+            })
         }
     }
 
@@ -710,6 +737,97 @@ mod tests {
     }
 
     #[rstest]
+    fn unsupported_single_order_report_is_not_a_not_found_response() {
+        let client = RecordingExecutionClient::new(Default::default());
+        let command = GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            Some(ClientOrderId::from("UNSUPPORTED-ORDER")),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            futures::executor::block_on(client.generate_order_status_report(&command)).is_err()
+        );
+    }
+
+    #[rstest]
+    fn unsupported_order_reports_are_not_an_empty_response() {
+        let client = RecordingExecutionClient::new(Default::default());
+        let command = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .open_only(false)
+            .build()
+            .unwrap();
+        assert!(
+            futures::executor::block_on(client.generate_order_status_reports(&command)).is_err()
+        );
+    }
+
+    #[rstest]
+    fn unsupported_fill_reports_are_not_an_empty_response() {
+        let client = RecordingExecutionClient::new(Default::default());
+        let command = GenerateFillReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        assert!(futures::executor::block_on(client.generate_fill_reports(command)).is_err());
+    }
+
+    #[rstest]
+    fn unsupported_position_reports_are_not_an_empty_response() {
+        let client = RecordingExecutionClient::new(Default::default());
+        let command = GeneratePositionStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        assert!(
+            futures::executor::block_on(client.generate_position_status_reports(&command)).is_err()
+        );
+    }
+
+    #[rstest]
+    fn unsupported_mass_status_is_not_a_complete_empty_response() {
+        let client = RecordingExecutionClient::new(Default::default());
+        assert!(futures::executor::block_on(client.generate_mass_status(None)).is_err());
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(5))]
+    fn implemented_empty_queries_produce_complete_mass_status(#[case] lookback: Option<u64>) {
+        let mut client = MassStatusExecutionClient::new(false);
+        client.empty_reports = true;
+
+        let report = futures::executor::block_on(client.generate_mass_status(lookback))
+            .unwrap()
+            .unwrap();
+
+        assert!(report.order_reports_ref().is_empty());
+        assert!(report.fill_reports_ref().is_empty());
+        assert!(report.position_reports_ref().is_empty());
+        assert!(report.reports_complete());
+        assert_eq!(client.order_commands.borrow().len(), 1);
+        assert_eq!(client.fill_requests.borrow().len(), 1);
+        assert_eq!(client.position_queries.borrow().len(), 1);
+        assert_eq!(
+            report.lookback_start(),
+            client.order_commands.borrow()[0].start
+        );
+        assert_eq!(
+            report.lookback_start(),
+            client.fill_requests.borrow()[0].start
+        );
+        assert_eq!(
+            report.lookback_start(),
+            client.position_queries.borrow()[0].start
+        );
+        assert_eq!(report.lookback_start().is_some(), lookback.is_some());
+    }
+
+    #[rstest]
     fn generate_mass_status_default_composes_granular_reports() {
         let client = MassStatusExecutionClient::new(false);
 
@@ -765,6 +883,8 @@ mod tests {
                 .as_u64()
                 .saturating_sub(checked_mins_to_nanos(5).unwrap()),
         );
+        assert_eq!(mass_status.lookback_start(), Some(expected_start));
+        assert!(mass_status.reports_complete());
         assert_eq!(order_cmd.start, Some(expected_start));
         assert_eq!(fill_cmd.start, Some(expected_start));
         assert_eq!(position_cmd.start, Some(expected_start));

@@ -69,6 +69,8 @@ pub(crate) struct FillReportScope {
     instrument_id: Option<InstrumentId>,
     venue_order_id: Option<VenueOrderId>,
     expected_order_side: Option<OrderSide>,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
 }
 
 impl FillReportScope {
@@ -80,7 +82,19 @@ impl FillReportScope {
             instrument_id,
             venue_order_id,
             expected_order_side: None,
+            start: None,
+            end: None,
         }
+    }
+
+    pub(crate) const fn with_time_window(
+        mut self,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> Self {
+        self.start = start;
+        self.end = end;
+        self
     }
 
     pub(crate) const fn with_expected_order_side(
@@ -231,7 +245,7 @@ fn validate_quantity_evidence(
     precision: u8,
     field: &str,
     allow_zero: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Quantity> {
     if allow_zero {
         anyhow::ensure!(
             value >= Decimal::ZERO,
@@ -247,7 +261,7 @@ fn validate_quantity_evidence(
         quantity.as_decimal() == value,
         "{field} {value} is not exactly representable with quantity precision {precision}",
     );
-    Ok(())
+    Ok(quantity)
 }
 
 fn validate_price_evidence(value: Decimal, precision: u8, field: &str) -> anyhow::Result<()> {
@@ -737,6 +751,7 @@ fn classify_target_trade<'a>(
     instrument_id: Option<InstrumentId>,
     venue_order_id: VenueOrderId,
     expected_order_side: Option<OrderSide>,
+    ts_event: Option<UnixNanos>,
 ) -> anyhow::Result<TargetTradeAdmission<'a>> {
     if !validate_target_trade_role(trade, venue_order_id)? {
         return Ok(TargetTradeAdmission {
@@ -834,7 +849,7 @@ fn classify_target_trade<'a>(
                 &format!("pending {quantity_field}"),
                 &format!("pending {price_field}"),
             )?;
-            require_trade_timestamp(parse_timestamp(&trade.match_time), trade)?;
+            require_trade_timestamp(ts_event, trade)?;
             Ok(TargetTradeAdmission {
                 class: TargetTradeClass::Pending,
                 confirmed_fill: None,
@@ -848,7 +863,7 @@ fn classify_target_trade<'a>(
                 &quantity_field,
                 &price_field,
             )?;
-            let ts_event = require_trade_timestamp(parse_timestamp(&trade.match_time), trade)?;
+            let ts_event = require_trade_timestamp(ts_event, trade)?;
             Ok(TargetTradeAdmission {
                 class: TargetTradeClass::Confirmed,
                 confirmed_fill: Some(AdmittedTargetFill {
@@ -948,6 +963,14 @@ pub(crate) struct FillBuildDiscards {
     pub untimestamped_trades: usize,
 }
 
+impl FillBuildDiscards {
+    pub(crate) const fn reports_complete(&self) -> bool {
+        self.in_scope_historical == 0
+            && self.unowned_maker_trades == 0
+            && self.untimestamped_trades == 0
+    }
+}
+
 fn admit_selected_trade<'a>(
     selected_trades: &mut AHashMap<&'a str, &'a PolymarketTradeReport>,
     trade: &'a PolymarketTradeReport,
@@ -974,13 +997,21 @@ pub(crate) fn build_fill_reports_from_trades(
     scope: FillReportScope,
     ts_init: UnixNanos,
     load_ids: Option<&[InstrumentId]>,
-    lookback_start: Option<UnixNanos>,
 ) -> anyhow::Result<(Vec<FillReport>, FillBuildDiscards)> {
     let mut reports = Vec::new();
     let mut discards = FillBuildDiscards::default();
     let mut selected_trades = AHashMap::new();
 
     for trade in trades {
+        let ts_event = parse_timestamp(&trade.match_time);
+        if trade.status == PolymarketTradeStatus::Confirmed
+            && ts_event.is_some_and(|ts| {
+                scope.start.is_some_and(|start| ts < start) || scope.end.is_some_and(|end| ts > end)
+            })
+        {
+            continue;
+        }
+
         if let Some(target_order_id) = scope.venue_order_id {
             let admission = classify_target_trade(
                 trade,
@@ -989,6 +1020,7 @@ pub(crate) fn build_fill_reports_from_trades(
                 scope.instrument_id,
                 target_order_id,
                 scope.expected_order_side,
+                ts_event,
             )?;
 
             if matches!(admission.class, TargetTradeClass::Unrelated) {
@@ -1028,18 +1060,18 @@ pub(crate) fn build_fill_reports_from_trades(
                 .iter()
                 .any(|mo| mo.is_owned_by(ctx.user_address, ctx.api_key))
             {
-                let ts_event = parse_timestamp(&trade.match_time);
                 let instrument_id =
                     instrument_id_from_market_token(trade.market.as_str(), trade.asset_id.as_str());
                 let in_load_ids_scope = instrument_in_load_ids_scope(instrument_id, load_ids);
+                if !in_load_ids_scope
+                    || scope.instrument_id.is_some_and(|requested| {
+                        !polymarket_instrument_ids_equivalent(requested, instrument_id)
+                    })
+                {
+                    continue;
+                }
 
-                if !trade_in_lookback_window(
-                    ts_event,
-                    lookback_start,
-                    in_load_ids_scope,
-                    &trade.id,
-                    &mut discards,
-                ) {
+                if !trade_has_usable_timestamp(ts_event, scope, &mut discards) {
                     continue;
                 }
                 discards.unowned_maker_trades += 1;
@@ -1068,6 +1100,7 @@ pub(crate) fn build_fill_reports_from_trades(
                         classify_unmapped_historical(
                             &mut discards,
                             load_ids,
+                            scope.instrument_id,
                             &trade.market,
                             token_id.as_str(),
                         );
@@ -1117,18 +1150,7 @@ pub(crate) fn build_fill_reports_from_trades(
                 continue;
             }
 
-            let ts_event = parse_timestamp(&trade.match_time);
-            let in_load_ids_scope = selected_maker_orders.iter().any(|(_, instrument, _, _)| {
-                instrument_in_load_ids_scope(instrument.id(), load_ids)
-            });
-
-            if !trade_in_lookback_window(
-                ts_event,
-                lookback_start,
-                in_load_ids_scope,
-                &trade.id,
-                &mut discards,
-            ) {
+            if !trade_has_usable_timestamp(ts_event, scope, &mut discards) {
                 continue;
             }
 
@@ -1189,6 +1211,7 @@ pub(crate) fn build_fill_reports_from_trades(
                     classify_unmapped_historical(
                         &mut discards,
                         load_ids,
+                        scope.instrument_id,
                         &trade.market,
                         token_id.as_str(),
                     );
@@ -1220,16 +1243,8 @@ pub(crate) fn build_fill_reports_from_trades(
                 &format!("taker trade {} size", trade.id),
                 &format!("taker trade {} price", trade.id),
             )?;
-            let ts_event = parse_timestamp(&trade.match_time);
-            let in_load_ids_scope = instrument_in_load_ids_scope(instrument_id, load_ids);
 
-            if !trade_in_lookback_window(
-                ts_event,
-                lookback_start,
-                in_load_ids_scope,
-                &trade.id,
-                &mut discards,
-            ) {
+            if !trade_has_usable_timestamp(ts_event, scope, &mut discards) {
                 continue;
             }
 
@@ -1309,41 +1324,25 @@ pub(crate) fn build_order_reports_from_orders(
     Ok((reports, filtered))
 }
 
-/// Applies time-range filters to fill reports.
-pub(crate) fn apply_fill_time_filters(
-    mut reports: Vec<FillReport>,
-    start: Option<UnixNanos>,
-    end: Option<UnixNanos>,
-) -> Vec<FillReport> {
-    match (start, end) {
-        (Some(s), Some(e)) => reports.retain(|r| r.ts_event >= s && r.ts_event <= e),
-        (Some(s), None) => reports.retain(|r| r.ts_event >= s),
-        (None, Some(e)) => reports.retain(|r| r.ts_event <= e),
-        (None, None) => {}
-    }
-
-    reports
-}
-
 fn build_position_report_from_reportable_position(
     position: &DataApiPosition,
     account_id: AccountId,
     ts: UnixNanos,
-) -> Option<PositionStatusReport> {
+) -> anyhow::Result<PositionStatusReport> {
     let instrument_id = instrument_id_from_market_token(&position.condition_id, &position.asset);
-    let quantity = match Quantity::from_decimal_dp(position.size, USDC_DECIMALS as u8) {
-        Ok(quantity) => quantity,
-        Err(e) => {
-            log::warn!(
-                "Skipping invalid Data API position {}-{} size {}: {e}",
-                position.condition_id,
-                position.asset,
-                position.size,
-            );
-            return None;
-        }
-    };
-    Some(PositionStatusReport::new(
+    let quantity = validate_quantity_evidence(
+        position.size,
+        USDC_DECIMALS as u8,
+        "Data API position size",
+        false,
+    )
+    .with_context(|| {
+        format!(
+            "invalid Data API position {}-{}",
+            position.condition_id, position.asset,
+        )
+    })?;
+    Ok(PositionStatusReport::new(
         account_id,
         instrument_id,
         PositionSideSpecified::Long,
@@ -1404,6 +1403,14 @@ fn build_reconciliation_position_report(
         return Ok(None);
     }
 
+    anyhow::ensure!(
+        position.size >= Decimal::ZERO,
+        "Data API position {}-{} size {} must be non-negative",
+        position.condition_id,
+        position.asset,
+        position.size,
+    );
+
     if position_is_dust(position) {
         return Ok(None);
     }
@@ -1417,9 +1424,7 @@ fn build_reconciliation_position_report(
         ));
     }
 
-    Ok(build_position_report_from_reportable_position(
-        position, account_id, ts,
-    ))
+    build_position_report_from_reportable_position(position, account_id, ts).map(Some)
 }
 
 /// Full reconciliation mass status generation.
@@ -1465,10 +1470,10 @@ pub(crate) async fn generate_mass_status(
         &trades,
         ctx,
         instruments,
-        FillReportScope::new(None, None),
+        FillReportScope::new(None, None)
+            .with_time_window(lookback_start, lookback_start.map(|_| ts_init)),
         ts_init,
         load_ids,
-        lookback_start,
     )?;
 
     if fill_discards.unowned_maker_trades > 0 {
@@ -1515,19 +1520,17 @@ pub(crate) async fn generate_mass_status(
 
     let mut mass_status = ExecutionMassStatus::new(client_id, ctx.account_id, venue, ts_init, None);
 
-    if let Some(lookback_start) = lookback_start {
-        let reported_orders: AHashSet<VenueOrderId> = order_reports
-            .iter()
-            .map(|report| report.venue_order_id)
-            .collect();
-        let reports_complete = fill_discards.in_scope_historical == 0
-            && fill_discards.unowned_maker_trades == 0
-            && fill_discards.untimestamped_trades == 0
-            && fill_reports
+    let reports_complete = fill_discards.reports_complete()
+        && (lookback_start.is_none() || {
+            let reported_orders: AHashSet<VenueOrderId> = order_reports
                 .iter()
-                .all(|report| reported_orders.contains(&report.venue_order_id));
-        mass_status.set_report_window(Some(lookback_start), reports_complete);
-    }
+                .map(|report| report.venue_order_id)
+                .collect();
+            fill_reports
+                .iter()
+                .all(|report| reported_orders.contains(&report.venue_order_id))
+        });
+    mass_status.set_report_window(lookback_start, reports_complete);
 
     mass_status.add_order_reports(order_reports);
     mass_status.add_position_reports(position_reports);
@@ -1638,41 +1641,33 @@ fn position_is_dust(position: &DataApiPosition) -> bool {
     is_dust
 }
 
-fn trade_in_lookback_window(
+fn trade_has_usable_timestamp(
     ts_event: Option<UnixNanos>,
-    lookback_start: Option<UnixNanos>,
-    in_load_ids_scope: bool,
-    trade_id: &str,
+    scope: FillReportScope,
     discards: &mut FillBuildDiscards,
 ) -> bool {
-    let Some(cutoff) = lookback_start else {
+    if ts_event.is_some() || (scope.start.is_none() && scope.end.is_none()) {
         return true;
-    };
-
-    match ts_event {
-        Some(ts_event) => ts_event >= cutoff,
-        None => {
-            if in_load_ids_scope {
-                discards.untimestamped_trades += 1;
-            } else {
-                log::debug!(
-                    "Dropping out-of-scope historical trade {trade_id} with unparsable match_time"
-                );
-            }
-            false
-        }
     }
+
+    discards.untimestamped_trades += 1;
+    false
 }
 
 fn classify_unmapped_historical(
     discards: &mut FillBuildDiscards,
     load_ids: Option<&[InstrumentId]>,
+    requested_instrument: Option<InstrumentId>,
     market: &str,
     token_id: &str,
 ) {
     let instrument_id = instrument_id_from_market_token(market, token_id);
     discards.unmapped_instruments += 1;
-    if instrument_in_load_ids_scope(instrument_id, load_ids) {
+
+    if instrument_in_load_ids_scope(instrument_id, load_ids)
+        && requested_instrument
+            .is_none_or(|requested| polymarket_instrument_ids_equivalent(requested, instrument_id))
+    {
         discards.in_scope_historical += 1;
         log::warn!("Unmapped in-scope historical instrument {instrument_id}");
         return;
@@ -1860,6 +1855,47 @@ mod tests {
     }
 
     #[rstest]
+    #[case(true, true, 1)]
+    #[case(true, false, 0)]
+    #[case(false, true, 0)]
+    #[case(false, false, 0)]
+    fn unattributed_maker_discard_respects_collection_scope(
+        #[case] loaded_scope: bool,
+        #[case] requested_scope: bool,
+        #[case] expected_discards: usize,
+    ) {
+        let mut trade = confirmed_taker_trade();
+        trade.trader_side = PolymarketLiquiditySide::Maker;
+        trade.maker_orders.clear();
+        let instrument_id =
+            instrument_id_from_market_token(trade.market.as_str(), trade.asset_id.as_str());
+        let other_id = InstrumentId::from("OTHER.POLYMARKET");
+        let load_ids = [if loaded_scope {
+            instrument_id
+        } else {
+            other_id
+        }];
+        let requested = if requested_scope {
+            instrument_id
+        } else {
+            other_id
+        };
+
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[trade],
+            &test_fill_context(),
+            &test_instruments(),
+            FillReportScope::new(Some(requested), None),
+            UnixNanos::from(1),
+            Some(&load_ids),
+        )
+        .unwrap();
+
+        assert!(reports.is_empty());
+        assert_eq!(discards.unowned_maker_trades, expected_discards);
+    }
+
+    #[rstest]
     fn foreign_confirmed_taker_trade_is_ignored() {
         let mut trade = confirmed_taker_trade();
         trade.maker_address = "0x1111111111111111111111111111111111111111".to_string();
@@ -1872,11 +1908,85 @@ mod tests {
             FillReportScope::new(None, None),
             UnixNanos::from(1),
             None,
-            None,
         )
         .expect("foreign taker trade is outside local report scope");
 
         assert!(reports.is_empty());
+    }
+
+    #[rstest]
+    #[case(true, true, 1)]
+    #[case(true, false, 0)]
+    #[case(false, true, 0)]
+    #[case(false, false, 0)]
+    fn unmapped_history_discard_respects_both_instrument_scopes(
+        #[case] loaded_scope: bool,
+        #[case] requested_scope: bool,
+        #[case] expected_discards: usize,
+    ) {
+        let trade = confirmed_taker_trade();
+        let instrument_id =
+            instrument_id_from_market_token(trade.market.as_str(), trade.asset_id.as_str());
+        let other_id = InstrumentId::from("OTHER.POLYMARKET");
+        let load_ids = [if loaded_scope {
+            instrument_id
+        } else {
+            other_id
+        }];
+        let requested = if requested_scope {
+            instrument_id
+        } else {
+            other_id
+        };
+
+        let (reports, discards) = build_fill_reports_from_trades(
+            &[trade],
+            &test_fill_context(),
+            &AtomicMap::new(),
+            FillReportScope::new(Some(requested), None),
+            UnixNanos::from(1),
+            Some(&load_ids),
+        )
+        .unwrap();
+
+        assert!(reports.is_empty());
+        assert_eq!(discards.unmapped_instruments, 1);
+        assert_eq!(discards.in_scope_historical, expected_discards);
+        assert_eq!(discards.reports_complete(), expected_discards == 0);
+    }
+
+    #[rstest]
+    #[case::before("9", false)]
+    #[case::at_start("10", true)]
+    #[case::at_end("20", true)]
+    #[case::after("21", false)]
+    fn confirmed_trade_time_bounds_precede_value_validation(
+        #[case] seconds: &str,
+        #[case] in_window: bool,
+    ) {
+        let mut trade = confirmed_taker_trade();
+        trade.match_time = seconds.to_string();
+        trade.size = -Decimal::ONE;
+
+        let result = build_fill_reports_from_trades(
+            &[trade],
+            &test_fill_context(),
+            &test_instruments(),
+            FillReportScope::new(None, None).with_time_window(
+                Some(UnixNanos::from(10_000_000_000)),
+                Some(UnixNanos::from(20_000_000_000)),
+            ),
+            UnixNanos::from(30_000_000_000),
+            None,
+        );
+
+        if in_window {
+            assert!(result.unwrap_err().to_string().contains("size"));
+        } else {
+            let (reports, discards) = result.unwrap();
+            assert!(reports.is_empty());
+            assert!(discards.reports_complete());
+        }
     }
 
     #[rstest]
@@ -1891,7 +2001,6 @@ mod tests {
             &test_instruments(),
             FillReportScope::new(None, None),
             UnixNanos::from(1),
-            None,
             None,
         )
         .expect_err("owned trade with contradictory condition must fail");
@@ -1910,7 +2019,6 @@ mod tests {
             &test_instruments(),
             FillReportScope::new(None, None),
             UnixNanos::from(1),
-            None,
             None,
         )
         .expect_err("owned trade with contradictory outcome must fail");
@@ -1931,7 +2039,6 @@ mod tests {
             &test_instruments(),
             FillReportScope::new(None, None),
             UnixNanos::from(1),
-            None,
             None,
         )
         .expect_err("owned maker leg with contradictory outcome must fail");
