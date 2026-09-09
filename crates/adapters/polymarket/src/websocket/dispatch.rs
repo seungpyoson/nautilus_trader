@@ -2722,6 +2722,7 @@ mod tests {
         let mut cache = Cache::default();
         let venue = test_instrument().id().venue;
         let lookup = PolymarketInstrumentLookup::new(cache.instrument_read_view(), venue);
+
         for cycle in 0..3 {
             let InstrumentAny::BinaryOption(mut option) = test_instrument() else {
                 unreachable!();

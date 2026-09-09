@@ -445,6 +445,7 @@ impl LiveNode {
     /// Returns an error if startup fails.
     pub async fn start(&mut self) -> anyhow::Result<()> {
         self.check_execution_health()?;
+
         if self.state().is_running() {
             anyhow::bail!("Already running");
         }
@@ -902,6 +903,7 @@ impl LiveNode {
     #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
     async fn perform_startup_reconciliation(&mut self) -> anyhow::Result<()> {
         self.process_pending_settlements();
+
         if !self.config.exec_engine.reconciliation {
             log::info!("Startup reconciliation disabled");
             self.kernel
@@ -2135,6 +2137,7 @@ impl LiveNode {
                 .exec_manager
                 .prepare_contract_settlements(instrument_id),
         }?;
+
         for settlement in settlements {
             let initialized = OrderEventAny::Initialized(settlement.order.init_event().clone());
             let strategy_id = settlement.order.strategy_id();
@@ -2412,6 +2415,7 @@ impl LiveNode {
         if let Err(e) = finalize_result {
             errors.push(format!("Failed to finalize startup abort: {e}"));
         }
+
         if let Err(e) = self.check_execution_health() {
             errors.push(e.to_string());
         }
@@ -2544,6 +2548,7 @@ impl LiveNode {
         if let Err(e) = kernel_result {
             errors.push(format!("failed while finalizing kernel shutdown: {e}"));
         }
+
         if let Err(e) = self.check_execution_health() {
             errors.push(e.to_string());
         }

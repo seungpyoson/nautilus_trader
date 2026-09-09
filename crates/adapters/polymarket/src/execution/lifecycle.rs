@@ -1203,6 +1203,7 @@ mod tests {
     #[rstest]
     fn lookup_follows_cache_updates_for_active_and_expired_instruments() {
         let (client, cache) = test_client();
+
         for expired in [false, true] {
             let instrument = test_binary_option("0xUPDATE", expired, expired);
             cache
@@ -1360,6 +1361,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_follows_cache_through_repeated_disconnect_and_reload() {
         let (mut client, cache) = test_client();
+
         for n in 0..3 {
             let symbol = format!("0xDISCONNECT_{n}");
             let instrument = test_binary_option(&symbol, true, true);

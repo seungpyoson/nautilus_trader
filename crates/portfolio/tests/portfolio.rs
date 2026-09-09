@@ -5884,6 +5884,7 @@ fn test_realized_pnl_for_closed_netting_position_requires_cycle_identity(
         .position_owned(&position_id)
         .unwrap();
     position.events.clear();
+
     if snapshot_missing_identity {
         portfolio
             .cache()

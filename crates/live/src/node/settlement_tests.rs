@@ -700,6 +700,7 @@ async fn contract_settlement_final_drain_gates_queued_trading(
         f.instrument.expiration_ns().unwrap(),
         f.instrument.expiration_ns().unwrap(),
     )));
+
     if already_pending {
         AsyncRunner::handle_data_event(event);
     } else {
@@ -738,6 +739,7 @@ async fn contract_settlement_final_drain_gates_queued_trading(
     assert_eq!(f.modified.borrow().len(), expected_dispatches);
     assert_eq!(f.cancels.borrow().len(), 1);
     let result = f.node.finalize_stop().await;
+
     match expected_error {
         Some(expected) => {
             let error = result.unwrap_err();
@@ -1036,6 +1038,7 @@ async fn contract_settlement_startup_abort_reports_final_drain_fault(
 
     assert_eq!(f.node.state(), NodeState::Stopped);
     assert!(f.submitted.borrow().is_empty());
+
     if conflicting {
         let error = result.unwrap_err();
         assert!(format!("{error:#}").contains("Conflicting contract close"));
@@ -1164,6 +1167,7 @@ async fn contract_settlement_mass_status_keeps_resolved_inventory_flat() {
     let mut f = Fixture::new();
     f.fill("OWNER-001", "OPEN", OrderSide::Buy, "10.00", "0.400");
     f.close("1.000", InstrumentCloseType::ContractExpired);
+
     for venue_qty in [Some(Quantity::from("10.00")), None] {
         let mut mass = ExecutionMassStatus::new(
             f.client_id,

@@ -590,6 +590,7 @@ impl ExecutionManager {
                 "Cannot settle unknown instrument {}",
                 close.instrument_id,
             );
+
             if let Some(previous) = cache.instrument_close(&close.instrument_id)
                 && previous.close_type == InstrumentCloseType::ContractExpired
             {
@@ -624,6 +625,7 @@ impl ExecutionManager {
             let Some(close) = cache.instrument_close(&instrument_id).copied() else {
                 return Ok(Vec::new());
             };
+
             if close.close_type != InstrumentCloseType::ContractExpired {
                 return Ok(Vec::new());
             }
@@ -4545,6 +4547,7 @@ impl ExecutionManager {
         if self.has_contract_close(&report.instrument_id) {
             return None;
         }
+
         if report.venue_position_id.is_some() {
             self.reconcile_position_report_hedging(
                 report,

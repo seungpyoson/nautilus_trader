@@ -188,6 +188,7 @@ async fn start_venue(
         )
         .route("/ws", get(local_user_socket))
         .with_state(state.clone());
+
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -394,6 +395,7 @@ async fn run_recon_case(case: &str, winner: bool, claim: bool, mode: NodeRunMode
         probe: probe.clone(),
     })
     .unwrap();
+
     if claim {
         // The strategy-config field alone does not register a claim on this revision (the
         // `Strategy::external_order_instrument_ids` default returns None unless overridden), so the
@@ -409,6 +411,7 @@ async fn run_recon_case(case: &str, winner: bool, claim: bool, mode: NodeRunMode
     let fill_reads = venue.fill_report_reads.clone();
     let flat = venue.flat.clone();
     let monitor_events = event_count.clone();
+
     let monitor = tokio::spawn(async move {
         let resolution_seen = tokio::time::timeout(Duration::from_secs(8), async {
             while monitor_probe.resolution_count.load(Ordering::SeqCst) == 0 {

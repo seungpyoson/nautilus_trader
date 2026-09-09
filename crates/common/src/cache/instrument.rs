@@ -226,6 +226,7 @@ mod tests {
     fn read_view_releases_definitions_and_index_entries_on_purge() {
         let mut cache = Cache::default();
         let view = cache.instrument_read_view();
+
         for n in 0..64 {
             let instrument =
                 instrument(&format!("condition-{n}.POLYMARKET"), &format!("token-{n}"));
