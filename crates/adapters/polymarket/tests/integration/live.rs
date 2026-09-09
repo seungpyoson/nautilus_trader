@@ -292,7 +292,7 @@ async fn user_stream_survives_malformed_token(
     let cache = h.cache().borrow();
     let cached = cache.order(&order.client_order_id()).unwrap();
     assert_eq!(cached.status(), expected_status);
-    let fill_count = event_count(cached, |event| matches!(event, OrderEventAny::Filled(_)));
+    let fill_count = event_count(&cached, |event| matches!(event, OrderEventAny::Filled(_)));
     if liquidity.is_some() {
         assert_eq!(fill_count, 1);
         assert_eq!(cached.filled_qty().as_decimal(), Decimal::from(100));
@@ -300,7 +300,7 @@ async fn user_stream_survives_malformed_token(
         assert_eq!(fill_count, 0);
         assert_eq!(cached.filled_qty().as_decimal(), Decimal::ZERO);
         assert_eq!(
-            event_count(cached, |event| matches!(event, OrderEventAny::Canceled(_))),
+            event_count(&cached, |event| matches!(event, OrderEventAny::Canceled(_))),
             1,
         );
     }
