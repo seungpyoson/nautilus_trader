@@ -3004,8 +3004,12 @@ async fn test_position_collection_preserves_invalid_quantity_failure(
 }
 
 #[rstest]
+#[case::unbounded(None)]
+#[case::bounded(Some(60))]
 #[tokio::test]
-async fn test_generate_mass_status_treats_condition_hex_case_as_same_load_scope() {
+async fn test_generate_mass_status_treats_condition_hex_case_as_same_load_scope(
+    #[case] lookback_mins: Option<u64>,
+) {
     let state = TestServerState::default();
     *state.orders_response_override.lock().await = Some(json!({
         "data": [],
@@ -3014,6 +3018,13 @@ async fn test_generate_mass_status_treats_condition_hex_case_as_same_load_scope(
     let mut trade = load_json("http_trades_page.json")["data"][0].clone();
     let token_id = trade["asset_id"].as_str().unwrap().to_string();
     trade["market"] = json!(TEST_CONDITION_ID.to_ascii_uppercase());
+    trade["match_time"] = json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string()
+    );
     *state.trades_response_override.lock().await = Some(json!({
         "data": [trade],
         "next_cursor": "LTE=",
@@ -3029,7 +3040,7 @@ async fn test_generate_mass_status_treats_condition_hex_case_as_same_load_scope(
     let (client, _rx, _cache) = create_test_execution_client_from_config(config);
 
     let mass_status = client
-        .generate_mass_status(Some(60))
+        .generate_mass_status(lookback_mins)
         .await
         .expect("case-equivalent condition remains in configured reconciliation scope")
         .expect("mass status available");
