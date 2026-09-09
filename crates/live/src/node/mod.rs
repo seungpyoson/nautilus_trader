@@ -444,6 +444,7 @@ impl LiveNode {
     ///
     /// Returns an error if startup fails.
     pub async fn start(&mut self) -> anyhow::Result<()> {
+        self.check_execution_health()?;
         if self.state().is_running() {
             anyhow::bail!("Already running");
         }
@@ -602,6 +603,7 @@ impl LiveNode {
         if drained_events > 0 {
             log::info!("Drained {drained_events} remaining events during shutdown");
         }
+        self.check_execution_health()?;
 
         match (controller_stop_result, stop_result) {
             (Ok(()), Ok(())) => Ok(()),
@@ -1079,6 +1081,7 @@ impl LiveNode {
     ///
     /// Returns an error if the node fails to start or encounters a runtime error.
     pub async fn run_with_mode(&mut self, mode: NodeRunMode) -> anyhow::Result<()> {
+        self.check_execution_health()?;
         if self.state().is_running() {
             anyhow::bail!("Already running");
         }
@@ -1944,6 +1947,7 @@ impl LiveNode {
 
         log::info!("Event loop stopped");
 
+        self.check_execution_health()?;
         stop_result
     }
 
@@ -2093,10 +2097,24 @@ impl LiveNode {
     }
 
     fn process_settlement(&mut self, input: SettlementInput) {
+        if self.kernel.exec_engine.borrow().halt_reason().is_some() {
+            return;
+        }
+
         if let Err(e) = self.apply_settlement(input) {
-            log::error!("Cannot apply contract settlement, stopping node: {e}");
+            self.kernel
+                .exec_engine
+                .borrow_mut()
+                .halt(format!("Cannot apply contract settlement: {e:#}"));
             self.handle.stop();
         }
+    }
+
+    fn check_execution_health(&self) -> anyhow::Result<()> {
+        if let Some(reason) = self.kernel.exec_engine.borrow().halt_reason() {
+            anyhow::bail!("{reason}");
+        }
+        Ok(())
     }
 
     fn apply_settlement(&mut self, input: SettlementInput) -> anyhow::Result<()> {
@@ -2381,6 +2399,9 @@ impl LiveNode {
         if let Err(e) = finalize_result {
             errors.push(format!("Failed to finalize startup abort: {e}"));
         }
+        if let Err(e) = self.check_execution_health() {
+            errors.push(e.to_string());
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -2509,6 +2530,9 @@ impl LiveNode {
 
         if let Err(e) = kernel_result {
             errors.push(format!("failed while finalizing kernel shutdown: {e}"));
+        }
+        if let Err(e) = self.check_execution_health() {
+            errors.push(e.to_string());
         }
 
         if errors.is_empty() {

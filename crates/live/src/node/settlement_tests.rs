@@ -15,6 +15,9 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use nautilus_common::messages::execution::{
+    BatchModifyOrders, CancelAllOrders, ModifyOrder, SubmitOrder, SubmitOrderList,
+};
 use nautilus_core::UnixNanos;
 use nautilus_execution::engine::stubs::StubExecutionClient;
 use nautilus_model::{
@@ -24,10 +27,10 @@ use nautilus_model::{
         AccountType, InstrumentCloseType, LiquiditySide, OmsType, OrderSide, OrderType,
         PositionSide,
     },
-    events::{AccountState, OrderFilled},
-    identifiers::{AccountId, PositionId, TradeId, VenueOrderId},
+    events::{AccountState, OrderDenied, OrderFilled},
+    identifiers::{AccountId, OrderListId, PositionId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny, stubs::binary_option},
-    orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
+    orders::{OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
     reports::ExecutionMassStatus,
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
@@ -43,13 +46,23 @@ struct Fixture {
     account_id: AccountId,
     client_id: ClientId,
     submitted: Rc<RefCell<Vec<ClientOrderId>>>,
+    modified: Rc<RefCell<Vec<ClientOrderId>>>,
+    cancels: Rc<RefCell<Vec<CancelAllOrders>>>,
     positions: Rc<RefCell<Vec<PositionEvent>>>,
     position_handler: TypedHandler<PositionEvent>,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_base_currency(Currency::USDC())
+    }
+
+    fn with_base_currency(base_currency: Currency) -> Self {
         let config = LiveNodeConfig {
+            portfolio: Some(nautilus_portfolio::config::PortfolioConfig {
+                use_mark_xrates: true,
+                ..Default::default()
+            }),
             exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: true,
                 position_check_threshold_ms: 0,
@@ -65,16 +78,16 @@ impl Fixture {
             account_id,
             AccountType::Cash,
             vec![AccountBalance::new(
-                Money::from("100 USDC"),
-                Money::from("0 USDC"),
-                Money::from("100 USDC"),
+                Money::new(100.0, base_currency),
+                Money::zero(base_currency),
+                Money::new(100.0, base_currency),
             )],
             vec![],
             true,
             UUID4::new(),
             UnixNanos::default(),
             UnixNanos::default(),
-            Some(Currency::USDC()),
+            Some(base_currency),
         );
         node.kernel
             .cache
@@ -94,6 +107,8 @@ impl Fixture {
             None,
         );
         let submitted = client.submitted_order_ids();
+        let modified = client.modified_order_ids();
+        let cancels = client.cancel_all_commands();
         node.kernel
             .exec_engine
             .borrow_mut()
@@ -115,6 +130,8 @@ impl Fixture {
             account_id,
             client_id,
             submitted,
+            modified,
+            cancels,
             positions,
             position_handler,
         }
@@ -132,6 +149,18 @@ impl Fixture {
         qty: &str,
         px: &str,
     ) -> OrderFilled {
+        let order = self.accept_order(strategy, tag, side, qty, px);
+        self.fill_order(&order, tag, qty, px)
+    }
+
+    fn accept_order(
+        &mut self,
+        strategy: &str,
+        tag: &str,
+        side: OrderSide,
+        qty: &str,
+        px: &str,
+    ) -> OrderAny {
         let order = OrderTestBuilder::new(OrderType::Limit)
             .trader_id(self.node.trader_id())
             .strategy_id(StrategyId::from(strategy))
@@ -158,17 +187,19 @@ impl Fixture {
             .unwrap();
         let accepted =
             TestOrderEventStubs::accepted(&order, self.account_id, VenueOrderId::new(tag));
-        let order = self
-            .node
+        self.node
             .kernel
             .cache
             .borrow_mut()
             .update_order(&accepted)
-            .unwrap();
+            .unwrap()
+    }
+
+    fn fill_order(&mut self, order: &OrderAny, tag: &str, qty: &str, px: &str) -> OrderFilled {
         // These are real fills executed before expiry but may be delivered after settlement.
         let ts_event = UnixNanos::from(self.instrument.expiration_ns().unwrap().as_u64() - 1);
         let event = TestOrderEventStubs::filled(
-            &order,
+            order,
             &self.instrument,
             Some(TradeId::new(tag)),
             None,
@@ -278,6 +309,149 @@ impl Fixture {
             &IndexSet::new(),
         )
     }
+
+    fn position_report_result(&self) -> PositionReportResult {
+        let mut check = self
+            .node
+            .exec_manager
+            .prepare_position_report_check(UUID4::new(), &[]);
+        check.client_coverage.insert(
+            (self.instrument.id(), self.account_id),
+            ReportClientCoverage::Resolved(IndexSet::from([self.client_id])),
+        );
+        PositionReportResult {
+            check,
+            reports: vec![PositionStatusReport::new(
+                self.account_id,
+                self.instrument.id(),
+                PositionSide::Long,
+                Quantity::from("20.00"),
+                UnixNanos::from(1_000),
+                UnixNanos::from(1_000),
+                None,
+                None,
+                Some(dec!(0.4)),
+            )],
+            queried_clients: IndexSet::from([self.client_id]),
+            failed_clients: IndexSet::new(),
+        }
+    }
+
+    fn trading_commands(&mut self) -> Vec<TradingCommandMessage> {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(self.node.trader_id())
+            .strategy_id(StrategyId::from("OWNER-001"))
+            .instrument_id(self.instrument.id())
+            .client_order_id(ClientOrderId::from("QUEUED-SUBMIT"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.00"))
+            .price(Price::from("0.400"))
+            .build();
+        self.node
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(self.client_id), false)
+            .unwrap();
+        let submit = SubmitOrder::new(
+            order.trader_id(),
+            Some(self.client_id),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            order.init_event().clone(),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+        let list_order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(ClientOrderId::from("QUEUED-LIST"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.00"))
+            .price(Price::from("0.400"))
+            .build();
+        self.node
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(list_order.clone(), None, Some(self.client_id), false)
+            .unwrap();
+        let submit_list = SubmitOrderList::new(
+            order.trader_id(),
+            Some(self.client_id),
+            order.strategy_id(),
+            OrderList::new(
+                OrderListId::from("QUEUED-LIST"),
+                order.instrument_id(),
+                order.strategy_id(),
+                vec![list_order.client_order_id()],
+                UnixNanos::default(),
+            ),
+            vec![list_order.init_event().clone()],
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+        let working = self.accept_order("OWNER-001", "WORKING", OrderSide::Buy, "1.00", "0.400");
+        let modify = ModifyOrder::new(
+            working.trader_id(),
+            Some(self.client_id),
+            working.strategy_id(),
+            working.instrument_id(),
+            working.client_order_id(),
+            working.venue_order_id(),
+            None,
+            Some(Price::from("0.500")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        let cancel = CancelAllOrders::new(
+            working.trader_id(),
+            Some(self.client_id),
+            working.strategy_id(),
+            working.instrument_id(),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        let batch_modify = BatchModifyOrders::new(
+            order.trader_id(),
+            Some(self.client_id),
+            order.strategy_id(),
+            order.instrument_id(),
+            vec![modify.clone()],
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        [
+            TradingCommand::SubmitOrder(submit),
+            TradingCommand::SubmitOrderList(submit_list),
+            TradingCommand::ModifyOrder(modify),
+            TradingCommand::ModifyOrders(batch_modify),
+            TradingCommand::CancelAllOrders(cancel),
+        ]
+        .into_iter()
+        .map(|command| {
+            TradingCommandMessage::new(MessagingSwitchboard::exec_engine_execute(), command)
+        })
+        .collect()
+    }
 }
 
 impl Drop for Fixture {
@@ -331,6 +505,8 @@ fn contract_settlement_late_fill_and_duplicate(
     f.close(price, InstrumentCloseType::ContractExpired);
     let late = f.fill("OWNER-001", "LATE", side, "3.00", "0.500");
     f.assert_settled(pnl, 2);
+    let recorded = f.node.kernel.portfolio.borrow().recorded_realized_pnls();
+    assert_eq!(recorded[&Currency::USDC()].len(), 2);
     f.node
         .process_exec_event(ExecutionEvent::Order(OrderEventAny::Filled(late)));
     f.assert_settled(pnl, 2);
@@ -342,6 +518,166 @@ fn contract_settlement_late_fill_and_duplicate(
             .orders_total_count(None, None, None, None, None),
         4
     );
+}
+
+#[rstest]
+fn contract_settlement_freezes_authoritative_fill_report_planner() {
+    let mut f = Fixture::new();
+    f.fill("OWNER-001", "OPEN", OrderSide::Buy, "10.00", "0.400");
+    let result = f.position_report_result();
+    assert!(
+        f.node.handle_position_report_result(result).is_some(),
+        "the unresolved discrepancy must query fills"
+    );
+    f.close("1.000", InstrumentCloseType::ContractExpired);
+    for _ in 0..3 {
+        let result = f.position_report_result();
+        assert!(
+            f.node.handle_position_report_result(result).is_none(),
+            "held tokens after settlement must not launch a fill-report task"
+        );
+        let mut result = f.position_report_result();
+        let plan = f.node.exec_manager.prepare_position_fill_report_plan(
+            &mut result.check,
+            &result.reports,
+            &result.queried_clients,
+            &result.failed_clients,
+            &[],
+        );
+        assert!(plan.queries.is_empty());
+        assert!(plan.discrepancy_keys.is_empty());
+    }
+}
+
+#[rstest]
+fn contract_settlement_records_same_timestamp_partial_fill_cycles() {
+    let mut f = Fixture::with_base_currency(Currency::EUR());
+    f.node
+        .kernel
+        .cache
+        .borrow_mut()
+        .set_mark_xrate(Currency::USDC(), Currency::EUR(), 0.5);
+    let opening = f.fill("OWNER-001", "OPEN", OrderSide::Buy, "10.00", "0.400");
+    f.close("1.000", InstrumentCloseType::ContractExpired);
+    let order = f.accept_order("OWNER-001", "LATE", OrderSide::Buy, "6.00", "0.500");
+    for trade in ["LATE-1", "LATE-2"] {
+        let order = f
+            .node
+            .kernel
+            .cache
+            .borrow()
+            .order_owned(&order.client_order_id())
+            .unwrap();
+        let fill = f.fill_order(&order, trade, "3.00", "0.500");
+        assert_eq!(fill.ts_event, opening.ts_event);
+        f.node
+            .process_exec_event(ExecutionEvent::Order(OrderEventAny::Filled(fill)));
+    }
+    assert!(!f.node.handle.should_stop());
+    let recorded = f.node.kernel.portfolio.borrow().recorded_realized_pnls();
+    assert_eq!(
+        recorded[&Currency::USDC()]
+            .iter()
+            .map(|entry| entry.2)
+            .collect::<Vec<_>>(),
+        vec![5.9, 1.4, 1.4]
+    );
+    assert_eq!(
+        recorded[&Currency::EUR()]
+            .iter()
+            .map(|entry| entry.2)
+            .collect::<Vec<_>>(),
+        vec![2.95, 0.7, 0.7]
+    );
+    assert_eq!(
+        f.node
+            .kernel
+            .portfolio
+            .borrow_mut()
+            .realized_pnl_for_account(
+                &f.instrument.id(),
+                Some(&f.account_id),
+                Some(Currency::USDC())
+            ),
+        Some(Money::from("8.70 USDC"))
+    );
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn contract_settlement_failure_blocks_queued_trading_and_returns_error(
+    #[case] application_failure: bool,
+) {
+    let mut f = Fixture::new();
+    f.fill("OWNER-001", "OPEN", OrderSide::Buy, "10.00", "0.400");
+    let commands = f.trading_commands();
+    // Positive control: these exact commands reach the client before the failure.
+    for command in &commands {
+        f.node.process_exec_command(TradingCommandMessage::new(
+            command.endpoint(),
+            command.command().clone(),
+        ));
+    }
+    assert_eq!(f.submitted.borrow().len(), 2);
+    assert_eq!(f.modified.borrow().len(), 2);
+    assert_eq!(f.cancels.borrow().len(), 1);
+    f.submitted.borrow_mut().clear();
+    f.modified.borrow_mut().clear();
+    f.cancels.borrow_mut().clear();
+    f.node.runner.as_ref().unwrap().bind_senders();
+    let sender = nautilus_common::runner::try_get_trading_cmd_sender().unwrap();
+    for command in commands {
+        sender.execute(command);
+    }
+    // Change the just-initialized settlement order through the real order-event path.
+    // This fails after add_order/publish, rather than at settlement preparation.
+    let cache = f.node.kernel.cache.clone();
+    let injected = Rc::new(RefCell::new(0));
+    let captured = injected.clone();
+    let handler = TypedHandler::from(move |event: &OrderEventAny| {
+        if application_failure
+            && let OrderEventAny::Initialized(init) = event
+            && init.client_order_id.as_str().starts_with("EXPIRATION-")
+        {
+            let denied = OrderEventAny::Denied(OrderDenied::new(
+                init.trader_id,
+                init.strategy_id,
+                init.instrument_id,
+                init.client_order_id,
+                "Application-phase test rejection".into(),
+                UUID4::new(),
+                init.ts_init,
+                init.ts_init,
+            ));
+            cache.borrow_mut().update_order(&denied).unwrap();
+            *captured.borrow_mut() += 1;
+        }
+    });
+    msgbus::subscribe_order_events("events.order.*".into(), handler.clone(), None);
+    f.close("1.000", InstrumentCloseType::ContractExpired);
+    if !application_failure {
+        f.close("0.000", InstrumentCloseType::ContractExpired);
+    }
+    assert!(f.node.handle.should_stop());
+    assert_eq!(*injected.borrow(), usize::from(application_failure));
+    f.node.drain_runner_pending();
+    assert!(f.submitted.borrow().is_empty());
+    assert!(f.modified.borrow().is_empty());
+    assert_eq!(
+        f.cancels.borrow().len(),
+        1,
+        "cancels remain available during shutdown"
+    );
+    msgbus::unsubscribe_order_events("events.order.*".into(), &handler);
+    let error = f.node.finalize_stop().await.unwrap_err().to_string();
+    let expected = if application_failure {
+        "Settlement did not close position"
+    } else {
+        "Conflicting contract close"
+    };
+    assert!(error.contains(expected), "fatal reason was lost: {error}");
 }
 
 #[rstest]

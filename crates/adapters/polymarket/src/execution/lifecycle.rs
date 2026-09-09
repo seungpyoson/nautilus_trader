@@ -31,6 +31,7 @@ use nautilus_common::{
 use nautilus_core::{collections::AtomicMap, string::secret::SecretString, time::AtomicTime};
 use nautilus_live::{execution::context::OrderContext, task::TaskGroupGuard};
 use nautilus_model::{
+    enums::InstrumentCloseType,
     events::{OrderEventAny, OrderFilled, PositionEvent},
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
@@ -914,6 +915,15 @@ fn sync_execution_lookup_for_instrument(
             return true;
         }
 
+        // Economic settlement closes the position before venue redemption removes its tokens.
+        // Reconciliation still needs this lookup to decode the remaining inventory.
+        if cache
+            .instrument_close(&instrument_id)
+            .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+        {
+            return true;
+        }
+
         cache.has_orders_open(
             Some(&core.venue),
             Some(&instrument_id),
@@ -968,6 +978,7 @@ mod tests {
     use nautilus_core::{UUID4, UnixNanos, nanos::DurationNanos};
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
+        data::InstrumentClose,
         enums::{AccountType, OmsType, OrderSide, OrderStatus, PositionSide, TimeInForce},
         events::{OrderEventAny, PositionClosed, PositionEvent, order::spec::OrderFillVoidedSpec},
         identifiers::{
@@ -1505,7 +1516,11 @@ mod tests {
     }
 
     #[rstest]
-    fn position_event_subscription_prunes_expired_lookup_after_position_closes() {
+    #[case(false)]
+    #[case(true)]
+    fn position_event_subscription_retains_settled_lookup_after_position_closes(
+        #[case] contract_settled: bool,
+    ) {
         let (client, cache) = test_client();
         let expired = test_binary_option("0xEXPIRED_CLOSED", true, true);
         let position = open_position(&expired);
@@ -1536,18 +1551,35 @@ mod tests {
             cache.update_position(&closed).unwrap();
         }
 
+        if contract_settled {
+            cache
+                .borrow_mut()
+                .add_instrument_close(InstrumentClose::new(
+                    expired.id(),
+                    Price::from("1.00"),
+                    InstrumentCloseType::ContractExpired,
+                    UnixNanos::from(1),
+                    UnixNanos::from(1),
+                ))
+                .unwrap();
+        }
+
         let mut client = client;
         client.ensure_position_event_subscription();
         let event = position_closed_event(&closed);
         assert!(matches!(event, PositionEvent::PositionClosed(_)));
         publish_position_event("events.position.TEST".into(), &event);
 
-        assert!(
-            !client
+        assert_eq!(
+            client
                 .shared_token_instruments
-                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
+                .contains_key(&Ustr::from(expired.raw_symbol().as_str())),
+            contract_settled,
         );
-        assert!(!client.neg_risk_index.contains_key(&expired.id()));
+        assert_eq!(
+            client.neg_risk_index.contains_key(&expired.id()),
+            contract_settled,
+        );
     }
 
     #[rstest]

@@ -122,6 +122,7 @@ pub struct ExecutionEngine {
     pos_id_generator: PositionIdGenerator,
     config: ExecutionEngineConfig,
     command_count: Cell<u64>,
+    halt_reason: Option<String>,
     event_count: u64,
     report_count: u64,
     filtered_unclaimed_external_order_count: u64,
@@ -160,6 +161,7 @@ impl ExecutionEngine {
             pos_id_generator: PositionIdGenerator::new(trader_id, clock),
             config: config.unwrap_or_default(),
             command_count: Cell::new(0),
+            halt_reason: None,
             event_count: 0,
             report_count: 0,
             filtered_unclaimed_external_order_count: 0,
@@ -1814,6 +1816,23 @@ impl ExecutionEngine {
         self.execute_command(command);
     }
 
+    /// Permanently blocks submit and modify commands after a fatal execution fault.
+    ///
+    /// The first reason is retained for the lifetime of this engine, including across reset.
+    /// Cancel/query commands and execution events remain available for orderly shutdown.
+    pub fn halt(&mut self, reason: String) {
+        if self.halt_reason.is_none() {
+            log::error!("Execution halted: {reason}");
+            self.halt_reason = Some(reason);
+        }
+    }
+
+    /// Returns the fatal reason preventing further submissions and modifications.
+    #[must_use]
+    pub fn halt_reason(&self) -> Option<&str> {
+        self.halt_reason.as_deref()
+    }
+
     /// Processes an order event, updating internal state and routing as needed.
     pub fn process(&mut self, event: &OrderEventAny) {
         self.handle_event(event);
@@ -1867,6 +1886,7 @@ impl ExecutionEngine {
 
     /// Resets the execution engine and all registered execution clients to initial state.
     ///
+    /// A fatal execution halt is retained; only a new engine can accept submissions again.
     /// Cancels engine-owned timers (snapshot, purge) but leaves timers owned by
     /// other components on the shared clock untouched.
     pub fn reset(&mut self) {
@@ -1908,6 +1928,25 @@ impl ExecutionEngine {
 
     fn execute_command(&self, command: TradingCommand) {
         self.command_count.set(self.command_count.get() + 1);
+
+        if let Some(reason) = &self.halt_reason {
+            match &command {
+                TradingCommand::SubmitOrder(_)
+                | TradingCommand::SubmitOrderList(_)
+                | TradingCommand::ModifyOrder(_)
+                | TradingCommand::ModifyOrders(_) => {
+                    log::error!(
+                        "Blocking command after fatal execution fault ({reason}): {command}"
+                    );
+                    return;
+                }
+                TradingCommand::CancelOrder(_)
+                | TradingCommand::CancelOrders(_)
+                | TradingCommand::CancelAllOrders(_)
+                | TradingCommand::QueryOrder(_)
+                | TradingCommand::QueryAccount(_) => {}
+            }
+        }
 
         if self.config.debug {
             log::debug!("{RECV}{CMD} {command}");

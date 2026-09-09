@@ -91,6 +91,7 @@ struct VenueState {
     market: Value,
     holding: Value,
     position_reads: Arc<AtomicUsize>,
+    fill_report_reads: Arc<AtomicUsize>,
     order_submissions: Arc<AtomicUsize>,
     flat: Arc<AtomicBool>,
 }
@@ -110,6 +111,11 @@ async fn local_positions(State(state): State<VenueState>) -> Json<Value> {
 
 async fn local_empty_page() -> Json<Value> {
     Json(json!({"data": [], "next_cursor": "LTE="}))
+}
+
+async fn local_fill_reports(State(state): State<VenueState>) -> Json<Value> {
+    state.fill_report_reads.fetch_add(1, Ordering::SeqCst);
+    local_empty_page().await
 }
 
 async fn reject_order_submission(State(state): State<VenueState>) -> StatusCode {
@@ -162,6 +168,7 @@ async fn start_venue(
         market,
         holding,
         position_reads: Arc::new(AtomicUsize::new(0)),
+        fill_report_reads: Arc::new(AtomicUsize::new(0)),
         order_submissions: Arc::new(AtomicUsize::new(0)),
         flat: Arc::new(AtomicBool::new(false)),
     };
@@ -171,7 +178,7 @@ async fn start_venue(
         .route("/markets/keyset", get(local_markets))
         .route("/positions", get(local_positions))
         .route("/data/orders", get(local_empty_page))
-        .route("/data/trades", get(local_empty_page))
+        .route("/data/trades", get(local_fill_reports))
         .route("/order", post(reject_order_submission))
         .route("/orders", post(reject_order_submission))
         .route("/version", get(|| async { Json(json!({"version": 2})) }))
@@ -399,6 +406,7 @@ async fn run_recon_case(case: &str, winner: bool, claim: bool, mode: NodeRunMode
     let stop_handle = node.handle();
     let monitor_probe = probe.clone();
     let reads = venue.position_reads.clone();
+    let fill_reads = venue.fill_report_reads.clone();
     let flat = venue.flat.clone();
     let monitor_events = event_count.clone();
     let monitor = tokio::spawn(async move {
@@ -410,6 +418,7 @@ async fn run_recon_case(case: &str, winner: bool, claim: bool, mode: NodeRunMode
         .await
         .is_ok();
         let reads_at_resolution = reads.load(Ordering::SeqCst);
+        let fills_at_resolution = fill_reads.load(Ordering::SeqCst);
         // The second query proves the first post-resolution report task completed
         let holding_read_after_resolution = tokio::time::timeout(Duration::from_secs(8), async {
             while reads.load(Ordering::SeqCst) < reads_at_resolution + 2 {
@@ -439,6 +448,8 @@ async fn run_recon_case(case: &str, winner: bool, claim: bool, mode: NodeRunMode
             reads_before_flat,
             flat_inventory_read,
             reads_total,
+            fills_at_resolution,
+            fill_reads.load(Ordering::SeqCst),
         )
     });
     let run = tokio::time::timeout(Duration::from_secs(40), node.run_with_mode(mode)).await;
@@ -526,6 +537,8 @@ async fn run_recon_case(case: &str, winner: bool, claim: bool, mode: NodeRunMode
             "venue_reads_before_flat": observed.4,
             "flat_inventory_read_after_redemption": observed.5,
             "venue_reads_total": observed.6,
+            "fill_report_reads_at_resolution": observed.7,
+            "fill_report_reads_total": observed.8,
             "owner_position_closed_callbacks": probe.position_closed_count.load(Ordering::SeqCst),
             "original_open": original.is_open(),
             "positions": all_positions, "orders": orders, "position_events": event_summary,
@@ -549,6 +562,10 @@ async fn run_recon_case(case: &str, winner: bool, claim: bool, mode: NodeRunMode
         "owner closes once while the venue still reports the holding"
     );
     assert!(observed.5, "the venue must be read after redemption");
+    assert_eq!(
+        observed.7, observed.8,
+        "settled holdings must not trigger fill-report queries"
+    );
     assert!(!original.is_open(), "the owned position must remain closed");
     assert_eq!(probe.position_closed_count.load(Ordering::SeqCst), 1);
     assert_eq!(

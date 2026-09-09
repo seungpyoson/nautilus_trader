@@ -2895,6 +2895,11 @@ impl ExecutionManager {
         let mut queries = Vec::new();
 
         for key in keys {
+            if self.has_contract_close(&key.0) {
+                self.position_reconciliation_states.shift_remove(&key);
+                continue;
+            }
+
             let coverage = check
                 .client_coverage
                 .entry(key)
