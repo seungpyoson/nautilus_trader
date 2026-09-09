@@ -28,10 +28,14 @@ use crate::execution::manager::ReconciliationSummary;
 pub enum StartupReconciliationOutcome {
     /// Reconciliation was disabled and wallet order initialization finished.
     Disabled,
-    /// The native startup pass and portfolio initialization finished.
+    /// The native startup pass, portfolio initialization and bounded pending-message pass finished.
     ///
     /// Individual clients may still have unavailable or unresolved reports.
     Finished,
+    /// Stop or shutdown was requested before the pre-trader startup boundary.
+    ///
+    /// The bounded pending-message pass may have been skipped or interrupted.
+    Interrupted,
     /// Startup reconciliation or portfolio initialization returned an error.
     Failed,
 }
@@ -69,7 +73,9 @@ pub struct CollectedMassStatusSummary {
     pub lookback_start: Option<UnixNanos>,
     /// The adapter's completeness declaration, not independent query-class coverage proof.
     pub reports_complete: bool,
-    /// Native application evidence for the returned report.
+    /// Native application evidence when this report was reconciled.
+    ///
+    /// Later reports and queued events can change the cache before summary publication.
     pub application: ReconciliationSummary,
 }
 
@@ -105,12 +111,14 @@ pub struct ClientReconciliationSummary {
 
 /// Bounded diagnostic snapshot from the latest native startup reconciliation attempt.
 ///
-/// Published when reconciliation returns, before actors and strategies start or error cleanup.
+/// Published after the bounded pending-message pass and its abort check, before actors and
+/// strategies start. Reconciliation failures publish before error cleanup instead.
 /// It survives stop for diagnosis and is cleared when the node enters Starting. Failures before
 /// that transition and cancellation of the reconciliation future do not publish a new result.
-/// This is not a live
-/// readiness permit: collection declarations do not establish query-class coverage, omitted
-/// inventory, historical economics, persistence, or fresh valuation.
+/// This is not a live readiness permit: the pending-message pass does not establish queue
+/// quiescence or acknowledge successful application. Collection declarations and per-report
+/// observations do not establish query-class coverage, omitted inventory, final cache agreement,
+/// historical economics, persistence, or fresh valuation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartupReconciliationSummary {
     /// How the native attempt ended, distinct from individual report reconciliation.

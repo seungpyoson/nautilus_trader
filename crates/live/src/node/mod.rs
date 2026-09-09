@@ -443,15 +443,19 @@ impl LiveNode {
             }
         }
 
-        if let Err(e) = self.perform_startup_reconciliation().await {
-            if let Err(finalize_err) = self.abort_startup("Startup reconciliation failed").await {
-                anyhow::bail!(
-                    "startup reconciliation failed: {e}; failed to finalize startup abort: {finalize_err}"
-                );
-            }
+        let summary = match self.perform_startup_reconciliation().await {
+            Ok(summary) => summary,
+            Err(e) => {
+                if let Err(finalize_err) = self.abort_startup("Startup reconciliation failed").await
+                {
+                    anyhow::bail!(
+                        "startup reconciliation failed: {e}; failed to finalize startup abort: {finalize_err}"
+                    );
+                }
 
-            return Err(e);
-        }
+                return Err(e);
+            }
+        };
 
         // Process only the bounded prefix queued before this poll. Socket notifications
         // remain deferred until their trader/controller subscribers have started.
@@ -468,7 +472,7 @@ impl LiveNode {
             self.runner = Some(runner);
         }
 
-        if let Some(reason) = self.startup_abort_reason() {
+        if let Some(reason) = self.finish_startup_reconciliation(summary) {
             self.abort_startup(reason).await?;
             return Ok(());
         }
@@ -833,7 +837,9 @@ impl LiveNode {
     /// # Errors
     ///
     /// Returns an error if reconciliation fails or times out.
-    async fn perform_startup_reconciliation(&mut self) -> anyhow::Result<()> {
+    async fn perform_startup_reconciliation(
+        &mut self,
+    ) -> anyhow::Result<StartupReconciliationSummary> {
         let ts_started = self.kernel.generate_timestamp_ns();
         let clients = {
             let engine = self.kernel.exec_engine.borrow();
@@ -865,17 +871,33 @@ impl LiveNode {
             ts_finished: ts_started,
             clients,
         };
-        let result = self.reconcile_startup_clients(&mut summary).await;
-        if result.is_ok() {
-            summary.outcome = if self.config.exec_engine.reconciliation {
-                StartupReconciliationOutcome::Finished
-            } else {
-                StartupReconciliationOutcome::Disabled
-            };
+
+        if let Err(error) = self.reconcile_startup_clients(&mut summary).await {
+            summary.ts_finished = self.kernel.generate_timestamp_ns();
+            self.handle.publish_startup_reconciliation(summary);
+            return Err(error);
+        }
+        summary.outcome = if self.config.exec_engine.reconciliation {
+            StartupReconciliationOutcome::Finished
+        } else {
+            StartupReconciliationOutcome::Disabled
+        };
+        Ok(summary)
+    }
+
+    /// Publishes once at the pre-trader boundary, after the bounded pending-message pass.
+    fn finish_startup_reconciliation(
+        &self,
+        mut summary: StartupReconciliationSummary,
+    ) -> Option<&'static str> {
+        let abort_reason = self.startup_abort_reason();
+
+        if abort_reason.is_some() {
+            summary.outcome = StartupReconciliationOutcome::Interrupted;
         }
         summary.ts_finished = self.kernel.generate_timestamp_ns();
         self.handle.publish_startup_reconciliation(summary);
-        result
+        abort_reason
     }
 
     #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
@@ -1290,27 +1312,30 @@ impl LiveNode {
         debug_assert_eq!(engine_connection_status, EngineConnectionStatus::Connected);
 
         // Run reconciliation now that instruments are in cache and start trader
-        if let Err(e) = self.perform_startup_reconciliation().await {
-            let result = self.abort_startup("Startup reconciliation failed").await;
-            Self::drain_channels(
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
-            log::info!("Event loop stopped");
-
-            if let Err(finalize_err) = result {
-                anyhow::bail!(
-                    "startup reconciliation failed: {e}; failed to finalize startup abort: {finalize_err}"
+        let summary = match self.perform_startup_reconciliation().await {
+            Ok(summary) => summary,
+            Err(e) => {
+                let result = self.abort_startup("Startup reconciliation failed").await;
+                Self::drain_channels(
+                    &mut time_evt_rx,
+                    &mut system_evt_rx,
+                    &mut system_cmd_rx,
+                    &mut exec_evt_rx,
+                    &mut exec_cmd_rx,
+                    &mut data_evt_rx,
+                    &mut data_cmd_rx,
                 );
-            }
+                log::info!("Event loop stopped");
 
-            return Err(e);
-        }
+                if let Err(finalize_err) = result {
+                    anyhow::bail!(
+                        "startup reconciliation failed: {e}; failed to finalize startup abort: {finalize_err}"
+                    );
+                }
+
+                return Err(e);
+            }
+        };
 
         // Use the same bounded polling and node handlers as the retained-runner path.
         if self.startup_abort_reason().is_none() {
@@ -1332,7 +1357,7 @@ impl LiveNode {
             });
         }
 
-        if let Some(reason) = self.startup_abort_reason() {
+        if let Some(reason) = self.finish_startup_reconciliation(summary) {
             let result = self.abort_startup(reason).await;
             Self::drain_channels(
                 &mut time_evt_rx,
