@@ -434,6 +434,9 @@ impl PolymarketExecutionClient {
         self.core.set_disconnected();
 
         if self.shutdown_errors.is_empty() {
+            // Successful shutdown has joined every task that could still need these lookups.
+            self.shared_token_instruments.store(AHashMap::new());
+            self.neg_risk_index.store(AHashMap::new());
             Ok(())
         } else {
             let errors = std::mem::take(&mut self.shutdown_errors);
@@ -1727,6 +1730,34 @@ mod tests {
         client.ensure_position_event_subscription();
         assert!(client.order_event_handler.is_some());
         assert!(client.position_event_handler.is_some());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn disconnect_releases_lookup_state_and_cache_reload_restores_metadata() {
+        let (mut client, cache) = test_client();
+        let instrument = test_binary_option("0xDISCONNECT", true, true);
+        let token = Ustr::from(instrument.raw_symbol().as_str());
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+
+        for _ in 0..3 {
+            client.load_instruments_from_cache();
+            client.ensure_order_event_subscription();
+            client.ensure_position_event_subscription();
+            assert!(client.shared_token_instruments.contains_key(&token));
+            assert!(client.neg_risk_index.contains_key(&instrument.id()));
+
+            client.disconnect_client().await.unwrap();
+
+            assert!(client.shared_token_instruments.load().is_empty());
+            assert!(client.neg_risk_index.load().is_empty());
+            assert!(client.order_event_handler.is_none());
+            assert!(client.position_event_handler.is_none());
+            assert!(cache.borrow().instrument(&instrument.id()).is_some());
+        }
     }
 
     #[rstest]

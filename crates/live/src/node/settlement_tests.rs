@@ -926,6 +926,76 @@ async fn contract_settlement_startup_drain_precedes_reconciliation() {
 }
 
 #[rstest]
+#[case(None)]
+#[case(Some(NodeRunMode::Owned))]
+#[case(Some(NodeRunMode::Hosted))]
+#[tokio::test]
+async fn contract_settlement_startup_abort_reports_final_drain_fault(
+    #[case] mode: Option<NodeRunMode>,
+    #[values(false, true)] conflicting: bool,
+) {
+    let mut f = Fixture::new();
+    // No venue operation is involved; the order stub has no asynchronous disconnect lifecycle.
+    f.node
+        .kernel
+        .exec_engine
+        .borrow_mut()
+        .deregister_client(f.client_id)
+        .unwrap();
+    f.node.runner.as_ref().unwrap().bind_senders();
+    let sender = nautilus_common::live::runner::get_data_event_sender();
+    for price in ["1.000", if conflicting { "0.000" } else { "1.000" }] {
+        sender
+            .send(DataEvent::Data(Data::InstrumentClose(
+                InstrumentClose::new(
+                    f.instrument.id(),
+                    Price::from(price),
+                    InstrumentCloseType::ContractExpired,
+                    f.instrument.expiration_ns().unwrap(),
+                    f.instrument.expiration_ns().unwrap(),
+                ),
+            )))
+            .unwrap();
+    }
+    // A separate stop request aborts connection before reconciliation handles the closes.
+    // The fault is discovered only when the abort drains buffered channel traffic.
+    f.node.handle().stop();
+    assert!(f.node.check_execution_health().is_ok());
+
+    let result = match mode {
+        Some(mode) => f.node.run_with_mode(mode).await,
+        None => f.node.start().await,
+    };
+
+    assert_eq!(f.node.state(), NodeState::Stopped);
+    assert!(f.submitted.borrow().is_empty());
+    if conflicting {
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains("Conflicting contract close"));
+        assert!(f.node.check_execution_health().is_err());
+    } else {
+        result.unwrap();
+        f.node.check_execution_health().unwrap();
+    }
+}
+
+#[rstest]
+fn contract_settlement_final_health_preserves_previous_failure() {
+    let mut f = Fixture::new();
+    f.close("1.000", InstrumentCloseType::ContractExpired);
+    f.close("0.000", InstrumentCloseType::ContractExpired);
+
+    let error = f
+        .node
+        .with_execution_health(Err(anyhow::anyhow!("connection failure")))
+        .unwrap_err();
+
+    let message = format!("{error:#}");
+    assert!(message.contains("connection failure"));
+    assert!(message.contains("Conflicting contract close"));
+}
+
+#[rstest]
 fn contract_settlement_preserves_accounts_and_unrelated_instrument() {
     let mut f = Fixture::new();
     let first_account = f.account_id;

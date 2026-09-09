@@ -603,17 +603,15 @@ impl LiveNode {
         if drained_events > 0 {
             log::info!("Drained {drained_events} remaining events during shutdown");
         }
-        self.check_execution_health()?;
-
-        match (controller_stop_result, stop_result) {
+        let result = match (controller_stop_result, stop_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(controller_err), Ok(())) => Err(controller_err),
             (Ok(()), Err(stop_err)) => Err(stop_err),
-            (Err(controller_err), Err(stop_err)) => {
-                log::error!("Error stopping plug-in controllers: {controller_err}");
-                Err(stop_err)
-            }
-        }
+            (Err(controller_err), Err(stop_err)) => Err(stop_err.context(format!(
+                "Error stopping plug-in controllers: {controller_err}"
+            ))),
+        };
+        self.with_execution_health(result)
     }
 
     /// Disposes the live node kernel and releases resources.
@@ -1082,6 +1080,12 @@ impl LiveNode {
     /// Returns an error if the node fails to start or encounters a runtime error.
     pub async fn run_with_mode(&mut self, mode: NodeRunMode) -> anyhow::Result<()> {
         self.check_execution_health()?;
+        let result = self.run_with_mode_inner(mode).await;
+        // Every exit, including startup aborts, must observe faults found by its final drain.
+        self.with_execution_health(result)
+    }
+
+    async fn run_with_mode_inner(&mut self, mode: NodeRunMode) -> anyhow::Result<()> {
         if self.state().is_running() {
             anyhow::bail!("Already running");
         }
@@ -1947,7 +1951,6 @@ impl LiveNode {
 
         log::info!("Event loop stopped");
 
-        self.check_execution_health()?;
         stop_result
     }
 
@@ -2115,6 +2118,14 @@ impl LiveNode {
             anyhow::bail!("{reason}");
         }
         Ok(())
+    }
+
+    fn with_execution_health(&self, result: anyhow::Result<()>) -> anyhow::Result<()> {
+        match (result, self.check_execution_health()) {
+            (Err(error), Err(health_error)) => Err(error.context(health_error)),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), health) => health,
+        }
     }
 
     fn apply_settlement(&mut self, input: SettlementInput) -> anyhow::Result<()> {
@@ -2325,7 +2336,9 @@ impl LiveNode {
     async fn abort_startup(&mut self, reason: &str) -> anyhow::Result<()> {
         log::info!("{reason}, aborting startup");
         self.handle.set_shutting_down();
-        self.finalize_stop().await
+        let result = self.finalize_stop().await;
+        self.drain_runner_pending();
+        self.with_execution_health(result)
     }
 
     async fn abort_startup_with_error(
@@ -2336,7 +2349,7 @@ impl LiveNode {
         match self.abort_startup(reason).await {
             Ok(()) => Err(startup_err),
             Err(finalize_err) => {
-                anyhow::bail!("{startup_err}; failed to finalize startup abort: {finalize_err}")
+                anyhow::bail!("{startup_err:#}; failed to finalize startup abort: {finalize_err:#}")
             }
         }
     }
