@@ -13002,6 +13002,473 @@ enum PositionRequestMutation {
     },
 }
 
+#[rstest]
+#[case::already_matched(PositionSideSpecified::Long, "5.0", Some(dec!(3000)), dec!(5), true)]
+#[case::applied_adjustment(PositionSideSpecified::Long, "3.0", Some(dec!(3000)), dec!(3), true)]
+#[case::partial_cross_zero(PositionSideSpecified::Short, "3.0", None, dec!(0), false)]
+#[tokio::test]
+async fn test_reconcile_positions_reports_final_native_quantities(
+    #[case] side: PositionSideSpecified,
+    #[case] quantity: &str,
+    #[case] avg_px: Option<Decimal>,
+    #[case] expected_net: Decimal,
+    #[case] expected_match: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-TERMINAL-QUANTITY"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(instrument);
+    ctx.add_position(&position);
+    let report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        side,
+        Quantity::from(quantity),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        avg_px,
+    );
+    let client = MockPositionExecutionClient::new(vec![], vec![report]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    let cache = ctx.cache.borrow();
+    let net: Decimal = cache
+        .positions_open(
+            None,
+            Some(&instrument_id),
+            None,
+            Some(&test_account_id()),
+            None,
+        )
+        .iter()
+        .map(|position| position.signed_decimal_qty())
+        .sum();
+    assert_eq!(net, expected_net);
+    assert_eq!(summary.position_keys, 1);
+    assert_eq!(summary.matched, usize::from(expected_match));
+    assert_eq!(summary.unresolved, usize::from(!expected_match));
+    assert_eq!(summary.deferred, 0);
+    assert_eq!(summary.failed_queries, 0);
+    assert_eq!(summary.incomplete_events, 0);
+
+    if expected_net == dec!(5) {
+        assert_eq!(summary.applied_events, 0);
+    } else {
+        assert!(summary.applied_events > 0);
+    }
+}
+
+#[rstest]
+#[case::failed(false)]
+#[case::unsupported(true)]
+#[tokio::test]
+async fn test_reconcile_positions_query_failure_preserves_exposure(#[case] unsupported: bool) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-TERMINAL-QUERY"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(instrument);
+    ctx.add_position(&position);
+    let failing_client = MockPositionExecutionClient::failing_position_reports();
+    let unsupported_client = MockExecutionClient::new(vec![]);
+    let client: &dyn ExecutionClient = if unsupported {
+        &unsupported_client
+    } else {
+        &failing_client
+    };
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&[client], ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.position_keys, 1);
+    assert_eq!(summary.failed_queries, 1);
+    assert_eq!(summary.matched, 0);
+    assert_eq!(summary.deferred, 1);
+    assert_eq!(summary.unresolved, 0);
+    assert_eq!(summary.applied_events, 0);
+    assert_eq!(summary.incomplete_events, 0);
+    {
+        let cache = ctx.cache.borrow();
+        let retained = cache.position(&position.id).unwrap();
+        assert_eq!(retained.signed_decimal_qty(), position.signed_decimal_qty());
+        assert_eq!(retained.event_count(), position.event_count());
+    }
+    assert_eq!(
+        ctx.manager
+            .position_recon_retry_count(&(instrument_id, test_account_id())),
+        0,
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_reconcile_positions_missing_instrument_and_exhaustion_are_not_matches() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_retries: 1,
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-TERMINAL-EXHAUSTED"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_position(&position);
+    let client = MockPositionExecutionClient::new(vec![], vec![]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+
+    for _ in 0..2 {
+        let summary = ctx
+            .manager
+            .reconcile_positions(&clients, ctx.exec_engine.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(summary.position_keys, 1);
+        assert_eq!(summary.matched, 0);
+        assert_eq!(summary.deferred, 0);
+        assert_eq!(summary.unresolved, 1);
+        assert_eq!(summary.failed_queries, 0);
+        assert_eq!(summary.applied_events, 0);
+        assert_eq!(summary.incomplete_events, 0);
+        {
+            let cache = ctx.cache.borrow();
+            let retained = cache.position(&position.id).unwrap();
+            assert_eq!(retained.signed_decimal_qty(), position.signed_decimal_qty());
+            assert_eq!(retained.event_count(), position.event_count());
+        }
+        assert_eq!(
+            ctx.manager
+                .position_recon_retry_count(&(instrument_id, test_account_id())),
+            1,
+        );
+    }
+}
+
+#[rstest]
+#[case::unmatched(false)]
+#[case::matched_by_callback(true)]
+#[tokio::test]
+async fn test_reconcile_positions_preserves_incomplete_native_application(
+    #[case] close_in_callback: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    // Retain the registered execution client, but omit its native account so that
+    // generated order events cannot complete their position application.
+    ctx.cache.borrow_mut().reset();
+    let instrument = test_instrument();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-TERMINAL-INCOMPLETE"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(instrument.clone());
+    ctx.add_position(&position);
+    assert!(ctx.cache.borrow().account(&test_account_id()).is_none());
+    let client = MockPositionExecutionClient::new(vec![], vec![]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+    let closed = close_test_long_position(
+        position.clone(),
+        &instrument,
+        "5.0",
+        TradeId::from("T-INCOMPLETE-CALLBACK-CLOSE"),
+    );
+    let callback_count = Rc::new(Cell::new(0));
+    let handler = msgbus::TypedHandler::from({
+        let cache = ctx.cache.clone();
+        let callback_count = callback_count.clone();
+        move |event: &OrderEventAny| {
+            if matches!(event, OrderEventAny::Filled(_)) {
+                callback_count.set(callback_count.get() + 1);
+
+                if close_in_callback {
+                    cache.borrow_mut().update_position(&closed).unwrap();
+                }
+            }
+        }
+    });
+    // The strategy topic still publishes the order fill when its position
+    // application failed before the instrument-specific filled publication.
+    let topic = switchboard::get_event_order_topic(StrategyId::from("EXTERNAL"));
+    msgbus::subscribe_order_events(topic.into(), handler.clone(), None);
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    msgbus::unsubscribe_order_events(topic.into(), &handler);
+    assert_eq!(callback_count.get(), 1);
+    assert_eq!(summary.position_keys, 1);
+    assert_eq!(summary.matched, usize::from(close_in_callback));
+    assert_eq!(summary.unresolved, usize::from(!close_in_callback));
+    assert_eq!(summary.deferred, 0);
+    assert_eq!(summary.failed_queries, 0);
+    assert!(summary.incomplete_events > 0);
+    {
+        let cache = ctx.cache.borrow();
+        let retained = cache.position(&position.id).unwrap();
+        assert_eq!(
+            retained.signed_decimal_qty(),
+            if close_in_callback { dec!(0) } else { dec!(5) },
+        );
+        assert_eq!(
+            retained.event_count(),
+            position.event_count() + usize::from(close_in_callback),
+        );
+    }
+    assert!(
+        ctx.cache
+            .borrow()
+            .orders(None, None, None, Some(&test_account_id()), None)
+            .iter()
+            .any(|order| order.status() == OrderStatus::Filled),
+        "order-only application must not masquerade as position reconciliation",
+    );
+}
+
+#[rstest]
+#[cfg_attr(
+    not(all(feature = "simulation", madsim)),
+    tokio::test(start_paused = true)
+)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+async fn test_reconcile_positions_defers_unreported_position_opened_during_query() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-TERMINAL-NEW-UNREPORTED"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(instrument);
+    let client = MockPositionExecutionClient::new(vec![], vec![]).with_position_request_mutation(
+        PositionRequestMutation::Add {
+            cache: ctx.cache.clone(),
+            position: position.clone(),
+        },
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.position_keys, 1);
+    assert_eq!(summary.deferred, 1);
+    assert_eq!(summary.matched, 0);
+    assert_eq!(summary.unresolved, 0);
+    assert_eq!(summary.failed_queries, 0);
+    assert_eq!(summary.applied_events, 0);
+    assert_eq!(summary.incomplete_events, 0);
+    let cache = ctx.cache.borrow();
+    let retained = cache.position(&position.id).unwrap();
+    assert_eq!(retained.signed_decimal_qty(), dec!(5));
+    assert_eq!(retained.event_count(), position.event_count());
+    assert_eq!(
+        ctx.manager
+            .position_recon_retry_count(&(instrument_id, test_account_id())),
+        0,
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_reconcile_positions_rechecks_initial_match_after_application_callback() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let matched_instrument = test_instrument();
+    let adjusted_instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+    let matched_position = create_test_position(
+        &matched_instrument,
+        PositionId::from("P-TERMINAL-CALLBACK-MATCH"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    let adjusted_position = create_test_position(
+        &adjusted_instrument,
+        PositionId::from("P-TERMINAL-CALLBACK-ADJUST"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(matched_instrument.clone());
+    ctx.add_instrument(adjusted_instrument.clone());
+    ctx.add_position(&matched_position);
+    ctx.add_position(&adjusted_position);
+    let reports = [(&matched_instrument, "5.0"), (&adjusted_instrument, "3.0")]
+        .into_iter()
+        .map(|(instrument, quantity)| {
+            PositionStatusReport::new(
+                test_account_id(),
+                instrument.id(),
+                PositionSideSpecified::Long,
+                Quantity::from(quantity),
+                UnixNanos::from(1_000_000),
+                UnixNanos::from(1_000_000),
+                None,
+                None,
+                Some(dec!(3000)),
+            )
+        })
+        .collect();
+    let client = MockPositionExecutionClient::new(vec![], reports);
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+    let closed = close_test_long_position(
+        matched_position.clone(),
+        &matched_instrument,
+        "5.0",
+        TradeId::from("T-TERMINAL-CALLBACK-CLOSE"),
+    );
+    let callback_count = Rc::new(Cell::new(0));
+    let handler = msgbus::TypedHandler::from({
+        let cache = ctx.cache.clone();
+        let callback_count = callback_count.clone();
+        move |_event: &OrderEventAny| {
+            callback_count.set(callback_count.get() + 1);
+            cache.borrow_mut().update_position(&closed).unwrap();
+        }
+    });
+    let topic = switchboard::get_order_filled_topic(adjusted_instrument.id());
+    msgbus::subscribe_order_events(topic.into(), handler.clone(), None);
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    msgbus::unsubscribe_order_events(topic.into(), &handler);
+    assert_eq!(callback_count.get(), 1);
+    assert!(
+        ctx.cache
+            .borrow()
+            .position(&matched_position.id)
+            .unwrap()
+            .is_closed()
+    );
+    assert_eq!(summary.position_keys, 2);
+    assert_eq!(summary.matched, 1);
+    assert_eq!(summary.unresolved, 1);
+    assert_eq!(summary.deferred, 0);
+    assert_eq!(summary.failed_queries, 0);
+    assert!(summary.applied_events > 0);
+    assert_eq!(summary.incomplete_events, 0);
+}
+
+#[rstest]
+#[case::different_cache(false, "must share the manager's cache")]
+#[case::borrowed_engine(true, "requires an unborrowed engine")]
+fn test_reconcile_positions_rejects_invalid_engine_before_query(
+    #[case] borrow_engine: bool,
+    #[case] expected_error: &str,
+) {
+    use std::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+
+    let mut ctx = TestContext::new();
+    let other = TestContext::new();
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-INVALID-ENGINE-QUERY"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    let position_id = position.id;
+    ctx.add_instrument(instrument);
+    let client = MockPositionExecutionClient::new(vec![], vec![]).with_position_request_mutation(
+        PositionRequestMutation::Add {
+            cache: ctx.cache.clone(),
+            position,
+        },
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+    let engine = if borrow_engine {
+        ctx.exec_engine.clone()
+    } else {
+        other.exec_engine.clone()
+    };
+    let held_borrow = borrow_engine.then(|| engine.borrow());
+
+    // A single poll must reject before the mock consumes its query mutation.
+    let result = {
+        let mut future = pin!(ctx.manager.reconcile_positions(&clients, engine.clone()));
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+    };
+
+    drop(held_borrow);
+    let Poll::Ready(Err(error)) = result else {
+        panic!("invalid engine must fail immediately before querying");
+    };
+    assert!(error.to_string().contains(expected_error));
+    assert!(client.position_request_mutation.borrow().is_some());
+    assert!(ctx.cache.borrow().position(&position_id).is_none());
+    assert_eq!(
+        ctx.manager
+            .position_recon_retry_count(&(instrument_id, test_account_id())),
+        0,
+    );
+}
+
 struct MockPositionExecutionClient {
     client_id: ClientId,
     account_id: AccountId,

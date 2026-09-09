@@ -284,6 +284,61 @@ pub(crate) struct PositionReportCheck {
     pub activity_revisions: IndexMap<InstrumentAccountKey, u64>,
 }
 
+/// Terminal observations from one native position reconciliation check.
+///
+/// Quantities use the existing net/side aggregates and account tolerance. These counts
+/// do not establish provider inventory coverage, historical economics, or readiness.
+/// In particular, matching quantities do not forgive incomplete event application.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PositionReconciliationSummary {
+    /// Instrument/account keys observed during preparation, generation, or final checking.
+    pub position_keys: usize,
+    /// Eligible keys whose quantity postcondition held after the entire event batch.
+    pub matched: usize,
+    /// Keys deferred for activity or unavailable, failed, or unprepared client coverage.
+    pub deferred: usize,
+    /// Keys with unresolved discrepancies, including exhausted or unbuildable adjustments.
+    pub unresolved: usize,
+    /// Execution clients whose position query failed, even if no position key was known.
+    pub failed_queries: usize,
+    /// Events whose canonical native application completed.
+    pub applied_events: usize,
+    /// Events whose canonical application was incomplete, possibly after partial mutation.
+    pub incomplete_events: usize,
+}
+
+pub(crate) struct PositionReportCollection {
+    pub check: PositionReportCheck,
+    pub reports: Vec<PositionStatusReport>,
+    pub queried_clients: IndexSet<ClientId>,
+    pub failed_clients: IndexSet<ClientId>,
+}
+
+pub(crate) struct PositionReportQueryResult {
+    pub reports: Vec<PositionStatusReport>,
+    pub queried_clients: IndexSet<ClientId>,
+    pub failed_clients: IndexSet<ClientId>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum PositionCheckDisposition {
+    CheckQuantity,
+    #[default]
+    Deferred,
+    Unresolved,
+}
+
+#[derive(Default)]
+struct PositionCheckState {
+    reports: Vec<PositionStatusReport>,
+    disposition: PositionCheckDisposition,
+}
+
+struct PositionReconciliationBatch {
+    events: Vec<OrderEventAny>,
+    positions: IndexMap<InstrumentAccountKey, PositionCheckState>,
+}
+
 struct RetainedFillState {
     fill_keys: IndexSet<(AccountId, InstrumentId, TradeId)>,
     missing_order_ids: IndexSet<(AccountId, InstrumentId, ClientOrderId)>,
@@ -2817,37 +2872,195 @@ impl ExecutionManager {
         &mut self,
         clients: &[&dyn ExecutionClient],
     ) -> Vec<OrderEventAny> {
-        let check = self.prepare_position_report_check(UUID4::new(), clients);
-        let mut reports = Vec::new();
-        let mut queried_clients = IndexSet::new();
-        let mut failed_clients = IndexSet::new();
+        let collection = self.collect_position_report_check(clients).await;
+        self.reconcile_position_reports(
+            &collection.check,
+            collection.reports,
+            &collection.queried_clients,
+            &collection.failed_clients,
+        )
+    }
 
+    /// Queries positions, applies generated adjustments, and checks final native quantities.
+    ///
+    /// All adjustments are generated before any are dispatched, matching the live node.
+    /// Unlike [`Self::check_positions_consistency`], this method applies its events itself.
+    /// The summary is diagnostic evidence, not complete provider coverage or readiness.
+    /// The engine must share this manager's cache and remain unborrowed during the call;
+    /// pass client handles which do not retain a borrow of the engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before querying if the engine is borrowed or uses another cache.
+    pub async fn reconcile_positions(
+        &mut self,
+        clients: &[&dyn ExecutionClient],
+        exec_engine: Rc<RefCell<ExecutionEngine>>,
+    ) -> anyhow::Result<PositionReconciliationSummary> {
+        {
+            let engine = exec_engine.try_borrow_mut().map_err(|e| {
+                anyhow::anyhow!("Position reconciliation requires an unborrowed engine: {e}")
+            })?;
+            anyhow::ensure!(
+                Rc::ptr_eq(&self.cache, engine.cache()),
+                "Position reconciliation engine must share the manager's cache"
+            );
+        }
+        let collection = self.collect_position_report_check(clients).await;
+        Ok(self.apply_position_report_check(collection, &exec_engine))
+    }
+
+    async fn collect_position_report_check(
+        &mut self,
+        clients: &[&dyn ExecutionClient],
+    ) -> PositionReportCollection {
+        let check = self.prepare_position_report_check(UUID4::new(), clients);
         for client in clients {
-            let client_id = client.client_id();
-            queried_clients.insert(client_id);
             self.set_position_reconciliation_tolerance(
                 client.account_id(),
                 client.position_reconciliation_tolerance(),
             );
+        }
+        let result = request_position_reports(clients.iter().copied(), &check.command).await;
+        PositionReportCollection {
+            check,
+            reports: result.reports,
+            queried_clients: result.queried_clients,
+            failed_clients: result.failed_clients,
+        }
+    }
 
-            match client
-                .generate_position_status_reports(&check.command)
-                .await
+    pub(crate) fn apply_position_report_check(
+        &mut self,
+        collection: PositionReportCollection,
+        exec_engine: &Rc<RefCell<ExecutionEngine>>,
+    ) -> PositionReconciliationSummary {
+        let PositionReportCollection {
+            check,
+            reports,
+            queried_clients,
+            failed_clients,
+        } = collection;
+        let mut batch = self.generate_position_reconciliation(
+            &check,
+            reports,
+            &queried_clients,
+            &failed_clients,
+        );
+        let (applied_events, incomplete_events) =
+            self.process_reconciliation_events(&batch.events, exec_engine);
+
+        // Include positions which appeared without a report during collection or dispatch.
+        {
+            let cache = self.cache.borrow();
+            for position in cache
+                .iter_position_open_ids(None, None, None, None)
+                .filter_map(|id| cache.position_ref(&id))
             {
-                Ok(client_reports) => {
-                    reports.extend(client_reports);
+                if self.should_reconcile_instrument(&position.instrument_id) {
+                    batch
+                        .positions
+                        .entry((position.instrument_id, position.account_id))
+                        .or_default();
                 }
-                Err(e) => {
-                    failed_clients.insert(client_id);
-                    log::warn!(
-                        "Failed to query position reports from {}: {e}",
-                        client.client_id()
-                    );
+            }
+        }
+        let mut summary = PositionReconciliationSummary {
+            position_keys: batch.positions.len(),
+            failed_queries: failed_clients.len(),
+            applied_events,
+            incomplete_events,
+            ..Default::default()
+        };
+
+        for (key, target) in &batch.positions {
+            // Existing routing evidence is necessary but does not declare provider scope.
+            let covered = matches!(
+                check.client_coverage.get(key),
+                Some(ReportClientCoverage::Resolved(clients))
+                    if !clients.is_empty()
+                        && clients.is_subset(&queried_clients)
+                        && clients.is_disjoint(&failed_clients)
+            );
+
+            if !covered {
+                summary.deferred += 1;
+                continue;
+            }
+
+            match target.disposition {
+                PositionCheckDisposition::Deferred => summary.deferred += 1,
+                PositionCheckDisposition::Unresolved => summary.unresolved += 1,
+                PositionCheckDisposition::CheckQuantity => {
+                    if self.position_quantity_postcondition(*key, &target.reports) {
+                        summary.matched += 1;
+                    } else {
+                        summary.unresolved += 1;
+                    }
                 }
             }
         }
 
-        self.reconcile_position_reports(&check, reports, &queried_clients, &failed_clients)
+        summary
+    }
+
+    pub(crate) fn process_reconciliation_events(
+        &mut self,
+        events: &[OrderEventAny],
+        exec_engine: &Rc<RefCell<ExecutionEngine>>,
+    ) -> (usize, usize) {
+        if events.is_empty() {
+            return (0, 0);
+        }
+
+        log::info!(
+            "Processing {} reconciliation event{}",
+            events.len(),
+            if events.len() == 1 { "" } else { "s" }
+        );
+        let mut applied = 0;
+        let mut incomplete = 0;
+
+        for event in events {
+            self.record_local_activity(event.client_order_id());
+            if let OrderEventAny::Filled(fill) = event {
+                self.record_position_activity(fill.instrument_id, fill.account_id);
+            }
+
+            match exec_engine.borrow_mut().process_with_outcome(event) {
+                EventApplicationOutcome::Applied => applied += 1,
+                EventApplicationOutcome::Incomplete => incomplete += 1,
+            }
+
+            if let OrderEventAny::Filled(fill) = event {
+                self.commit_recent_fill_if_applied(fill);
+            }
+        }
+        (applied, incomplete)
+    }
+
+    fn position_quantity_postcondition(
+        &self,
+        key: InstrumentAccountKey,
+        reports: &[PositionStatusReport],
+    ) -> bool {
+        let cache = self.cache.borrow();
+        let cached = Self::position_qty_aggregates(
+            cache
+                .iter_position_open_ids(None, Some(&key.0), None, Some(&key.1))
+                .filter_map(|id| cache.position_ref(&id))
+                .map(|position| position.signed_decimal_qty()),
+        );
+        let venue =
+            Self::position_qty_aggregates(reports.iter().map(|report| report.signed_decimal_qty));
+        let venue_has_side_reports = reports.iter().any(PositionStatusReport::is_long)
+            && reports.iter().any(PositionStatusReport::is_short);
+        Self::position_quantities_match(
+            cached,
+            venue,
+            venue_has_side_reports,
+            self.position_reconciliation_tolerance(key.1),
+        )
     }
 
     /// Reconciles cached positions against venue position reports.
@@ -2859,9 +3072,20 @@ impl ExecutionManager {
         queried_clients: &IndexSet<ClientId>,
         failed_clients: &IndexSet<ClientId>,
     ) -> Vec<OrderEventAny> {
+        self.generate_position_reconciliation(check, reports, queried_clients, failed_clients)
+            .events
+    }
+
+    fn generate_position_reconciliation(
+        &mut self,
+        check: &PositionReportCheck,
+        reports: Vec<PositionStatusReport>,
+        queried_clients: &IndexSet<ClientId>,
+        failed_clients: &IndexSet<ClientId>,
+    ) -> PositionReconciliationBatch {
         log::debug!("Checking position consistency between cached-state and venues");
 
-        let mut venue_positions: IndexMap<InstrumentAccountKey, Vec<PositionStatusReport>> =
+        let mut venue_positions: IndexMap<InstrumentAccountKey, PositionCheckState> =
             IndexMap::new();
 
         for report in reports {
@@ -2872,12 +3096,14 @@ impl ExecutionManager {
             venue_positions
                 .entry((report.instrument_id, report.account_id))
                 .or_default()
+                .reports
                 .push(report);
         }
 
         let mut events = Vec::new();
 
         for key in check.client_coverage.keys() {
+            let target = venue_positions.entry(*key).or_default();
             let prepared_revision = check
                 .activity_revisions
                 .get(key)
@@ -2893,10 +3119,7 @@ impl ExecutionManager {
                 continue;
             }
 
-            let venue_reports = venue_positions
-                .get(key)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
+            let venue_reports = target.reports.as_slice();
 
             if venue_reports.is_empty() {
                 match check.client_coverage.get(key) {
@@ -2955,14 +3178,16 @@ impl ExecutionManager {
                 }
             }
 
-            if let Some(discrepancy_events) = self.check_position_discrepancy(*key, venue_reports) {
-                events.extend(discrepancy_events);
-            }
+            let (disposition, discrepancy_events) =
+                self.check_position_discrepancy(*key, venue_reports);
+            target.disposition = disposition;
+            events.extend(discrepancy_events);
         }
 
         let current_position_keys = self.open_position_keys_for_reconciliation();
 
-        for (key, venue_reports) in &venue_positions {
+        for (key, target) in &mut venue_positions {
+            let venue_reports = target.reports.as_slice();
             if check.client_coverage.contains_key(key)
                 || venue_reports
                     .iter()
@@ -2980,9 +3205,10 @@ impl ExecutionManager {
                 continue;
             }
 
-            if let Some(discrepancy_events) = self.check_position_discrepancy(*key, venue_reports) {
-                events.extend(discrepancy_events);
-            }
+            let (disposition, discrepancy_events) =
+                self.check_position_discrepancy(*key, venue_reports);
+            target.disposition = disposition;
+            events.extend(discrepancy_events);
         }
 
         // Prune retry counters for (instrument, account) pairs no longer actively
@@ -2992,8 +3218,9 @@ impl ExecutionManager {
             .chain(
                 venue_positions
                     .iter()
-                    .filter(|(_, reports)| {
-                        reports
+                    .filter(|(_, target)| {
+                        target
+                            .reports
                             .iter()
                             .any(|report| report.signed_decimal_qty != Decimal::ZERO)
                     })
@@ -3003,18 +3230,21 @@ impl ExecutionManager {
         self.position_reconciliation_states
             .retain(|k, _| active_keys.contains(k));
 
-        events
+        PositionReconciliationBatch {
+            events,
+            positions: venue_positions,
+        }
     }
 
-    fn positions_avg_px(cached_positions: &[Position]) -> Option<Decimal> {
+    fn positions_avg_px(cached_positions: &[(Decimal, f64)]) -> Option<Decimal> {
         let mut total_value = Decimal::ZERO;
         let mut total_qty = Decimal::ZERO;
 
-        for position in cached_positions {
-            let qty = position.signed_decimal_qty().abs();
-            if position.avg_px_open > 0.0
+        for (signed_quantity, avg_px_open) in cached_positions {
+            let qty = signed_quantity.abs();
+            if *avg_px_open > 0.0
                 && qty > Decimal::ZERO
-                && let Ok(avg_px) = Decimal::from_str(&position.avg_px_open.to_string())
+                && let Ok(avg_px) = Decimal::from_str(&avg_px_open.to_string())
             {
                 total_value += avg_px * qty;
                 total_qty += qty;
@@ -3608,20 +3838,19 @@ impl ExecutionManager {
         &mut self,
         key: InstrumentAccountKey,
         venue_reports: &[PositionStatusReport],
-    ) -> Option<Vec<OrderEventAny>> {
+    ) -> (PositionCheckDisposition, Vec<OrderEventAny>) {
         let (instrument_id, account_id) = key;
 
         let cached_positions = {
             let cache = self.cache.borrow();
             cache
-                .positions_open(None, Some(&instrument_id), None, Some(&account_id), None)
+                .positions_open_refs(None, Some(&instrument_id), None, Some(&account_id), None)
                 .into_iter()
-                .map(|position| (*position).clone())
+                .map(|position| (position.signed_decimal_qty(), position.avg_px_open))
                 .collect::<Vec<_>>()
         };
-        let (cached_signed_qty, cached_long_qty, cached_short_qty) = Self::position_qty_aggregates(
-            cached_positions.iter().map(Position::signed_decimal_qty),
-        );
+        let (cached_signed_qty, cached_long_qty, cached_short_qty) =
+            Self::position_qty_aggregates(cached_positions.iter().map(|(quantity, _)| *quantity));
         let (venue_signed_qty, venue_long_qty, venue_short_qty) = Self::position_qty_aggregates(
             venue_reports.iter().map(|report| report.signed_decimal_qty),
         );
@@ -3637,13 +3866,15 @@ impl ExecutionManager {
         let tolerance = self.position_reconciliation_tolerance(account_id);
         let venue_has_side_reports = venue_reports.iter().any(PositionStatusReport::is_long)
             && venue_reports.iter().any(PositionStatusReport::is_short);
-        let net_qty_matches = (cached_signed_qty - venue_signed_qty).abs() <= tolerance;
-        let side_qty_matches = (cached_long_qty - venue_long_qty).abs() <= tolerance
-            && (cached_short_qty - venue_short_qty).abs() <= tolerance;
 
-        if net_qty_matches && (!venue_has_side_reports || side_qty_matches) {
+        if Self::position_quantities_match(
+            (cached_signed_qty, cached_long_qty, cached_short_qty),
+            (venue_signed_qty, venue_long_qty, venue_short_qty),
+            venue_has_side_reports,
+            tolerance,
+        ) {
             self.position_reconciliation_states.shift_remove(&key);
-            return None;
+            return (PositionCheckDisposition::CheckQuantity, Vec::new());
         }
 
         let ts_now = self.clock.borrow().timestamp_ns();
@@ -3656,7 +3887,7 @@ impl ExecutionManager {
             log::debug!(
                 "Skipping position reconciliation for {instrument_id}: recent activity within threshold"
             );
-            return None;
+            return (PositionCheckDisposition::Deferred, Vec::new());
         }
 
         let report_shape = if nonflat_count > 1 || venue_has_side_reports {
@@ -3671,7 +3902,7 @@ impl ExecutionManager {
             .map_or(0, |state| state.retries);
 
         if retries >= self.config.position_check_retries {
-            return None;
+            return (PositionCheckDisposition::Unresolved, Vec::new());
         }
 
         if report_shape == PositionReportShape::MultiLeg {
@@ -3687,7 +3918,7 @@ impl ExecutionManager {
                     self.config.position_check_retries,
                 );
             }
-            return None;
+            return (PositionCheckDisposition::Unresolved, Vec::new());
         }
 
         log::warn!(
@@ -3706,7 +3937,7 @@ impl ExecutionManager {
                     self.config.position_check_retries,
                 );
             }
-            return None;
+            return (PositionCheckDisposition::Unresolved, Vec::new());
         };
 
         let cached_avg_px = Self::positions_avg_px(&cached_positions);
@@ -3825,7 +4056,10 @@ impl ExecutionManager {
             self.position_reconciliation_states.shift_remove(&key);
         }
 
-        result
+        match result {
+            Some(events) if !events.is_empty() => (PositionCheckDisposition::CheckQuantity, events),
+            _ => (PositionCheckDisposition::Unresolved, Vec::new()),
+        }
     }
 
     fn set_position_reconciliation_retries(
@@ -3841,6 +4075,18 @@ impl ExecutionManager {
                 retries,
             },
         );
+    }
+
+    fn position_quantities_match(
+        cached: (Decimal, Decimal, Decimal),
+        venue: (Decimal, Decimal, Decimal),
+        venue_has_side_reports: bool,
+        tolerance: Decimal,
+    ) -> bool {
+        let net_matches = (cached.0 - venue.0).abs() <= tolerance;
+        let sides_match =
+            (cached.1 - venue.1).abs() <= tolerance && (cached.2 - venue.2).abs() <= tolerance;
+        net_matches && (!venue_has_side_reports || sides_match)
     }
 
     fn position_qty_aggregates(
@@ -5133,6 +5379,36 @@ impl ExecutionManager {
         ));
 
         Some((event, fill_key))
+    }
+}
+
+pub(crate) async fn request_position_reports<'a>(
+    clients: impl Iterator<Item = &'a dyn ExecutionClient>,
+    command: &GeneratePositionStatusReports,
+) -> PositionReportQueryResult {
+    let mut reports = Vec::new();
+    let mut queried_clients = IndexSet::new();
+    let mut failed_clients = IndexSet::new();
+
+    for client in clients {
+        let client_id = client.client_id();
+        queried_clients.insert(client_id);
+
+        match client.generate_position_status_reports(command).await {
+            Ok(client_reports) => reports.extend(client_reports),
+            Err(e) => {
+                failed_clients.insert(client_id);
+                log::warn!(
+                    "Failed to query position reports from {}: {e}",
+                    client.client_id()
+                );
+            }
+        }
+    }
+    PositionReportQueryResult {
+        reports,
+        queried_clients,
+        failed_clients,
     }
 }
 
