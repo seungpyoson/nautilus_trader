@@ -54,7 +54,10 @@ use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_live::{
     builder::LiveNodeBuilder,
     config::{LiveExecutionEngineConfig, LiveNodeConfig},
-    node::{LiveNode, LiveNodeHandle, NodeState},
+    node::{
+        LiveNode, LiveNodeHandle, MassStatusCollection, NodeState, StartupReconciliationOutcome,
+        StartupReconciliationSummary,
+    },
 };
 use nautilus_model::{
     accounts::AccountAny,
@@ -92,6 +95,23 @@ impl TestActor {
 impl DataActor for TestActor {}
 
 nautilus_actor!(TestActor);
+
+#[derive(Debug)]
+struct ReconciliationSummaryActor {
+    core: DataActorCore,
+    handle: LiveNodeHandle,
+    observed: Arc<Mutex<Option<Arc<StartupReconciliationSummary>>>>,
+}
+
+impl DataActor for ReconciliationSummaryActor {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        *self.observed.lock().unwrap() = self.handle.startup_reconciliation_summary();
+        self.handle.stop();
+        Ok(())
+    }
+}
+
+nautilus_actor!(ReconciliationSummaryActor);
 
 #[derive(Debug)]
 struct TestStrategy {
@@ -2293,6 +2313,108 @@ mod serial_tests {
     }
 
     #[rstest]
+    #[case::start_complete(false, true, StartupMassStatusBehavior::Available, true)]
+    #[case::run_complete(true, true, StartupMassStatusBehavior::Available, true)]
+    #[case::start_incomplete_collection(false, true, StartupMassStatusBehavior::Available, false)]
+    #[case::run_incomplete_collection(true, true, StartupMassStatusBehavior::Available, false)]
+    #[case::start_unavailable(false, true, StartupMassStatusBehavior::Unavailable, false)]
+    #[case::run_unavailable(true, true, StartupMassStatusBehavior::Unavailable, false)]
+    #[case::start_disabled(false, false, StartupMassStatusBehavior::Available, true)]
+    #[case::run_disabled(true, false, StartupMassStatusBehavior::Available, true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_summary_is_visible_to_actor_and_survives_stop(
+        #[case] run: bool,
+        #[case] enabled: bool,
+        #[case] behavior: StartupMassStatusBehavior,
+        #[case] reports_complete: bool,
+    ) {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: enabled,
+                reconciliation_lookback_mins: Some(42),
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) =
+            live_node_with_startup_mass_status_client("StartupSummaryActorNode", config, behavior);
+        let client_id = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+        let mut report = ExecutionMassStatus::new(
+            client_id,
+            AccountId::from("STARTUP-MASS-STATUS-001"),
+            Venue::from("BINANCE"),
+            UnixNanos::from(8),
+            None,
+        );
+        report.set_report_window(Some(UnixNanos::from(7)), reports_complete);
+        let report_id = report.report_id;
+        *state.mass_status.lock().unwrap() = Some(report);
+        let handle = node.handle();
+        let observed = Arc::new(Mutex::new(None));
+        assert!(handle.startup_reconciliation_summary().is_none());
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: handle.clone(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        assert!(result.is_ok(), "unexpected startup failure: {result:#?}");
+        let summary = observed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("summary must be available during actor startup");
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert_eq!(summary.requested_lookback_mins, Some(42));
+        assert_eq!(summary.clients.len(), 1);
+        assert_eq!(summary.clients[0].client_id, client_id);
+        assert!(Arc::ptr_eq(
+            &summary,
+            &handle.startup_reconciliation_summary().unwrap()
+        ));
+
+        if !enabled {
+            assert_eq!(summary.outcome, StartupReconciliationOutcome::Disabled);
+            assert_eq!(
+                summary.clients[0].collection,
+                MassStatusCollection::NotRequested
+            );
+            assert!(summary.clients[0].report.is_none());
+            assert!(!state.mass_status_requested.load(Ordering::Relaxed));
+        } else {
+            assert_eq!(summary.outcome, StartupReconciliationOutcome::Finished);
+            if matches!(behavior, StartupMassStatusBehavior::Available) {
+                assert_eq!(
+                    summary.clients[0].collection,
+                    MassStatusCollection::Received
+                );
+                let received = summary.clients[0].report.as_ref().unwrap();
+                assert_eq!(received.report_id, report_id);
+                assert_eq!(received.lookback_start, Some(UnixNanos::from(7)));
+                assert_eq!(received.ts_init, UnixNanos::from(8));
+                assert_eq!(received.reports_complete, reports_complete);
+                assert!(received.application.all_received_reports_reconciled());
+            } else {
+                assert_eq!(
+                    summary.clients[0].collection,
+                    MassStatusCollection::Unavailable
+                );
+                assert!(summary.clients[0].report.is_none());
+            }
+        }
+        node.dispose();
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_start_continues_when_mass_status_unavailable() {
         let config = LiveNodeConfig {
@@ -2324,6 +2446,14 @@ mod serial_tests {
 
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Finished);
+        assert_eq!(
+            summary.clients[0].collection,
+            MassStatusCollection::Unavailable
+        );
+        assert!(summary.clients[0].report.is_none());
+
         assert!(node.kernel().trader().borrow().is_disposed());
         assert_eq!(node.kernel().trader().borrow().component_count(), 0);
     }
@@ -2880,6 +3010,13 @@ mod serial_tests {
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Finished);
+        assert_eq!(
+            summary.clients[0].collection,
+            MassStatusCollection::Unavailable
+        );
+        assert!(summary.clients[0].report.is_none());
     }
 
     #[rstest]
@@ -2910,6 +3047,10 @@ mod serial_tests {
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Failed);
+        assert_eq!(summary.clients[0].collection, MassStatusCollection::Failed);
+        assert!(summary.clients[0].report.is_none());
     }
 
     #[rstest]
@@ -2940,6 +3081,10 @@ mod serial_tests {
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Failed);
+        assert_eq!(summary.clients[0].collection, MassStatusCollection::Failed);
+        assert!(summary.clients[0].report.is_none());
     }
 
     #[rstest]
@@ -2982,6 +3127,13 @@ mod serial_tests {
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Failed);
+        assert_eq!(
+            summary.clients[0].collection,
+            MassStatusCollection::TimedOut
+        );
+        assert!(summary.clients[0].report.is_none());
     }
 
     // The maintenance dispatcher is a single `select!` arm in `LiveNode::run`

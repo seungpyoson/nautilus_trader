@@ -14,11 +14,14 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU8, Ordering},
 };
 
-use super::metrics::{RunnerMetrics, RunnerMetricsSnapshot};
+use super::{
+    metrics::{RunnerMetrics, RunnerMetricsSnapshot},
+    reconciliation::StartupReconciliationSummary,
+};
 
 const STOP_REQUESTED: u8 = 1 << 7;
 const STATE_MASK: u8 = !STOP_REQUESTED;
@@ -116,6 +119,7 @@ pub(super) enum RunningTransition {
 #[derive(Clone, Debug)]
 pub struct LiveNodeHandle {
     control: Arc<AtomicU8>,
+    reconciliation: Arc<Mutex<Option<Arc<StartupReconciliationSummary>>>>,
     pub(crate) metrics: Arc<RunnerMetrics>,
 }
 
@@ -132,10 +136,15 @@ impl LiveNodeHandle {
         Self {
             control: Arc::new(AtomicU8::new(NodeState::Idle.as_u8())),
             metrics: Arc::new(RunnerMetrics::default()),
+            reconciliation: Arc::new(Mutex::new(None)),
         }
     }
 
     pub(crate) fn set_starting(&self) {
+        *self
+            .reconciliation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         self.set_state(NodeState::Starting);
     }
 
@@ -192,6 +201,25 @@ impl LiveNodeHandle {
     #[must_use]
     pub fn metrics_snapshot(&self) -> RunnerMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// Returns the latest completed startup reconciliation attempt, including failures.
+    ///
+    /// The bounded diagnostic survives stop and is cleared when entering Starting. An
+    /// independently read node state and summary are not an atomic readiness check.
+    #[must_use]
+    pub fn startup_reconciliation_summary(&self) -> Option<Arc<StartupReconciliationSummary>> {
+        self.reconciliation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn publish_startup_reconciliation(&self, summary: StartupReconciliationSummary) {
+        *self
+            .reconciliation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(summary));
     }
 
     /// Signals the node to stop.

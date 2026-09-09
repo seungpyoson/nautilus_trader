@@ -181,12 +181,7 @@ fn generate_reconciliation_order_events_inner(
         }
     }
 
-    if working.status() == OrderStatus::Filled
-        && matches!(
-            report.order_status,
-            OrderStatus::Canceled | OrderStatus::Expired,
-        )
-    {
+    if is_terminal_report_after_full_fill(&working, report) {
         return events;
     }
 
@@ -204,11 +199,15 @@ fn has_material_fill_decrease(order: &OrderAny, report: &OrderStatusReport) -> b
         return false;
     }
 
+    !fill_quantities_within_tolerance(order, report)
+}
+
+fn fill_quantities_within_tolerance(order: &OrderAny, report: &OrderStatusReport) -> bool {
     let precision = order
         .filled_qty()
         .precision
         .max(report.filled_qty.precision);
-    !is_within_single_unit_tolerance(
+    is_within_single_unit_tolerance(
         report.filled_qty.as_decimal(),
         order.filled_qty().as_decimal(),
         precision,
@@ -441,6 +440,53 @@ pub fn reconcile_order_report_with_commission(
             None
         }
     }
+}
+
+fn is_terminal_report_after_full_fill(order: &OrderAny, report: &OrderStatusReport) -> bool {
+    order.status() == OrderStatus::Filled
+        && matches!(
+            report.order_status,
+            OrderStatus::Canceled | OrderStatus::Expired
+        )
+}
+
+/// Returns whether the reported order state is satisfied under native reconciliation policy.
+///
+/// Preserves an unchanged accepted snapshot during a pending command and cancellations of
+/// superseded venue IDs, including the native fill-quantity tolerance for lower reports and
+/// closed orders. This compares order identity, status, filled quantity and amendable fields;
+/// it does not verify commissions or historical position economics.
+#[must_use]
+pub fn order_report_is_reconciled(order: &OrderAny, report: &OrderStatusReport) -> bool {
+    if order.instrument_id() != report.instrument_id
+        || order.account_id() != Some(report.account_id)
+        || order.order_side() != report.order_side
+        || order.order_type() != report.order_type
+        || report
+            .client_order_id
+            .is_some_and(|id| id != order.client_order_id())
+    {
+        return false;
+    }
+
+    if is_superseded_cancel_report(order, report) {
+        return true;
+    }
+
+    if order.venue_order_id() != Some(report.venue_order_id) {
+        return false;
+    }
+
+    is_unchanged_accepted_report_during_pending_command(order, report)
+        || ((order.status() == report.order_status
+            || is_terminal_report_after_full_fill(order, report))
+            && (order.filled_qty() == report.filled_qty
+                || (matches!(
+                    report.order_status,
+                    OrderStatus::PartiallyFilled | OrderStatus::Filled
+                ) && (report.filled_qty < order.filled_qty() || order.is_closed())
+                    && fill_quantities_within_tolerance(order, report)))
+            && !should_reconciliation_update(order, report))
 }
 
 fn is_unchanged_accepted_report_during_pending_command(
@@ -1375,12 +1421,7 @@ fn reconcile_fill_quantity_mismatch(
     if report_filled_qty < order_filled_qty {
         // Venue cumulative below cached: apply no event so cached state is
         // preserved. Suppress sub-unit gaps as precision noise.
-        let precision = order_filled_qty.precision.max(report_filled_qty.precision);
-        if is_within_single_unit_tolerance(
-            report_filled_qty.as_decimal(),
-            order_filled_qty.as_decimal(),
-            precision,
-        ) {
+        if fill_quantities_within_tolerance(order, report) {
             return None;
         }
 
@@ -1399,13 +1440,7 @@ fn reconcile_fill_quantity_mismatch(
         // Check if order is already closed - skip inferred fill to avoid invalid state
         // (matching Python behavior in _handle_fill_quantity_mismatch)
         if order.is_closed() {
-            let precision = order_filled_qty.precision.max(report_filled_qty.precision);
-
-            if is_within_single_unit_tolerance(
-                report_filled_qty.as_decimal(),
-                order_filled_qty.as_decimal(),
-                precision,
-            ) {
+            if fill_quantities_within_tolerance(order, report) {
                 return None;
             }
 

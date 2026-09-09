@@ -142,6 +142,7 @@ pub mod plugin;
 
 mod metrics;
 mod queue;
+mod reconciliation;
 mod state;
 
 use builder::ExternalMessageBusIngress;
@@ -150,6 +151,10 @@ use config::{LiveNodeConfig, PluginConfig, validate_live_environment};
 pub use metrics::{RunnerChannelMetricsSnapshot, RunnerMetricsDelta, RunnerMetricsSnapshot};
 use metrics::{RunnerChannelQueueDepths, RunnerMetrics};
 use queue::{QueueMonitor, QueueStateTransition};
+pub use reconciliation::{
+    ClientReconciliationSummary, CollectedMassStatusSummary, MassStatusCollection,
+    StartupReconciliationOutcome, StartupReconciliationSummary,
+};
 use state::{EngineConnectionStatus, RunningTransition};
 pub use state::{LiveNodeHandle, NodeRunMode, NodeState};
 
@@ -793,8 +798,56 @@ impl LiveNode {
     /// # Errors
     ///
     /// Returns an error if reconciliation fails or times out.
-    #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
     async fn perform_startup_reconciliation(&mut self) -> anyhow::Result<()> {
+        let ts_started = self.kernel.generate_timestamp_ns();
+        let clients = {
+            let engine = self.kernel.exec_engine.borrow();
+            engine
+                .client_ids()
+                .into_iter()
+                .map(|client_id| {
+                    let client = engine
+                        .get_client(&client_id)
+                        .expect("client IDs collected while holding the engine borrow");
+                    ClientReconciliationSummary {
+                        client_id,
+                        account_id: client.account_id(),
+                        venue: client.venue(),
+                        collection: MassStatusCollection::NotRequested,
+                        report: None,
+                    }
+                })
+                .collect()
+        };
+        let mut summary = StartupReconciliationSummary {
+            outcome: StartupReconciliationOutcome::Failed,
+            requested_lookback_mins: self
+                .config
+                .exec_engine
+                .reconciliation_lookback_mins
+                .map(u64::from),
+            ts_started,
+            ts_finished: ts_started,
+            clients,
+        };
+        let result = self.reconcile_startup_clients(&mut summary).await;
+        if result.is_ok() {
+            summary.outcome = if self.config.exec_engine.reconciliation {
+                StartupReconciliationOutcome::Finished
+            } else {
+                StartupReconciliationOutcome::Disabled
+            };
+        }
+        summary.ts_finished = self.kernel.generate_timestamp_ns();
+        self.handle.publish_startup_reconciliation(summary);
+        result
+    }
+
+    #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
+    async fn reconcile_startup_clients(
+        &mut self,
+        summary: &mut StartupReconciliationSummary,
+    ) -> anyhow::Result<()> {
         if !self.config.exec_engine.reconciliation {
             log::info!("Startup reconciliation disabled");
             self.kernel
@@ -809,19 +862,16 @@ impl LiveNode {
             color = LogColor::Blue
         );
 
-        let lookback_mins = self
-            .config
-            .exec_engine
-            .reconciliation_lookback_mins
-            .map(u64::from);
+        let lookback_mins = summary.requested_lookback_mins;
 
         let timeout = self.config.timeout_reconciliation;
         let start = dst::time::Instant::now();
-        let client_ids = self.kernel.exec_engine.borrow().client_ids();
 
-        for client_id in client_ids {
+        for client in &mut summary.clients {
+            let client_id = client.client_id;
             let elapsed = start.elapsed();
             if elapsed >= timeout {
+                client.collection = MassStatusCollection::TimedOut;
                 anyhow::bail!("Startup reconciliation timeout reached");
             }
             let remaining = timeout
@@ -834,7 +884,7 @@ impl LiveNode {
                 color = LogColor::Blue
             );
 
-            let mass_status_result = dst::time::timeout(remaining, async {
+            let mass_status_result = match dst::time::timeout(remaining, async {
                 self.kernel
                     .exec_engine
                     .borrow_mut()
@@ -842,14 +892,20 @@ impl LiveNode {
                     .await
             })
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Startup reconciliation timeout reached while requesting mass status from {client_id}"
-                )
-            })?;
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    client.collection = MassStatusCollection::TimedOut;
+                    anyhow::bail!(
+                        "Startup reconciliation timeout reached while requesting mass status from {client_id}"
+                    );
+                }
+            };
 
             match mass_status_result {
                 Ok(Some(mass_status)) => {
+                    client.collection = MassStatusCollection::Received;
+                    let mut report = CollectedMassStatusSummary::from(&mass_status);
                     log_info!(
                         "Reconciling ExecutionMassStatus for {}",
                         client_id,
@@ -862,6 +918,8 @@ impl LiveNode {
                         .exec_manager
                         .reconcile_execution_mass_status(mass_status, exec_engine_rc)
                         .await;
+                    report.application = result.summary;
+                    client.report = Some(report);
 
                     anyhow::ensure!(
                         self.kernel
@@ -874,7 +932,7 @@ impl LiveNode {
 
                     if result.events.is_empty() {
                         log_info!(
-                            "Reconciliation for {} succeeded",
+                            "Reconciliation for {} generated no events",
                             client_id,
                             color = LogColor::Blue
                         );
@@ -908,12 +966,14 @@ impl LiveNode {
                     }
                 }
                 Ok(None) => {
+                    client.collection = MassStatusCollection::Unavailable;
                     log::warn!(
                         "No mass status available from {client_id} \
                          (likely adapter error when generating reports)"
                     );
                 }
                 Err(e) => {
+                    client.collection = MassStatusCollection::Failed;
                     return Err(e).context(format!("Failed to get mass status from {client_id}"));
                 }
             }
@@ -6144,6 +6204,30 @@ mod tests {
         assert_eq!(handle.state(), NodeState::Idle);
         assert!(!handle.should_stop());
         assert!(!handle.is_running());
+    }
+
+    #[rstest]
+    fn test_handle_reconciliation_diagnostic_survives_stop_and_clears_on_starting() {
+        let handle = LiveNodeHandle::new();
+        handle.set_starting();
+        let observer = handle.clone();
+        handle.publish_startup_reconciliation(StartupReconciliationSummary {
+            outcome: StartupReconciliationOutcome::Failed,
+            requested_lookback_mins: None,
+            ts_started: Default::default(),
+            ts_finished: Default::default(),
+            clients: Vec::new(),
+        });
+        handle.set_stopped();
+        let previous = observer.startup_reconciliation_summary().unwrap();
+        assert_eq!(previous.outcome, StartupReconciliationOutcome::Failed);
+
+        handle.set_starting();
+
+        assert_eq!(observer.state(), NodeState::Starting);
+        assert!(observer.startup_reconciliation_summary().is_none());
+        // Already retrieved snapshots remain inert diagnostics.
+        assert_eq!(previous.outcome, StartupReconciliationOutcome::Failed);
     }
 
     #[rstest]
