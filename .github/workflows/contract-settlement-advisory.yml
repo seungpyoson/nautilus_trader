@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: 713a1594769bee69ebb187175614568d948be3e4
+      REVIEWED_SHA: a4d76e0996789b73874336018d621bfb03b8b1a7
       CONTROL_SHA: 0bfa8b4b9380fb95664d800f5275e9eac040c367
       CONTROL_TEST_SHA: bb57d0af7a225891c96c213511149f792b842181
       CARGO_BUILD_JOBS: "2"
@@ -32,7 +32,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 713a1594769bee69ebb187175614568d948be3e4
+          ref: a4d76e0996789b73874336018d621bfb03b8b1a7
           fetch-depth: 0
           persist-credentials: false
 
