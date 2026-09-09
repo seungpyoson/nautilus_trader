@@ -31,6 +31,7 @@ use nautilus_common::{
     cache::{AccountLookupError, AccountRef, Cache},
     clock::Clock,
     enums::LogColor,
+    messages::execution::EventApplicationOutcome,
     msgbus::{self, MessagingSwitchboard, TypedHandler, TypedIntoHandler},
     timer::{TimeEvent, TimeEventCallback},
 };
@@ -246,10 +247,9 @@ impl Portfolio {
             let inner = WeakCell::clone(&inner_weak);
 
             TypedHandler::from(move |event: &AccountState| {
-                if let Some(inner_rc) = inner.upgrade() {
-                    let inner_rc: Rc<RefCell<PortfolioState>> = inner_rc.into();
-                    update_account(&clock, &cache, &inner_rc, config, event);
-                }
+                let inner_rc = inner.upgrade()?;
+                let inner_rc: Rc<RefCell<PortfolioState>> = inner_rc.into();
+                Some(update_account(&clock, &cache, &inner_rc, config, event))
             })
         };
 
@@ -337,6 +337,9 @@ impl Portfolio {
                         OrderUpdateSource::Endpoint,
                     );
                 }
+
+                // Portfolio calculations are outside order and position application acknowledgements
+                None
             })
         };
         msgbus::register_order_event_endpoint(
@@ -365,7 +368,9 @@ impl Portfolio {
         );
         msgbus::subscribe_account_state(
             "events.account.*".into(),
-            update_account_handler,
+            TypedHandler::from(move |event: &AccountState| {
+                let _ = update_account_handler.handle(event);
+            }),
             Some(10),
         );
     }
@@ -3964,7 +3969,7 @@ fn update_account(
     inner: &Rc<RefCell<PortfolioState>>,
     config: PortfolioConfig,
     event: &AccountState,
-) {
+) -> EventApplicationOutcome {
     let already_applied = {
         cache
             .borrow()
@@ -3975,7 +3980,7 @@ fn update_account(
 
     if !already_applied && let Err(e) = cache.borrow_mut().update_account_state(event) {
         log::error!("Failed to update account state: {e}");
-        return;
+        return EventApplicationOutcome::Incomplete;
     }
 
     // Throttled logging logic
@@ -4010,6 +4015,7 @@ fn update_account(
     drop(inner_ref);
 
     register_equity_curve_account(clock, cache, inner, config, event.account_id);
+    EventApplicationOutcome::Applied
 }
 
 fn equity_curve_timer_name(account_id: AccountId) -> String {

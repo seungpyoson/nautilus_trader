@@ -32,7 +32,7 @@ use nautilus_common::{
         system::trading::TradingStateChanged,
     },
     msgbus::{
-        self, MessagingSwitchboard, TypedHandler,
+        self, MessagingSwitchboard, TypedHandler, TypedIntoHandler,
         stubs::{TypedIntoMessageSavingHandler, get_typed_into_message_saving_handler},
     },
     runner::{
@@ -95,7 +95,13 @@ fn register_process_handler() -> TypedIntoMessageSavingHandler<OrderEventAny> {
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(Some(
         Ustr::from("ExecEngine.process"),
     ));
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     saving_handler
 }
 
@@ -369,7 +375,13 @@ fn process_order_event_handler() -> TypedIntoMessageSavingHandler<OrderEventAny>
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(Some(
         Ustr::from("ExecEngine.process"),
     ));
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     saving_handler
 }
 

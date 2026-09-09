@@ -13,9 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU8, Ordering},
+use std::{
+    num::NonZeroU64,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 use super::{
@@ -112,6 +115,12 @@ pub(super) enum RunningTransition {
     Invalid(u8),
 }
 
+#[derive(Debug, Default)]
+struct StartupReconciliationState {
+    completed_attempts: u64,
+    latest: Option<Arc<StartupReconciliationSummary>>,
+}
+
 /// A thread-safe handle to control a `LiveNode` from other threads.
 ///
 /// This allows stopping and querying the node's state without requiring the
@@ -119,7 +128,7 @@ pub(super) enum RunningTransition {
 #[derive(Clone, Debug)]
 pub struct LiveNodeHandle {
     control: Arc<AtomicU8>,
-    reconciliation: Arc<Mutex<Option<Arc<StartupReconciliationSummary>>>>,
+    reconciliation: Arc<Mutex<StartupReconciliationState>>,
     pub(crate) metrics: Arc<RunnerMetrics>,
 }
 
@@ -136,15 +145,15 @@ impl LiveNodeHandle {
         Self {
             control: Arc::new(AtomicU8::new(NodeState::Idle.as_u8())),
             metrics: Arc::new(RunnerMetrics::default()),
-            reconciliation: Arc::new(Mutex::new(None)),
+            reconciliation: Arc::new(Mutex::new(StartupReconciliationState::default())),
         }
     }
 
     pub(crate) fn set_starting(&self) {
-        *self
-            .reconciliation
+        self.reconciliation
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest = None;
         self.set_state(NodeState::Starting);
     }
 
@@ -212,14 +221,24 @@ impl LiveNodeHandle {
         self.reconciliation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest
             .clone()
     }
 
-    pub(crate) fn publish_startup_reconciliation(&self, summary: StartupReconciliationSummary) {
-        *self
+    pub(crate) fn publish_startup_reconciliation(&self, mut summary: StartupReconciliationSummary) {
+        let mut reconciliation = self
             .reconciliation
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(summary));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        summary.completion_sequence = reconciliation
+            .completed_attempts
+            .checked_add(1)
+            .and_then(NonZeroU64::new);
+
+        if let Some(sequence) = summary.completion_sequence {
+            reconciliation.completed_attempts = sequence.get();
+        }
+        reconciliation.latest = Some(Arc::new(summary));
     }
 
     /// Signals the node to stop.
@@ -243,5 +262,46 @@ impl EngineConnectionStatus {
             Self::StopRequested => Some("Stop signal received during startup"),
             Self::ShutdownRequested => Some("Shutdown signal received during startup"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_core::{UUID4, UnixNanos};
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        node::reconciliation::StartupReconciliationOutcome, runner::ExecutionApplicationSummary,
+    };
+
+    #[rstest]
+    fn test_reconciliation_sequence_exhaustion_never_reuses_a_watermark() {
+        let handle = LiveNodeHandle::new();
+        handle.reconciliation.lock().unwrap().completed_attempts = u64::MAX - 1;
+        let summary = StartupReconciliationSummary {
+            instance_id: UUID4::new(),
+            completion_sequence: None,
+            client_identities_unchanged: false,
+            outcome: StartupReconciliationOutcome::Finished,
+            requested_lookback_mins: None,
+            ts_started: UnixNanos::default(),
+            ts_finished: UnixNanos::default(),
+            pending_execution: ExecutionApplicationSummary::default(),
+            clients: Vec::new(),
+        };
+        handle.publish_startup_reconciliation(summary.clone());
+        let last_numbered = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(last_numbered.completion_sequence.unwrap().get(), u64::MAX);
+
+        for _ in 0..2 {
+            handle.set_starting();
+            assert!(handle.startup_reconciliation_summary().is_none());
+            handle.publish_startup_reconciliation(summary.clone());
+            let exhausted = handle.startup_reconciliation_summary().unwrap();
+            assert!(exhausted.completion_sequence.is_none());
+            assert_eq!(exhausted.instance_id, summary.instance_id);
+        }
+        assert_eq!(last_numbered.completion_sequence.unwrap().get(), u64::MAX);
     }
 }

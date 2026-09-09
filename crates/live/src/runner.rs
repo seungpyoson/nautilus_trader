@@ -69,8 +69,9 @@ use nautilus_common::{
         replace_system_event_sender,
     },
     messages::{
-        DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent, data::DataCommand,
-        execution::TradingCommand,
+        DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent,
+        data::DataCommand,
+        execution::{EventApplicationOutcome, TradingCommand},
     },
     msgbus::{self, MessagingSwitchboard},
     runner::{
@@ -80,6 +81,65 @@ use nautilus_common::{
     },
 };
 use nautilus_model::events::OrderEventAny;
+
+/// Application acknowledgements for direct execution messages handled by this dispatcher.
+///
+/// Batches count each child dispatch; a report (including mass status) counts once.
+/// Nested endpoint calls and other callback paths are not counted, even when they use the same
+/// endpoints. These counts do not establish queue quiescence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionApplicationSummary {
+    /// Dispatches whose configured native application completed.
+    pub applied: u64,
+    /// Dispatches with failed or unconfirmed native application.
+    pub incomplete: u64,
+    /// Dispatches that had no acknowledging handler, or were suppressed before dispatch.
+    pub unacknowledged: u64,
+    /// At least one counter could not represent its full count.
+    pub overflowed: bool,
+}
+
+impl ExecutionApplicationSummary {
+    /// Returns whether all observed applications were acknowledged as completed.
+    ///
+    /// An empty set satisfies this predicate; it does not establish startup completion.
+    #[must_use]
+    pub const fn all_applications_confirmed(&self) -> bool {
+        self.incomplete == 0 && self.unacknowledged == 0 && !self.overflowed
+    }
+
+    pub(crate) fn record(&mut self, outcome: Option<EventApplicationOutcome>) {
+        let count = match outcome {
+            Some(EventApplicationOutcome::Applied) => &mut self.applied,
+            Some(EventApplicationOutcome::Incomplete) => &mut self.incomplete,
+            None => &mut self.unacknowledged,
+        };
+
+        if let Some(next) = count.checked_add(1) {
+            *count = next;
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    #[cfg(feature = "node")]
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.overflowed |= other.overflowed;
+
+        for (count, incoming) in [
+            (&mut self.applied, other.applied),
+            (&mut self.incomplete, other.incomplete),
+            (&mut self.unacknowledged, other.unacknowledged),
+        ] {
+            if let Some(next) = count.checked_add(incoming) {
+                *count = next;
+            } else {
+                *count = u64::MAX;
+                self.overflowed = true;
+            }
+        }
+    }
+}
 
 /// Asynchronous implementation of `DataCommandSender` for live environments.
 #[derive(Debug)]
@@ -471,50 +531,66 @@ impl AsyncRunner {
     /// Handles an execution event by sending to the appropriate engine endpoint.
     #[inline]
     pub fn handle_exec_event(event: ExecutionEvent) {
+        let _ = Self::handle_exec_event_with_outcome(event);
+    }
+
+    /// Dispatches through the normal endpoints and counts their application acknowledgements.
+    #[inline]
+    #[must_use]
+    pub fn handle_exec_event_with_outcome(event: ExecutionEvent) -> ExecutionApplicationSummary {
+        let mut summary = ExecutionApplicationSummary::default();
+
         match event {
             ExecutionEvent::Order(order_event) => {
-                msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), order_event);
+                summary.record(msgbus::send_order_event_with_outcome(
+                    MessagingSwitchboard::exec_engine_process(),
+                    order_event,
+                ));
             }
             ExecutionEvent::OrderSubmittedBatch(batch) => {
                 for submitted in batch {
-                    msgbus::send_order_event(
+                    summary.record(msgbus::send_order_event_with_outcome(
                         MessagingSwitchboard::exec_engine_process(),
                         OrderEventAny::Submitted(submitted),
-                    );
+                    ));
                 }
             }
             ExecutionEvent::OrderAcceptedBatch(batch) => {
                 for accepted in batch {
-                    msgbus::send_order_event(
+                    summary.record(msgbus::send_order_event_with_outcome(
                         MessagingSwitchboard::exec_engine_process(),
                         OrderEventAny::Accepted(accepted),
-                    );
+                    ));
                 }
             }
             ExecutionEvent::OrderCanceledBatch(batch) => {
                 for canceled in batch {
-                    msgbus::send_order_event(
+                    summary.record(msgbus::send_order_event_with_outcome(
                         MessagingSwitchboard::exec_engine_process(),
                         OrderEventAny::Canceled(canceled),
-                    );
+                    ));
                 }
             }
             ExecutionEvent::Report(report) => {
-                Self::handle_exec_report(report);
+                summary.record(msgbus::send_execution_report_with_outcome(
+                    MessagingSwitchboard::exec_engine_reconcile_execution_report(),
+                    report,
+                ));
             }
             ExecutionEvent::Account(ref account) => {
-                msgbus::send_account_state(
+                summary.record(msgbus::send_account_state_with_outcome(
                     MessagingSwitchboard::portfolio_update_account(),
                     account,
-                );
+                ));
             }
         }
+
+        summary
     }
 
     #[inline]
     pub fn handle_exec_report(report: ExecutionReport) {
-        let endpoint = MessagingSwitchboard::exec_engine_reconcile_execution_report();
-        msgbus::send_execution_report(endpoint, report);
+        let _ = Self::handle_exec_event_with_outcome(ExecutionEvent::Report(report));
     }
 }
 
@@ -732,6 +808,30 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[cfg(feature = "node")]
+    fn test_application_counter_overflow_cannot_confirm_completion(#[case] merge: bool) {
+        let mut summary = ExecutionApplicationSummary {
+            applied: u64::MAX,
+            ..Default::default()
+        };
+
+        if merge {
+            summary.merge(ExecutionApplicationSummary {
+                applied: 1,
+                ..Default::default()
+            });
+        } else {
+            summary.record(Some(EventApplicationOutcome::Applied));
+        }
+
+        assert_eq!(summary.applied, u64::MAX);
+        assert!(summary.overflowed);
+        assert!(!summary.all_applications_confirmed());
+    }
 
     // Test fixture for creating test quotes
     fn test_quote() -> QuoteTick {

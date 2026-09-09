@@ -16,7 +16,10 @@
 use indexmap::IndexMap;
 use nautilus_core::{
     UUID4,
-    python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3},
+    python::{
+        IntoPyObjectNautilusExt,
+        serialization::{from_dict_pyo3, to_dict_pyo3},
+    },
 };
 use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
 
@@ -169,6 +172,7 @@ impl ExecutionMassStatus {
             self.lookback_start().map(|timestamp| timestamp.as_u64()),
         )?;
         dict.set_item("reports_complete", self.reports_complete())?;
+        dict.set_item("coverage", to_dict_pyo3(py, self.coverage())?)?;
 
         let order_reports_dict = PyDict::new(py);
         for (key, value) in &self.order_reports() {
@@ -191,5 +195,50 @@ impl ExecutionMassStatus {
         dict.set_item("position_reports", position_reports_dict)?;
 
         Ok(dict.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_core::UnixNanos;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::reports::mass_status::{
+        ConditionalOrderCoverage, ExecutionMassStatusCoverage, ExecutionReportCoverage,
+        ExecutionReportScope,
+    };
+
+    #[rstest]
+    fn test_mass_status_python_dict_preserves_coverage() {
+        let mut report = ExecutionMassStatus::new(
+            ClientId::from("SIM"),
+            AccountId::from("SIM-001"),
+            Venue::from("SIM"),
+            UnixNanos::from(1_000_000_000),
+            None,
+        );
+        report.set_coverage(ExecutionMassStatusCoverage {
+            orders: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            fills: ExecutionReportCoverage::History {
+                scope: ExecutionReportScope::Account,
+                start: None,
+                end: Some(UnixNanos::from(1_000_000_000)),
+            },
+            positions: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Instruments(vec![InstrumentId::from("TEST.SIM")]),
+            },
+            conditional_orders: ConditionalOrderCoverage::Included,
+        });
+
+        Python::initialize();
+        Python::attach(|py| {
+            let values = report.py_to_dict(py).unwrap();
+            let dict = values.bind(py).cast::<PyDict>().unwrap().clone().unbind();
+            let restored = ExecutionMassStatus::py_from_dict(py, dict).unwrap();
+            assert_eq!(restored, report);
+        });
     }
 }

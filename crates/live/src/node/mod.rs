@@ -111,6 +111,7 @@ use nautilus_model::{
     events::OrderEventAny,
     identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     orders::Order,
+    reports::ExecutionMassStatus,
 };
 use nautilus_network::mode::ReconnectRequestOutcome;
 #[cfg(feature = "python")]
@@ -131,7 +132,10 @@ use crate::{
             TargetedOrderReportResult, request_position_reports, request_targeted_order_reports,
         },
     },
-    runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent, RunnerReceivers},
+    runner::{
+        AsyncRunner, AsyncRunnerChannels, ExecutionApplicationSummary, PendingRunnerEvent,
+        RunnerReceivers,
+    },
     socket::{SocketReconnectLookup, SocketReconnectRegistry},
 };
 
@@ -165,6 +169,12 @@ pub use state::{LiveNodeHandle, NodeRunMode, NodeState};
 /// `Pending`. Under a host event loop that starves the adapter I/O tasks feeding those channels,
 /// which shows up as lapsed heartbeats and reconnects rather than as backpressure.
 const DISPATCHES_PER_YIELD: usize = 64;
+
+struct StartupReconciliationAttempt {
+    summary: StartupReconciliationSummary,
+    // Original reports are owned only until publication; the public summary retains no histories.
+    reports: Vec<(usize, ExecutionMassStatus)>,
+}
 
 /// High-level abstraction for a live Nautilus system node.
 ///
@@ -443,8 +453,8 @@ impl LiveNode {
             }
         }
 
-        let summary = match self.perform_startup_reconciliation().await {
-            Ok(summary) => summary,
+        let mut attempt = match self.perform_startup_reconciliation().await {
+            Ok(attempt) => attempt,
             Err(e) => {
                 if let Err(finalize_err) = self.abort_startup("Startup reconciliation failed").await
                 {
@@ -467,12 +477,13 @@ impl LiveNode {
                     event,
                     &mut startup_system_events,
                     &mut startup_system_commands,
+                    &mut attempt.summary.pending_execution,
                 )
             });
             self.runner = Some(runner);
         }
 
-        if let Some(reason) = self.finish_startup_reconciliation(summary) {
+        if let Some(reason) = self.finish_startup_reconciliation(attempt) {
             self.abort_startup(reason).await?;
             return Ok(());
         }
@@ -594,11 +605,12 @@ impl LiveNode {
         event: PendingRunnerEvent,
         system_events: &mut Vec<SystemEvent>,
         system_commands: &mut Vec<SystemCommand>,
+        applications: &mut ExecutionApplicationSummary,
     ) -> ControlFlow<()> {
         match event {
             PendingRunnerEvent::SystemEvent(event) => system_events.push(event),
             PendingRunnerEvent::SystemCommand(command) => system_commands.push(command),
-            event => self.process_runner_event(event),
+            event => applications.merge(self.process_runner_event_with_outcome(event)),
         }
 
         if self.startup_abort_reason().is_some() {
@@ -609,17 +621,27 @@ impl LiveNode {
     }
 
     fn process_runner_event(&mut self, event: PendingRunnerEvent) {
+        let _ = self.process_runner_event_with_outcome(event);
+    }
+
+    fn process_runner_event_with_outcome(
+        &mut self,
+        event: PendingRunnerEvent,
+    ) -> ExecutionApplicationSummary {
         match event {
             PendingRunnerEvent::TimeEvent(message) => {
                 let _ = AsyncRunner::handle_time_event(message);
             }
             PendingRunnerEvent::SystemEvent(event) => self.process_system_event(event),
             PendingRunnerEvent::SystemCommand(command) => self.process_system_command(command),
-            PendingRunnerEvent::ExecEvent(event) => self.process_exec_event(event),
+            PendingRunnerEvent::ExecEvent(event) => {
+                return self.process_exec_event_with_outcome(event);
+            }
             PendingRunnerEvent::ExecCommand(command) => self.process_exec_command(command),
             PendingRunnerEvent::DataEvent(event) => AsyncRunner::handle_data_event(event),
             PendingRunnerEvent::DataCommand(command) => AsyncRunner::handle_data_command(command),
         }
+        ExecutionApplicationSummary::default()
     }
 
     fn process_system_events(&self, events: Vec<SystemEvent>) {
@@ -839,7 +861,7 @@ impl LiveNode {
     /// Returns an error if reconciliation fails or times out.
     async fn perform_startup_reconciliation(
         &mut self,
-    ) -> anyhow::Result<StartupReconciliationSummary> {
+    ) -> anyhow::Result<StartupReconciliationAttempt> {
         let ts_started = self.kernel.generate_timestamp_ns();
         let clients = {
             let engine = self.kernel.exec_engine.borrow();
@@ -861,6 +883,9 @@ impl LiveNode {
                 .collect()
         };
         let mut summary = StartupReconciliationSummary {
+            instance_id: self.kernel.instance_id(),
+            completion_sequence: None,
+            client_identities_unchanged: false,
             outcome: StartupReconciliationOutcome::Failed,
             requested_lookback_mins: self
                 .config
@@ -869,10 +894,16 @@ impl LiveNode {
                 .map(u64::from),
             ts_started,
             ts_finished: ts_started,
+            pending_execution: ExecutionApplicationSummary::default(),
             clients,
         };
 
-        if let Err(error) = self.reconcile_startup_clients(&mut summary).await {
+        let mut reports = Vec::new();
+
+        if let Err(error) = self
+            .reconcile_startup_clients(&mut summary, &mut reports)
+            .await
+        {
             summary.ts_finished = self.kernel.generate_timestamp_ns();
             self.handle.publish_startup_reconciliation(summary);
             return Err(error);
@@ -882,21 +913,44 @@ impl LiveNode {
         } else {
             StartupReconciliationOutcome::Disabled
         };
-        Ok(summary)
+        Ok(StartupReconciliationAttempt { summary, reports })
     }
 
     /// Publishes once at the pre-trader boundary, after the bounded pending-message pass.
     fn finish_startup_reconciliation(
         &self,
-        mut summary: StartupReconciliationSummary,
+        mut attempt: StartupReconciliationAttempt,
     ) -> Option<&'static str> {
         let abort_reason = self.startup_abort_reason();
 
         if abort_reason.is_some() {
-            summary.outcome = StartupReconciliationOutcome::Interrupted;
+            attempt.summary.outcome = StartupReconciliationOutcome::Interrupted;
+        } else {
+            let engine = self.kernel.exec_engine.borrow();
+            attempt.summary.client_identities_unchanged = engine.client_ids().len()
+                == attempt.summary.clients.len()
+                && attempt.summary.clients.iter().all(|requested| {
+                    engine
+                        .get_client(&requested.client_id)
+                        .is_some_and(|client| {
+                            client.account_id() == requested.account_id
+                                && client.venue() == requested.venue
+                        })
+                });
+
+            for (client_index, report) in &attempt.reports {
+                let collected = attempt.summary.clients[*client_index]
+                    .report
+                    .as_mut()
+                    .expect("retained reports have a matching collected summary");
+                collected.final_inventory = Some(
+                    self.exec_manager
+                        .check_mass_status_inventory(report, &engine),
+                );
+            }
         }
-        summary.ts_finished = self.kernel.generate_timestamp_ns();
-        self.handle.publish_startup_reconciliation(summary);
+        attempt.summary.ts_finished = self.kernel.generate_timestamp_ns();
+        self.handle.publish_startup_reconciliation(attempt.summary);
         abort_reason
     }
 
@@ -904,6 +958,7 @@ impl LiveNode {
     async fn reconcile_startup_clients(
         &mut self,
         summary: &mut StartupReconciliationSummary,
+        reports: &mut Vec<(usize, ExecutionMassStatus)>,
     ) -> anyhow::Result<()> {
         if !self.config.exec_engine.reconciliation {
             log::info!("Startup reconciliation disabled");
@@ -924,7 +979,7 @@ impl LiveNode {
         let timeout = self.config.timeout_reconciliation;
         let start = dst::time::Instant::now();
 
-        for client in &mut summary.clients {
+        for (client_index, client) in summary.clients.iter_mut().enumerate() {
             let client_id = client.client_id;
             let elapsed = start.elapsed();
             if elapsed >= timeout {
@@ -966,14 +1021,13 @@ impl LiveNode {
                         color = LogColor::Blue
                     );
 
-                    let exec_engine_rc = self.kernel.exec_engine.clone();
-
-                    let result = self
-                        .exec_manager
-                        .reconcile_execution_mass_status(mass_status, exec_engine_rc)
-                        .await;
+                    let result = self.exec_manager.reconcile_execution_mass_status_ref(
+                        &mass_status,
+                        &self.kernel.exec_engine,
+                    );
                     report.application = result.summary;
                     client.report = Some(report);
+                    reports.push((client_index, mass_status));
 
                     anyhow::ensure!(
                         self.kernel
@@ -1312,8 +1366,8 @@ impl LiveNode {
         debug_assert_eq!(engine_connection_status, EngineConnectionStatus::Connected);
 
         // Run reconciliation now that instruments are in cache and start trader
-        let summary = match self.perform_startup_reconciliation().await {
-            Ok(summary) => summary,
+        let mut attempt = match self.perform_startup_reconciliation().await {
+            Ok(attempt) => attempt,
             Err(e) => {
                 let result = self.abort_startup("Startup reconciliation failed").await;
                 Self::drain_channels(
@@ -1353,11 +1407,12 @@ impl LiveNode {
                     event,
                     &mut startup_system_events,
                     &mut startup_system_commands,
+                    &mut attempt.summary.pending_execution,
                 )
             });
         }
 
-        if let Some(reason) = self.finish_startup_reconciliation(summary) {
+        if let Some(reason) = self.finish_startup_reconciliation(attempt) {
             let result = self.abort_startup(reason).await;
             Self::drain_channels(
                 &mut time_evt_rx,
@@ -2091,11 +2146,20 @@ impl LiveNode {
     }
 
     fn process_exec_event(&mut self, event: ExecutionEvent) {
+        let _ = self.process_exec_event_with_outcome(event);
+    }
+
+    fn process_exec_event_with_outcome(
+        &mut self,
+        event: ExecutionEvent,
+    ) -> ExecutionApplicationSummary {
         let Some(close_ids) = self.observe_exec_event_before_dispatch(&event) else {
-            return;
+            let mut summary = ExecutionApplicationSummary::default();
+            summary.record(None);
+            return summary;
         };
 
-        self.dispatch_exec_event_and_commit_fill(event);
+        let summary = self.dispatch_exec_event_and_commit_fill(event);
 
         for client_order_id in &close_ids {
             let is_closed = self
@@ -2109,6 +2173,7 @@ impl LiveNode {
                     .clear_recon_tracking(client_order_id, true);
             }
         }
+        summary
     }
 
     fn process_exec_command(&mut self, message: TradingCommandMessage) {
@@ -2129,17 +2194,21 @@ impl LiveNode {
     /// [`AsyncRunner::handle_exec_event`]; the gated commit runs AFTER dispatch,
     /// so a fill the execution engine rejects (unknown order, invalid
     /// transition) is never marked and its later `Fill` report stays eligible.
-    fn dispatch_exec_event_and_commit_fill(&mut self, evt: ExecutionEvent) {
+    fn dispatch_exec_event_and_commit_fill(
+        &mut self,
+        evt: ExecutionEvent,
+    ) -> ExecutionApplicationSummary {
         let recent_fill_candidate = match &evt {
             ExecutionEvent::Order(OrderEventAny::Filled(fill)) => Some(fill.clone()),
             _ => None,
         };
 
-        AsyncRunner::handle_exec_event(evt);
+        let summary = AsyncRunner::handle_exec_event_with_outcome(evt);
 
         if let Some(fill) = &recent_fill_candidate {
             self.exec_manager.commit_recent_fill_if_applied(fill);
         }
+        summary
     }
 
     async fn connect_data_phase(&mut self, deadline: dst::time::Instant) -> anyhow::Result<()> {
@@ -4398,6 +4467,9 @@ mod tests {
 
         assert!(is_recent_fill(&node, &fill));
         assert_eq!(node.observe_exec_event_before_dispatch(&report_event), None);
+        let suppressed = node.process_exec_event_with_outcome(report_event);
+        assert_eq!(suppressed.unacknowledged, 1);
+        assert!(!suppressed.all_applications_confirmed());
     }
 
     #[rstest]
@@ -6218,15 +6290,20 @@ mod tests {
         handle.set_starting();
         let observer = handle.clone();
         handle.publish_startup_reconciliation(StartupReconciliationSummary {
+            instance_id: UUID4::new(),
+            completion_sequence: None,
+            client_identities_unchanged: false,
             outcome: StartupReconciliationOutcome::Failed,
             requested_lookback_mins: None,
             ts_started: UnixNanos::default(),
             ts_finished: UnixNanos::default(),
+            pending_execution: ExecutionApplicationSummary::default(),
             clients: Vec::new(),
         });
         handle.set_stopped();
         let previous = observer.startup_reconciliation_summary().unwrap();
         assert_eq!(previous.outcome, StartupReconciliationOutcome::Failed);
+        assert_eq!(previous.completion_sequence.unwrap().get(), 1);
 
         handle.set_starting();
 
@@ -6234,6 +6311,16 @@ mod tests {
         assert!(observer.startup_reconciliation_summary().is_none());
         // Already retrieved snapshots remain inert diagnostics.
         assert_eq!(previous.outcome, StartupReconciliationOutcome::Failed);
+        let mut next = (*previous).clone();
+        next.outcome = StartupReconciliationOutcome::Finished;
+        // Publication owns the sequence even when the supplied diagnostic carries an old one.
+        handle.publish_startup_reconciliation(next);
+        let current = observer.startup_reconciliation_summary().unwrap();
+        assert_eq!(current.completion_sequence.unwrap().get(), 2);
+        assert_eq!(current.instance_id, previous.instance_id);
+        assert_eq!(current.ts_finished, previous.ts_finished);
+        assert_eq!(current.outcome, StartupReconciliationOutcome::Finished);
+        assert_eq!(previous.completion_sequence.unwrap().get(), 1);
     }
 
     #[rstest]

@@ -751,7 +751,7 @@ impl PolymarketExecutionClient {
             .context("failed to fetch positions from Data API")?;
 
         let ts_now = self.clock.get_time_ns();
-        let reports = build_reconciliation_position_reports(
+        let (reports, _) = build_reconciliation_position_reports(
             &positions,
             self.core.account_id,
             ts_now,

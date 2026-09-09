@@ -162,7 +162,13 @@ fn order_event_handler() -> TypedIntoMessageSavingHandler<OrderEventAny> {
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(Some(
         Ustr::from("ExecEngine.process"),
     ));
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     saving_handler
 }
 
@@ -327,17 +333,20 @@ fn order_event_handler_with_cache(
     let messages: Rc<RefCell<Vec<OrderEventAny>>> = Rc::new(RefCell::new(Vec::new()));
     let messages_for_handler = messages.clone();
 
-    msgbus::register_order_event_endpoint(
-        MessagingSwitchboard::exec_engine_process(),
-        TypedIntoHandler::from(move |event: OrderEventAny| {
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = TypedIntoHandler::from(move |event: OrderEventAny| {
             if let Ok(mut cache_ref) = cache.try_borrow_mut() {
                 let _ = cache_ref.update_order(&event);
             }
 
             // Save the event for test assertions
             messages_for_handler.borrow_mut().push(event);
-        }),
-    );
+        });
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     TypedIntoMessageSavingHandler::new_with_messages(
         Some(Ustr::from("ExecEngine.process")),
@@ -9890,7 +9899,13 @@ fn test_process_order_rejection_no_refcell_reentrant_panic(
     let handler = TypedIntoHandler::from(move |_event: OrderEventAny| {
         let _guard = cache_clone.borrow_mut();
     });
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let mut engine = get_order_matching_engine(instrument, None, Some(cache), None, None);
 

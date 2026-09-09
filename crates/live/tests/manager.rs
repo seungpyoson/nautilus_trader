@@ -40,7 +40,7 @@ use nautilus_common::{
         },
     },
     msgbus::{
-        self, MessagingSwitchboard,
+        self, MessagingSwitchboard, TypedIntoHandler,
         stubs::{
             TypedMessageSavingHandler, get_any_saving_handler,
             get_typed_into_message_saving_handler, get_typed_message_saving_handler,
@@ -3542,7 +3542,13 @@ async fn test_split_lighter_reduce_only_lifecycle_does_not_apply_economics() {
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -3699,7 +3705,13 @@ async fn test_bounded_complete_lifecycle_applies_beside_split_close() {
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let (mut opening_order, opening_fill) = create_bounded_fill_lifecycle(
         instrument_id,
@@ -3899,7 +3911,13 @@ async fn test_bounded_hedge_fill_applies_economics_once() {
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4116,7 +4134,13 @@ async fn test_bounded_reduce_only_fill_requires_sufficient_correlated_position(
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4242,7 +4266,13 @@ async fn test_incomplete_bounded_reports_project_fills_order_only(#[case] has_fi
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4337,7 +4367,13 @@ async fn test_bounded_active_partial_order_keeps_order_without_economics() {
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4433,7 +4469,13 @@ async fn test_bounded_nonflat_position_requires_coherent_historical_fill(
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4543,7 +4585,13 @@ async fn test_bounded_complete_reports_require_unambiguous_position_coverage(
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4656,7 +4704,13 @@ async fn test_bounded_interleaved_multi_fill_orders_project_economics_order_only
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4767,7 +4821,13 @@ async fn test_bounded_same_timestamp_orders_project_economics_order_only() {
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
