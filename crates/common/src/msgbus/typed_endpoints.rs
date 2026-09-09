@@ -15,7 +15,7 @@
 
 //! Type-safe endpoint mapping for point-to-point messaging.
 //!
-//! This module provides [`EndpointMap<T>`] for registering handlers at named
+//! This module provides [`EndpointMap<T, R>`] for registering handlers at named
 //! endpoints and sending typed messages directly to them.
 
 use std::fmt::Debug;
@@ -31,17 +31,17 @@ use super::{
 ///
 /// Provides O(1) lookup for registered endpoints and type-safe message dispatch.
 #[derive(Debug)]
-pub struct EndpointMap<T: 'static> {
-    handlers: IndexMap<MStr<Endpoint>, TypedHandler<T>>,
+pub struct EndpointMap<T: 'static, R: 'static = ()> {
+    handlers: IndexMap<MStr<Endpoint>, TypedHandler<T, R>>,
 }
 
-impl<T: 'static> Default for EndpointMap<T> {
+impl<T: 'static, R: 'static> Default for EndpointMap<T, R> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: 'static> EndpointMap<T> {
+impl<T: 'static, R: 'static> EndpointMap<T, R> {
     /// Creates a new empty endpoint map.
     #[must_use]
     pub fn new() -> Self {
@@ -77,7 +77,7 @@ impl<T: 'static> EndpointMap<T> {
     /// Registers a handler at an endpoint.
     ///
     /// If the endpoint already has a handler, it will be replaced.
-    pub fn register(&mut self, endpoint: MStr<Endpoint>, handler: TypedHandler<T>) {
+    pub fn register(&mut self, endpoint: MStr<Endpoint>, handler: TypedHandler<T, R>) {
         log::debug!(
             "Registering endpoint '{endpoint}' with handler ID {}",
             handler.id()
@@ -93,7 +93,7 @@ impl<T: 'static> EndpointMap<T> {
 
     /// Gets the handler registered at an endpoint.
     #[must_use]
-    pub fn get(&self, endpoint: MStr<Endpoint>) -> Option<&TypedHandler<T>> {
+    pub fn get(&self, endpoint: MStr<Endpoint>) -> Option<&TypedHandler<T, R>> {
         self.handlers.get(&endpoint)
     }
 
@@ -130,17 +130,17 @@ impl<T: 'static> EndpointMap<T> {
 /// Unlike [`EndpointMap`] which borrows messages, this map transfers ownership
 /// of messages to handlers, enabling zero-copy processing.
 #[derive(Debug)]
-pub struct IntoEndpointMap<T: 'static> {
-    handlers: IndexMap<MStr<Endpoint>, TypedIntoHandler<T>>,
+pub struct IntoEndpointMap<T: 'static, R: 'static = ()> {
+    handlers: IndexMap<MStr<Endpoint>, TypedIntoHandler<T, R>>,
 }
 
-impl<T: 'static> Default for IntoEndpointMap<T> {
+impl<T: 'static, R: 'static> Default for IntoEndpointMap<T, R> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: 'static> IntoEndpointMap<T> {
+impl<T: 'static, R: 'static> IntoEndpointMap<T, R> {
     /// Creates a new empty endpoint map.
     #[must_use]
     pub fn new() -> Self {
@@ -176,7 +176,7 @@ impl<T: 'static> IntoEndpointMap<T> {
     /// Registers a handler at an endpoint.
     ///
     /// If the endpoint already has a handler, it will be replaced.
-    pub fn register(&mut self, endpoint: MStr<Endpoint>, handler: TypedIntoHandler<T>) {
+    pub fn register(&mut self, endpoint: MStr<Endpoint>, handler: TypedIntoHandler<T, R>) {
         log::debug!(
             "Registering endpoint '{endpoint}' with handler ID {}",
             handler.id()
@@ -192,7 +192,7 @@ impl<T: 'static> IntoEndpointMap<T> {
 
     /// Gets the handler registered at an endpoint.
     #[must_use]
-    pub fn get(&self, endpoint: MStr<Endpoint>) -> Option<&TypedIntoHandler<T>> {
+    pub fn get(&self, endpoint: MStr<Endpoint>) -> Option<&TypedIntoHandler<T, R>> {
         self.handlers.get(&endpoint)
     }
 

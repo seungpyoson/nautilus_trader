@@ -1987,7 +1987,13 @@ mod tests {
     fn register_risk_event_handler(id: &str) -> TypedIntoMessageSavingHandler<OrderEventAny> {
         let (handler, saving_handler) =
             get_typed_into_message_saving_handler::<OrderEventAny>(Some(Ustr::from(id)));
-        msgbus::register_order_event_endpoint(MessagingSwitchboard::risk_engine_process(), handler);
+        msgbus::register_order_event_endpoint(MessagingSwitchboard::risk_engine_process(), {
+            let receiver = handler;
+            TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+                receiver.handle(event);
+                None
+            })
+        });
         saving_handler
     }
 
@@ -1997,23 +2003,29 @@ mod tests {
     ) -> TypedIntoMessageSavingHandler<OrderEventAny> {
         let messages = Rc::new(RefCell::new(Vec::new()));
         let messages_for_handler = messages.clone();
-        msgbus::register_order_event_endpoint(
-            MessagingSwitchboard::exec_engine_process(),
-            TypedIntoHandler::from(move |event: OrderEventAny| {
+        msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+            let receiver = TypedIntoHandler::from(move |event: OrderEventAny| {
                 cache.borrow_mut().update_order(&event).unwrap();
                 messages_for_handler.borrow_mut().push(event);
-            }),
-        );
+            });
+            TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+                receiver.handle(event);
+                None
+            })
+        });
         TypedIntoMessageSavingHandler::new_with_messages(Some(Ustr::from(id)), messages)
     }
 
     fn register_portfolio_event_handler(id: &str) -> TypedIntoMessageSavingHandler<OrderEventAny> {
         let (handler, saving_handler) =
             get_typed_into_message_saving_handler::<OrderEventAny>(Some(Ustr::from(id)));
-        msgbus::register_order_event_endpoint(
-            MessagingSwitchboard::portfolio_update_order(),
-            handler,
-        );
+        msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), {
+            let receiver = handler;
+            TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+                receiver.handle(event);
+                None
+            })
+        });
         saving_handler
     }
 

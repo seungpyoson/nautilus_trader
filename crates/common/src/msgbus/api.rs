@@ -68,7 +68,7 @@ use super::{
 };
 use crate::messages::{
     data::{DataCommand, DataResponse},
-    execution::{ExecutionReport, TradingCommand},
+    execution::{EventApplicationOutcome, ExecutionReport, TradingCommand},
 };
 
 /// Registers a handler for an endpoint using runtime type dispatch (Any).
@@ -129,7 +129,7 @@ pub fn register_bar_endpoint(endpoint: MStr<Endpoint>, handler: TypedHandler<Bar
 /// Registers an order event handler at an endpoint (ownership-based).
 pub fn register_order_event_endpoint(
     endpoint: MStr<Endpoint>,
-    handler: TypedIntoHandler<OrderEventAny>,
+    handler: TypedIntoHandler<OrderEventAny, Option<EventApplicationOutcome>>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -140,7 +140,7 @@ pub fn register_order_event_endpoint(
 /// Registers an account state handler at an endpoint.
 pub fn register_account_state_endpoint(
     endpoint: MStr<Endpoint>,
-    handler: TypedHandler<AccountState>,
+    handler: TypedHandler<AccountState, Option<EventApplicationOutcome>>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -184,7 +184,7 @@ pub fn register_data_response_endpoint(
 /// Registers an execution report handler at an endpoint (ownership-based).
 pub fn register_execution_report_endpoint(
     endpoint: MStr<Endpoint>,
-    handler: TypedIntoHandler<ExecutionReport>,
+    handler: TypedIntoHandler<ExecutionReport, Option<EventApplicationOutcome>>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -1402,7 +1402,7 @@ pub fn send_response(correlation_id: &UUID4, message: &DataResponse) {
 
 /// Sends a quote tick to an endpoint handler.
 pub fn send_quote(endpoint: MStr<Endpoint>, quote: &QuoteTick) {
-    send_endpoint_ref(
+    let _ = send_endpoint_ref(
         endpoint,
         quote,
         |bus| bus.endpoints_quotes.get(endpoint),
@@ -1412,7 +1412,7 @@ pub fn send_quote(endpoint: MStr<Endpoint>, quote: &QuoteTick) {
 
 /// Sends a trade tick to an endpoint handler.
 pub fn send_trade(endpoint: MStr<Endpoint>, trade: &TradeTick) {
-    send_endpoint_ref(
+    let _ = send_endpoint_ref(
         endpoint,
         trade,
         |bus| bus.endpoints_trades.get(endpoint),
@@ -1422,7 +1422,7 @@ pub fn send_trade(endpoint: MStr<Endpoint>, trade: &TradeTick) {
 
 /// Sends a bar to an endpoint handler.
 pub fn send_bar(endpoint: MStr<Endpoint>, bar: &Bar) {
-    send_endpoint_ref(
+    let _ = send_endpoint_ref(
         endpoint,
         bar,
         |bus| bus.endpoints_bars.get(endpoint),
@@ -1432,27 +1432,53 @@ pub fn send_bar(endpoint: MStr<Endpoint>, bar: &Bar) {
 
 /// Sends an order event to an endpoint handler, transferring ownership.
 pub fn send_order_event(endpoint: MStr<Endpoint>, event: OrderEventAny) {
+    let _ = send_order_event_with_outcome(endpoint, event);
+}
+
+/// Sends through the registered endpoint and returns its native application outcome.
+///
+/// Returns `None` when the endpoint is absent or cannot acknowledge application.
+/// This result does not acknowledge subscribers or external persistence.
+#[must_use]
+pub fn send_order_event_with_outcome(
+    endpoint: MStr<Endpoint>,
+    event: OrderEventAny,
+) -> Option<EventApplicationOutcome> {
     send_endpoint_owned(
         endpoint,
         event,
         |bus| bus.endpoints_order_events.get(endpoint),
         "send_order_event",
-    );
+    )
+    .flatten()
 }
 
 /// Sends an account state to an endpoint handler.
 pub fn send_account_state(endpoint: MStr<Endpoint>, state: &AccountState) {
+    let _ = send_account_state_with_outcome(endpoint, state);
+}
+
+/// Sends through the registered endpoint and returns its native application outcome.
+///
+/// Returns `None` when the endpoint is absent or cannot acknowledge application.
+/// This result does not acknowledge subscribers or external persistence.
+#[must_use]
+pub fn send_account_state_with_outcome(
+    endpoint: MStr<Endpoint>,
+    state: &AccountState,
+) -> Option<EventApplicationOutcome> {
     send_endpoint_ref(
         endpoint,
         state,
         |bus| bus.endpoints_account_state.get(endpoint),
         "send_account_state",
-    );
+    )
+    .flatten()
 }
 
 /// Sends a trading command to an endpoint handler, transferring ownership.
 pub fn send_trading_command(endpoint: MStr<Endpoint>, command: TradingCommand) {
-    send_endpoint_owned(
+    let _ = send_endpoint_owned(
         endpoint,
         command,
         |bus| bus.endpoints_trading_commands.get(endpoint),
@@ -1463,7 +1489,7 @@ pub fn send_trading_command(endpoint: MStr<Endpoint>, command: TradingCommand) {
 /// Sends a data command to an endpoint handler, transferring ownership.
 pub fn send_data_command(endpoint: MStr<Endpoint>, command: DataCommand) {
     let is_request = data_command_is_request(&command);
-    send_endpoint_owned_counted(
+    let _ = send_endpoint_owned_counted(
         endpoint,
         command,
         |bus| bus.endpoints_data_commands.get(endpoint),
@@ -1474,7 +1500,7 @@ pub fn send_data_command(endpoint: MStr<Endpoint>, command: DataCommand) {
 
 /// Sends a data response to an endpoint handler, transferring ownership.
 pub fn send_data_response(endpoint: MStr<Endpoint>, response: DataResponse) {
-    send_endpoint_owned(
+    let _ = send_endpoint_owned(
         endpoint,
         response,
         |bus| bus.endpoints_data_responses.get(endpoint),
@@ -1484,17 +1510,30 @@ pub fn send_data_response(endpoint: MStr<Endpoint>, response: DataResponse) {
 
 /// Sends an execution report to an endpoint handler, transferring ownership.
 pub fn send_execution_report(endpoint: MStr<Endpoint>, report: ExecutionReport) {
+    let _ = send_execution_report_with_outcome(endpoint, report);
+}
+
+/// Sends through the registered endpoint and returns its native application outcome.
+///
+/// Returns `None` when the endpoint is absent or cannot acknowledge application.
+/// This result does not acknowledge subscribers or external persistence.
+#[must_use]
+pub fn send_execution_report_with_outcome(
+    endpoint: MStr<Endpoint>,
+    report: ExecutionReport,
+) -> Option<EventApplicationOutcome> {
     send_endpoint_owned(
         endpoint,
         report,
         |bus| bus.endpoints_exec_reports.get(endpoint),
         "send_execution_report",
-    );
+    )
+    .flatten()
 }
 
 /// Sends data to an endpoint handler, transferring ownership.
 pub fn send_data(endpoint: MStr<Endpoint>, data: Data) {
-    send_endpoint_owned(
+    let _ = send_endpoint_owned(
         endpoint,
         data,
         |bus| bus.endpoints_data.get(endpoint),
@@ -1505,7 +1544,7 @@ pub fn send_data(endpoint: MStr<Endpoint>, data: Data) {
 /// Sends DeFi data to an endpoint handler, transferring ownership.
 #[cfg(feature = "defi")]
 pub fn send_defi_data(endpoint: MStr<Endpoint>, data: DefiData) {
-    send_endpoint_owned(
+    let _ = send_endpoint_owned(
         endpoint,
         data,
         |bus| bus.endpoints_defi_data.get(endpoint),
@@ -1514,13 +1553,14 @@ pub fn send_defi_data(endpoint: MStr<Endpoint>, data: DefiData) {
 }
 
 #[inline]
-fn send_endpoint_ref<T: 'static, F>(
+fn send_endpoint_ref<T: 'static, R: 'static, F>(
     endpoint: MStr<Endpoint>,
     message: &T,
     get_handler: F,
     fn_name: &str,
-) where
-    F: FnOnce(&MessageBus) -> Option<&TypedHandler<T>>,
+) -> Option<R>
+where
+    F: FnOnce(&MessageBus) -> Option<&TypedHandler<T, R>>,
 {
     dispatch_tap_send(endpoint, message);
 
@@ -1535,33 +1575,36 @@ fn send_endpoint_ref<T: 'static, F>(
     };
 
     if let Some(handler) = handler {
-        handler.handle(message);
+        Some(handler.handle(message))
     } else {
         log::error!("{fn_name}: no registered endpoint '{endpoint}'");
+        None
     }
 }
 
 #[inline]
-fn send_endpoint_owned<T: 'static, F>(
+fn send_endpoint_owned<T: 'static, R: 'static, F>(
     endpoint: MStr<Endpoint>,
     message: T,
     get_handler: F,
     fn_name: &str,
-) where
-    F: FnOnce(&MessageBus) -> Option<&TypedIntoHandler<T>>,
+) -> Option<R>
+where
+    F: FnOnce(&MessageBus) -> Option<&TypedIntoHandler<T, R>>,
 {
-    send_endpoint_owned_counted(endpoint, message, get_handler, fn_name, false);
+    send_endpoint_owned_counted(endpoint, message, get_handler, fn_name, false)
 }
 
 #[inline]
-fn send_endpoint_owned_counted<T: 'static, F>(
+fn send_endpoint_owned_counted<T: 'static, R: 'static, F>(
     endpoint: MStr<Endpoint>,
     message: T,
     get_handler: F,
     fn_name: &str,
     count_request: bool,
-) where
-    F: FnOnce(&MessageBus) -> Option<&TypedIntoHandler<T>>,
+) -> Option<R>
+where
+    F: FnOnce(&MessageBus) -> Option<&TypedIntoHandler<T, R>>,
 {
     // Capture before the dispatch consumes `message`
     dispatch_tap_send(endpoint, &message);
@@ -1580,9 +1623,10 @@ fn send_endpoint_owned_counted<T: 'static, F>(
     };
 
     if let Some(handler) = handler {
-        handler.handle(message);
+        Some(handler.handle(message))
     } else {
         log::error!("{fn_name}: no registered endpoint '{endpoint}'");
+        None
     }
 }
 
@@ -1776,6 +1820,94 @@ mod tests {
             2,
             "{response_kind} duplicate responses must still increment the response count",
         );
+    }
+
+    #[rstest]
+    #[case(false, None)]
+    #[case(true, None)]
+    #[case(true, Some(EventApplicationOutcome::Applied))]
+    #[case(true, Some(EventApplicationOutcome::Incomplete))]
+    fn test_endpoint_outcome_requires_handler_acknowledgement(
+        #[case] registered: bool,
+        #[case] outcome: Option<EventApplicationOutcome>,
+        #[values("order", "account", "report")] message_type: &str,
+    ) {
+        use nautilus_model::reports::ExecutionMassStatus;
+
+        let bus = get_message_bus();
+        *bus.borrow_mut() = MessageBus::default();
+        let endpoint: MStr<Endpoint> = "Test.application".into();
+        let calls = Rc::new(Cell::new(0));
+        let callback_calls = Rc::clone(&calls);
+        let acknowledge = move || {
+            // The canonical dispatch must release its bus borrow before invoking the endpoint
+            let bus = get_message_bus();
+            let _guard = bus.borrow_mut();
+            callback_calls.set(callback_calls.get() + 1);
+            outcome
+        };
+
+        let result = match message_type {
+            "order" => {
+                if registered {
+                    register_order_event_endpoint(
+                        endpoint,
+                        TypedIntoHandler::from(move |_: OrderEventAny| acknowledge()),
+                    );
+                }
+
+                send_order_event_with_outcome(
+                    endpoint,
+                    OrderEventAny::Denied(OrderDeniedSpec::builder().build()),
+                )
+            }
+            "account" => {
+                if registered {
+                    register_account_state_endpoint(
+                        endpoint,
+                        TypedHandler::from(move |_: &AccountState| acknowledge()),
+                    );
+                }
+
+                let state = AccountState::new(
+                    AccountId::new("SIM-001"),
+                    AccountType::Cash,
+                    vec![],
+                    vec![],
+                    true,
+                    UUID4::new(),
+                    0.into(),
+                    0.into(),
+                    Some(Currency::USD()),
+                );
+                send_account_state_with_outcome(endpoint, &state)
+            }
+            "report" => {
+                if registered {
+                    register_execution_report_endpoint(
+                        endpoint,
+                        TypedIntoHandler::from(move |_: ExecutionReport| acknowledge()),
+                    );
+                }
+
+                let report = ExecutionMassStatus::new(
+                    ClientId::new("SIM"),
+                    AccountId::new("SIM-001"),
+                    Venue::new("SIM"),
+                    0.into(),
+                    None,
+                );
+                send_execution_report_with_outcome(
+                    endpoint,
+                    ExecutionReport::MassStatus(Box::new(report)),
+                )
+            }
+            _ => unreachable!(),
+        };
+
+        assert_eq!(result, if registered { outcome } else { None });
+        assert_eq!(calls.get(), usize::from(registered));
+        assert_eq!(bus.borrow().sent_count(), u64::from(registered));
     }
 
     #[rstest]
@@ -3196,7 +3328,13 @@ mod tests {
         });
 
         let endpoint: MStr<Endpoint> = "ReentrantTest.accountState".into();
-        register_account_state_endpoint(endpoint, handler);
+        register_account_state_endpoint(endpoint, {
+            let receiver = handler;
+            TypedHandler::from_with_id(receiver.id(), move |event| {
+                receiver.handle(event);
+                None
+            })
+        });
 
         let state = AccountState::new(
             AccountId::new("SIM-001"),
@@ -3229,7 +3367,13 @@ mod tests {
         });
 
         let endpoint: MStr<Endpoint> = "ReentrantTest.orderEvent".into();
-        register_order_event_endpoint(endpoint, handler);
+        register_order_event_endpoint(endpoint, {
+            let receiver = handler;
+            TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+                receiver.handle(event);
+                None
+            })
+        });
 
         let event = OrderEventAny::Denied(OrderDeniedSpec::builder().build());
         send_order_event(endpoint, event);
@@ -3604,7 +3748,13 @@ mod tests {
         });
 
         let endpoint: MStr<Endpoint> = "ReentrantTest.execReport".into();
-        register_execution_report_endpoint(endpoint, handler);
+        register_execution_report_endpoint(endpoint, {
+            let receiver = handler;
+            TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+                receiver.handle(event);
+                None
+            })
+        });
 
         let report = ExecutionReport::MassStatus(Box::new(ExecutionMassStatus::new(
             ClientId::new("SIM"),
@@ -3653,7 +3803,13 @@ mod tests {
         });
 
         let event_endpoint: MStr<Endpoint> = "ReentrantTest.orderEvt".into();
-        register_order_event_endpoint(event_endpoint, event_handler);
+        register_order_event_endpoint(event_endpoint, {
+            let receiver = event_handler;
+            TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+                receiver.handle(event);
+                None
+            })
+        });
 
         let event = OrderEventAny::Denied(OrderDeniedSpec::builder().build());
         send_order_event(event_endpoint, event);
@@ -3726,7 +3882,13 @@ mod tests {
             *evt_received_clone.borrow_mut() = true;
         });
         let evt_endpoint: MStr<Endpoint> = "ReentrantTest.orderEvt2".into();
-        register_order_event_endpoint(evt_endpoint, evt_handler);
+        register_order_event_endpoint(evt_endpoint, {
+            let receiver = evt_handler;
+            TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+                receiver.handle(event);
+                None
+            })
+        });
 
         let cmd_handler = TypedIntoHandler::from(move |_cmd: TradingCommand| {
             let event = OrderEventAny::Denied(OrderDeniedSpec::builder().build());
@@ -3773,7 +3935,13 @@ mod tests {
             *final_received_clone.borrow_mut() = true;
         });
         let final_evt_endpoint: MStr<Endpoint> = "ReentrantTest.finalEvt".into();
-        register_order_event_endpoint(final_evt_endpoint, final_evt_handler);
+        register_order_event_endpoint(final_evt_endpoint, {
+            let receiver = final_evt_handler;
+            TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+                receiver.handle(event);
+                None
+            })
+        });
 
         let call_depth_clone2 = call_depth.clone();
         let mid_cmd_handler = TypedIntoHandler::from(move |_cmd: TradingCommand| {
@@ -3801,7 +3969,13 @@ mod tests {
             send_trading_command(mid_cmd_endpoint, command);
         });
         let init_evt_endpoint: MStr<Endpoint> = "ReentrantTest.initEvt".into();
-        register_order_event_endpoint(init_evt_endpoint, init_evt_handler);
+        register_order_event_endpoint(init_evt_endpoint, {
+            let receiver = init_evt_handler;
+            TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+                receiver.handle(event);
+                None
+            })
+        });
 
         let event = OrderEventAny::Denied(OrderDeniedSpec::builder().build());
         send_order_event(init_evt_endpoint, event);

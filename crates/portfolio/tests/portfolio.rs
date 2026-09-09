@@ -18,6 +18,7 @@ use std::{cell::RefCell, rc::Rc};
 use nautilus_common::{
     cache::Cache,
     clock::{Clock, TestClock},
+    messages::execution::EventApplicationOutcome,
     msgbus::{self, MessageBus, MessagingSwitchboard, TypedHandler},
 };
 use nautilus_core::{UUID4, UnixNanos, approx_eq};
@@ -10046,4 +10047,52 @@ fn test_portfolio_statistics_returns_snapshot(
             .values()
             .all(|m| m.contains_key("PnL (total)"))
     );
+}
+
+#[rstest]
+fn test_account_endpoint_acknowledges_native_application_and_rejects_negative_balance() {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let portfolio = Portfolio::new(clock, Rc::clone(&cache), None);
+    let account_id = AccountId::from("SIM-ACK");
+    let endpoint = MessagingSwitchboard::portfolio_update_account();
+    let state = |amount: &str| {
+        let total = Money::from(amount);
+        AccountState::new(
+            account_id,
+            AccountType::Cash,
+            vec![AccountBalance::new(
+                total,
+                Money::zero(Currency::USD()),
+                total,
+            )],
+            vec![],
+            true,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+            Some(Currency::USD()),
+        )
+    };
+    let initial = state("1000.00 USD");
+    let negative = state("-1.00 USD");
+
+    let first = msgbus::send_account_state_with_outcome(endpoint, &initial);
+    let duplicate = msgbus::send_account_state_with_outcome(endpoint, &initial);
+    let rejected = msgbus::send_account_state_with_outcome(endpoint, &negative);
+    let retained = cache
+        .borrow()
+        .account(&account_id)
+        .unwrap()
+        .last_event()
+        .unwrap()
+        .event_id;
+    drop(portfolio);
+    let gone = msgbus::send_account_state_with_outcome(endpoint, &initial);
+
+    assert_eq!(first, Some(EventApplicationOutcome::Applied));
+    assert_eq!(duplicate, Some(EventApplicationOutcome::Applied));
+    assert_eq!(rejected, Some(EventApplicationOutcome::Incomplete));
+    assert_eq!(retained, initial.event_id);
+    assert_eq!(gone, None);
 }

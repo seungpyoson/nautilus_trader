@@ -27,21 +27,21 @@ use ustr::Ustr;
 ///
 /// Provides zero-cost dispatch for statically typed messages. Can also be used
 /// with `dyn Any` for dynamic dispatch when type flexibility is needed.
-pub trait Handler<T: ?Sized>: 'static {
+pub trait Handler<T: ?Sized, R = ()>: 'static {
     /// Returns the unique identifier for this handler.
     fn id(&self) -> Ustr;
 
     /// Handles a message of type `T`.
-    fn handle(&self, message: &T);
+    fn handle(&self, message: &T) -> R;
 }
 
-impl<T: ?Sized, H: Handler<T>> Handler<T> for Rc<H> {
+impl<T: ?Sized, R, H: Handler<T, R>> Handler<T, R> for Rc<H> {
     fn id(&self) -> Ustr {
         (**self).id()
     }
 
-    fn handle(&self, message: &T) {
-        (**self).handle(message);
+    fn handle(&self, message: &T) -> R {
+        (**self).handle(message)
     }
 }
 
@@ -55,36 +55,36 @@ impl<T: ?Sized, H: Handler<T>> Handler<T> for Rc<H> {
 /// Uses `Rc` intentionally (not `Arc`) for single-threaded use within each
 /// async runtime. The `MessageBus` uses thread-local storage to ensure each
 /// thread gets its own handlers.
-pub struct TypedHandler<T: 'static + ?Sized>(pub Rc<dyn Handler<T>>);
+pub struct TypedHandler<T: 'static + ?Sized, R: 'static = ()>(pub Rc<dyn Handler<T, R>>);
 
-impl<T: 'static + ?Sized> Clone for TypedHandler<T> {
+impl<T: 'static + ?Sized, R: 'static> Clone for TypedHandler<T, R> {
     fn clone(&self) -> Self {
         Self(Rc::clone(&self.0))
     }
 }
 
-impl<T: 'static + ?Sized> TypedHandler<T> {
+impl<T: 'static + ?Sized, R: 'static> TypedHandler<T, R> {
     /// Returns the handler ID.
     pub fn id(&self) -> Ustr {
         self.0.id()
     }
 
     /// Handles a message by delegating to the inner handler.
-    pub fn handle(&self, message: &T) {
-        self.0.handle(message);
+    pub fn handle(&self, message: &T) -> R {
+        self.0.handle(message)
     }
 }
 
-impl<T: 'static> TypedHandler<T> {
+impl<T: 'static, R: 'static> TypedHandler<T, R> {
     /// Creates a new typed handler from any type implementing `Handler<T>`.
-    pub fn new<H: Handler<T>>(handler: H) -> Self {
+    pub fn new<H: Handler<T, R>>(handler: H) -> Self {
         Self(Rc::new(handler))
     }
 
     /// Creates a new typed handler from a callback function.
     pub fn from<F>(callback: F) -> Self
     where
-        F: Fn(&T) + 'static,
+        F: Fn(&T) -> R + 'static,
     {
         Self::new(CallbackHandler::new(None::<&str>, callback))
     }
@@ -92,13 +92,13 @@ impl<T: 'static> TypedHandler<T> {
     /// Creates a new typed handler from a callback function with a custom ID.
     pub fn from_with_id<S: AsRef<str>, F>(id: S, callback: F) -> Self
     where
-        F: Fn(&T) + 'static,
+        F: Fn(&T) -> R + 'static,
     {
         Self::new(CallbackHandler::new(Some(id), callback))
     }
 }
 
-impl<T: 'static + ?Sized> Debug for TypedHandler<T> {
+impl<T: 'static + ?Sized, R: 'static> Debug for TypedHandler<T, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(TypedHandler))
             .field("id", &self.0.id())
@@ -107,15 +107,15 @@ impl<T: 'static + ?Sized> Debug for TypedHandler<T> {
     }
 }
 
-impl<T: 'static + ?Sized> PartialEq for TypedHandler<T> {
+impl<T: 'static + ?Sized, R: 'static> PartialEq for TypedHandler<T, R> {
     fn eq(&self, other: &Self) -> bool {
         self.0.id() == other.0.id()
     }
 }
 
-impl<T: 'static + ?Sized> Eq for TypedHandler<T> {}
+impl<T: 'static + ?Sized, R: 'static> Eq for TypedHandler<T, R> {}
 
-impl<T: 'static + ?Sized> std::hash::Hash for TypedHandler<T> {
+impl<T: 'static + ?Sized, R: 'static> std::hash::Hash for TypedHandler<T, R> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.id().hash(state);
     }
@@ -171,7 +171,7 @@ struct DowncastingHandler<T, F: Fn(&T)> {
 impl<T: 'static, F: Fn(&T) + 'static> DowncastingHandler<T, F> {
     fn new<S: AsRef<str>>(id: Option<S>, callback: F) -> Self {
         let id_ustr = id.map_or_else(
-            || generate_handler_id::<T, F>(&callback),
+            || generate_handler_id::<T, F, ()>(&callback),
             |s| Ustr::from(s.as_ref()),
         );
         Self {
@@ -237,13 +237,13 @@ impl<F: Fn(&dyn Any) + 'static> Handler<dyn Any> for AnyCallbackHandler<F> {
 ///
 /// This is the typed equivalent of `TypedMessageHandler`,
 /// but without runtime downcasting overhead.
-pub struct CallbackHandler<T, F: Fn(&T)> {
+pub struct CallbackHandler<T, F: Fn(&T) -> R, R = ()> {
     id: Ustr,
     callback: F,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<(T, fn() -> R)>,
 }
 
-impl<T: 'static, F: Fn(&T) + 'static> CallbackHandler<T, F> {
+impl<T: 'static, F: Fn(&T) -> R + 'static, R: 'static> CallbackHandler<T, F, R> {
     /// Creates a new callback handler with an optional custom ID.
     pub fn new<S: AsRef<str>>(id: Option<S>, callback: F) -> Self {
         let id_ustr = id.map_or_else(
@@ -259,17 +259,17 @@ impl<T: 'static, F: Fn(&T) + 'static> CallbackHandler<T, F> {
     }
 }
 
-impl<T: 'static, F: Fn(&T) + 'static> Handler<T> for CallbackHandler<T, F> {
+impl<T: 'static, F: Fn(&T) -> R + 'static, R: 'static> Handler<T, R> for CallbackHandler<T, F, R> {
     fn id(&self) -> Ustr {
         self.id
     }
 
-    fn handle(&self, message: &T) {
-        (self.callback)(message);
+    fn handle(&self, message: &T) -> R {
+        (self.callback)(message)
     }
 }
 
-impl<T, F: Fn(&T)> Debug for CallbackHandler<T, F> {
+impl<T, F: Fn(&T) -> R, R> Debug for CallbackHandler<T, F, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(CallbackHandler))
             .field("id", &self.id)
@@ -278,13 +278,13 @@ impl<T, F: Fn(&T)> Debug for CallbackHandler<T, F> {
     }
 }
 
-fn generate_handler_id<T: 'static + ?Sized, F: 'static + Fn(&T)>(callback: &F) -> Ustr {
+fn generate_handler_id<T: 'static + ?Sized, F: 'static + Fn(&T) -> R, R>(callback: &F) -> Ustr {
     let callback_ptr = std::ptr::from_ref(callback);
     let uuid = UUID4::new();
     Ustr::from(&format!("<{callback_ptr:?}>-{uuid}"))
 }
 
-fn generate_into_handler_id<T: 'static, F: 'static + Fn(T)>(callback: &F) -> Ustr {
+fn generate_into_handler_id<T: 'static, F: 'static + Fn(T) -> R, R>(callback: &F) -> Ustr {
     let callback_ptr = std::ptr::from_ref(callback);
     let uuid = UUID4::new();
     Ustr::from(&format!("<{callback_ptr:?}>-{uuid}"))
@@ -295,21 +295,21 @@ fn generate_into_handler_id<T: 'static, F: 'static + Fn(T)>(callback: &F) -> Ust
 /// Unlike [`Handler<T>`] which borrows messages, this trait takes ownership
 /// of messages, enabling zero-copy processing when the handler needs to store
 /// or forward the message.
-pub trait IntoHandler<T>: 'static {
+pub trait IntoHandler<T, R = ()>: 'static {
     /// Returns the unique identifier for this handler.
     fn id(&self) -> Ustr;
 
     /// Handles a message of type `T`, taking ownership.
-    fn handle(&self, message: T);
+    fn handle(&self, message: T) -> R;
 }
 
-impl<T, H: IntoHandler<T>> IntoHandler<T> for Rc<H> {
+impl<T, R, H: IntoHandler<T, R>> IntoHandler<T, R> for Rc<H> {
     fn id(&self) -> Ustr {
         (**self).id()
     }
 
-    fn handle(&self, message: T) {
-        (**self).handle(message);
+    fn handle(&self, message: T) -> R {
+        (**self).handle(message)
     }
 }
 
@@ -323,24 +323,24 @@ impl<T, H: IntoHandler<T>> IntoHandler<T> for Rc<H> {
 /// Uses `Rc` intentionally (not `Arc`) for single-threaded use within each
 /// async runtime. The `MessageBus` uses thread-local storage to ensure each
 /// thread gets its own handlers.
-pub struct TypedIntoHandler<T: 'static>(pub Rc<dyn IntoHandler<T>>);
+pub struct TypedIntoHandler<T: 'static, R: 'static = ()>(pub Rc<dyn IntoHandler<T, R>>);
 
-impl<T: 'static> Clone for TypedIntoHandler<T> {
+impl<T: 'static, R: 'static> Clone for TypedIntoHandler<T, R> {
     fn clone(&self) -> Self {
         Self(Rc::clone(&self.0))
     }
 }
 
-impl<T: 'static> TypedIntoHandler<T> {
+impl<T: 'static, R: 'static> TypedIntoHandler<T, R> {
     /// Creates a new typed into handler from any type implementing `IntoHandler<T>`.
-    pub fn new<H: IntoHandler<T>>(handler: H) -> Self {
+    pub fn new<H: IntoHandler<T, R>>(handler: H) -> Self {
         Self(Rc::new(handler))
     }
 
     /// Creates a new typed into handler from a callback function.
     pub fn from<F>(callback: F) -> Self
     where
-        F: Fn(T) + 'static,
+        F: Fn(T) -> R + 'static,
     {
         Self::new(IntoCallbackHandler::new(None::<&str>, callback))
     }
@@ -348,7 +348,7 @@ impl<T: 'static> TypedIntoHandler<T> {
     /// Creates a new typed into handler from a callback function with a custom ID.
     pub fn from_with_id<S: AsRef<str>, F>(id: S, callback: F) -> Self
     where
-        F: Fn(T) + 'static,
+        F: Fn(T) -> R + 'static,
     {
         Self::new(IntoCallbackHandler::new(Some(id), callback))
     }
@@ -359,12 +359,12 @@ impl<T: 'static> TypedIntoHandler<T> {
     }
 
     /// Handles a message by delegating to the inner handler, taking ownership.
-    pub fn handle(&self, message: T) {
-        self.0.handle(message);
+    pub fn handle(&self, message: T) -> R {
+        self.0.handle(message)
     }
 }
 
-impl<T: 'static> Debug for TypedIntoHandler<T> {
+impl<T: 'static, R: 'static> Debug for TypedIntoHandler<T, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(TypedIntoHandler))
             .field("id", &self.0.id())
@@ -373,15 +373,15 @@ impl<T: 'static> Debug for TypedIntoHandler<T> {
     }
 }
 
-impl<T: 'static> PartialEq for TypedIntoHandler<T> {
+impl<T: 'static, R: 'static> PartialEq for TypedIntoHandler<T, R> {
     fn eq(&self, other: &Self) -> bool {
         self.0.id() == other.0.id()
     }
 }
 
-impl<T: 'static> Eq for TypedIntoHandler<T> {}
+impl<T: 'static, R: 'static> Eq for TypedIntoHandler<T, R> {}
 
-impl<T: 'static> std::hash::Hash for TypedIntoHandler<T> {
+impl<T: 'static, R: 'static> std::hash::Hash for TypedIntoHandler<T, R> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.id().hash(state);
     }
@@ -390,13 +390,13 @@ impl<T: 'static> std::hash::Hash for TypedIntoHandler<T> {
 /// A callback-based handler implementation that takes ownership.
 ///
 /// This is the ownership-based equivalent of `CallbackHandler`.
-pub struct IntoCallbackHandler<T, F: Fn(T)> {
+pub struct IntoCallbackHandler<T, F: Fn(T) -> R, R = ()> {
     id: Ustr,
     callback: F,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<(T, fn() -> R)>,
 }
 
-impl<T: 'static, F: Fn(T) + 'static> IntoCallbackHandler<T, F> {
+impl<T: 'static, F: Fn(T) -> R + 'static, R: 'static> IntoCallbackHandler<T, F, R> {
     /// Creates a new into callback handler with an optional custom ID.
     pub fn new<S: AsRef<str>>(id: Option<S>, callback: F) -> Self {
         let id_ustr = id.map_or_else(
@@ -412,17 +412,19 @@ impl<T: 'static, F: Fn(T) + 'static> IntoCallbackHandler<T, F> {
     }
 }
 
-impl<T: 'static, F: Fn(T) + 'static> IntoHandler<T> for IntoCallbackHandler<T, F> {
+impl<T: 'static, F: Fn(T) -> R + 'static, R: 'static> IntoHandler<T, R>
+    for IntoCallbackHandler<T, F, R>
+{
     fn id(&self) -> Ustr {
         self.id
     }
 
-    fn handle(&self, message: T) {
-        (self.callback)(message);
+    fn handle(&self, message: T) -> R {
+        (self.callback)(message)
     }
 }
 
-impl<T, F: Fn(T)> Debug for IntoCallbackHandler<T, F> {
+impl<T, F: Fn(T) -> R, R> Debug for IntoCallbackHandler<T, F, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(IntoCallbackHandler))
             .field("id", &self.id)

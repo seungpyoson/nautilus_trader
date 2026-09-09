@@ -803,7 +803,7 @@ fn create_external_terminal_event(
 /// Creates an `OrderFilled` event from a `FillReport`.
 ///
 /// This is used during reconciliation when a fill report is received from the venue.
-/// Returns `None` if the fill is a duplicate or would cause an overfill.
+/// Returns `None` if the fill identity contradicts its order, is a duplicate, or would overfill.
 pub fn reconcile_fill_report(
     order: &OrderAny,
     report: &FillReport,
@@ -811,6 +811,21 @@ pub fn reconcile_fill_report(
     ts_now: UnixNanos,
     allow_overfills: bool,
 ) -> Option<OrderEventAny> {
+    if report.instrument_id != order.instrument_id()
+        || instrument.id() != order.instrument_id()
+        || report.order_side != order.order_side()
+        || report
+            .client_order_id
+            .is_some_and(|id| id != order.client_order_id())
+    {
+        log::error!(
+            "Cannot reconcile fill {}: report identity contradicts order {}",
+            report.trade_id,
+            order.client_order_id(),
+        );
+        return None;
+    }
+
     debug_assert!(
         !report.last_qty.is_zero(),
         "fill report last_qty must be non-zero for {}",

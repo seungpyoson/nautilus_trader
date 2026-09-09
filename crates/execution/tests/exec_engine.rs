@@ -2541,10 +2541,13 @@ fn test_process_stale_cancel_after_fill_does_not_publish_order_event(
     });
     msgbus::subscribe_order_events(order_topic.into(), order_handler.clone(), None);
     msgbus::subscribe_order_events(cancels_topic.into(), cancels_handler.clone(), None);
-    msgbus::register_order_event_endpoint(
-        MessagingSwitchboard::portfolio_update_order(),
-        portfolio_handler,
-    );
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let stale_cancel = OrderEventAny::Canceled(build_order_canceled(
         order.trader_id(),
@@ -2823,10 +2826,13 @@ fn test_process_leg_fill_without_order_updates_position_and_publishes_order_befo
     msgbus::subscribe_order_events(fills_topic.into(), fills_handler.clone(), None);
     msgbus::subscribe_order_events(order_topic.into(), order_handler.clone(), None);
     msgbus::subscribe_position_events(position_topic.into(), position_handler.clone(), None);
-    msgbus::register_order_event_endpoint(
-        MessagingSwitchboard::portfolio_update_order(),
-        portfolio_handler,
-    );
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let event = OrderEventAny::Filled(fill);
 
@@ -2912,10 +2918,13 @@ fn test_process_duplicate_leg_fill_without_order_does_not_reapply_position(
             received_portfolio.borrow_mut().push(event);
         }
     });
-    msgbus::register_order_event_endpoint(
-        MessagingSwitchboard::portfolio_update_order(),
-        portfolio_handler,
-    );
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     execution_engine.process(&event);
     execution_engine.process(&event);
@@ -3112,10 +3121,13 @@ fn test_project_reconciliation_fill_applies_no_portfolio_economics_on_cash_accou
             received_portfolio.borrow_mut().push(event);
         }
     });
-    msgbus::register_order_event_endpoint(
-        MessagingSwitchboard::portfolio_update_order(),
-        portfolio_handler,
-    );
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let fill = build_order_filled(
         order.trader_id(),
@@ -3178,7 +3190,13 @@ fn test_reconciliation_projection_rejects_orderless_leg(
         let received_portfolio = received_portfolio.clone();
         move |event: OrderEventAny| received_portfolio.borrow_mut().push(event)
     });
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let outcome = execution_engine.project_reconciliation_fill_with_outcome(&fill);
 
@@ -3331,7 +3349,13 @@ fn test_process_cash_account_fill_sends_portfolio_update_order_endpoint(
             received.borrow_mut().push((event, status, positions));
         }
     });
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let event = OrderEventAny::Filled(build_order_filled(
         order.trader_id(),
@@ -3416,7 +3440,13 @@ fn test_process_non_fill_order_event_sends_portfolio_update_order_endpoint(
             received.borrow_mut().push((event, status));
         }
     });
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let event = build_portfolio_non_fill_event(event_kind, &instrument, &order, account_id);
     let expected_event_type = event.event_type();
@@ -3472,7 +3502,13 @@ fn test_process_margin_account_fill_sends_single_portfolio_update_before_positio
             received.borrow_mut().push((event, status, positions));
         }
     });
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let event = OrderEventAny::Filled(build_order_filled(
         order.trader_id(),
@@ -13733,7 +13769,10 @@ fn test_reconcile_fill_report_skips_when_instrument_missing(mut execution_engine
         Price::from("1.00000"),
     );
 
-    execution_engine.reconcile_fill_report(&report);
+    assert_eq!(
+        execution_engine.reconcile_fill_report_with_outcome(&report),
+        EventApplicationOutcome::Incomplete
+    );
 
     // Without an instrument the engine cannot bootstrap an external order.
     let cache = execution_engine.cache().borrow();
@@ -13741,7 +13780,21 @@ fn test_reconcile_fill_report_skips_when_instrument_missing(mut execution_engine
 }
 
 #[rstest]
-fn test_reconcile_fill_report_applies_fill_event(mut execution_engine: ExecutionEngine) {
+#[case(false, EventApplicationOutcome::Incomplete)]
+#[case(true, EventApplicationOutcome::Applied)]
+fn test_reconcile_fill_report_applies_fill_event(
+    mut execution_engine: ExecutionEngine,
+    #[case] account_present: bool,
+    #[case] expected: EventApplicationOutcome,
+) {
+    if account_present {
+        execution_engine
+            .cache()
+            .borrow_mut()
+            .add_account(cash_account_for(AccountId::test_default()).into())
+            .unwrap();
+    }
+
     let instrument = audusd_sim();
     let client_order_id = ClientOrderId::from("O-001");
     let venue_order_id = VenueOrderId::from("V-001");
@@ -13780,12 +13833,28 @@ fn test_reconcile_fill_report_applies_fill_event(mut execution_engine: Execution
         Price::from("1.00000"),
     );
 
-    execution_engine.reconcile_fill_report(&report);
+    let outcome = execution_engine.reconcile_fill_report_with_outcome(&report);
+    let replay = execution_engine.reconcile_fill_report_with_outcome(&report);
+    let position_report = create_position_report(
+        instrument.id(),
+        PositionSideSpecified::Long,
+        Quantity::from(50_000),
+        None,
+    );
+    let position_outcome =
+        execution_engine.reconcile_position_report_with_outcome(&position_report);
 
     let cache = execution_engine.cache().borrow();
     let order = cache.order(&client_order_id).unwrap();
     assert_eq!(order.filled_qty(), Quantity::from(50_000));
     assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+    assert_eq!(outcome, expected);
+    assert_eq!(position_outcome, expected);
+    assert_eq!(replay, EventApplicationOutcome::Incomplete);
+    assert_eq!(
+        cache.positions_total_count(None, None, None, None, None),
+        usize::from(account_present)
+    );
 }
 
 #[rstest]
@@ -13893,7 +13962,10 @@ fn test_reconcile_fill_report_uses_report_account_for_position(
         Price::from("1.00000"),
     );
 
-    execution_engine.reconcile_fill_report(&report);
+    assert_eq!(
+        execution_engine.reconcile_fill_report_with_outcome(&report),
+        EventApplicationOutcome::Applied
+    );
 
     let cache = execution_engine.cache().borrow();
     let report_account_positions = cache.positions(
@@ -14064,7 +14136,10 @@ fn test_reconcile_position_report_netting_mode(mut execution_engine: ExecutionEn
         None,
     );
 
-    execution_engine.reconcile_position_report(&report);
+    assert_eq!(
+        execution_engine.reconcile_position_report_with_outcome(&report),
+        EventApplicationOutcome::Incomplete
+    );
 }
 
 #[rstest]
@@ -14088,7 +14163,10 @@ fn test_reconcile_position_report_hedging_mode_position_not_found(
         Some(venue_position_id),
     );
 
-    execution_engine.reconcile_position_report(&report);
+    assert_eq!(
+        execution_engine.reconcile_position_report_with_outcome(&report),
+        EventApplicationOutcome::Incomplete
+    );
 }
 
 #[rstest]
@@ -17039,7 +17117,10 @@ fn test_reconcile_order_with_fills_applies_terminal_without_cached_instrument(
         Quantity::from(100_000),
         Quantity::from(0),
     );
-    execution_engine.reconcile_order_with_fills(&report, &[]);
+    assert_eq!(
+        execution_engine.reconcile_order_with_fills_with_outcome(&report, &[]),
+        EventApplicationOutcome::Applied
+    );
 
     let cache = execution_engine.cache().borrow();
     assert_eq!(
@@ -17091,7 +17172,10 @@ fn test_reconcile_order_with_fills_defers_terminal_with_companion_fill_without_c
         Price::from("1.00000"),
     );
 
-    execution_engine.reconcile_order_with_fills(&report, &[fill]);
+    assert_eq!(
+        execution_engine.reconcile_order_with_fills_with_outcome(&report, &[fill]),
+        EventApplicationOutcome::Incomplete
+    );
 
     let cache = execution_engine.cache().borrow();
     let order = cache.order(&client_order_id).unwrap();
@@ -18202,4 +18286,116 @@ fn test_prior_cycle_fill_void_applied_with_carried_replay() {
     assert_eq!(position.replay_events.len(), 3);
     // The rebuild spans both cycles, so the archived cycle it absorbed is dropped
     assert_eq!(cache.position_snapshot_count(&position_id), 0);
+}
+
+#[rstest]
+#[case("valid", EventApplicationOutcome::Applied)]
+#[case("instrument", EventApplicationOutcome::Incomplete)]
+#[case("side", EventApplicationOutcome::Incomplete)]
+#[case("client", EventApplicationOutcome::Incomplete)]
+#[case("overfill", EventApplicationOutcome::Incomplete)]
+fn test_runtime_bundle_keeps_companion_failure_after_matching_snapshot(
+    mut execution_engine: ExecutionEngine,
+    #[case] fault: &str,
+    #[case] expected: EventApplicationOutcome,
+) {
+    let instrument = audusd_sim();
+    let account_id = AccountId::test_default();
+    let client_order_id = ClientOrderId::from("O-BUNDLE-OUTCOME");
+    let venue_order_id = VenueOrderId::from("V-BUNDLE-OUTCOME");
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_account(cash_account_for(account_id).into())
+        .unwrap();
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .price(Price::from("1.00000"))
+        .build();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, None, true)
+        .unwrap();
+    execution_engine.process(&TestOrderEventStubs::submitted(&order, account_id));
+    execution_engine.process(&TestOrderEventStubs::accepted(
+        &order,
+        account_id,
+        venue_order_id,
+    ));
+    let report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::Filled,
+        Quantity::from(100_000),
+        Quantity::from(100_000),
+    );
+    let mut fill = create_fill_report(
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        TradeId::from("T-COMPANION"),
+        Quantity::from(100_000),
+        Price::from("1.00000"),
+    );
+
+    match fault {
+        "valid" => {}
+        "instrument" => fill.instrument_id = InstrumentId::from("FOREIGN.SIM"),
+        "side" => fill.order_side = OrderSide::Sell,
+        "client" => fill.client_order_id = Some(ClientOrderId::from("O-FOREIGN")),
+        "overfill" => fill.last_qty = Quantity::from(200_000),
+        _ => unreachable!(),
+    }
+
+    let outcome = execution_engine.reconcile_order_with_fills_with_outcome(&report, &[fill]);
+    let cache = execution_engine.cache().borrow();
+    let order = cache.order(&client_order_id).unwrap();
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.filled_qty(), Quantity::from(100_000));
+    assert_eq!(
+        order
+            .trade_ids()
+            .iter()
+            .any(|id| **id == TradeId::from("T-COMPANION")),
+        fault == "valid"
+    );
+    assert_eq!(cache.positions_total_count(None, None, None, None, None), 1);
+    assert_eq!(outcome, expected);
+}
+
+#[rstest]
+fn test_registered_execution_report_endpoint_loses_acknowledgement_with_owner(
+    execution_engine: ExecutionEngine,
+) {
+    let engine = Rc::new(RefCell::new(execution_engine));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    let endpoint = MessagingSwitchboard::exec_engine_reconcile_execution_report();
+    let make_report = || {
+        ExecutionReport::MassStatus(Box::new(ExecutionMassStatus::new(
+            ClientId::from("SIM"),
+            AccountId::test_default(),
+            Venue::from("SIM"),
+            0.into(),
+            None,
+        )))
+    };
+
+    let live = msgbus::send_execution_report_with_outcome(endpoint, make_report());
+    assert_eq!(engine.borrow().report_count(), 1);
+    drop(engine);
+    let gone = msgbus::send_execution_report_with_outcome(endpoint, make_report());
+
+    assert_eq!(live, Some(EventApplicationOutcome::Applied));
+    assert_eq!(gone, None);
 }

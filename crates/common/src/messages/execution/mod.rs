@@ -44,6 +44,18 @@ pub use self::{
 /// Parameter indicating that a conditional order should close the whole position at trigger time.
 pub const PARAMS_CLOSE_POSITION: &str = "close_position";
 
+/// Outcome of a native execution or account endpoint's configured application.
+///
+/// An incomplete application may have mutated some state. This does not certify report
+/// collection, external persistence, subscriber acceptance, portfolio valuation, or freshness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventApplicationOutcome {
+    /// The endpoint completed its configured application.
+    Applied,
+    /// The endpoint could not complete its configured application.
+    Incomplete,
+}
+
 /// Execution report variants for reconciliation.
 #[derive(Clone, Debug, Display)]
 pub enum ExecutionReport {
