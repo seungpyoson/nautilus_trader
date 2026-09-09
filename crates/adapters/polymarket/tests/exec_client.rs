@@ -2354,8 +2354,15 @@ async fn test_generate_mass_status_ignores_foreign_unparsable_trade_time() {
 }
 
 #[rstest]
+#[case::bounded_invalid(Some(60), false)]
+#[case::unbounded_invalid(None, false)]
+#[case::bounded_valid(Some(60), true)]
+#[case::unbounded_valid(None, true)]
 #[tokio::test]
-async fn test_generate_mass_status_ignores_out_of_scope_unparsable_maker_trade() {
+async fn test_generate_mass_status_ignores_out_of_scope_unattributed_maker_trade(
+    #[case] lookback_mins: Option<u64>,
+    #[case] valid_timestamp: bool,
+) {
     let state = TestServerState::default();
     *state.orders_response_override.lock().await = Some(json!({
         "data": [],
@@ -2364,7 +2371,18 @@ async fn test_generate_mass_status_ignores_out_of_scope_unparsable_maker_trade()
     let mut trade = load_json("http_trades_page.json")["data"][0].clone();
     trade["trader_side"] = json!("MAKER");
     trade["market"] = json!("0x1111111111111111111111111111111111111111111111111111111111111111");
-    trade["match_time"] = json!("not-a-timestamp");
+    trade["maker_orders"] = json!([]);
+    trade["match_time"] = if valid_timestamp {
+        json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .to_string()
+        )
+    } else {
+        json!("not-a-timestamp")
+    };
     *state.trades_response_override.lock().await = Some(json!({
         "data": [trade],
         "next_cursor": "LTE=",
@@ -2382,9 +2400,9 @@ async fn test_generate_mass_status_ignores_out_of_scope_unparsable_maker_trade()
     client.on_instrument(instrument);
 
     let mass_status = client
-        .generate_mass_status(Some(60))
+        .generate_mass_status(lookback_mins)
         .await
-        .expect("out-of-scope trade is outside the bounded report")
+        .expect("out-of-scope trade is excluded independently of the report window")
         .expect("mass status available");
 
     assert!(mass_status.reports_complete());
@@ -2630,8 +2648,12 @@ async fn test_generate_mass_status_rejects_malformed_position_with_wrong_loaded_
 }
 
 #[rstest]
+#[case::bounded(Some(60))]
+#[case::unbounded(None)]
 #[tokio::test]
-async fn test_generate_mass_status_lookback_marks_in_scope_historical_incomplete() {
+async fn test_generate_mass_status_marks_in_scope_historical_incomplete(
+    #[case] lookback_mins: Option<u64>,
+) {
     let state = TestServerState::default();
     *state.orders_response_override.lock().await = Some(json!({
         "data": [],
@@ -2651,19 +2673,134 @@ async fn test_generate_mass_status_lookback_marks_in_scope_historical_incomplete
     let (client, _rx, _cache) = create_test_execution_client(addr);
 
     let mass_status = client
-        .generate_mass_status(Some(60))
+        .generate_mass_status(lookback_mins)
         .await
         .expect("mass status")
         .expect("mass status available");
 
-    assert!(mass_status.lookback_start().is_some());
+    assert_eq!(
+        mass_status.lookback_start().is_some(),
+        lookback_mins.is_some()
+    );
     assert!(!mass_status.reports_complete());
     assert!(mass_status.fill_reports().is_empty());
 }
 
 #[rstest]
+#[case::bounded(Some(60))]
+#[case::unbounded(None)]
 #[tokio::test]
-async fn test_generate_mass_status_treats_condition_hex_case_as_same_load_scope() {
+async fn test_generate_mass_status_marks_unattributed_maker_trade_incomplete(
+    #[case] lookback_mins: Option<u64>,
+) {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [], "next_cursor": "LTE=",
+    }));
+    let mut trade = load_json("http_trade_report.json");
+    trade["trader_side"] = json!("MAKER");
+    trade["maker_orders"] = json!([]);
+    trade["match_time"] = json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string()
+    );
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [trade], "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let report = client
+        .generate_mass_status(lookback_mins)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(!report.reports_complete());
+    assert!(report.fill_reports().is_empty());
+}
+
+#[rstest]
+#[case::mass_overflow(true, "79228162514264337593543950335", false)]
+#[case::granular_overflow(false, "79228162514264337593543950335", false)]
+#[case::mass_negative(true, "-1", false)]
+#[case::granular_negative(false, "-1", false)]
+#[case::mass_lossy_precision(true, "0.0100001", false)]
+#[case::granular_lossy_precision(false, "0.0100001", false)]
+#[case::mass_valid(true, "0.010000", true)]
+#[case::granular_valid(false, "0.010000", true)]
+#[tokio::test]
+async fn test_position_collection_preserves_invalid_quantity_failure(
+    #[case] mass: bool,
+    #[case] size: &str,
+    #[case] valid: bool,
+) {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [], "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [], "next_cursor": "LTE=",
+    }));
+    *state.positions_response_override.lock().await = Some(json!([{
+        "asset": TEST_TOKEN_ID, "conditionId": TEST_CONDITION_ID,
+        "size": size, "avgPrice": "0.5000",
+    }]));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id =
+        InstrumentId::from(format!("{TEST_CONDITION_ID}-{TEST_TOKEN_ID}.POLYMARKET").as_str());
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 6);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let count = if mass {
+        client.generate_mass_status(None).await.map(|report| {
+            report
+                .unwrap()
+                .position_reports_ref()
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+        })
+    } else {
+        client
+            .generate_position_status_reports(&GeneratePositionStatusReports {
+                command_id: UUID4::new(),
+                ts_init: UnixNanos::default(),
+                instrument_id: None,
+                start: None,
+                end: None,
+                params: None,
+                log_receipt_level: LogLevel::Info,
+                correlation_id: None,
+                causation_id: None,
+            })
+            .await
+            .map(|reports| reports.len())
+    };
+
+    if valid {
+        assert_eq!(count.unwrap(), 1);
+    } else {
+        let error = count.expect_err("invalid position must not become successful empty inventory");
+        assert!(
+            format!("{error:#}").contains("position"),
+            "unexpected error: {error:#}"
+        );
+    }
+}
+
+#[rstest]
+#[case::unbounded(None)]
+#[case::bounded(Some(60))]
+#[tokio::test]
+async fn test_generate_mass_status_treats_condition_hex_case_as_same_load_scope(
+    #[case] lookback_mins: Option<u64>,
+) {
     let state = TestServerState::default();
     *state.orders_response_override.lock().await = Some(json!({
         "data": [],
@@ -2672,6 +2809,13 @@ async fn test_generate_mass_status_treats_condition_hex_case_as_same_load_scope(
     let mut trade = load_json("http_trades_page.json")["data"][0].clone();
     let token_id = trade["asset_id"].as_str().unwrap().to_string();
     trade["market"] = json!(TEST_CONDITION_ID.to_ascii_uppercase());
+    trade["match_time"] = json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string()
+    );
     *state.trades_response_override.lock().await = Some(json!({
         "data": [trade],
         "next_cursor": "LTE=",
@@ -2687,7 +2831,7 @@ async fn test_generate_mass_status_treats_condition_hex_case_as_same_load_scope(
     let (client, _rx, _cache) = create_test_execution_client_from_config(config);
 
     let mass_status = client
-        .generate_mass_status(Some(60))
+        .generate_mass_status(lookback_mins)
         .await
         .expect("case-equivalent condition remains in configured reconciliation scope")
         .expect("mass status available");
@@ -4082,22 +4226,28 @@ async fn test_generate_fill_reports_rejects_target_order_on_wrong_loaded_instrum
 }
 
 #[rstest]
+#[case::load_scope(false)]
+#[case::explicit_scope(true)]
 #[tokio::test]
-async fn test_generate_fill_reports_drops_out_of_scope_unmapped_history() {
+async fn test_generate_fill_reports_drops_out_of_scope_unmapped_history(
+    #[case] explicit_scope: bool,
+) {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
     let mut config = create_test_exec_config(addr);
-    config.instrument_config = Some(PolymarketInstrumentProviderConfig {
-        load_ids: Some(vec![InstrumentId::from("OTHER.POLYMARKET")]),
-        ..Default::default()
-    });
+    if !explicit_scope {
+        config.instrument_config = Some(PolymarketInstrumentProviderConfig {
+            load_ids: Some(vec![InstrumentId::from("OTHER.POLYMARKET")]),
+            ..Default::default()
+        });
+    }
     let (client, _rx, _cache) = create_test_execution_client_from_config(config);
 
     let reports = client
         .generate_fill_reports(GenerateFillReports {
             command_id: UUID4::new(),
             ts_init: UnixNanos::default(),
-            instrument_id: None,
+            instrument_id: explicit_scope.then(|| InstrumentId::from("OTHER.POLYMARKET")),
             venue_order_id: None,
             start: None,
             end: None,
@@ -4116,6 +4266,9 @@ async fn test_generate_fill_reports_drops_out_of_scope_unmapped_history() {
 #[tokio::test]
 async fn test_generate_fill_reports_empty_without_instruments() {
     let state = TestServerState::default();
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [], "next_cursor": "LTE=",
+    }));
     let addr = start_mock_server(state).await;
     let (client, _rx, _cache) = create_test_execution_client(addr);
 
@@ -4135,6 +4288,148 @@ async fn test_generate_fill_reports_empty_without_instruments() {
     let reports = client.generate_fill_reports(cmd).await.unwrap();
 
     assert!(reports.is_empty());
+}
+
+#[rstest]
+#[case::unmapped_empty(false, false)]
+#[case::unmapped_partial(false, true)]
+#[case::unattributed_empty(true, false)]
+#[case::unattributed_partial(true, true)]
+#[tokio::test]
+async fn test_generate_fill_reports_rejects_in_scope_discarded_evidence(
+    #[case] unattributed_maker: bool,
+    #[case] include_valid: bool,
+) {
+    let target_order_id = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let state = TestServerState::default();
+    let mut trades = recovery_trades_response(target_order_id, "10.0000", "0.5000");
+    let mut discarded = trades["data"][0].clone();
+    discarded["id"] = json!("discarded-confirmed-trade");
+    if unattributed_maker {
+        discarded["trader_side"] = json!("MAKER");
+        discarded["maker_orders"] = json!([]);
+    } else {
+        discarded["asset_id"] =
+            json!("99999999999999999999999999999999999999999999999999999999999999999");
+    }
+    trades["data"] = if include_valid {
+        json!([trades["data"][0].clone(), discarded])
+    } else {
+        json!([discarded])
+    };
+    *state.trades_response_override.lock().await = Some(trades);
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let error = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: None,
+            venue_order_id: None,
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect_err("dropped in-scope confirmed evidence cannot become a successful fill query");
+
+    assert!(error.to_string().contains("incomplete fill reports"));
+}
+
+#[rstest]
+#[case::before_start("1700000000", false)]
+#[case::at_start("1700000001", true)]
+#[case::inside("1700000002", true)]
+#[case::at_end("1700000003", true)]
+#[case::after_end("1700000004", false)]
+#[case::invalid_time("not-a-timestamp", true)]
+#[tokio::test]
+async fn test_generate_fill_reports_scopes_unmapped_evidence_by_time(
+    #[case] match_time: &str,
+    #[case] incomplete: bool,
+) {
+    let target_order_id = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let state = TestServerState::default();
+    let mut trades = recovery_trades_response(target_order_id, "10.0000", "0.5000");
+    trades["data"][0]["match_time"] = json!(match_time);
+    *state.trades_response_override.lock().await = Some(trades);
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let result = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: None,
+            venue_order_id: None,
+            start: Some(UnixNanos::from(1_700_000_001_000_000_000)),
+            end: Some(UnixNanos::from(1_700_000_003_000_000_000)),
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await;
+
+    if incomplete {
+        let error = result.expect_err("in-scope unmapped evidence must refuse the query");
+        assert!(error.to_string().contains("incomplete fill reports"));
+    } else {
+        assert!(
+            result
+                .expect("out-of-window evidence is excluded")
+                .is_empty()
+        );
+    }
+}
+
+#[rstest]
+#[case::before("1700000001", 0)]
+#[case::at_inclusive_bounds("1700000002", 1)]
+#[case::after("1700000003", 0)]
+#[tokio::test]
+async fn test_generate_fill_reports_applies_time_window_to_loaded_trades(
+    #[case] match_time: &str,
+    #[case] expected_count: usize,
+    #[values(false, true)] targeted: bool,
+) {
+    let target_order_id = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let state = TestServerState::default();
+    let mut trades = recovery_trades_response(target_order_id, "10.0000", "0.5000");
+    trades["data"][0]["match_time"] = json!(match_time);
+    *state.trades_response_override.lock().await = Some(trades);
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let reports = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            venue_order_id: targeted.then(|| VenueOrderId::from(target_order_id)),
+            start: Some(UnixNanos::from(1_700_000_002_000_000_000)),
+            end: Some(UnixNanos::from(1_700_000_002_000_000_000)),
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect("loaded confirmed trades are filtered by the requested window");
+
+    assert_eq!(reports.len(), expected_count);
 }
 
 #[rstest]
@@ -10064,6 +10359,7 @@ async fn test_submit_order_list_fok_unfilled_error_rejects_immediately() {
 
     assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
     assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+
     for _ in 0..2 {
         let rejected = assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
         assert_eq!(order_event_reason(&rejected), reason);

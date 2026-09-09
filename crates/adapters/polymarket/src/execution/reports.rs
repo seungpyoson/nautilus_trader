@@ -38,9 +38,9 @@ use super::{
         weighted_average_price,
     },
     reconciliation::{
-        FillContext, FillReportScope, TargetOrderReportScope, apply_fill_time_filters,
-        build_fill_reports_from_trades, build_reconciliation_position_reports,
-        build_target_order_report, cap_order_report_filled_qty, confirmed_filled_quantities,
+        FillContext, FillReportScope, TargetOrderReportScope, build_fill_reports_from_trades,
+        build_reconciliation_position_reports, build_target_order_report,
+        cap_order_report_filled_qty, confirmed_filled_quantities,
         normalize_terminal_order_report_quantity,
     },
 };
@@ -228,7 +228,6 @@ impl PolymarketExecutionClient {
                 .with_expected_order_side(expected_order_side),
             ts_init,
             self.config.reconciliation_load_ids(),
-            None,
         )?;
 
         if fill_discards.has_pending_target {
@@ -639,7 +638,6 @@ impl PolymarketExecutionClient {
                         FillReportScope::new(cmd.instrument_id, None),
                         self.clock.get_time_ns(),
                         collection_load_ids,
-                        None,
                     )?;
                     confirmed_filled_quantities(&fills)
                 }
@@ -715,20 +713,27 @@ impl PolymarketExecutionClient {
         } else {
             self.config.reconciliation_load_ids()
         };
-        let (mut reports, _) = build_fill_reports_from_trades(
+        let (mut reports, discards) = build_fill_reports_from_trades(
             &trades,
             &ctx,
             &self.shared_token_instruments,
             FillReportScope::new(scope_instrument_id, cmd.venue_order_id)
-                .with_expected_order_side(expected_order_side),
+                .with_expected_order_side(expected_order_side)
+                .with_time_window(cmd.start, cmd.end),
             self.clock.get_time_ns(),
             collection_load_ids,
-            None,
         )?;
 
-        self.fill_tracker.snap_fill_reports(&mut reports);
+        anyhow::ensure!(
+            discards.reports_complete(),
+            "incomplete fill reports: {} in-scope unmapped fills, {} unattributed maker trades, \
+             {} trades with invalid timestamps",
+            discards.in_scope_historical,
+            discards.unowned_maker_trades,
+            discards.untimestamped_trades,
+        );
 
-        let reports = apply_fill_time_filters(reports, cmd.start, cmd.end);
+        self.fill_tracker.snap_fill_reports(&mut reports);
 
         log::debug!("Generated {} fill reports", reports.len());
         Ok(reports)
@@ -796,15 +801,8 @@ async fn fetch_confirmed_fill_reports(
             return Ok(None);
         }
     };
-    let (reports, _) = build_fill_reports_from_trades(
-        &trades,
-        ctx,
-        token_instruments,
-        scope,
-        ts_init,
-        load_ids,
-        None,
-    )?;
+    let (reports, _) =
+        build_fill_reports_from_trades(&trades, ctx, token_instruments, scope, ts_init, load_ids)?;
     Ok(Some(reports))
 }
 

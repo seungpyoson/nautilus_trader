@@ -12870,20 +12870,19 @@ async fn test_position_check_retries_stops_after_max() {
     // return None on the cache.instrument() lookup
     ctx.add_position(&position);
 
-    let mock_client = MockExecutionClient::new(vec![]);
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
-    // First attempt: detects discrepancy, can't reconcile, retry count -> 1
-    let events = ctx.manager.check_positions_consistency(&clients).await;
-    assert!(events.is_empty());
-
-    // Second attempt: retry count -> 2 (= max), logs error
-    let events = ctx.manager.check_positions_consistency(&clients).await;
-    assert!(events.is_empty());
-
-    // Third attempt: retries exhausted, silently skipped
-    let events = ctx.manager.check_positions_consistency(&clients).await;
-    assert!(events.is_empty());
+    // Failed reconciliation consumes one attempt until the configured limit.
+    for expected_retries in [1, 2, 2] {
+        let events = ctx.manager.check_positions_consistency(&clients).await;
+        assert!(events.is_empty());
+        assert_eq!(
+            ctx.manager
+                .position_recon_retry_count(&(instrument.id(), test_account_id())),
+            expected_retries,
+        );
+    }
 }
 
 #[tokio::test]
@@ -12902,7 +12901,7 @@ async fn test_position_check_retries_clears_when_discrepancy_resolves() {
 
     // First: add position without instrument to force a failed retry
     ctx.add_position(&position);
-    let mock_client = MockExecutionClient::new(vec![]);
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_positions_consistency(&clients).await;
@@ -12936,7 +12935,7 @@ async fn test_position_check_stale_retries_pruned_when_position_closed() {
     let position = create_test_position(&instrument, position_id, OrderSide::Buy, "5.0", "3000.00");
     ctx.add_position(&position);
 
-    let mock_client = MockExecutionClient::new(vec![]);
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     // First call: reconciliation succeeds (generates events to match venue=flat)
@@ -13542,8 +13541,11 @@ async fn test_position_check_reconciles_at_client_tolerance_boundary() {
         .any(|event| matches!(event, OrderEventAny::Filled(fill) if fill.last_qty == Quantity::from("0.010000"))));
 }
 
+#[rstest]
+#[case::failed(false)]
+#[case::unsupported(true)]
 #[tokio::test]
-async fn test_position_check_failed_client_query_skips_cached_position() {
+async fn test_position_check_failed_client_query_skips_cached_position(#[case] unsupported: bool) {
     let config = ExecutionManagerConfig {
         position_check_retries: 3,
         position_check_threshold_ns: 0,
@@ -13574,7 +13576,13 @@ async fn test_position_check_failed_client_query_skips_cached_position() {
 
     ctx.add_instrument(instrument);
     let failing_client = MockPositionExecutionClient::failing_position_reports();
-    let clients: Vec<&dyn ExecutionClient> = vec![&failing_client];
+    let unsupported_client = MockExecutionClient::new(vec![]);
+    let client: &dyn ExecutionClient = if unsupported {
+        &unsupported_client
+    } else {
+        &failing_client
+    };
+    let clients = vec![client];
     let events = ctx.manager.check_positions_consistency(&clients).await;
 
     assert!(
@@ -14321,23 +14329,31 @@ async fn test_position_check_dedup_skips_second_hedge_position_same_instrument()
     ctx.add_position(&pos_long);
     ctx.add_position(&pos_short);
 
-    let mock_client = MockExecutionClient::new(vec![]);
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
-    // Three cycles: each increments retry by 1 (not 2) thanks to dedup
-    ctx.manager.check_positions_consistency(&clients).await;
-    ctx.manager.check_positions_consistency(&clients).await;
-    let events = ctx.manager.check_positions_consistency(&clients).await;
-    assert!(events.is_empty());
+    // Each cycle consumes exactly one retry across both hedge legs.
+    for expected_retries in 1..=3 {
+        let events = ctx.manager.check_positions_consistency(&clients).await;
+        assert!(events.is_empty());
+        assert_eq!(
+            ctx.manager
+                .position_recon_retry_count(&(instrument.id(), test_account_id())),
+            expected_retries,
+        );
+    }
 
-    // With correct dedup retry count is 3 (= max), so adding the instrument
-    // now should still be suppressed. If dedup were broken (2 per cycle),
-    // retries would have hit 6 instead.
+    // Retries remain exhausted after adding the instrument.
     ctx.add_instrument(instrument.clone());
     let events = ctx.manager.check_positions_consistency(&clients).await;
     assert!(
         events.is_empty(),
         "Expected retries to be exhausted after 3 cycles with dedup"
+    );
+    assert_eq!(
+        ctx.manager
+            .position_recon_retry_count(&(instrument.id(), test_account_id())),
+        3,
     );
 }
 
@@ -14549,7 +14565,7 @@ async fn test_position_check_retries_independent_per_account() {
     ctx.add_position(&pos_a);
     ctx.add_position(&pos_b);
 
-    let mock_client = MockExecutionClient::new(vec![]);
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     ctx.manager.check_positions_consistency(&clients).await;
@@ -14883,7 +14899,7 @@ async fn test_position_check_stale_retries_pruned_per_account() {
     ctx.add_position(&pos_a);
     ctx.add_position(&pos_b);
 
-    let mock_client = MockExecutionClient::new(vec![]);
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     // Cycle 1: both keys reach the failed-retry path, so counters land at 1 each.
