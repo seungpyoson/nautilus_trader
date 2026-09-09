@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: d65e1c38577893569b7965b2a85c2799d0b5ce1c
+      REVIEWED_SHA: ec41455df41b3d48ea0bb890540228ad2dcdc15b
       CARGO_BUILD_JOBS: "2"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -31,7 +31,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: d65e1c38577893569b7965b2a85c2799d0b5ce1c
+          ref: ec41455df41b3d48ea0bb890540228ad2dcdc15b
           persist-credentials: false
 
       - name: Verify reviewed commit
@@ -58,11 +58,18 @@ jobs:
           cargo nextest run --locked --cargo-profile ci-pr --profile ci
           -p nautilus-live --lib --tests --no-fail-fast
 
-      - name: Model execution and live Clippy
+      - name: Common and Polymarket collection tests
+        shell: bash
+        run: >-
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci
+          -p nautilus-common -p nautilus-polymarket --lib --tests --no-fail-fast
+
+      - name: Model common execution live and Polymarket Clippy
         shell: bash
         run: >-
           cargo clippy --locked --profile ci-pr
-          -p nautilus-model -p nautilus-execution -p nautilus-live
+          -p nautilus-model -p nautilus-common -p nautilus-execution
+          -p nautilus-live -p nautilus-polymarket
           --lib --tests -- -D warnings
 
       - name: Verify source remained unchanged
