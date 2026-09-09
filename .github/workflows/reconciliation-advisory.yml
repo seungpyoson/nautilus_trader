@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: 99ca2cee6df241364a81f4df0fa36b56ea0f75b3
+      REVIEWED_SHA: 7cf5907b0dfcc51b8f1adb8ce1ec094a31961c48
       CARGO_BUILD_JOBS: "2"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -31,7 +31,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 99ca2cee6df241364a81f4df0fa36b56ea0f75b3
+          ref: 7cf5907b0dfcc51b8f1adb8ce1ec094a31961c48
           persist-credentials: false
 
       - name: Verify reviewed commit
@@ -58,10 +58,11 @@ jobs:
           cargo nextest run --locked --cargo-profile ci-pr --profile ci
           -p nautilus-live --lib --tests
 
-      - name: Execution engine Clippy
+      - name: Model execution and live Clippy
         shell: bash
         run: >-
-          cargo clippy --locked --profile ci-pr -p nautilus-execution
+          cargo clippy --locked --profile ci-pr
+          -p nautilus-model -p nautilus-execution -p nautilus-live
           --lib --tests -- -D warnings
 
       - name: Verify source remained unchanged
