@@ -1,0 +1,72 @@
+name: Reconciliation application advisory
+
+# Fork infrastructure only; kept outside the source pull request.
+on:
+  push:
+    branches: [ci/reconciliation-application-advisory]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    if: github.repository == 'seungpyoson/nautilus_trader'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      REVIEWED_SHA: 99ca2cee6df241364a81f4df0fa36b56ea0f75b3
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
+          allowed-endpoints: >-
+            ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
+            ${{ vars.CI_ALLOWED_ENDPOINTS }}
+
+      - name: Check out reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 99ca2cee6df241364a81f4df0fa36b56ea0f75b3
+          persist-credentials: false
+
+      - name: Verify reviewed commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+
+      - name: Common setup
+        uses: ./.github/actions/common-setup
+        with:
+          python-version: "3.13"
+          build-type: test
+          free-disk-space: "true"
+          rust-cache-key: reconciliation-application-ci-pr
+
+      - name: Execution engine tests
+        shell: bash
+        run: >-
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci
+          -p nautilus-execution --lib --tests
+
+      - name: Live reconciliation and lifecycle tests
+        shell: bash
+        run: >-
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci
+          -p nautilus-live --lib --tests
+
+      - name: Execution engine Clippy
+        shell: bash
+        run: >-
+          cargo clippy --locked --profile ci-pr -p nautilus-execution
+          --lib --tests -- -D warnings
+
+      - name: Verify source remained unchanged
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
