@@ -154,7 +154,7 @@ impl Fixture {
     }
 
     fn accept_order(
-        &mut self,
+        &self,
         strategy: &str,
         tag: &str,
         side: OrderSide,
@@ -233,7 +233,7 @@ impl Fixture {
         close
     }
 
-    fn assert_settled(&mut self, expected_pnl: &str, closes: usize) {
+    fn assert_settled(&self, expected_pnl: &str, closes: usize) {
         assert!(!self.node.handle.should_stop());
         assert_eq!(
             self.node.kernel.cache.borrow().positions_open_count(
@@ -337,7 +337,7 @@ impl Fixture {
         }
     }
 
-    fn trading_commands(&mut self) -> Vec<TradingCommandMessage> {
+    fn trading_commands(&self) -> Vec<TradingCommandMessage> {
         let order = OrderTestBuilder::new(OrderType::Limit)
             .trader_id(self.node.trader_id())
             .strategy_id(StrategyId::from("OWNER-001"))
