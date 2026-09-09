@@ -124,6 +124,7 @@ struct StartupCacheObservation {
     status: Option<OrderStatus>,
     event_count: usize,
     account_present: bool,
+    summary: Option<Arc<StartupReconciliationSummary>>,
 }
 
 #[derive(Debug)]
@@ -147,6 +148,7 @@ impl DataActor for StartupCacheActor {
                 status,
                 event_count,
                 account_present: cache.account(&self.account_id).is_some(),
+                summary: self.handle.startup_reconciliation_summary(),
             }
         };
         *self.observed.lock().unwrap() = Some(observation);
@@ -2430,6 +2432,20 @@ mod serial_tests {
         ];
         let observed = Arc::new(Mutex::new(None));
         let handle = node.handle();
+        let during_dispatch = Arc::new(Mutex::new(None));
+        let handler = TypedHandler::from({
+            let handle = handle.clone();
+            let clock = node.kernel().clock();
+            let during_dispatch = during_dispatch.clone();
+            move |_event: &OrderEventAny| {
+                *during_dispatch.lock().unwrap() = Some((
+                    handle.startup_reconciliation_summary().is_none(),
+                    clock.borrow().timestamp_ns(),
+                ));
+            }
+        });
+        let topic = switchboard::get_order_canceled_topic(instrument_id);
+        msgbus::subscribe_order_events(topic.to_string().into(), handler.clone(), None);
         node.add_actor(StartupCacheActor {
             core: DataActorCore::new(DataActorConfig::default()),
             handle: handle.clone(),
@@ -2445,6 +2461,7 @@ mod serial_tests {
             node.start().await
         };
 
+        msgbus::unsubscribe_order_events(topic.to_string().into(), &handler);
         assert!(result.is_ok(), "startup failed: {result:#?}");
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         let observation = observed.lock().unwrap();
@@ -2454,6 +2471,24 @@ mod serial_tests {
         assert_eq!(observation.status, Some(OrderStatus::Canceled));
         assert_eq!(observation.event_count, 4);
         assert!(observation.account_present);
+        let (unpublished, ts_dispatch) = during_dispatch
+            .lock()
+            .unwrap()
+            .expect("queued cancellation must reach its native callback");
+        assert!(
+            unpublished,
+            "summary must remain unavailable during pending dispatch"
+        );
+        let summary = observation
+            .summary
+            .as_ref()
+            .expect("summary must precede actor startup");
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Finished);
+        assert!(summary.ts_finished >= ts_dispatch);
+        assert!(Arc::ptr_eq(
+            summary,
+            &handle.startup_reconciliation_summary().unwrap(),
+        ));
         assert_eq!(handle.state(), NodeState::Stopped);
     }
 
@@ -2476,14 +2511,17 @@ mod serial_tests {
     }
 
     #[rstest]
-    #[case::start_stop(false, false)]
-    #[case::run_stop(true, false)]
-    #[case::start_shutdown(false, true)]
-    #[case::run_shutdown(true, true)]
+    #[case::start_stop(false, false, false)]
+    #[case::run_stop(true, false, false)]
+    #[case::start_shutdown(false, true, false)]
+    #[case::run_shutdown(true, true, false)]
+    #[case::start_stop_before_pending(false, false, true)]
+    #[case::run_stop_before_pending(true, false, true)]
     #[tokio::test(flavor = "current_thread")]
-    async fn test_queued_execution_callback_aborts_before_actor_start(
+    async fn test_execution_callback_aborts_before_actor_start(
         #[case] run: bool,
         #[case] shutdown: bool,
+        #[case] stop_before_pending: bool,
     ) {
         let config = LiveNodeConfig {
             delay_post_stop: Duration::ZERO,
@@ -2536,13 +2574,67 @@ mod serial_tests {
             ExecutionEvent::Order(canceled),
         ];
         let handle = node.handle();
+        let during_reconciliation = Arc::new(Mutex::new(None));
+        let raw_handler = ShareableMessageHandler::from_typed({
+            let handle = handle.clone();
+            let clock = node.kernel().clock();
+            let during_reconciliation = during_reconciliation.clone();
+            move |_report: &OrderStatusReport| {
+                *during_reconciliation.lock().unwrap() = Some((
+                    handle.startup_reconciliation_summary().is_none(),
+                    clock.borrow().timestamp_ns(),
+                ));
+                handle.stop();
+            }
+        });
+        let raw_topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+
+        if stop_before_pending {
+            let mut mass_status = ExecutionMassStatus::new(
+                ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID),
+                account_id,
+                instrument_id.venue,
+                UnixNanos::from(1),
+                None,
+            );
+            let mut report = test_order_report(
+                account_id,
+                client_order_id,
+                venue_order_id,
+                OrderStatus::Accepted,
+            );
+            {
+                let cache = node.kernel().cache();
+                let cache = cache.borrow();
+                let order = cache.order(&client_order_id).unwrap();
+                report.order_type = order.order_type();
+                report.time_in_force = order.time_in_force();
+                report.quantity = order.quantity();
+                report.price = order.price();
+            }
+            mass_status.add_order_reports(vec![report]);
+            *state.mass_status.lock().unwrap() = Some(mass_status);
+            msgbus::subscribe_any(raw_topic.to_string().into(), raw_handler.clone(), None);
+        }
         let trader_id = node.kernel().trader_id();
         let callback_count = Arc::new(AtomicUsize::new(0));
+        let during_dispatch = Arc::new(Mutex::new(None));
         let handler = TypedHandler::from({
             let handle = handle.clone();
             let callback_count = callback_count.clone();
+            let clock = node.kernel().clock();
+            let during_dispatch = during_dispatch.clone();
             move |_event: &OrderEventAny| {
                 callback_count.fetch_add(1, Ordering::Relaxed);
+                *during_dispatch.lock().unwrap() = Some((
+                    handle.startup_reconciliation_summary().is_none(),
+                    clock.borrow().timestamp_ns(),
+                ));
+
+                if stop_before_pending {
+                    // Shutdown may dispatch the skipped prefix after publication.
+                    return;
+                }
 
                 if shutdown {
                     let command = ShutdownSystem::new(
@@ -2579,9 +2671,38 @@ mod serial_tests {
         };
 
         msgbus::unsubscribe_order_events(topic.to_string().into(), &handler);
+
+        if stop_before_pending {
+            msgbus::unsubscribe_any(raw_topic.to_string().into(), &raw_handler);
+        }
         assert!(result.is_ok(), "startup abort failed: {result:#?}");
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
-        assert_eq!(callback_count.load(Ordering::Relaxed), 1);
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Interrupted);
+
+        if stop_before_pending {
+            let (unpublished, ts_reconciliation) = during_reconciliation.lock().unwrap().unwrap();
+            assert!(
+                unpublished,
+                "summary must remain unavailable during reconciliation"
+            );
+            assert!(summary.ts_finished >= ts_reconciliation);
+
+            if let Some((unpublished, _)) = *during_dispatch.lock().unwrap() {
+                assert!(
+                    !unpublished,
+                    "skipped events may only dispatch during later cleanup"
+                );
+            }
+        } else {
+            assert_eq!(callback_count.load(Ordering::Relaxed), 1);
+            let (unpublished, ts_dispatch) = during_dispatch.lock().unwrap().unwrap();
+            assert!(
+                unpublished,
+                "summary must remain unavailable during pending dispatch"
+            );
+            assert!(summary.ts_finished >= ts_dispatch);
+        }
         assert!(
             observed.lock().unwrap().is_none(),
             "actor must not start after queued abort"
