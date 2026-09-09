@@ -478,7 +478,7 @@ impl PolymarketExecutionClient {
         );
     }
 
-    pub(super) fn stop_client(&mut self) {
+    pub(super) fn stop_client(&self) {
         if self.core.is_stopped() {
             return;
         }
@@ -497,7 +497,7 @@ impl PolymarketExecutionClient {
         log::info!("Polymarket execution client stopped");
     }
 
-    pub(super) fn reset_client(&mut self) {
+    pub(super) fn reset_client(&self) {
         log::debug!("Resetting Polymarket execution client");
 
         self.stopping.store(true, Ordering::Release);
@@ -1382,7 +1382,7 @@ mod tests {
 
     #[rstest]
     fn reset_clears_session_state_and_lookup_follows_native_cache() {
-        let (mut client, cache) = test_client();
+        let (client, cache) = test_client();
         let instrument = test_binary_option("0xRESET", true, true);
         cache
             .borrow_mut()
