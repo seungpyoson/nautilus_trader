@@ -230,6 +230,90 @@ async fn tracked_full_fill_emits_event_and_closes() {
 }
 
 #[rstest]
+#[case::order("ws_user_order_cancellation.json", None, "LIVE")]
+#[case::taker_matched("ws_user_trade_full.json", Some("TAKER"), "MATCHED")]
+#[case::taker_confirmed("ws_user_trade_full.json", Some("TAKER"), "CONFIRMED")]
+#[case::maker_matched("ws_user_trade_full.json", Some("MAKER"), "MATCHED")]
+#[case::maker_confirmed("ws_user_trade_full.json", Some("MAKER"), "CONFIRMED")]
+#[tokio::test]
+async fn user_stream_survives_malformed_token(
+    #[case] fixture: &str,
+    #[case] liquidity: Option<&str>,
+    #[case] trade_status: &str,
+    #[values("", " \t\r\n", "\u{2003}")] token: &str,
+) {
+    let mut h = harness::Harness::build().await;
+    let order = harness::limit_order(h.instrument_id(), "O-MALFORMED-TOKEN");
+    h.submit_via_risk(&order);
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &order, OrderStatus::Accepted)
+        })
+        .await,
+        "healthy control must reach Accepted before malformed input",
+    );
+
+    let mut valid = crate::mock_venue::load_json(fixture);
+    let expected_status = if let Some(liquidity) = liquidity {
+        valid["event_type"] = "trade".into();
+        valid["trader_side"] = liquidity.into();
+        valid["status"] = trade_status.into();
+        if liquidity == "MAKER" {
+            valid["side"] = "SELL".into();
+            valid["maker_orders"][0]["owner"] = valid["owner"].clone();
+            valid["maker_orders"][0]["order_id"] =
+                crate::mock_venue::DEFAULT_ACCEPTED_ORDER_ID.into();
+        }
+        OrderStatus::Filled
+    } else {
+        valid["event_type"] = "order".into();
+        OrderStatus::Canceled
+    };
+    let mut malformed = valid.clone();
+    if liquidity == Some("MAKER") {
+        malformed["maker_orders"][0]["asset_id"] = token.into();
+    } else {
+        malformed["asset_id"] = token.into();
+    }
+
+    // Both frames use the same live consumer and order identity, without reconnecting
+    h.mock_state.send_user(malformed).await;
+    h.mock_state.send_user(valid.clone()).await;
+    assert!(
+        h.pump_until(DEADLINE, |cache| {
+            order_reached(cache, &order, expected_status)
+        })
+        .await,
+        "valid message after malformed token did not reach {expected_status}",
+    );
+    h.mock_state.send_user(valid).await;
+    h.pump_for(Duration::from_millis(200)).await;
+
+    let cache = h.cache().borrow();
+    let cached = cache.order(&order.client_order_id()).unwrap();
+    assert_eq!(cached.status(), expected_status);
+    let fill_count = event_count(cached, |event| matches!(event, OrderEventAny::Filled(_)));
+    if liquidity.is_some() {
+        assert_eq!(fill_count, 1);
+        assert_eq!(cached.filled_qty().as_decimal(), Decimal::from(100));
+    } else {
+        assert_eq!(fill_count, 0);
+        assert_eq!(cached.filled_qty().as_decimal(), Decimal::ZERO);
+        assert_eq!(
+            event_count(cached, |event| matches!(event, OrderEventAny::Canceled(_))),
+            1,
+        );
+    }
+    assert_eq!(
+        h.mock_state
+            .user_socket_count
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+    );
+    harness::invariants::assert_tracked_used_events(h.routed());
+}
+
+#[rstest]
 #[tokio::test]
 async fn tracked_partial_then_full_fill_is_exact_and_deduplicated() {
     let mut h = harness::Harness::build().await;

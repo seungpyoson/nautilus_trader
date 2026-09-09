@@ -42,8 +42,8 @@ impl PolymarketInstrumentLookup {
 
 impl TokenInstrumentLookup for PolymarketInstrumentLookup {
     fn get_cloned(&self, token: &Ustr) -> Option<InstrumentAny> {
-        self.view
-            .instrument(self.venue, Symbol::from(token.as_str()))
+        let symbol = Symbol::new_checked(token.as_str()).ok()?;
+        self.view.instrument(self.venue, symbol)
     }
 }
 

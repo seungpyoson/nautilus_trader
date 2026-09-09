@@ -1896,6 +1896,53 @@ mod tests {
             .expect("valid open-order fixture")
     }
 
+    #[rstest]
+    #[case("")]
+    #[case(" \t\r\n")]
+    #[case("\u{2003}")]
+    fn malformed_order_token_returns_error_and_preserves_valid_reports(#[case] token: &str) {
+        use nautilus_common::cache::Cache;
+
+        use crate::execution::instruments::PolymarketInstrumentLookup;
+
+        let mut cache = Cache::default();
+        let instrument = test_instrument();
+        let instrument_id = instrument.id();
+        cache.add_instrument(instrument).unwrap();
+        let lookup =
+            PolymarketInstrumentLookup::new(cache.instrument_read_view(), instrument_id.venue);
+        let order = open_order();
+        let venue_order_id = VenueOrderId::from(order.id.as_str());
+        let scope = TargetOrderReportScope::new(instrument_id, venue_order_id, None, None, None);
+        let ctx = test_fill_context();
+        let ts = UnixNanos::from(1);
+        let mut malformed = order.clone();
+        malformed.asset_id = Ustr::from(token);
+
+        let error = build_target_order_report(&malformed, &lookup, &ctx, scope, ts)
+            .expect_err("malformed target token must return an error");
+        assert!(
+            error
+                .to_string()
+                .contains("has no loaded Polymarket instrument")
+        );
+        let error = build_order_reports_from_orders(&[malformed], &lookup, &ctx, None, ts, None)
+            .expect_err("malformed in-scope collection token must return an error");
+        assert!(error.to_string().contains("unmapped in-scope open order"));
+
+        let target = build_target_order_report(&order, &lookup, &ctx, scope, ts).unwrap();
+        let (reports, filtered) =
+            build_order_reports_from_orders(&[order], &lookup, &ctx, None, ts, None).unwrap();
+        assert_eq!(filtered, 0);
+        assert_eq!(reports.len(), 1);
+        for report in [&target, &reports[0]] {
+            assert_eq!(report.instrument_id, instrument_id);
+            assert_eq!(report.venue_order_id, venue_order_id);
+            assert_eq!(report.order_status, OrderStatus::Accepted);
+            assert_eq!(report.quantity.as_decimal(), Decimal::from(100));
+        }
+    }
+
     fn data_api_positions() -> Vec<DataApiPosition> {
         serde_json::from_str(include_str!(
             "../../test_data/data_api_positions_response.json"
