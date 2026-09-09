@@ -26,6 +26,7 @@ pub mod refs;
 mod bounded;
 mod error;
 mod index;
+mod instrument;
 mod position;
 
 #[cfg(test)]
@@ -54,6 +55,8 @@ pub use error::{
 };
 use index::CacheIndex;
 use indexmap::IndexMap;
+pub use instrument::InstrumentReadView;
+use instrument::InstrumentStore;
 use nautilus_core::{
     DurationNanos, SharedCell, UnixNanos,
     correctness::{
@@ -2189,7 +2192,7 @@ pub struct Cache {
     database: Option<Box<dyn CacheDatabaseAdapter>>,
     general: AHashMap<String, Bytes>,
     currencies: AHashMap<Ustr, Currency>,
-    instruments: AHashMap<InstrumentId, InstrumentAny>,
+    instruments: InstrumentStore,
     instrument_closes: AHashMap<InstrumentId, InstrumentClose>,
     synthetics: AHashMap<InstrumentId, SyntheticInstrument>,
     books: AHashMap<InstrumentId, OrderBook>,
@@ -2291,7 +2294,7 @@ impl Cache {
             database,
             general: AHashMap::new(),
             currencies: AHashMap::new(),
-            instruments: AHashMap::new(),
+            instruments: AHashMap::new().into(),
             instrument_closes: AHashMap::new(),
             synthetics: AHashMap::new(),
             books: AHashMap::new(),
@@ -2474,7 +2477,7 @@ impl Cache {
         };
 
         self.currencies = cache_map.currencies;
-        self.instruments = cache_map.instruments;
+        self.instruments.replace(cache_map.instruments);
         self.instrument_closes = cache_map.instrument_closes;
         self.synthetics = cache_map.synthetics;
         self.accounts = cache_map
@@ -2525,10 +2528,11 @@ impl Cache {
     ///
     /// Returns an error if loading instruments cache fails.
     pub async fn cache_instruments(&mut self) -> anyhow::Result<()> {
-        self.instruments = match &mut self.database {
+        let instruments = match &mut self.database {
             Some(db) => db.load_instruments().await?,
             None => AHashMap::new(),
         };
+        self.instruments.replace(instruments);
 
         log::info!("Cached {} instruments from database", self.general.len());
         Ok(())
@@ -7990,7 +7994,7 @@ impl Cache {
         let mut ask_quotes = AHashMap::new();
         let mut quote_sources = AHashMap::new();
 
-        for (instrument_id, instrument) in &self.instruments {
+        for (instrument_id, instrument) in self.instruments.iter() {
             if instrument_id.venue != *venue {
                 continue;
             }
@@ -8116,6 +8120,12 @@ impl Cache {
     }
 
     // -- INSTRUMENT QUERIES ----------------------------------------------------------------------
+
+    /// Returns a thread-safe view which follows this cache's instrument lifecycle.
+    #[must_use]
+    pub fn instrument_read_view(&self) -> InstrumentReadView {
+        self.instruments.read_view()
+    }
 
     /// Returns a reference to the instrument for the `instrument_id` (if found).
     #[must_use]

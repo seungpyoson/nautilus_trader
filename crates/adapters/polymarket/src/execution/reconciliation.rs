@@ -18,7 +18,7 @@
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use nautilus_core::{
-    DurationNanos, UnixNanos, collections::AtomicMap, correctness::check_valid_string_ascii,
+    DurationNanos, UnixNanos, correctness::check_valid_string_ascii,
     datetime::NANOSECONDS_IN_SECOND, time::AtomicTime,
 };
 use nautilus_model::{
@@ -48,6 +48,7 @@ use crate::{
         enums::{PolymarketLiquiditySide, PolymarketOutcome, PolymarketTradeStatus},
         models::{PolymarketMakerOrder, is_owned_by_account},
     },
+    execution::instruments::TokenInstrumentLookup,
     http::{
         clob::PolymarketClobHttpClient,
         data_api::PolymarketDataApiHttpClient,
@@ -439,7 +440,7 @@ fn require_trade_timestamp(
 }
 
 fn resolve_target_instrument(
-    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instruments: &dyn TokenInstrumentLookup,
     token_id: Ustr,
     requested_instrument_id: Option<InstrumentId>,
     evidence: &str,
@@ -569,7 +570,7 @@ enum OrderEvidenceScope<'a> {
 
 fn build_order_report_from_order(
     order: &PolymarketOpenOrder,
-    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instruments: &dyn TokenInstrumentLookup,
     ctx: &FillContext<'_>,
     scope: OrderEvidenceScope<'_>,
     ts_init: UnixNanos,
@@ -728,7 +729,7 @@ fn build_order_report_from_order(
 
 pub(crate) fn build_target_order_report(
     order: &PolymarketOpenOrder,
-    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instruments: &dyn TokenInstrumentLookup,
     ctx: &FillContext<'_>,
     scope: TargetOrderReportScope<'_>,
     ts_init: UnixNanos,
@@ -810,7 +811,7 @@ struct TargetTradeAdmission<'a> {
 fn classify_target_trade<'a>(
     trade: &'a PolymarketTradeReport,
     ctx: &FillContext<'_>,
-    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instruments: &dyn TokenInstrumentLookup,
     instrument_id: Option<InstrumentId>,
     venue_order_id: VenueOrderId,
     expected_order_side: Option<OrderSide>,
@@ -1047,7 +1048,7 @@ fn admit_selected_trade<'a>(
 pub(crate) fn build_fill_reports_from_trades(
     trades: &[PolymarketTradeReport],
     ctx: &FillContext<'_>,
-    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instruments: &dyn TokenInstrumentLookup,
     scope: FillReportScope,
     ts_init: UnixNanos,
     load_ids: Option<&[InstrumentId]>,
@@ -1350,7 +1351,7 @@ pub(crate) fn build_fill_reports_from_trades(
 /// Converts open orders into order status reports.
 pub(crate) fn build_order_reports_from_orders(
     orders: &[PolymarketOpenOrder],
-    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instruments: &dyn TokenInstrumentLookup,
     ctx: &FillContext<'_>,
     instrument_filter: Option<InstrumentId>,
     ts_init: UnixNanos,
@@ -1440,7 +1441,7 @@ pub(crate) fn build_reconciliation_position_reports(
     positions: &[DataApiPosition],
     account_id: AccountId,
     ts: UnixNanos,
-    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instruments: &dyn TokenInstrumentLookup,
     instrument_filter: Option<InstrumentId>,
     load_ids: Option<&[InstrumentId]>,
 ) -> anyhow::Result<Vec<PositionStatusReport>> {
@@ -1467,7 +1468,7 @@ fn build_reconciliation_position_report(
     position: &DataApiPosition,
     account_id: AccountId,
     ts: UnixNanos,
-    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instruments: &dyn TokenInstrumentLookup,
     instrument_filter: Option<InstrumentId>,
     collection_load_ids: Option<&[InstrumentId]>,
 ) -> anyhow::Result<Option<PositionStatusReport>> {
@@ -1507,7 +1508,7 @@ fn build_reconciliation_position_report(
 pub(crate) async fn generate_mass_status(
     http_client: &PolymarketClobHttpClient,
     data_api_client: &PolymarketDataApiHttpClient,
-    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instruments: &dyn TokenInstrumentLookup,
     fill_tracker: &OrderFillTrackerMap,
     ctx: &FillContext<'_>,
     client_id: ClientId,
@@ -1691,7 +1692,7 @@ fn unmapped_in_scope_message(
 fn position_instrument_loaded(
     token_id: &str,
     instrument_id: InstrumentId,
-    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    instruments: &dyn TokenInstrumentLookup,
 ) -> bool {
     instruments
         .get_cloned(&Ustr::from(token_id))
@@ -1820,6 +1821,7 @@ pub(crate) fn normalize_terminal_order_report_quantity(report: &mut OrderStatusR
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::collections::AtomicMap;
     use nautilus_model::{
         enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
         identifiers::TradeId,

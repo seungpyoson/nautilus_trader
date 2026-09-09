@@ -19,6 +19,7 @@ pub mod order_builder;
 pub mod parse;
 
 pub(crate) mod context;
+pub(crate) mod instruments;
 pub(crate) mod order_fill_tracker;
 pub(crate) mod pending;
 pub(crate) mod reconciliation;
@@ -42,18 +43,15 @@ use nautilus_common::{
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
         ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
-    msgbus::TypedHandler,
 };
 use nautilus_core::{
     Params, UnixNanos,
-    collections::AtomicMap,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, SocketControl, task::TaskGroup};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, LiquiditySide, OmsType},
-    events::{OrderEventAny, PositionEvent},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
@@ -65,11 +63,11 @@ use nautilus_network::retry::RetryConfig;
 use parking_lot::Mutex;
 pub(crate) use responses::is_post_only_crossing;
 use rust_decimal::Decimal;
-use ustr::Ustr;
 
 pub(crate) use self::reports::get_pusd_currency;
 use self::{
     context::OrderContextRegistry,
+    instruments::PolymarketInstrumentLookup,
     order_builder::PolymarketOrderBuilder,
     order_fill_tracker::OrderFillTrackerMap,
     pending::{PendingCancelTracker, PendingSubmitTracker},
@@ -102,10 +100,7 @@ pub struct PolymarketExecutionClient {
     shutdown_errors: Vec<String>,
     stopping: Arc<AtomicBool>,
     heartbeat_healthy: Arc<AtomicBool>,
-    order_event_handler: Option<TypedHandler<OrderEventAny>>,
-    position_event_handler: Option<TypedHandler<PositionEvent>>,
-    shared_token_instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
-    neg_risk_index: Arc<AtomicMap<InstrumentId, bool>>,
+    instrument_lookup: PolymarketInstrumentLookup,
     pending_submits: PendingSubmitTracker,
     pending_cancels: PendingCancelTracker,
     order_contexts: Arc<OrderContextRegistry>,
@@ -204,6 +199,9 @@ impl PolymarketExecutionClient {
         let session_tasks = TaskGroup::new();
         let pending_tasks = TaskGroup::new();
 
+        let instrument_lookup =
+            PolymarketInstrumentLookup::new(core.cache().instrument_read_view(), core.venue);
+
         Ok(Self {
             core,
             clock,
@@ -219,10 +217,7 @@ impl PolymarketExecutionClient {
             shutdown_errors: Vec::new(),
             stopping: Arc::new(AtomicBool::new(false)),
             heartbeat_healthy: Arc::new(AtomicBool::new(true)),
-            order_event_handler: None,
-            position_event_handler: None,
-            shared_token_instruments: Arc::new(AtomicMap::new()),
-            neg_risk_index: Arc::new(AtomicMap::new()),
+            instrument_lookup,
             pending_submits: PendingSubmitTracker::default(),
             pending_cancels: PendingCancelTracker::default(),
             order_contexts: Arc::new(OrderContextRegistry::default()),
@@ -365,10 +360,6 @@ impl ExecutionClient for PolymarketExecutionClient {
         _strategy_id: StrategyId,
         _ts_init: UnixNanos,
     ) {
-    }
-
-    fn on_instrument(&mut self, instrument: InstrumentAny) {
-        self.on_instrument_update(&instrument);
     }
 
     fn calculate_commission(

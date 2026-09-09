@@ -19,20 +19,17 @@ use nautilus_common::messages::execution::{
     GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
     GeneratePositionStatusReports, QueryAccount, QueryOrder,
 };
-use nautilus_core::{
-    UnixNanos, collections::AtomicMap, string::secret::SecretString, time::AtomicTime,
-};
+use nautilus_core::{UnixNanos, string::secret::SecretString, time::AtomicTime};
 use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
     enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId, VenueOrderId},
-    instruments::{Instrument, InstrumentAny},
+    instruments::Instrument,
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Currency, Quantity},
 };
 use rust_decimal::Decimal;
-use ustr::Ustr;
 
 use super::{
     PolymarketExecutionClient,
@@ -50,6 +47,7 @@ use super::{
 };
 use crate::{
     common::enums::SignatureType,
+    execution::instruments::TokenInstrumentLookup,
     http::{
         clob::PolymarketClobHttpClient,
         query::{GetBalanceAllowanceParams, GetTradesParams},
@@ -227,7 +225,7 @@ impl PolymarketExecutionClient {
         let (mut order_fills, fill_discards) = build_fill_reports_from_trades(
             &trades,
             &ctx,
-            &self.shared_token_instruments,
+            &self.instrument_lookup,
             FillReportScope::new(Some(instrument_id), Some(venue_order_id))
                 .with_expected_order_side(expected_order_side),
             ts_init,
@@ -413,7 +411,7 @@ impl PolymarketExecutionClient {
 
         let http_client = self.http_client.clone();
         let fill_tracker = self.fill_tracker.clone();
-        let token_instruments = self.shared_token_instruments.clone();
+        let token_instruments = self.instrument_lookup.clone();
         let emitter = self.emitter.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
         let clock = self.clock;
@@ -548,7 +546,7 @@ impl PolymarketExecutionClient {
         let report = if let Some(order) = order {
             let mut report = build_target_order_report(
                 &order,
-                &self.shared_token_instruments,
+                &self.instrument_lookup,
                 &self.fill_context(),
                 TargetOrderReportScope::new(
                     instrument_id,
@@ -582,7 +580,7 @@ impl PolymarketExecutionClient {
                 fetch_confirmed_fill_reports(
                     &self.http_client,
                     &self.fill_context(),
-                    &self.shared_token_instruments,
+                    &self.instrument_lookup,
                     GetTradesParams::default(),
                     FillReportScope::new(Some(instrument_id), Some(venue_order_id))
                         .with_expected_order_side(report.order_side),
@@ -689,7 +687,7 @@ impl PolymarketExecutionClient {
         };
         let (mut reports, _) = super::reconciliation::build_order_reports_from_orders(
             &orders,
-            &self.shared_token_instruments,
+            &self.instrument_lookup,
             &ctx,
             cmd.instrument_id,
             self.clock.get_time_ns(),
@@ -833,7 +831,7 @@ impl PolymarketExecutionClient {
                     let (fills, _) = build_fill_reports_from_trades(
                         &trades,
                         &ctx,
-                        &self.shared_token_instruments,
+                        &self.instrument_lookup,
                         FillReportScope::new(cmd.instrument_id, None),
                         self.clock.get_time_ns(),
                         collection_load_ids,
@@ -952,7 +950,7 @@ impl PolymarketExecutionClient {
         let (mut reports, _) = build_fill_reports_from_trades(
             &trades,
             &ctx,
-            &self.shared_token_instruments,
+            &self.instrument_lookup,
             FillReportScope::new(scope_instrument_id, cmd.venue_order_id)
                 .with_expected_order_side(expected_order_side),
             self.clock.get_time_ns(),
@@ -984,7 +982,7 @@ impl PolymarketExecutionClient {
             &positions,
             self.core.account_id,
             ts_now,
-            &self.shared_token_instruments,
+            &self.instrument_lookup,
             cmd.instrument_id,
             self.config.reconciliation_load_ids(),
         )?;
@@ -1001,7 +999,7 @@ impl PolymarketExecutionClient {
         super::reconciliation::generate_mass_status(
             &self.http_client,
             &self.data_api_client,
-            &self.shared_token_instruments,
+            &self.instrument_lookup,
             &self.fill_tracker,
             &ctx,
             self.core.client_id,
@@ -1017,7 +1015,7 @@ impl PolymarketExecutionClient {
 async fn fetch_confirmed_fill_reports(
     http_client: &PolymarketClobHttpClient,
     ctx: &FillContext<'_>,
-    token_instruments: &AtomicMap<Ustr, InstrumentAny>,
+    token_instruments: &dyn TokenInstrumentLookup,
     params: GetTradesParams,
     scope: FillReportScope,
     ts_init: UnixNanos,

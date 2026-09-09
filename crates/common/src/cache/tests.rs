@@ -1312,7 +1312,8 @@ fn test_get_xrate_builds_quote_keys_from_instrument_currencies(
     let mut cache = Cache {
         instruments: AHashMap::with_hasher(RandomState::with_seeds(
             seeds.0, seeds.1, seeds.2, seeds.3,
-        )),
+        ))
+        .into(),
         ..Default::default()
     };
 
