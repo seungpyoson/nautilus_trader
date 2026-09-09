@@ -1264,7 +1264,7 @@ impl ExecutionManager {
                             match exec_engine.borrow_mut().process_with_outcome(&event) {
                                 EventApplicationOutcome::Applied => summary.applied_events += 1,
                                 EventApplicationOutcome::Incomplete => {
-                                    summary.incomplete_events += 1
+                                    summary.incomplete_events += 1;
                                 }
                             }
                             events.push(event);
