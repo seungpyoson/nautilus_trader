@@ -884,7 +884,7 @@ impl LiveNode {
                 color = LogColor::Blue
             );
 
-            let mass_status_result = match dst::time::timeout(remaining, async {
+            let Ok(mass_status_result) = dst::time::timeout(remaining, async {
                 self.kernel
                     .exec_engine
                     .borrow_mut()
@@ -892,14 +892,11 @@ impl LiveNode {
                     .await
             })
             .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    client.collection = MassStatusCollection::TimedOut;
-                    anyhow::bail!(
-                        "Startup reconciliation timeout reached while requesting mass status from {client_id}"
-                    );
-                }
+            else {
+                client.collection = MassStatusCollection::TimedOut;
+                anyhow::bail!(
+                    "Startup reconciliation timeout reached while requesting mass status from {client_id}"
+                );
             };
 
             match mass_status_result {

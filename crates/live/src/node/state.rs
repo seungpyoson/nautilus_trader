@@ -144,7 +144,7 @@ impl LiveNodeHandle {
         *self
             .reconciliation
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.set_state(NodeState::Starting);
     }
 
@@ -211,7 +211,7 @@ impl LiveNodeHandle {
     pub fn startup_reconciliation_summary(&self) -> Option<Arc<StartupReconciliationSummary>> {
         self.reconciliation
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -219,7 +219,7 @@ impl LiveNodeHandle {
         *self
             .reconciliation
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(summary));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(summary));
     }
 
     /// Signals the node to stop.
