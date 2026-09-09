@@ -57,7 +57,7 @@ use nautilus_core::{
     datetime::{NANOSECONDS_IN_MINUTE, NANOSECONDS_IN_SECOND},
 };
 use nautilus_execution::engine::{
-    ExecutionEngine, PositionStateSnapshot, config::ExecutionEngineConfig,
+    EventApplicationOutcome, ExecutionEngine, PositionStateSnapshot, config::ExecutionEngineConfig,
     stubs::StubExecutionClient,
 };
 use nautilus_model::{
@@ -2830,7 +2830,7 @@ fn test_process_leg_fill_without_order_updates_position_and_publishes_order_befo
 
     let event = OrderEventAny::Filled(fill);
 
-    execution_engine.process(&event);
+    let outcome = execution_engine.process_with_outcome(&event);
     msgbus::unsubscribe_order_events(fills_topic.into(), &fills_handler);
     msgbus::unsubscribe_order_events(order_topic.into(), &order_handler);
     msgbus::unsubscribe_position_events(position_topic.into(), &position_handler);
@@ -2843,6 +2843,7 @@ fn test_process_leg_fill_without_order_updates_position_and_publishes_order_befo
         .position(&expected_position_id)
         .expect("leg fill should open a position");
 
+    assert_eq!(outcome, EventApplicationOutcome::Applied);
     assert!(received_fills.borrow().is_empty());
     assert_eq!(received_portfolio.len(), 1);
     let OrderEventAny::Filled(portfolio_fill) = &received_portfolio[0].0 else {
@@ -3134,12 +3135,13 @@ fn test_project_reconciliation_fill_applies_no_portfolio_economics_on_cash_accou
         Some(Money::from("2 USD")),
     );
 
-    execution_engine.project_reconciliation_fill(&fill);
+    let outcome = execution_engine.project_reconciliation_fill_with_outcome(&fill);
 
     let cache = execution_engine.cache().borrow();
     let order = cache
         .order(&order.client_order_id())
         .expect("order should remain cached");
+    assert_eq!(outcome, EventApplicationOutcome::Applied);
     assert_eq!(order.filled_qty(), order.quantity());
     assert_eq!(order.status(), OrderStatus::Filled);
     assert_eq!(
@@ -3150,6 +3152,107 @@ fn test_project_reconciliation_fill_applies_no_portfolio_economics_on_cash_accou
     assert!(
         received_portfolio.borrow().is_empty(),
         "projection must not emit portfolio economics"
+    );
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_reconciliation_projection_rejects_orderless_leg(
+    mut execution_engine: ExecutionEngine,
+    #[case] indexed_missing_order: bool,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let (_, fill, _) = prepare_leg_fill_without_order(&execution_engine);
+
+    if indexed_missing_order {
+        execution_engine
+            .cache()
+            .borrow_mut()
+            .index_venue_order_id(&fill.client_order_id, &fill.venue_order_id)
+            .unwrap();
+    }
+
+    let received_portfolio = Rc::new(RefCell::new(Vec::<OrderEventAny>::new()));
+    let handler = TypedIntoHandler::from({
+        let received_portfolio = received_portfolio.clone();
+        move |event: OrderEventAny| received_portfolio.borrow_mut().push(event)
+    });
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::portfolio_update_order(), handler);
+
+    let outcome = execution_engine.project_reconciliation_fill_with_outcome(&fill);
+
+    assert_eq!(outcome, EventApplicationOutcome::Incomplete);
+    assert_eq!(
+        execution_engine
+            .cache()
+            .borrow()
+            .positions_total_count(None, None, None, None, None),
+        0
+    );
+    assert!(received_portfolio.borrow().is_empty());
+}
+
+#[rstest]
+#[case(false, EventApplicationOutcome::Incomplete)]
+#[case(true, EventApplicationOutcome::Applied)]
+fn test_fill_application_outcome_requires_position_account(
+    mut execution_engine: ExecutionEngine,
+    #[case] account_available: bool,
+    #[case] expected: EventApplicationOutcome,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let instrument = InstrumentAny::from(audusd_sim());
+    let account_id = AccountId::test_default();
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+    order
+        .apply(TestOrderEventStubs::submitted(&order, account_id))
+        .unwrap();
+    order
+        .apply(TestOrderEventStubs::accepted(
+            &order,
+            account_id,
+            VenueOrderId::from("V-OUTCOME"),
+        ))
+        .unwrap();
+
+    {
+        let mut cache = execution_engine.cache().borrow_mut();
+        cache.add_instrument(instrument.clone()).unwrap();
+
+        if account_available {
+            cache.add_account(CashAccount::default().into()).unwrap();
+        }
+        cache.add_order(order.clone(), None, None, false).unwrap();
+    }
+
+    let fill = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(account_id),
+    );
+    let outcome = execution_engine.process_with_outcome(&fill);
+
+    let cache = execution_engine.cache().borrow();
+    assert_eq!(outcome, expected);
+    assert_eq!(
+        cache.order(&order.client_order_id()).unwrap().status(),
+        OrderStatus::Filled
+    );
+    assert_eq!(
+        cache.positions_open_count(None, None, None, None, None),
+        usize::from(account_available)
     );
 }
 
@@ -8784,7 +8887,7 @@ fn test_reduce_only_netting_fill_does_not_open_opposite_position(
         None,
         Some(account_id),
     );
-    execution_engine.process(&filled_event);
+    let outcome = execution_engine.process_with_outcome(&filled_event);
 
     let phantom_position_id = PositionId::new(format!("{}-{}", instrument.id, strategy_id));
     let cache = execution_engine.cache().borrow();
@@ -8794,6 +8897,7 @@ fn test_reduce_only_netting_fill_does_not_open_opposite_position(
     let open_positions =
         cache.positions_open(None, Some(&instrument.id), None, Some(&account_id), None);
 
+    assert_eq!(outcome, EventApplicationOutcome::Incomplete);
     assert_eq!(reduce_only_order.status(), OrderStatus::Filled);
     assert!(!cache.position_exists(&phantom_position_id));
     assert_eq!(open_positions.len(), 1);

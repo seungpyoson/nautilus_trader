@@ -105,6 +105,18 @@ const TIMER_PURGE_CLOSED_ORDERS: &str = "ExecEngine_PURGE_CLOSED_ORDERS";
 const TIMER_PURGE_CLOSED_POSITIONS: &str = "ExecEngine_PURGE_CLOSED_POSITIONS";
 const TIMER_PURGE_ACCOUNT_EVENTS: &str = "ExecEngine_PURGE_ACCOUNT_EVENTS";
 
+/// Outcome of applying an order event through the execution engine.
+///
+/// An incomplete application may have mutated some state. This is not an atomicity or
+/// persistence guarantee, and does not describe report collection or portfolio valuation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventApplicationOutcome {
+    /// The configured order and position application completed.
+    Applied,
+    /// The engine could not complete the configured application.
+    Incomplete,
+}
+
 /// Central execution engine responsible for orchestrating order routing and execution.
 ///
 /// The execution engine manages the entire order lifecycle from submission to completion,
@@ -1849,9 +1861,29 @@ impl ExecutionEngine {
         self.handle_event(event);
     }
 
+    /// Processes an order event and returns its native application outcome.
+    ///
+    /// An incomplete outcome can include partial mutations. Message-bus consumers and external
+    /// persistence are outside this result; their acceptance is not acknowledged by the engine.
+    #[must_use]
+    pub fn process_with_outcome(&mut self, event: &OrderEventAny) -> EventApplicationOutcome {
+        self.handle_event_with_position_application(event, true)
+    }
+
     /// Projects a reconciled fill onto its order without applying position or portfolio economics.
     pub fn project_reconciliation_fill(&mut self, fill: &OrderFilled) {
-        self.handle_event_with_position_application(&OrderEventAny::Filled(fill.clone()), false);
+        let _ = self.project_reconciliation_fill_with_outcome(fill);
+    }
+
+    /// Projects a reconciled fill and returns its order-only application outcome.
+    ///
+    /// Success does not indicate that position or portfolio economics were applied.
+    #[must_use]
+    pub fn project_reconciliation_fill_with_outcome(
+        &mut self,
+        fill: &OrderFilled,
+    ) -> EventApplicationOutcome {
+        self.handle_event_with_position_application(&OrderEventAny::Filled(fill.clone()), false)
     }
 
     /// Starts the execution engine and all registered execution clients.
@@ -2684,14 +2716,14 @@ impl ExecutionEngine {
     }
 
     fn handle_event(&mut self, event: &OrderEventAny) {
-        self.handle_event_with_position_application(event, true);
+        let _ = self.process_with_outcome(event);
     }
 
     fn handle_event_with_position_application(
         &mut self,
         event: &OrderEventAny,
         apply_position: bool,
-    ) {
+    ) -> EventApplicationOutcome {
         self.event_count += 1;
 
         if self.config.debug {
@@ -2721,7 +2753,7 @@ impl ExecutionEngine {
                     "Cannot apply event to any order: {} not found in the cache with no VenueOrderId",
                     event.client_order_id()
                 );
-                return;
+                return EventApplicationOutcome::Incomplete;
             };
 
             // Look up client order ID from venue order ID
@@ -2729,6 +2761,7 @@ impl ExecutionEngine {
                 *id
             } else {
                 if let OrderEventAny::Filled(fill) = event
+                    && apply_position
                     && is_leg_fill
                 {
                     log::info!(
@@ -2737,15 +2770,14 @@ impl ExecutionEngine {
                         fill.instrument_id
                     );
                     drop(cache);
-                    self.handle_leg_fill_without_order(fill.clone());
-                    return;
+                    return self.handle_leg_fill_without_order(fill.clone());
                 }
 
                 log::error!(
                     "Cannot apply event to any order: {} and {venue_order_id} not found in the cache",
                     event.client_order_id(),
                 );
-                return;
+                return EventApplicationOutcome::Incomplete;
             };
 
             // Get order using found client order ID
@@ -2754,6 +2786,7 @@ impl ExecutionEngine {
                 client_order_id
             } else {
                 if let OrderEventAny::Filled(fill) = event
+                    && apply_position
                     && is_leg_fill
                 {
                     log::info!(
@@ -2762,14 +2795,13 @@ impl ExecutionEngine {
                         fill.instrument_id
                     );
                     drop(cache);
-                    self.handle_leg_fill_without_order(fill.clone());
-                    return;
+                    return self.handle_leg_fill_without_order(fill.clone());
                 }
 
                 log::error!(
                     "Cannot apply event to any order: {client_order_id} and {venue_order_id} not found in cache",
                 );
-                return;
+                return EventApplicationOutcome::Incomplete;
             }
         };
         let order_before_fill = if matches!(event, OrderEventAny::Filled(_)) {
@@ -2793,13 +2825,13 @@ impl ExecutionEngine {
                         "Cannot apply fill: order {} not found in the cache",
                         fill.client_order_id()
                     );
-                    return;
+                    return EventApplicationOutcome::Incomplete;
                 };
                 let configured_oms_type = self.determine_oms_type(fill);
                 let Some(position_id) =
                     self.determine_position_id(fill, configured_oms_type, Some(&order_before_fill))
                 else {
-                    return;
+                    return EventApplicationOutcome::Incomplete;
                 };
                 let oms_type = self
                     .cache
@@ -2821,17 +2853,19 @@ impl ExecutionEngine {
                     let Some(order) =
                         self.update_cached_order(client_order_id, &event, apply_position)
                     else {
-                        return;
+                        return EventApplicationOutcome::Incomplete;
                     };
 
-                    let position_events = if apply_position {
+                    let (position_events, outcome) = if apply_position {
                         self.handle_order_fill(&order, fill, oms_type)
                     } else {
-                        Vec::new()
+                        (Vec::new(), EventApplicationOutcome::Applied)
                     };
                     self.publish_order_event(&event);
                     self.publish_position_events(position_events);
+                    return outcome;
                 }
+                return EventApplicationOutcome::Incomplete;
             }
             OrderEventAny::FillVoided(voided) => {
                 let mut voided = voided.clone();
@@ -2842,7 +2876,7 @@ impl ExecutionEngine {
                     .map(|order| order.clone())
                 else {
                     log::error!("Cannot apply fill void: order {client_order_id} not found");
-                    return;
+                    return EventApplicationOutcome::Incomplete;
                 };
                 let original_fill = order_before_void
                     .events()
@@ -2866,11 +2900,11 @@ impl ExecutionEngine {
                         log::warn!(
                             "Duplicate fill void rejected at order level: trade_id={trade_id}"
                         );
-                        return;
+                        return EventApplicationOutcome::Incomplete;
                     }
                     Err(e) => {
                         log::error!("Cannot apply fill void to order: {e}");
-                        return;
+                        return EventApplicationOutcome::Incomplete;
                     }
                 }
 
@@ -2883,7 +2917,7 @@ impl ExecutionEngine {
                         Ok(positions) => positions,
                         Err(e) => {
                             log::error!("Cannot apply fill void to positions: {e}");
-                            return;
+                            return EventApplicationOutcome::Incomplete;
                         }
                     }
                 } else {
@@ -2901,7 +2935,7 @@ impl ExecutionEngine {
                 {
                     if let Err(e) = self.cache.borrow_mut().update_position(&position) {
                         log::error!("Cannot apply fill void to position {}: {e}", position.id);
-                        return;
+                        return EventApplicationOutcome::Incomplete;
                     }
 
                     if absorbed_prior_cycles {
@@ -2931,7 +2965,7 @@ impl ExecutionEngine {
                     .update_cached_order(client_order_id, &event, true)
                     .is_none()
                 {
-                    return;
+                    return EventApplicationOutcome::Incomplete;
                 }
 
                 if original_fill.is_some() {
@@ -2947,12 +2981,15 @@ impl ExecutionEngine {
                     .is_some()
                 {
                     self.publish_order_event(&event);
+                } else {
+                    return EventApplicationOutcome::Incomplete;
                 }
             }
         }
+        EventApplicationOutcome::Applied
     }
 
-    fn handle_leg_fill_without_order(&mut self, mut fill: OrderFilled) {
+    fn handle_leg_fill_without_order(&mut self, mut fill: OrderFilled) -> EventApplicationOutcome {
         let instrument =
             if let Some(instrument) = self.cache.borrow().instrument(&fill.instrument_id) {
                 instrument.clone()
@@ -2961,12 +2998,12 @@ impl ExecutionEngine {
                     "Cannot handle leg fill: no instrument found for {}, {fill}",
                     fill.instrument_id,
                 );
-                return;
+                return EventApplicationOutcome::Incomplete;
             };
 
         if let Err(e) = self.cache.borrow().try_account(&fill.account_id) {
             log::error!("Cannot handle leg fill: {e}, {fill}");
-            return;
+            return EventApplicationOutcome::Incomplete;
         }
 
         let oms_type = self.determine_oms_type(&fill);
@@ -2974,7 +3011,7 @@ impl ExecutionEngine {
         fill.position_id = Some(position_id);
 
         if !self.validate_fill_for_position(position_id, &fill) {
-            return;
+            return EventApplicationOutcome::Incomplete;
         }
 
         let duplicate_position_fill = self.position_contains_trade_id(position_id, fill.trade_id);
@@ -2988,14 +3025,15 @@ impl ExecutionEngine {
                 fill.trade_id,
                 position_id
             );
-            return;
+            return EventApplicationOutcome::Incomplete;
         }
 
         let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
         msgbus::send_order_event(portfolio_endpoint, event.clone());
-        let position_events = self.handle_position_update(&instrument, fill, oms_type);
+        let (position_events, outcome) = self.handle_position_update(&instrument, fill, oms_type);
         self.publish_order_event(&event);
         self.publish_position_events(position_events);
+        outcome
     }
 
     fn determine_leg_fill_position_id(
@@ -3632,7 +3670,7 @@ impl ExecutionEngine {
         order: &OrderAny,
         fill: OrderFilled,
         oms_type: OmsType,
-    ) -> Vec<PositionEvent> {
+    ) -> (Vec<PositionEvent>, EventApplicationOutcome) {
         let instrument =
             if let Some(instrument) = self.cache.borrow().instrument(&fill.instrument_id) {
                 instrument.clone()
@@ -3641,7 +3679,7 @@ impl ExecutionEngine {
                     "Cannot handle order fill: no instrument found for {}, {fill}",
                     fill.instrument_id,
                 );
-                return Vec::new();
+                return (Vec::new(), EventApplicationOutcome::Incomplete);
             };
 
         let is_margin_account = {
@@ -3650,7 +3688,7 @@ impl ExecutionEngine {
                 Ok(account) => account,
                 Err(e) => {
                     log::error!("Cannot handle order fill: {e}, {fill}");
-                    return Vec::new();
+                    return (Vec::new(), EventApplicationOutcome::Incomplete);
                 }
             };
 
@@ -3664,10 +3702,11 @@ impl ExecutionEngine {
             msgbus::send_order_event(portfolio_endpoint, OrderEventAny::Filled(fill.clone()));
         }
 
-        let (position, position_events) = if instrument.is_spread() {
-            (None, Vec::new())
+        let (position, position_events, mut outcome) = if instrument.is_spread() {
+            (None, Vec::new(), EventApplicationOutcome::Applied)
         } else {
-            let position_events = self.handle_position_update(&instrument, fill.clone(), oms_type);
+            let (position_events, outcome) =
+                self.handle_position_update(&instrument, fill.clone(), oms_type);
             let position_id = fill.position_id.unwrap();
             (
                 self.cache
@@ -3675,6 +3714,7 @@ impl ExecutionEngine {
                     .position(&position_id)
                     .map(|position| position.clone_without_events()),
                 position_events,
+                outcome,
             )
         };
 
@@ -3716,6 +3756,7 @@ impl ExecutionEngine {
                         )
                     {
                         log::error!("Failed to add position ID: {e}");
+                        outcome = EventApplicationOutcome::Incomplete;
                     }
                 }
             }
@@ -3727,7 +3768,7 @@ impl ExecutionEngine {
         let event = OrderEventAny::Filled(fill);
         msgbus::publish_order_event(topic, &event);
 
-        position_events
+        (position_events, outcome)
     }
 
     fn prepare_order_fill_void_positions(
@@ -3981,12 +4022,12 @@ impl ExecutionEngine {
         instrument: &InstrumentAny,
         fill: OrderFilled,
         oms_type: OmsType,
-    ) -> Vec<PositionEvent> {
+    ) -> (Vec<PositionEvent>, EventApplicationOutcome) {
         let position_id = if let Some(position_id) = fill.position_id {
             position_id
         } else {
             log::error!("Cannot handle position update: no position ID found for fill {fill}");
-            return Vec::new();
+            return (Vec::new(), EventApplicationOutcome::Incomplete);
         };
 
         let position_opt = self.cache.borrow().position_owned(&position_id);
@@ -3994,26 +4035,44 @@ impl ExecutionEngine {
         match position_opt {
             None => {
                 if self.reject_reduce_only_position_open(&fill, oms_type) {
-                    return Vec::new();
+                    return (Vec::new(), EventApplicationOutcome::Incomplete);
                 }
 
-                self.open_position(instrument, None, fill, oms_type)
-                    .unwrap_or_default()
+                Self::position_application(self.open_position(instrument, None, fill, oms_type))
             }
             Some(pos) if pos.is_closed() => {
                 if self.reject_reduce_only_position_open(&fill, oms_type) {
-                    return Vec::new();
+                    return (Vec::new(), EventApplicationOutcome::Incomplete);
                 }
 
-                self.open_position(instrument, Some(&pos), fill, oms_type)
-                    .unwrap_or_default()
+                Self::position_application(self.open_position(
+                    instrument,
+                    Some(&pos),
+                    fill,
+                    oms_type,
+                ))
             }
             Some(mut pos) => {
                 if self.will_flip_position(&pos, &fill) {
                     self.flip_position(instrument, &mut pos, &fill, oms_type)
                 } else {
-                    self.update_position(&mut pos, &fill).into_iter().collect()
+                    match self.update_position(&mut pos, &fill) {
+                        Some(event) => (vec![event], EventApplicationOutcome::Applied),
+                        None => (Vec::new(), EventApplicationOutcome::Incomplete),
+                    }
                 }
+            }
+        }
+    }
+
+    fn position_application(
+        result: anyhow::Result<Vec<PositionEvent>>,
+    ) -> (Vec<PositionEvent>, EventApplicationOutcome) {
+        match result {
+            Ok(events) => (events, EventApplicationOutcome::Applied),
+            Err(e) => {
+                log::error!("Failed to apply position: {e}");
+                (Vec::new(), EventApplicationOutcome::Incomplete)
             }
         }
     }
@@ -4244,8 +4303,9 @@ impl ExecutionEngine {
         position: &mut Position,
         fill: &OrderFilled,
         oms_type: OmsType,
-    ) -> Vec<PositionEvent> {
+    ) -> (Vec<PositionEvent>, EventApplicationOutcome) {
         let mut position_events = Vec::new();
+        let mut outcome = EventApplicationOutcome::Applied;
 
         if fill.commission.is_none() {
             log::warn!(
@@ -4270,6 +4330,8 @@ impl ExecutionEngine {
 
         if let Some(position_event) = self.update_position(position, &fill_split1) {
             position_events.push(position_event);
+        } else {
+            outcome = EventApplicationOutcome::Incomplete;
         }
 
         // Snapshot closed position before reusing ID (NETTING mode)
@@ -4277,6 +4339,7 @@ impl ExecutionEngine {
             && let Err(e) = self.snapshot_position(position)
         {
             log::warn!("Failed to snapshot position during flip: {e:?}");
+            outcome = EventApplicationOutcome::Incomplete;
         }
 
         if oms_type == OmsType::Hedging
@@ -4290,10 +4353,13 @@ impl ExecutionEngine {
         // Open flipped position
         match self.open_position(instrument, None, fill_split2, oms_type) {
             Ok(opened_events) => position_events.extend(opened_events),
-            Err(e) => log::error!("Failed to open flipped position: {e:?}"),
+            Err(e) => {
+                log::error!("Failed to open flipped position: {e:?}");
+                outcome = EventApplicationOutcome::Incomplete;
+            }
         }
 
-        position_events
+        (position_events, outcome)
     }
 
     /// Sets the internal position ID generator counts based on existing cached positions.
