@@ -74,10 +74,13 @@ pub trait ExecutionClient {
         self.venue() == venue
     }
 
-    /// Returns whether a bulk position status report request provides complete coverage for the
-    /// given instrument, so that an absent report is evidence the position is flat.
+    /// Returns whether a bulk position status report request provides complete coverage for this
+    /// client's account and the given instrument, so an absent report is evidence it is flat.
+    ///
+    /// Coverage requires an explicit declaration; a successful query alone is insufficient.
+    /// Clients which filter their bulk inventory must return false for excluded instruments.
     fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
-        true
+        false
     }
 
     /// Generates and publishes the account state event.
@@ -809,6 +812,7 @@ mod tests {
         assert!(report.fill_reports_ref().is_empty());
         assert!(report.position_reports_ref().is_empty());
         assert!(report.reports_complete());
+        assert!(!client.provides_bulk_position_coverage(test_position_report().instrument_id));
         assert_eq!(client.order_commands.borrow().len(), 1);
         assert_eq!(client.fill_requests.borrow().len(), 1);
         assert_eq!(client.position_queries.borrow().len(), 1);

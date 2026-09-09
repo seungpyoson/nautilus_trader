@@ -2514,6 +2514,7 @@ async fn test_generate_mass_status_applies_load_ids_to_all_report_types() {
     assert!(mass_status.order_reports().is_empty());
     assert!(mass_status.fill_reports().is_empty());
     assert!(mass_status.position_reports().is_empty());
+    assert!(!client.provides_bulk_position_coverage(loaded_instrument_id));
 }
 
 #[rstest]
@@ -4520,7 +4521,7 @@ async fn test_commission_failure_errors_direct_mass_and_targeted_rest_requests()
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_position_status_reports_always_empty() {
+async fn test_generate_position_status_reports_preserves_genuine_empty() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
     let (client, _rx, _cache) = create_test_execution_client(addr);
@@ -4539,8 +4540,80 @@ async fn test_generate_position_status_reports_always_empty() {
 
     let reports = client.generate_position_status_reports(&cmd).await.unwrap();
 
-    // Polymarket has no position endpoint
     assert!(reports.is_empty());
+    assert!(client.provides_bulk_position_coverage(InstrumentId::from(
+        format!("{TEST_CONDITION_ID}-{TEST_TOKEN_ID}.POLYMARKET").as_str(),
+    )));
+}
+
+#[rstest]
+#[case::unconfigured(None, true)]
+#[case::empty_load_list(Some(Vec::new()), true)]
+#[case::included(Some(vec![TEST_CONDITION_ID.to_string()]), true)]
+#[case::condition_case(Some(vec![TEST_CONDITION_ID.to_uppercase()]), true)]
+#[case::excluded(Some(vec!["OTHER".to_string()]), false)]
+#[tokio::test]
+async fn test_bulk_position_coverage_matches_collection_scope(
+    #[case] load_conditions: Option<Vec<String>>,
+    #[case] expected_coverage: bool,
+) {
+    let state = TestServerState::default();
+    *state.positions_response_override.lock().await = Some(json!([{
+        "asset": TEST_TOKEN_ID,
+        "conditionId": TEST_CONDITION_ID,
+        "size": "25.0000",
+        "avgPrice": "0.5000",
+    }]));
+    let addr = start_mock_server(state).await;
+    let instrument_id =
+        InstrumentId::from(format!("{TEST_CONDITION_ID}-{TEST_TOKEN_ID}.POLYMARKET").as_str());
+    let mut config = create_test_exec_config(addr);
+    config.instrument_config =
+        load_conditions.map(|conditions| PolymarketInstrumentProviderConfig {
+            load_ids: Some(
+                conditions
+                    .iter()
+                    .map(|condition| {
+                        InstrumentId::from(
+                            format!("{condition}-{TEST_TOKEN_ID}.POLYMARKET").as_str(),
+                        )
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+    let (mut client, _rx, cache) = create_test_execution_client_from_config(config);
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let reports = client
+        .generate_position_status_reports(&GeneratePositionStatusReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: None,
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        client.provides_bulk_position_coverage(instrument_id),
+        expected_coverage,
+    );
+    assert_eq!(reports.len(), usize::from(expected_coverage));
+    if expected_coverage {
+        assert_eq!(reports[0].instrument_id, instrument_id);
+        assert_eq!(reports[0].account_id, client.account_id());
+        assert_eq!(reports[0].quantity, Quantity::from("25.000000"));
+    }
+
+    assert!(!client.provides_bulk_position_coverage(InstrumentId::from("TEST-TOKEN.OTHER")));
 }
 
 #[rstest]
@@ -4583,6 +4656,7 @@ async fn test_generate_position_status_reports_explicit_target_ignores_load_ids_
 
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].instrument_id, instrument_id);
+    assert!(!client.provides_bulk_position_coverage(instrument_id));
 }
 
 #[rstest]

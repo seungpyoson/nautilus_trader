@@ -296,6 +296,14 @@ impl ExecutionClient for PolymarketExecutionClient {
         crate::common::consts::POSITION_RECONCILIATION_TOLERANCE
     }
 
+    fn provides_bulk_position_coverage(&self, instrument_id: InstrumentId) -> bool {
+        self.handles_order_venue(instrument_id.venue)
+            && reconciliation::instrument_in_load_ids_scope(
+                instrument_id,
+                self.config.reconciliation_load_ids(),
+            )
+    }
+
     fn generate_account_state(
         &self,
         balances: Vec<AccountBalance>,

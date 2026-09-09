@@ -2824,38 +2824,22 @@ impl ExecutionManager {
         key: InstrumentAccountKey,
         clients: &[&dyn ExecutionClient],
     ) -> ReportClientCoverage {
-        let account_clients = clients
-            .iter()
-            .filter(|client| client.account_id() == key.1)
-            .map(|client| client.client_id())
-            .collect::<IndexSet<_>>();
+        let mut responsible_clients = IndexSet::new();
+        let mut coverage_available = true;
 
-        if !account_clients.is_empty() {
-            return if clients.iter().any(|client| {
-                account_clients.contains(&client.client_id())
-                    && !client.provides_bulk_position_coverage(key.0)
-            }) {
-                ReportClientCoverage::Unavailable(account_clients)
-            } else {
-                ReportClientCoverage::Resolved(account_clients)
-            };
+        for client in clients {
+            if client.account_id() == key.1 && client.handles_order_venue(key.0.venue) {
+                responsible_clients.insert(client.client_id());
+                coverage_available &= client.provides_bulk_position_coverage(key.0);
+            }
         }
 
-        let venue_clients = clients
-            .iter()
-            .filter(|client| client.handles_order_venue(key.0.venue))
-            .map(|client| client.client_id())
-            .collect::<IndexSet<_>>();
-
-        if venue_clients.is_empty() {
+        if responsible_clients.is_empty() {
             ReportClientCoverage::Unresolved
-        } else if clients.iter().any(|client| {
-            venue_clients.contains(&client.client_id())
-                && !client.provides_bulk_position_coverage(key.0)
-        }) {
-            ReportClientCoverage::Unavailable(venue_clients)
+        } else if coverage_available {
+            ReportClientCoverage::Resolved(responsible_clients)
         } else {
-            ReportClientCoverage::Resolved(venue_clients)
+            ReportClientCoverage::Unavailable(responsible_clients)
         }
     }
 
@@ -5395,7 +5379,21 @@ pub(crate) async fn request_position_reports<'a>(
         queried_clients.insert(client_id);
 
         match client.generate_position_status_reports(command).await {
-            Ok(client_reports) => reports.extend(client_reports),
+            Ok(client_reports) => {
+                if let Some(report) = client_reports.iter().find(|report| {
+                    report.account_id != client.account_id()
+                        || !client.handles_order_venue(report.instrument_id.venue)
+                }) {
+                    failed_clients.insert(client_id);
+                    log::error!(
+                        "Discarding position query from {client_id}: report for {}/{} is outside the client's account or handled venues",
+                        report.instrument_id,
+                        report.account_id,
+                    );
+                } else {
+                    reports.extend(client_reports);
+                }
+            }
             Err(e) => {
                 failed_clients.insert(client_id);
                 log::warn!(
@@ -7208,7 +7206,9 @@ mod tests {
         let manager =
             ExecutionManager::new(clock, cache.clone(), ExecutionManagerConfig::default())
                 .expect("valid config");
-        let derivative = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let mut derivative = crypto_perpetual_ethusdt();
+        derivative.id = InstrumentId::from("ETHUSDT-LINEAR.BYBIT");
+        let derivative = InstrumentAny::CryptoPerpetual(derivative);
         let spot = test_bybit_spot_instrument();
         cache
             .borrow_mut()
@@ -7261,7 +7261,9 @@ mod tests {
         let mut manager =
             ExecutionManager::new(clock, cache.clone(), ExecutionManagerConfig::default())
                 .expect("valid config");
-        let derivative = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let mut derivative = crypto_perpetual_ethusdt();
+        derivative.id = InstrumentId::from("ETHUSDT-LINEAR.BYBIT");
+        let derivative = InstrumentAny::CryptoPerpetual(derivative);
         let spot = test_bybit_spot_instrument();
         cache
             .borrow_mut()
