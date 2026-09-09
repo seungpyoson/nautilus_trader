@@ -62,11 +62,17 @@ use nautilus_execution::{
     },
 };
 #[cfg(feature = "node")]
-use nautilus_model::position::PositionReplayEvent;
-#[cfg(feature = "node")]
-use nautilus_model::types::{money::MoneyRaw, quantity::QuantityRaw};
 use nautilus_model::{
-    enums::{LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
+    data::InstrumentClose,
+    events::{OrderAccepted, OrderSubmitted},
+    orders::{MarketOrder, OrderCore},
+    position::PositionReplayEvent,
+    types::{money::MoneyRaw, quantity::QuantityRaw},
+};
+use nautilus_model::{
+    enums::{
+        InstrumentCloseType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
+    },
     events::{OrderCanceled, OrderEventAny, OrderFilled, OrderInitialized},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
@@ -98,6 +104,15 @@ pub type InstrumentAccountKey = (InstrumentId, AccountId);
 type AccountInstrumentKey = (AccountId, InstrumentId);
 type AccountInstrumentStrategyKey = (AccountId, InstrumentId, StrategyId);
 type FillKey = (AccountId, InstrumentId, TradeId);
+
+/// One local accounting close, prepared without mutating order or position state.
+#[cfg(feature = "node")]
+#[derive(Debug)]
+pub(crate) struct ContractSettlement {
+    pub order: OrderAny,
+    pub position_id: PositionId,
+    pub events: [OrderEventAny; 3],
+}
 
 #[expect(clippy::too_many_arguments)]
 fn build_cross_zero_leg_report(
@@ -558,6 +573,174 @@ impl Debug for ExecutionManager {
 }
 
 impl ExecutionManager {
+    /// Records a contract close and prepares settlement events for its open positions.
+    #[cfg(feature = "node")]
+    pub(crate) fn process_instrument_close(
+        &mut self,
+        close: InstrumentClose,
+    ) -> anyhow::Result<Vec<ContractSettlement>> {
+        if close.close_type != InstrumentCloseType::ContractExpired {
+            return Ok(Vec::new());
+        }
+
+        {
+            let mut cache = self.cache.borrow_mut();
+            anyhow::ensure!(
+                cache.instrument(&close.instrument_id).is_some(),
+                "Cannot settle unknown instrument {}",
+                close.instrument_id,
+            );
+            if let Some(previous) = cache.instrument_close(&close.instrument_id)
+                && previous.close_type == InstrumentCloseType::ContractExpired
+            {
+                anyhow::ensure!(
+                    previous.close_price == close.close_price,
+                    "Conflicting contract close for {}",
+                    close.instrument_id,
+                );
+            } else {
+                cache.add_instrument_close(close)?;
+            }
+        }
+
+        self.prepare_contract_settlements(close.instrument_id)
+    }
+
+    fn has_contract_close(&self, instrument_id: &InstrumentId) -> bool {
+        self.cache
+            .borrow()
+            .instrument_close(instrument_id)
+            .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+    }
+
+    /// Prepares residual closes at the recorded contract price, including late fills.
+    #[cfg(feature = "node")]
+    pub(crate) fn prepare_contract_settlements(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<Vec<ContractSettlement>> {
+        let (close, instrument, positions) = {
+            let cache = self.cache.borrow();
+            let Some(close) = cache.instrument_close(&instrument_id).copied() else {
+                return Ok(Vec::new());
+            };
+            if close.close_type != InstrumentCloseType::ContractExpired {
+                return Ok(Vec::new());
+            }
+            let instrument = cache
+                .instrument(&instrument_id)
+                .ok_or_else(|| anyhow::anyhow!("Missing settlement instrument {instrument_id}"))?
+                .clone();
+            let positions = cache
+                .positions_open_refs(None, Some(&instrument_id), None, None, None)
+                .into_iter()
+                .map(|position| position.cloned())
+                .collect::<Vec<_>>();
+            (close, instrument, positions)
+        };
+        let ts_now = self.clock.borrow().timestamp_ns();
+        let mut settlements = Vec::new();
+
+        for position in positions {
+            let side = OrderCore::closing_side(position.side)
+                .ok_or_else(|| anyhow::anyhow!("Cannot close flat position {}", position.id))?;
+            let last_trade_id = position.last_trade_id().ok_or_else(|| {
+                anyhow::anyhow!("Missing settlement fill identity for {}", position.id)
+            })?;
+            let venue_order_id = create_position_reconciliation_venue_order_id(
+                position.account_id,
+                instrument_id,
+                side,
+                OrderType::Market,
+                position.quantity,
+                Some(close.close_price),
+                Some(position.id),
+                Some(&format!("CONTRACT-EXPIRATION:{last_trade_id}")),
+                position.ts_last,
+            );
+            let client_order_id = ClientOrderId::new(format!("EXPIRATION-{venue_order_id}"));
+            anyhow::ensure!(
+                self.cache.borrow().order(&client_order_id).is_none(),
+                "Settlement order {client_order_id} already exists but position {} remains open",
+                position.id,
+            );
+            let order = MarketOrder::new_checked(
+                position.trader_id,
+                position.strategy_id,
+                instrument_id,
+                client_order_id,
+                side,
+                position.quantity,
+                TimeInForce::Gtc,
+                UUID4::new(),
+                ts_now,
+                true,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?
+            .into();
+            let submitted = OrderEventAny::Submitted(OrderSubmitted::new(
+                position.trader_id,
+                position.strategy_id,
+                instrument_id,
+                client_order_id,
+                position.account_id,
+                UUID4::new(),
+                ts_now,
+                ts_now,
+            ));
+            let accepted = OrderEventAny::Accepted(OrderAccepted::new(
+                position.trader_id,
+                position.strategy_id,
+                instrument_id,
+                client_order_id,
+                venue_order_id,
+                position.account_id,
+                UUID4::new(),
+                ts_now,
+                ts_now,
+                true,
+            ));
+            let mut fill = OrderFilled::new(
+                position.trader_id,
+                position.strategy_id,
+                instrument_id,
+                client_order_id,
+                venue_order_id,
+                position.account_id,
+                TradeId::from(venue_order_id.as_str()),
+                side,
+                OrderType::Market,
+                position.quantity,
+                close.close_price,
+                instrument.quote_currency(),
+                LiquiditySide::Taker,
+                UUID4::new(),
+                ts_now,
+                ts_now,
+                true,
+                None,
+                Some(Money::zero(instrument.quote_currency())),
+                None,
+            );
+            fill.position_id = Some(position.id);
+            settlements.push(ContractSettlement {
+                order,
+                position_id: position.id,
+                events: [submitted, accepted, OrderEventAny::Filled(fill)],
+            });
+        }
+
+        Ok(settlements)
+    }
+
     /// Creates a new [`ExecutionManager`] instance.
     ///
     /// # Errors
@@ -3889,6 +4072,10 @@ impl ExecutionManager {
         venue_reports: &[PositionStatusReport],
     ) -> Option<Vec<OrderEventAny>> {
         let (instrument_id, account_id) = key;
+        if self.has_contract_close(&instrument_id) {
+            self.position_reconciliation_states.shift_remove(&key);
+            return None;
+        }
         let comparison = self.position_quantity_comparison(key, venue_reports);
         let tolerance = self.position_reconciliation_tolerance(account_id);
         let quantities_match = comparison.quantities_match(tolerance);
@@ -4350,6 +4537,9 @@ impl ExecutionManager {
         account_id: AccountId,
         instruments_with_unattributed_fills: &IndexSet<InstrumentId>,
     ) -> Option<Vec<OrderEventAny>> {
+        if self.has_contract_close(&report.instrument_id) {
+            return None;
+        }
         if report.venue_position_id.is_some() {
             self.reconcile_position_report_hedging(
                 report,

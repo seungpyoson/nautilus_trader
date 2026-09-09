@@ -68,7 +68,8 @@ use nautilus_core::{
 use nautilus_model::{
     accounts::Account,
     enums::{
-        AccountType, ContingencyType, OmsType, OrderStatus, OrderType, PositionSide, TimeInForce,
+        AccountType, ContingencyType, InstrumentCloseType, OmsType, OrderStatus, OrderType,
+        PositionSide, TimeInForce,
     },
     events::{
         OrderAccepted, OrderDenied, OrderDeniedReason, OrderEvent, OrderEventAny, OrderFillVoided,
@@ -4166,6 +4167,15 @@ impl ExecutionEngine {
         };
 
         if !order.is_reduce_only() {
+            return false;
+        }
+
+        // A venue fill can arrive after the contract's accounting close. Retain its
+        // economics even for a reduce-only order; the live node settles the residual.
+        if cache
+            .instrument_close(&fill.instrument_id)
+            .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+        {
             return false;
         }
 

@@ -98,7 +98,7 @@ use nautilus_common::{
         },
         system::{QueueStateChanged, ReconnectSocket, SocketStateChange, SocketStateChanged},
     },
-    msgbus::{self, BusMessage, MessagingSwitchboard},
+    msgbus::{self, BusMessage, MessagingSwitchboard, ShareableMessageHandler, TypedHandler},
     runner::{SystemChannel, TimeEventMessage, TradingCommandMessage},
 };
 use nautilus_core::{
@@ -108,7 +108,9 @@ use nautilus_core::{
 #[cfg(test)]
 use nautilus_model::reports::OrderStatusReport;
 use nautilus_model::{
-    events::OrderEventAny,
+    data::InstrumentClose,
+    enums::OrderStatus,
+    events::{OrderEventAny, PositionEvent},
     identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     orders::Order,
     reports::{FillReport, PositionStatusReport},
@@ -147,6 +149,9 @@ mod metrics;
 mod queue;
 mod state;
 
+#[cfg(test)]
+mod settlement_tests;
+
 use builder::ExternalMessageBusIngress;
 pub use builder::LiveNodeBuilder;
 use config::{LiveNodeConfig, PluginConfig, validate_live_environment};
@@ -167,6 +172,60 @@ type StreamProcessorCallback = dyn Fn(&dyn Any, &serde_json::Value) -> anyhow::R
 
 struct StreamProcessor(Box<StreamProcessorCallback>);
 
+#[derive(Debug)]
+enum SettlementInput {
+    Close(InstrumentClose),
+    Position(InstrumentId),
+}
+
+/// Defers accounting until the publishing data/position callback has released its borrows.
+#[derive(Debug)]
+struct SettlementQueue {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<SettlementInput>,
+    close_handler: ShareableMessageHandler,
+    position_handler: TypedHandler<PositionEvent>,
+}
+
+impl SettlementQueue {
+    fn new() -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let close_sender = sender.clone();
+        let close_handler = ShareableMessageHandler::from_typed(move |close: &InstrumentClose| {
+            let _ = close_sender.send(SettlementInput::Close(*close));
+        });
+        let position_handler = TypedHandler::from(move |event: &PositionEvent| {
+            if matches!(
+                event,
+                PositionEvent::PositionOpened(_) | PositionEvent::PositionChanged(_)
+            ) {
+                let _ = sender.send(SettlementInput::Position(event.instrument_id()));
+            }
+        });
+        msgbus::subscribe_instrument_close("data.close.*".into(), close_handler.clone(), None);
+        msgbus::subscribe_position_events(
+            "events.position.*".into(),
+            position_handler.clone(),
+            None,
+        );
+        Self {
+            receiver,
+            close_handler,
+            position_handler,
+        }
+    }
+
+    fn unsubscribe(&self) {
+        msgbus::unsubscribe_instrument_close("data.close.*".into(), &self.close_handler);
+        msgbus::unsubscribe_position_events("events.position.*".into(), &self.position_handler);
+    }
+}
+
+impl Drop for SettlementQueue {
+    fn drop(&mut self) {
+        self.unsubscribe();
+    }
+}
+
 impl Debug for StreamProcessor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(StreamProcessor)).finish()
@@ -179,6 +238,7 @@ impl Debug for StreamProcessor {
 /// with automatic client management and lifecycle handling.
 #[derive(Debug)]
 pub struct LiveNode {
+    settlement: SettlementQueue,
     kernel: NautilusKernel,
     runner: Option<AsyncRunner>,
     config: LiveNodeConfig,
@@ -219,6 +279,7 @@ impl LiveNode {
             config,
             handle: LiveNodeHandle::new(),
             exec_manager,
+            settlement: SettlementQueue::new(),
             exec_clients,
             socket_registry,
             cache_database_factory,
@@ -288,21 +349,16 @@ impl LiveNode {
             exec_manager_config,
         )?;
 
-        let node = Self {
+        let node = Self::new_from_builder(
             kernel,
-            runner: Some(runner),
+            runner,
             config,
-            handle: LiveNodeHandle::new(),
             exec_manager,
-            exec_clients: Vec::new(),
-            socket_registry: SocketReconnectRegistry::default(),
-            cache_database_factory: None,
-            external_msgbus: None,
-            stream_processors: Vec::new(),
-            shutdown_deadline: None,
-            #[cfg(feature = "plugin")]
-            plugins: plugin::NodePlugins,
-        };
+            Vec::new(),
+            SocketReconnectRegistry::default(),
+            None,
+            None,
+        );
         node.load_configured_plugins()?;
 
         log::info!("LiveNode built successfully with kernel config");
@@ -560,6 +616,7 @@ impl LiveNode {
 
     /// Disposes the live node kernel and releases resources.
     pub fn dispose(&mut self) {
+        self.settlement.unsubscribe();
         self.close_external_ingress();
         self.kernel.dispose();
         self.handle.set_stopped();
@@ -580,6 +637,11 @@ impl LiveNode {
                 biased;
 
                 () = dst::time::sleep_until(deadline) => break,
+                Some(input) = self.settlement.receiver.recv() => {
+                    self.process_settlement(input);
+                    self.process_pending_settlements();
+                    processed += 1;
+                }
                 event = runner.recv() => {
                     let Some(event) = event else {
                         dst::time::sleep_until(deadline).await;
@@ -603,6 +665,7 @@ impl LiveNode {
 
         let processed = runner.poll_pending(|event| self.process_runner_event(event));
         self.runner = Some(runner);
+        self.process_pending_settlements();
         processed
     }
 
@@ -618,6 +681,7 @@ impl LiveNode {
             PendingRunnerEvent::DataEvent(event) => AsyncRunner::handle_data_event(event),
             PendingRunnerEvent::DataCommand(command) => AsyncRunner::handle_data_command(command),
         }
+        self.process_pending_settlements();
     }
 
     fn process_system_events(&self, events: Vec<SystemEvent>) {
@@ -837,6 +901,7 @@ impl LiveNode {
     /// Returns an error if reconciliation fails or times out.
     #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
     async fn perform_startup_reconciliation(&mut self) -> anyhow::Result<()> {
+        self.process_pending_settlements();
         if !self.config.exec_engine.reconciliation {
             log::info!("Startup reconciliation disabled");
             self.kernel
@@ -961,6 +1026,7 @@ impl LiveNode {
             }
         }
 
+        self.process_pending_settlements();
         self.kernel.portfolio.borrow_mut().initialize_orders();
         self.kernel.portfolio.borrow_mut().initialize_positions();
         self.kernel
@@ -1067,7 +1133,7 @@ impl LiveNode {
                 let result = self
                     .abort_startup("External message bus ingress failed to start")
                     .await;
-                Self::drain_channels(
+                self.drain_channels(
                     &mut time_evt_rx,
                     &mut system_evt_rx,
                     &mut system_cmd_rx,
@@ -1123,7 +1189,7 @@ impl LiveNode {
             let result = self
                 .abort_startup_with_error("Data client connection timed out", e)
                 .await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1185,7 +1251,7 @@ impl LiveNode {
                 let result = self
                     .abort_startup_with_error("Execution client connection timed out", e)
                     .await;
-                Self::drain_channels(
+                self.drain_channels(
                     &mut time_evt_rx,
                     &mut system_evt_rx,
                     &mut system_cmd_rx,
@@ -1206,7 +1272,7 @@ impl LiveNode {
                     anyhow::anyhow!("readiness timeout while waiting for engine connections"),
                 )
                 .await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1224,7 +1290,7 @@ impl LiveNode {
             .or_else(|| self.startup_abort_reason())
         {
             self.abort_startup(reason).await?;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1242,7 +1308,7 @@ impl LiveNode {
         // Run reconciliation now that instruments are in cache and start trader
         if let Err(e) = self.perform_startup_reconciliation().await {
             let result = self.abort_startup("Startup reconciliation failed").await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1264,7 +1330,7 @@ impl LiveNode {
 
         if let Some(reason) = self.startup_abort_reason() {
             let result = self.abort_startup(reason).await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1279,7 +1345,7 @@ impl LiveNode {
 
         if let Err(e) = self.kernel.start_trader() {
             let result = self.abort_after_trader_start_failure(e).await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1294,7 +1360,7 @@ impl LiveNode {
         #[cfg(feature = "plugin")]
         if let Err(e) = self.plugins.start_controllers() {
             let result = self.abort_after_trader_start_failure(e).await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1808,6 +1874,9 @@ impl LiveNode {
                         metrics_start,
                     );
                 }
+                Some(input) = self.settlement.receiver.recv() => {
+                    self.process_settlement(input);
+                }
                 Some(evt) = data_evt_rx.recv() => {
                     let dispatch_start = dst::time::Instant::now();
 
@@ -1840,6 +1909,7 @@ impl LiveNode {
                 }
             }
 
+            self.process_pending_settlements();
             dispatches_since_yield += 1;
             if dispatches_since_yield >= DISPATCHES_PER_YIELD {
                 dispatches_since_yield = 0;
@@ -1862,7 +1932,7 @@ impl LiveNode {
         let stop_result = self.finalize_stop().await;
 
         // Handle events that arrived during finalize_stop
-        Self::drain_channels(
+        self.drain_channels(
             &mut time_evt_rx,
             &mut system_evt_rx,
             &mut system_cmd_rx,
@@ -2012,6 +2082,58 @@ impl LiveNode {
     }
 
     fn process_reconciliation_events(&mut self, events: &[OrderEventAny]) {
+        self.apply_reconciliation_events(events);
+        self.process_pending_settlements();
+    }
+
+    fn process_pending_settlements(&mut self) {
+        while let Ok(input) = self.settlement.receiver.try_recv() {
+            self.process_settlement(input);
+        }
+    }
+
+    fn process_settlement(&mut self, input: SettlementInput) {
+        if let Err(e) = self.apply_settlement(input) {
+            log::error!("Cannot apply contract settlement, stopping node: {e}");
+            self.handle.stop();
+        }
+    }
+
+    fn apply_settlement(&mut self, input: SettlementInput) -> anyhow::Result<()> {
+        let settlements = match input {
+            SettlementInput::Close(close) => self.exec_manager.process_instrument_close(close),
+            SettlementInput::Position(instrument_id) => self
+                .exec_manager
+                .prepare_contract_settlements(instrument_id),
+        }?;
+        for settlement in settlements {
+            let initialized = OrderEventAny::Initialized(settlement.order.init_event().clone());
+            let strategy_id = settlement.order.strategy_id();
+            let client_order_id = settlement.order.client_order_id();
+            self.kernel.cache.borrow_mut().add_order(
+                settlement.order,
+                Some(settlement.position_id),
+                None,
+                false,
+            )?;
+            msgbus::publish_order_event(format!("events.order.{strategy_id}").into(), &initialized);
+            self.apply_reconciliation_events(&settlement.events);
+            let cache = self.kernel.cache.borrow();
+            anyhow::ensure!(
+                cache
+                    .order(&client_order_id)
+                    .is_some_and(|order| order.status() == OrderStatus::Filled)
+                    && cache
+                        .position(&settlement.position_id)
+                        .is_some_and(|position| position.is_closed()),
+                "Settlement did not close position {}",
+                settlement.position_id,
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_reconciliation_events(&mut self, events: &[OrderEventAny]) {
         if events.is_empty() {
             return;
         }
@@ -2055,6 +2177,7 @@ impl LiveNode {
                     .clear_recon_tracking(client_order_id, true);
             }
         }
+        self.process_pending_settlements();
     }
 
     fn process_exec_command(&mut self, message: TradingCommandMessage) {
@@ -2229,7 +2352,7 @@ impl LiveNode {
         let finalize_result = self.finalize_stop().await;
 
         if let Some(receivers) = receivers {
-            Self::drain_channels(
+            self.drain_channels(
                 receivers.time_evt,
                 receivers.system_evt,
                 receivers.system_cmd,
@@ -2308,6 +2431,7 @@ impl LiveNode {
                     processed += 1;
                 }
             }
+            self.process_pending_settlements();
         }
 
         processed
@@ -2395,6 +2519,7 @@ impl LiveNode {
     }
 
     fn drain_channels(
+        &mut self,
         time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
         system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
         system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
@@ -2437,6 +2562,8 @@ impl LiveNode {
             AsyncRunner::handle_trading_command(cmd);
             drained += 1;
         }
+
+        self.process_pending_settlements();
 
         if drained > 0 {
             log::info!("Drained {drained} remaining events during shutdown");
