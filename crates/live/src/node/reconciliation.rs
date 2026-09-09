@@ -208,6 +208,10 @@ pub struct StartupReconciliationSummary {
     /// not proof of successful reconciliation or fresh prices, and is not comparable across
     /// independently constructed nodes, even when they use the same configured instance ID.
     pub completion_sequence: Option<NonZeroU64>,
+    /// The final registered client IDs, accounts and venues equal the requested identity set.
+    ///
+    /// This does not establish continuity of client objects or capabilities.
+    pub client_identities_unchanged: bool,
     /// How the native attempt ended, distinct from individual report reconciliation.
     pub outcome: StartupReconciliationOutcome,
     /// Configured historical lookback requested from clients.
@@ -220,6 +224,39 @@ pub struct StartupReconciliationSummary {
     pub pending_execution: ExecutionApplicationSummary,
     /// One result per client registered at the beginning of this attempt.
     pub clients: Vec<ClientReconciliationSummary>,
+}
+
+impl StartupReconciliationSummary {
+    /// Returns whether this published attempt reconciled every requested execution client.
+    ///
+    /// Requires at least one client, complete account-wide collection for the requested window,
+    /// successful native application, confirmed direct pending execution, and final supported
+    /// inventory agreement. Report initialization timestamps must fall within this attempt.
+    /// That timestamp consistency is not proof of fresh prices or venue state at publication.
+    /// This does not establish queue quiescence, historical economics, persistence or readiness.
+    #[must_use]
+    pub fn all_clients_reconciled(&self) -> bool {
+        self.outcome == StartupReconciliationOutcome::Finished
+            && self.completion_sequence.is_some()
+            && self.client_identities_unchanged
+            && !self.clients.is_empty()
+            && self.pending_execution.all_applications_confirmed()
+            && self.clients.iter().all(|client| {
+                client.collection == MassStatusCollection::Received
+                    && client.report.as_ref().is_some_and(|report| {
+                        report.client_id == client.client_id
+                            && report.account_id == client.account_id
+                            && report.venue == client.venue
+                            && self.ts_started <= report.ts_init
+                            && report.ts_init <= self.ts_finished
+                            && report.has_complete_account_collection(self.requested_lookback_mins)
+                            && report.application.all_received_reports_reconciled()
+                            && report
+                                .final_inventory
+                                .is_some_and(|inventory| inventory.all_inventory_reconciled())
+                    })
+            })
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +289,92 @@ mod tests {
             conditional_orders: ConditionalOrderCoverage::Included,
         });
         CollectedMassStatusSummary::from(&report)
+    }
+
+    fn reconciled_attempt() -> StartupReconciliationSummary {
+        let mut report = account_collection();
+        report.application.source_valid = true;
+        report.final_inventory = Some(ReconciliationInventorySummary {
+            source_valid: true,
+            ..Default::default()
+        });
+        StartupReconciliationSummary {
+            instance_id: UUID4::new(),
+            completion_sequence: NonZeroU64::new(1),
+            client_identities_unchanged: true,
+            outcome: StartupReconciliationOutcome::Finished,
+            requested_lookback_mins: None,
+            ts_started: report.ts_init,
+            ts_finished: report.ts_init,
+            pending_execution: ExecutionApplicationSummary::default(),
+            clients: vec![ClientReconciliationSummary {
+                client_id: report.client_id,
+                account_id: report.account_id,
+                venue: report.venue,
+                collection: MassStatusCollection::Received,
+                report: Some(report),
+            }],
+        }
+    }
+
+    #[rstest]
+    #[case::disabled(|s: &mut StartupReconciliationSummary| s.outcome = StartupReconciliationOutcome::Disabled)]
+    #[case::failed(|s: &mut StartupReconciliationSummary| s.outcome = StartupReconciliationOutcome::Failed)]
+    #[case::interrupted(|s: &mut StartupReconciliationSummary| s.outcome = StartupReconciliationOutcome::Interrupted)]
+    #[case::unpublished_or_exhausted(|s: &mut StartupReconciliationSummary| s.completion_sequence = None)]
+    #[case::client_identity_set_changed(|s: &mut StartupReconciliationSummary| s.client_identities_unchanged = false)]
+    #[case::no_clients(|s: &mut StartupReconciliationSummary| s.clients.clear())]
+    #[case::incomplete_ingress(|s: &mut StartupReconciliationSummary| s.pending_execution.incomplete = 1)]
+    #[case::unacknowledged_ingress(|s: &mut StartupReconciliationSummary| s.pending_execution.unacknowledged = 1)]
+    #[case::overflowed_ingress(|s: &mut StartupReconciliationSummary| s.pending_execution.overflowed = true)]
+    #[case::unavailable_collection(|s: &mut StartupReconciliationSummary| s.clients[0].collection = MassStatusCollection::Unavailable)]
+    #[case::missing_report(|s: &mut StartupReconciliationSummary| s.clients[0].report = None)]
+    fn test_complete_attempt_requires_every_boundary_fact(
+        #[case] invalidate: fn(&mut StartupReconciliationSummary),
+    ) {
+        let mut summary = reconciled_attempt();
+        // Equality at both timestamp boundaries is valid for a complete empty collection.
+        assert!(summary.all_clients_reconciled());
+        invalidate(&mut summary);
+        assert!(!summary.all_clients_reconciled());
+    }
+
+    #[rstest]
+    #[case::wrong_client(|r: &mut CollectedMassStatusSummary| r.client_id = ClientId::from("OTHER"))]
+    #[case::wrong_account(|r: &mut CollectedMassStatusSummary| r.account_id = AccountId::from("OTHER-001"))]
+    #[case::wrong_venue(|r: &mut CollectedMassStatusSummary| r.venue = Venue::from("OTHER"))]
+    #[case::old_report(|r: &mut CollectedMassStatusSummary| r.ts_init = UnixNanos::from(r.ts_init.as_u64() - 1))]
+    #[case::future_report(|r: &mut CollectedMassStatusSummary| r.ts_init = UnixNanos::from(r.ts_init.as_u64() + 1))]
+    #[case::incomplete_collection(|r: &mut CollectedMassStatusSummary| r.reports_complete = false)]
+    #[case::unknown_coverage(|r: &mut CollectedMassStatusSummary| r.coverage = ExecutionMassStatusCoverage::default())]
+    #[case::invalid_application_source(|r: &mut CollectedMassStatusSummary| r.application.source_valid = false)]
+    #[case::failed_application(|r: &mut CollectedMassStatusSummary| r.application.incomplete_events = 1)]
+    #[case::unresolved_history(|r: &mut CollectedMassStatusSummary| r.application.unresolved_history_orders = 1)]
+    #[case::unreconciled_fill(|r: &mut CollectedMassStatusSummary| r.application.fills.received = 1)]
+    #[case::missing_final_inventory(|r: &mut CollectedMassStatusSummary| r.final_inventory = None)]
+    #[case::invalid_final_source(|r: &mut CollectedMassStatusSummary| r.final_inventory.as_mut().unwrap().source_valid = false)]
+    #[case::unreported_final_order(|r: &mut CollectedMassStatusSummary| r.final_inventory.as_mut().unwrap().unreported_open_orders = 1)]
+    fn test_complete_attempt_rejects_invalid_client_evidence(
+        #[case] invalidate: fn(&mut CollectedMassStatusSummary),
+    ) {
+        let mut summary = reconciled_attempt();
+        assert!(summary.all_clients_reconciled());
+        invalidate(summary.clients[0].report.as_mut().unwrap());
+        assert!(!summary.all_clients_reconciled());
+    }
+
+    #[rstest]
+    fn test_complete_attempt_cannot_hide_an_unavailable_second_client() {
+        let mut summary = reconciled_attempt();
+        assert!(summary.all_clients_reconciled());
+        summary.clients.push(ClientReconciliationSummary {
+            client_id: ClientId::from("OTHER"),
+            account_id: AccountId::from("OTHER-001"),
+            venue: Venue::from("OTHER"),
+            collection: MassStatusCollection::Unavailable,
+            report: None,
+        });
+        assert!(!summary.all_clients_reconciled());
     }
 
     #[rstest]

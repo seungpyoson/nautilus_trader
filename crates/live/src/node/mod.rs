@@ -885,6 +885,7 @@ impl LiveNode {
         let mut summary = StartupReconciliationSummary {
             instance_id: self.kernel.instance_id(),
             completion_sequence: None,
+            client_identities_unchanged: false,
             outcome: StartupReconciliationOutcome::Failed,
             requested_lookback_mins: self
                 .config
@@ -926,6 +927,16 @@ impl LiveNode {
             attempt.summary.outcome = StartupReconciliationOutcome::Interrupted;
         } else {
             let engine = self.kernel.exec_engine.borrow();
+            attempt.summary.client_identities_unchanged = engine.client_ids().len()
+                == attempt.summary.clients.len()
+                && attempt.summary.clients.iter().all(|requested| {
+                    engine
+                        .get_client(&requested.client_id)
+                        .is_some_and(|client| {
+                            client.account_id() == requested.account_id
+                                && client.venue() == requested.venue
+                        })
+                });
 
             for (client_index, report) in &attempt.reports {
                 let collected = attempt.summary.clients[*client_index]
@@ -6282,6 +6293,7 @@ mod tests {
         handle.publish_startup_reconciliation(StartupReconciliationSummary {
             instance_id: UUID4::new(),
             completion_sequence: None,
+            client_identities_unchanged: false,
             outcome: StartupReconciliationOutcome::Failed,
             requested_lookback_mins: None,
             ts_started: UnixNanos::default(),

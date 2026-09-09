@@ -282,6 +282,7 @@ mod tests {
         let summary = StartupReconciliationSummary {
             instance_id: UUID4::new(),
             completion_sequence: None,
+            client_identities_unchanged: false,
             outcome: StartupReconciliationOutcome::Finished,
             requested_lookback_mins: None,
             ts_started: UnixNanos::default(),

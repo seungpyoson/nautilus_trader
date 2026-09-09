@@ -56,7 +56,7 @@ use nautilus_common::{
     nautilus_actor,
     testing::{wait_until, wait_until_async},
 };
-use nautilus_core::{Params, UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{
     builder::LiveNodeBuilder,
     config::{LiveExecutionEngineConfig, LiveNodeConfig},
@@ -78,7 +78,13 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
     orders::{Order, OrderAny, OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
-    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
+    reports::{
+        ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport,
+        mass_status::{
+            ConditionalOrderCoverage, ExecutionMassStatusCoverage, ExecutionReportCoverage,
+            ExecutionReportScope,
+        },
+    },
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_trading::{
@@ -921,12 +927,18 @@ mod serial_tests {
             }
 
             match self.behavior {
-                StartupMassStatusBehavior::Available => Ok(self
-                    .state
-                    .mass_status
-                    .lock()
-                    .expect("mass status lock poisoned")
-                    .clone()),
+                StartupMassStatusBehavior::Available => {
+                    let mut report = self
+                        .state
+                        .mass_status
+                        .lock()
+                        .expect("mass status lock poisoned");
+
+                    if let Some(report) = report.as_mut() {
+                        report.ts_init = get_atomic_clock_realtime().get_time_ns();
+                    }
+                    Ok(report.clone())
+                }
                 StartupMassStatusBehavior::Unavailable => Ok(None),
                 StartupMassStatusBehavior::Error => Err(anyhow::anyhow!("mass status failed")),
                 StartupMassStatusBehavior::Pending => {
@@ -2388,6 +2400,237 @@ mod serial_tests {
     }
 
     #[rstest]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_complete_startup_requires_publication_and_all_pending_applications(
+        #[values(false, true)] run: bool,
+        #[values(false, true)] incomplete_ingress: bool,
+    ) {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: true,
+                reconciliation_lookback_mins: None,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupCompleteEmptyNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let account_id = AccountId::from("STARTUP-MASS-STATUS-001");
+        let mut report = ExecutionMassStatus::new(
+            ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID),
+            account_id,
+            crypto_perpetual_ethusdt().id().venue,
+            UnixNanos::default(),
+            None,
+        );
+        report.set_report_window(None, true);
+        report.set_coverage(ExecutionMassStatusCoverage {
+            orders: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            fills: ExecutionReportCoverage::History {
+                scope: ExecutionReportScope::Account,
+                start: None,
+                end: None,
+            },
+            positions: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            conditional_orders: ConditionalOrderCoverage::NotApplicable,
+        });
+        *state.mass_status.lock().unwrap() = Some(report);
+        state
+            .queued_exec_events
+            .lock()
+            .unwrap()
+            .push(ExecutionEvent::Account(startup_queued_account_state(
+                account_id,
+            )));
+
+        if incomplete_ingress {
+            let missing = OrderTestBuilder::new(OrderType::Market)
+                .trader_id(node.kernel().trader_id())
+                .instrument_id(crypto_perpetual_ethusdt().id())
+                .client_order_id(ClientOrderId::from("O-UNREGISTERED-STARTUP"))
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("1.0"))
+                .build();
+            state
+                .queued_exec_events
+                .lock()
+                .unwrap()
+                .push(ExecutionEvent::Order(TestOrderEventStubs::accepted(
+                    &missing,
+                    AccountId::from("STARTUP-MASS-STATUS-001"),
+                    VenueOrderId::from("V-UNREGISTERED-STARTUP"),
+                )));
+        }
+        let observed = Arc::new(Mutex::new(None));
+        let handle = node.handle();
+        assert!(handle.startup_reconciliation_summary().is_none());
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: handle.clone(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        assert!(
+            result.is_ok(),
+            "startup must reach the final boundary: {result:#?}"
+        );
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        let summary = observed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("actor must observe final evidence");
+        let report = summary.clients[0].report.as_ref().unwrap();
+        assert!(report.has_complete_account_collection(None));
+        assert!(report.application.all_received_reports_reconciled());
+        assert!(report.final_inventory.unwrap().all_inventory_reconciled());
+        assert!(summary.client_identities_unchanged);
+        assert!(summary.ts_started <= report.ts_init && report.ts_init <= summary.ts_finished);
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
+        assert_eq!(
+            summary.pending_execution.incomplete,
+            u64::from(incomplete_ingress)
+        );
+        assert_eq!(summary.all_clients_reconciled(), !incomplete_ingress);
+        let mut unpublished = (*summary).clone();
+        unpublished.completion_sequence = None;
+        assert!(!unpublished.all_clients_reconciled());
+        assert!(Arc::ptr_eq(
+            &summary,
+            &handle.startup_reconciliation_summary().unwrap()
+        ));
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_complete_startup_rejects_an_unqueried_client_added_during_reconciliation(
+        #[values(false, true)] add_client: bool,
+        #[values(false, true)] run: bool,
+    ) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupClientIdentityNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let source = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+        let account = AccountId::from("STARTUP-MASS-STATUS-001");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let venue = instrument.id().venue;
+        node.kernel()
+            .cache()
+            .borrow_mut()
+            .add_instrument(instrument)
+            .unwrap();
+        let mut report =
+            ExecutionMassStatus::new(source, account, venue, UnixNanos::default(), None);
+        report.set_report_window(None, true);
+        report.set_coverage(ExecutionMassStatusCoverage {
+            orders: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            fills: ExecutionReportCoverage::History {
+                scope: ExecutionReportScope::Account,
+                start: None,
+                end: None,
+            },
+            positions: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            conditional_orders: ConditionalOrderCoverage::NotApplicable,
+        });
+        report.add_order_reports(vec![test_order_report(
+            account,
+            ClientOrderId::from("O-CLIENT-IDENTITY"),
+            VenueOrderId::from("V-CLIENT-IDENTITY"),
+            OrderStatus::Accepted,
+        )]);
+        *state.mass_status.lock().unwrap() = Some(report);
+        state
+            .queued_exec_events
+            .lock()
+            .unwrap()
+            .push(ExecutionEvent::Account(startup_queued_account_state(
+                account,
+            )));
+        let callback_count = Rc::new(Cell::new(0));
+        let handler = ShareableMessageHandler::from_typed({
+            let engine = node.kernel().exec_engine();
+            let callback_count = callback_count.clone();
+            move |_report: &OrderStatusReport| {
+                if add_client {
+                    engine
+                        .borrow_mut()
+                        .register_client(Box::new(StartupMassStatusExecutionClient::new(
+                            StartupMassStatusClientState::default(),
+                            StartupMassStatusBehavior::Unavailable,
+                            ClientId::from("ADDED-CLIENT"),
+                            AccountId::from("ADDED-001"),
+                            Venue::from("ADDED"),
+                            false,
+                        )))
+                        .unwrap();
+                }
+                callback_count.set(callback_count.get() + 1);
+            }
+        });
+        let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+        msgbus::subscribe_any(topic.to_string().into(), handler.clone(), None);
+        let observed = Arc::new(Mutex::new(None));
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: node.handle(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        msgbus::unsubscribe_any(topic.to_string().into(), &handler);
+        assert!(
+            result.is_ok(),
+            "startup must reach the final boundary: {result:#?}"
+        );
+        assert_eq!(callback_count.get(), 1);
+        let summary = observed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("actor must observe final evidence");
+        assert_eq!(summary.clients.len(), 1);
+        let report = summary.clients[0].report.as_ref().unwrap();
+        assert!(report.application.all_received_reports_reconciled());
+        assert!(report.final_inventory.unwrap().all_inventory_reconciled());
+        assert!(summary.pending_execution.all_applications_confirmed());
+        assert_eq!(summary.client_identities_unchanged, !add_client);
+        assert_eq!(summary.all_clients_reconciled(), !add_client);
+    }
+
+    #[rstest]
     #[case::empty(RetainedOrderCase::Empty)]
     #[case::open(RetainedOrderCase::Open)]
     #[case::inflight(RetainedOrderCase::Inflight)]
@@ -3515,7 +3758,14 @@ mod serial_tests {
                 let received = summary.clients[0].report.as_ref().unwrap();
                 assert_eq!(received.report_id, report_id);
                 assert_eq!(received.lookback_start, Some(UnixNanos::from(7)));
-                assert_eq!(received.ts_init, UnixNanos::from(8));
+                assert_eq!(
+                    received.ts_init,
+                    state.mass_status.lock().unwrap().as_ref().unwrap().ts_init
+                );
+                assert!(
+                    summary.ts_started <= received.ts_init
+                        && received.ts_init <= summary.ts_finished
+                );
                 assert_eq!(received.reports_complete, reports_complete);
                 assert!(received.application.all_received_reports_reconciled());
                 assert!(!received.has_complete_account_collection(Some(42)));
