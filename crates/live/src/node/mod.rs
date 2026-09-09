@@ -94,7 +94,7 @@ use nautilus_common::{
     messages::{
         DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent,
         data::DataCommand,
-        execution::{GenerateOrderStatusReports, GeneratePositionStatusReports, TradingCommand},
+        execution::{GenerateOrderStatusReports, TradingCommand},
         system::{QueueStateChanged, ReconnectSocket, SocketStateChange, SocketStateChanged},
     },
     msgbus::{self, BusMessage, MessagingSwitchboard},
@@ -111,7 +111,6 @@ use nautilus_model::{
     events::OrderEventAny,
     identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     orders::Order,
-    reports::PositionStatusReport,
 };
 use nautilus_network::mode::ReconnectRequestOutcome;
 #[cfg(feature = "python")]
@@ -127,9 +126,9 @@ use crate::{
     execution::{
         client::LiveExecutionClient,
         manager::{
-            ExecutionManager, ExecutionManagerConfig, OpenOrderReportCheck, PositionReportCheck,
-            SourcedOrderStatusReport, TargetedOrderQuery, TargetedOrderReportResult,
-            request_targeted_order_reports,
+            ExecutionManager, ExecutionManagerConfig, OpenOrderReportCheck,
+            PositionReportCollection, SourcedOrderStatusReport, TargetedOrderQuery,
+            TargetedOrderReportResult, request_position_reports, request_targeted_order_reports,
         },
     },
     runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent, RunnerReceivers},
@@ -1684,7 +1683,7 @@ impl LiveNode {
                 result = async {
                     match position_report_task.as_mut() {
                         Some(task) => task.future.as_mut().await,
-                        None => std::future::pending::<ReportTaskOutcome<PositionReportResult>>().await,
+                        None => std::future::pending::<ReportTaskOutcome<PositionReportCollection>>().await,
                     }
                 }, if position_report_task.is_some() => {
                     let maintenance_start = dst::time::Instant::now();
@@ -1693,13 +1692,11 @@ impl LiveNode {
 
                     match result {
                         ReportTaskOutcome::Completed(result) => {
-                            let events = self.exec_manager.reconcile_position_reports(
-                                &result.check,
-                                result.reports,
-                                &result.queried_clients,
-                                &result.failed_clients,
+                            let summary = self.exec_manager.apply_position_report_check(
+                                result,
+                                &self.kernel.exec_engine,
                             );
-                            self.process_reconciliation_events(&events);
+                            log::debug!("Position reconciliation check: {summary:?}");
                         }
                         ReportTaskOutcome::TimedOut => {
                             self.cleanup_cancelled_report_tasks(&[]);
@@ -2064,28 +2061,8 @@ impl LiveNode {
     }
 
     fn process_reconciliation_events(&mut self, events: &[OrderEventAny]) {
-        if events.is_empty() {
-            return;
-        }
-
-        log::info!(
-            "Processing {} reconciliation event{}",
-            events.len(),
-            if events.len() == 1 { "" } else { "s" }
-        );
-
-        for event in events {
-            self.exec_manager
-                .record_local_activity(event.client_order_id());
-            if let OrderEventAny::Filled(fill) = event {
-                self.exec_manager
-                    .record_position_activity(fill.instrument_id, fill.account_id);
-            }
-            self.kernel.exec_engine.borrow_mut().process(event);
-            if let OrderEventAny::Filled(fill) = event {
-                self.exec_manager.commit_recent_fill_if_applied(fill);
-            }
-        }
+        self.exec_manager
+            .process_reconciliation_events(events, &self.kernel.exec_engine);
     }
 
     fn process_exec_event(&mut self, event: ExecutionEvent) {
@@ -3090,10 +3067,16 @@ impl LiveNode {
         Some(PositionReportTask {
             future: Box::pin(async move {
                 let remaining = deadline.saturating_duration_since(dst::time::Instant::now());
-                match dst::time::timeout(remaining, request_position_reports(clients, command))
-                    .await
+                match dst::time::timeout(
+                    remaining,
+                    request_position_reports(
+                        clients.iter().map(|client| client as &dyn ExecutionClient),
+                        &command,
+                    ),
+                )
+                .await
                 {
-                    Ok(result) => ReportTaskOutcome::Completed(PositionReportResult {
+                    Ok(result) => ReportTaskOutcome::Completed(PositionReportCollection {
                         check,
                         reports: result.reports,
                         queried_clients: result.queried_clients,
@@ -3232,39 +3215,6 @@ async fn request_open_order_reports(
     }
 }
 
-async fn request_position_reports(
-    clients: Vec<LiveExecutionClient>,
-    command: GeneratePositionStatusReports,
-) -> PositionReportQueryResult {
-    let mut all_reports = Vec::new();
-    let mut queried_clients = IndexSet::new();
-    let mut failed_clients = IndexSet::new();
-
-    for client in clients {
-        let client_id = client.client_id();
-        queried_clients.insert(client_id);
-
-        match client.generate_position_status_reports(&command).await {
-            Ok(reports) => {
-                all_reports.extend(reports);
-            }
-            Err(e) => {
-                failed_clients.insert(client_id);
-                log::warn!(
-                    "Failed to generate position status reports from {}: {e}",
-                    client.client_id()
-                );
-            }
-        }
-    }
-
-    PositionReportQueryResult {
-        reports: all_reports,
-        queried_clients,
-        failed_clients,
-    }
-}
-
 fn reconciliation_check_due(
     now: dst::time::Instant,
     last: dst::time::Instant,
@@ -3325,23 +3275,11 @@ struct OpenOrderReportQueryResult {
     failed_clients: IndexSet<ClientId>,
 }
 
-type PositionReportFuture = Pin<Box<dyn Future<Output = ReportTaskOutcome<PositionReportResult>>>>;
+type PositionReportFuture =
+    Pin<Box<dyn Future<Output = ReportTaskOutcome<PositionReportCollection>>>>;
 
 struct PositionReportTask {
     future: PositionReportFuture,
-}
-
-struct PositionReportResult {
-    check: PositionReportCheck,
-    reports: Vec<PositionStatusReport>,
-    queried_clients: IndexSet<ClientId>,
-    failed_clients: IndexSet<ClientId>,
-}
-
-struct PositionReportQueryResult {
-    reports: Vec<PositionStatusReport>,
-    queried_clients: IndexSet<ClientId>,
-    failed_clients: IndexSet<ClientId>,
 }
 
 /// Flushes data events and commands from both `pending` and the channel receivers
