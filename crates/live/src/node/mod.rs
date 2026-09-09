@@ -111,6 +111,7 @@ use nautilus_model::{
     events::OrderEventAny,
     identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     orders::Order,
+    reports::ExecutionMassStatus,
 };
 use nautilus_network::mode::ReconnectRequestOutcome;
 #[cfg(feature = "python")]
@@ -168,6 +169,12 @@ pub use state::{LiveNodeHandle, NodeRunMode, NodeState};
 /// `Pending`. Under a host event loop that starves the adapter I/O tasks feeding those channels,
 /// which shows up as lapsed heartbeats and reconnects rather than as backpressure.
 const DISPATCHES_PER_YIELD: usize = 64;
+
+struct StartupReconciliationAttempt {
+    summary: StartupReconciliationSummary,
+    // Original reports are owned only until publication; the public summary retains no histories.
+    reports: Vec<(usize, ExecutionMassStatus)>,
+}
 
 /// High-level abstraction for a live Nautilus system node.
 ///
@@ -446,8 +453,8 @@ impl LiveNode {
             }
         }
 
-        let mut summary = match self.perform_startup_reconciliation().await {
-            Ok(summary) => summary,
+        let mut attempt = match self.perform_startup_reconciliation().await {
+            Ok(attempt) => attempt,
             Err(e) => {
                 if let Err(finalize_err) = self.abort_startup("Startup reconciliation failed").await
                 {
@@ -470,13 +477,13 @@ impl LiveNode {
                     event,
                     &mut startup_system_events,
                     &mut startup_system_commands,
-                    &mut summary.pending_execution,
+                    &mut attempt.summary.pending_execution,
                 )
             });
             self.runner = Some(runner);
         }
 
-        if let Some(reason) = self.finish_startup_reconciliation(summary) {
+        if let Some(reason) = self.finish_startup_reconciliation(attempt) {
             self.abort_startup(reason).await?;
             return Ok(());
         }
@@ -854,7 +861,7 @@ impl LiveNode {
     /// Returns an error if reconciliation fails or times out.
     async fn perform_startup_reconciliation(
         &mut self,
-    ) -> anyhow::Result<StartupReconciliationSummary> {
+    ) -> anyhow::Result<StartupReconciliationAttempt> {
         let ts_started = self.kernel.generate_timestamp_ns();
         let clients = {
             let engine = self.kernel.exec_engine.borrow();
@@ -890,7 +897,12 @@ impl LiveNode {
             clients,
         };
 
-        if let Err(error) = self.reconcile_startup_clients(&mut summary).await {
+        let mut reports = Vec::new();
+
+        if let Err(error) = self
+            .reconcile_startup_clients(&mut summary, &mut reports)
+            .await
+        {
             summary.ts_finished = self.kernel.generate_timestamp_ns();
             self.handle.publish_startup_reconciliation(summary);
             return Err(error);
@@ -900,21 +912,34 @@ impl LiveNode {
         } else {
             StartupReconciliationOutcome::Disabled
         };
-        Ok(summary)
+        Ok(StartupReconciliationAttempt { summary, reports })
     }
 
     /// Publishes once at the pre-trader boundary, after the bounded pending-message pass.
     fn finish_startup_reconciliation(
         &self,
-        mut summary: StartupReconciliationSummary,
+        mut attempt: StartupReconciliationAttempt,
     ) -> Option<&'static str> {
         let abort_reason = self.startup_abort_reason();
 
         if abort_reason.is_some() {
-            summary.outcome = StartupReconciliationOutcome::Interrupted;
+            attempt.summary.outcome = StartupReconciliationOutcome::Interrupted;
+        } else {
+            let engine = self.kernel.exec_engine.borrow();
+
+            for (client_index, report) in &attempt.reports {
+                let collected = attempt.summary.clients[*client_index]
+                    .report
+                    .as_mut()
+                    .expect("retained reports have a matching collected summary");
+                collected.final_inventory = Some(
+                    self.exec_manager
+                        .check_mass_status_inventory(report, &engine),
+                );
+            }
         }
-        summary.ts_finished = self.kernel.generate_timestamp_ns();
-        self.handle.publish_startup_reconciliation(summary);
+        attempt.summary.ts_finished = self.kernel.generate_timestamp_ns();
+        self.handle.publish_startup_reconciliation(attempt.summary);
         abort_reason
     }
 
@@ -922,6 +947,7 @@ impl LiveNode {
     async fn reconcile_startup_clients(
         &mut self,
         summary: &mut StartupReconciliationSummary,
+        reports: &mut Vec<(usize, ExecutionMassStatus)>,
     ) -> anyhow::Result<()> {
         if !self.config.exec_engine.reconciliation {
             log::info!("Startup reconciliation disabled");
@@ -942,7 +968,7 @@ impl LiveNode {
         let timeout = self.config.timeout_reconciliation;
         let start = dst::time::Instant::now();
 
-        for client in &mut summary.clients {
+        for (client_index, client) in summary.clients.iter_mut().enumerate() {
             let client_id = client.client_id;
             let elapsed = start.elapsed();
             if elapsed >= timeout {
@@ -988,10 +1014,10 @@ impl LiveNode {
 
                     let result = self
                         .exec_manager
-                        .reconcile_execution_mass_status(mass_status, exec_engine_rc)
-                        .await;
+                        .reconcile_execution_mass_status_ref(&mass_status, exec_engine_rc);
                     report.application = result.summary;
                     client.report = Some(report);
+                    reports.push((client_index, mass_status));
 
                     anyhow::ensure!(
                         self.kernel
@@ -1330,8 +1356,8 @@ impl LiveNode {
         debug_assert_eq!(engine_connection_status, EngineConnectionStatus::Connected);
 
         // Run reconciliation now that instruments are in cache and start trader
-        let mut summary = match self.perform_startup_reconciliation().await {
-            Ok(summary) => summary,
+        let mut attempt = match self.perform_startup_reconciliation().await {
+            Ok(attempt) => attempt,
             Err(e) => {
                 let result = self.abort_startup("Startup reconciliation failed").await;
                 Self::drain_channels(
@@ -1371,12 +1397,12 @@ impl LiveNode {
                     event,
                     &mut startup_system_events,
                     &mut startup_system_commands,
-                    &mut summary.pending_execution,
+                    &mut attempt.summary.pending_execution,
                 )
             });
         }
 
-        if let Some(reason) = self.finish_startup_reconciliation(summary) {
+        if let Some(reason) = self.finish_startup_reconciliation(attempt) {
             let result = self.abort_startup(reason).await;
             Self::drain_channels(
                 &mut time_evt_rx,

@@ -213,6 +213,43 @@ impl ReconciliationSummary {
     }
 }
 
+/// Final supported inventory postconditions against a retained mass status report.
+///
+/// This compares current native order fields and position quantities in both directions.
+/// Legitimate activity after collection can make these observations incomplete. Historical
+/// fill application remains separate; these counts do not establish historical economics,
+/// portfolio valuation, persistence or venue freshness.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReconciliationInventorySummary {
+    /// The registered source and required cached ownership, accounts and instruments remain valid.
+    pub source_valid: bool,
+    /// Received order reports whose native postconditions no longer hold.
+    pub unresolved_order_reports: usize,
+    /// Received position reports whose native quantity postconditions no longer hold.
+    pub unresolved_position_reports: usize,
+    /// Retained open orders not accounted for by a matching native order report.
+    pub unreported_open_orders: usize,
+    /// Retained open positions absent from the report's instrument or venue-position scope.
+    pub unreported_open_positions: usize,
+    /// Retained in-flight orders, including those without an assigned account.
+    pub inflight_orders: usize,
+}
+
+impl ReconciliationInventorySummary {
+    /// Returns whether all supported inventory postconditions held at this observation.
+    ///
+    /// Collection coverage and original application outcomes must also be checked separately.
+    #[must_use]
+    pub const fn all_inventory_reconciled(&self) -> bool {
+        self.source_valid
+            && self.unresolved_order_reports == 0
+            && self.unresolved_position_reports == 0
+            && self.unreported_open_orders == 0
+            && self.unreported_open_positions == 0
+            && self.inflight_orders == 0
+    }
+}
+
 /// Result of reconciliation containing events and external order metadata.
 #[derive(Debug, Default)]
 pub struct ReconciliationResult {
@@ -682,6 +719,14 @@ impl ExecutionManager {
         mass_status: ExecutionMassStatus,
         exec_engine: Rc<RefCell<ExecutionEngine>>,
     ) -> ReconciliationResult {
+        self.reconcile_execution_mass_status_ref(&mass_status, exec_engine)
+    }
+
+    pub(crate) fn reconcile_execution_mass_status_ref(
+        &mut self,
+        mass_status: &ExecutionMassStatus,
+        exec_engine: Rc<RefCell<ExecutionEngine>>,
+    ) -> ReconciliationResult {
         let mut summary = ReconciliationSummary {
             orders: ReconciliationReportCounts {
                 received: mass_status.order_reports_ref().len(),
@@ -775,7 +820,7 @@ impl ExecutionManager {
                         .all(|instrument_id| client.handles_order_venue(instrument_id.venue))
                 })
         };
-        summary.source_valid &= self.validate_mass_status_order_sources(&mass_status);
+        summary.source_valid &= self.validate_mass_status_order_sources(mass_status);
 
         // Publish raw reports before any state mutation (including fill adjustment
         // below, which can synthesise replacement order/fill reports). The
@@ -843,9 +888,9 @@ impl ExecutionManager {
             .map(|fill| (fill.account_id, fill.instrument_id, fill.trade_id))
             .collect();
         let (adjusted_order_reports, adjusted_fill_reports) =
-            self.adjust_mass_status_fills(&mass_status);
+            self.adjust_mass_status_fills(mass_status);
         let order_only_venue_order_ids = self.order_only_venue_order_ids(
-            &mass_status,
+            mass_status,
             &adjusted_order_reports,
             &adjusted_fill_reports,
             &retained_fill_state,
@@ -1331,7 +1376,7 @@ impl ExecutionManager {
         }
 
         self.summarize_mass_status_reports(
-            &mass_status,
+            mass_status,
             &retained_fill_state,
             &applied_fill_keys,
             &instruments_with_unattributed_fills,
@@ -1476,49 +1521,181 @@ impl ExecutionManager {
                 continue;
             }
 
-            if cache.instrument(&report.instrument_id).is_none() {
-                summary.positions.unresolved += 1;
-                continue;
-            }
-
-            let cached_qty = if let Some(position_id) = report.venue_position_id {
-                if instruments_with_unattributed_fills.contains(&report.instrument_id) {
-                    summary.positions.unresolved += 1;
-                    continue;
-                }
-
-                match cache.position_ref(&position_id) {
-                    Some(position)
-                        if position.account_id == report.account_id
-                            && position.instrument_id == report.instrument_id =>
-                    {
-                        position.signed_decimal_qty()
-                    }
-                    Some(_) => {
-                        summary.positions.unresolved += 1;
-                        continue;
-                    }
-                    None => Decimal::ZERO,
-                }
-            } else {
-                cache
-                    .iter_position_open_ids(
-                        None,
-                        Some(&report.instrument_id),
-                        None,
-                        Some(&report.account_id),
-                    )
-                    .filter_map(|id| cache.position_ref(&id))
-                    .map(|position| position.signed_decimal_qty())
-                    .sum()
-            };
-
-            if self.position_quantity_matches(report, cached_qty) {
+            if !(report.venue_position_id.is_some()
+                && instruments_with_unattributed_fills.contains(&report.instrument_id))
+                && self.position_report_is_reconciled(&cache, report)
+            {
                 summary.positions.reconciled += 1;
             } else {
                 summary.positions.unresolved += 1;
             }
         }
+    }
+
+    fn position_report_is_reconciled(&self, cache: &Cache, report: &PositionStatusReport) -> bool {
+        if cache.instrument(&report.instrument_id).is_none() {
+            return false;
+        }
+        let cached_qty = if let Some(position_id) = report.venue_position_id {
+            match cache.position_ref(&position_id) {
+                Some(position)
+                    if position.account_id == report.account_id
+                        && position.instrument_id == report.instrument_id =>
+                {
+                    position.signed_decimal_qty()
+                }
+                Some(_) => return false,
+                None => Decimal::ZERO,
+            }
+        } else {
+            cache
+                .iter_position_open_ids(
+                    None,
+                    Some(&report.instrument_id),
+                    None,
+                    Some(&report.account_id),
+                )
+                .filter_map(|id| cache.position_ref(&id))
+                .map(|position| position.signed_decimal_qty())
+                .sum()
+        };
+        self.position_quantity_matches(report, cached_qty)
+    }
+
+    /// Observes both directions of the final native inventory without applying reports or events.
+    #[cfg(feature = "node")]
+    pub(crate) fn check_mass_status_inventory(
+        &self,
+        mass_status: &ExecutionMassStatus,
+        exec_engine: &ExecutionEngine,
+    ) -> ReconciliationInventorySummary {
+        let Some(client) = exec_engine.get_client(&mass_status.client_id) else {
+            return ReconciliationInventorySummary::default();
+        };
+        let cache = self.cache.borrow();
+        let mut summary = ReconciliationInventorySummary {
+            source_valid: client.account_id() == mass_status.account_id
+                && client.venue() == mass_status.venue
+                && cache.account_ref(&mass_status.account_id).is_some(),
+            ..Default::default()
+        };
+        let source_owns_report = |account_id, instrument_id: InstrumentId| {
+            account_id == mass_status.account_id
+                && client.handles_order_venue(instrument_id.venue)
+                && cache.instrument(&instrument_id).is_some()
+        };
+        let resolved_order_id = |direct: Option<ClientOrderId>, venue: VenueOrderId| {
+            direct.filter(|id| cache.order_exists(id)).or_else(|| {
+                cache
+                    .client_order_id(&venue)
+                    .copied()
+                    .filter(|id| cache.order_exists(id))
+            })
+        };
+        let cached_sources_match = |direct: Option<ClientOrderId>, venue: VenueOrderId| {
+            [direct, cache.client_order_id(&venue).copied()]
+                .into_iter()
+                .flatten()
+                .filter(|id| cache.order_exists(id))
+                .all(|id| cache.client_id(&id) == Some(&mass_status.client_id))
+        };
+
+        for report in mass_status.order_reports_ref().values() {
+            summary.source_valid &= source_owns_report(report.account_id, report.instrument_id);
+            let order = resolved_order_id(report.client_order_id, report.venue_order_id)
+                .and_then(|id| cache.order_ref(&id));
+            summary.source_valid &= order.is_some()
+                && cached_sources_match(report.client_order_id, report.venue_order_id);
+
+            if !order.is_some_and(|order| order_report_is_reconciled(&order, report)) {
+                summary.unresolved_order_reports += 1;
+            }
+        }
+
+        for fill in mass_status.fill_reports_ref().values().flatten() {
+            summary.source_valid &= source_owns_report(fill.account_id, fill.instrument_id)
+                && cached_sources_match(fill.client_order_id, fill.venue_order_id);
+        }
+
+        for report in mass_status.position_reports_ref().values().flatten() {
+            summary.source_valid &= source_owns_report(report.account_id, report.instrument_id);
+
+            if !self.position_report_is_reconciled(&cache, report) {
+                summary.unresolved_position_reports += 1;
+            }
+        }
+
+        // An account-only index would hide submitted orders whose account has not been assigned.
+        // Visit open and in-flight IDs once, using the existing native indexes and source binding.
+        let retained_order_ids = cache
+            .iter_client_order_ids_open(None, None, None, None)
+            .chain(
+                cache
+                    .iter_client_order_ids_inflight(None, None, None, None)
+                    .filter(|id| !cache.is_order_open(id)),
+            );
+
+        for id in retained_order_ids {
+            let Some(order) = cache.order_ref(&id) else {
+                summary.source_valid = false;
+                continue;
+            };
+            let source = cache.client_id(&id);
+            let account = order.account_id();
+            let venue_handled = client.handles_order_venue(order.instrument_id().venue);
+
+            if account != Some(mass_status.account_id) && source != Some(&mass_status.client_id) {
+                // Unassigned inventory at a handled venue cannot establish its own exclusion.
+                summary.source_valid &= !(account.is_none() && source.is_none() && venue_handled);
+                continue;
+            }
+            summary.source_valid &= account == Some(mass_status.account_id)
+                && source == Some(&mass_status.client_id)
+                && venue_handled
+                && cache.instrument(&order.instrument_id()).is_some();
+            summary.inflight_orders += usize::from(order.is_inflight());
+
+            if order.is_open()
+                && !order.venue_order_id().is_some_and(|venue_order_id| {
+                    mass_status
+                        .order_reports_ref()
+                        .get(&venue_order_id)
+                        .is_some_and(|report| {
+                            resolved_order_id(report.client_order_id, report.venue_order_id)
+                                == Some(id)
+                                && order_report_is_reconciled(&order, report)
+                        })
+                })
+            {
+                summary.unreported_open_orders += 1;
+            }
+        }
+
+        for id in cache.iter_position_open_ids(None, None, None, Some(&mass_status.account_id)) {
+            let Some(position) = cache.position_ref(&id) else {
+                summary.source_valid = false;
+                continue;
+            };
+            summary.source_valid &= client.handles_order_venue(position.instrument_id.venue)
+                && cache.instrument(&position.instrument_id).is_some();
+
+            if !mass_status
+                .position_reports_ref()
+                .get(&position.instrument_id)
+                .is_some_and(|reports| {
+                    reports.iter().any(|report| {
+                        report.account_id == position.account_id
+                            && report
+                                .venue_position_id
+                                .is_none_or(|reported_id| reported_id == id)
+                    })
+                })
+            {
+                // Do not let offsetting or tolerance-sized cached positions certify an empty list.
+                summary.unreported_open_positions += 1;
+            }
+        }
+        summary
     }
 
     fn position_quantity_matches(

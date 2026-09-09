@@ -29,7 +29,10 @@ use nautilus_model::{
     },
 };
 
-use crate::{execution::manager::ReconciliationSummary, runner::ExecutionApplicationSummary};
+use crate::{
+    execution::manager::{ReconciliationInventorySummary, ReconciliationSummary},
+    runner::ExecutionApplicationSummary,
+};
 
 /// How the startup reconciliation attempt ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +90,10 @@ pub struct CollectedMassStatusSummary {
     ///
     /// Later reports and queued events can change the cache before summary publication.
     pub application: ReconciliationSummary,
+    /// Final native inventory observations after the bounded pending-message pass.
+    ///
+    /// Unavailable when startup failed or was interrupted before the final observation.
+    pub final_inventory: Option<ReconciliationInventorySummary>,
 }
 
 impl From<&ExecutionMassStatus> for CollectedMassStatusSummary {
@@ -101,6 +108,7 @@ impl From<&ExecutionMassStatus> for CollectedMassStatusSummary {
             reports_complete: report.reports_complete(),
             coverage: report.coverage().clone(),
             application: ReconciliationSummary::default(),
+            final_inventory: None,
         }
     }
 }
