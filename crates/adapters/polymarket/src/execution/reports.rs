@@ -617,57 +617,54 @@ impl PolymarketExecutionClient {
             collection_load_ids,
         )?;
 
-        let needs_confirmed_fills = reports.iter().any(|report| {
+        let local_filled_for_report = |report: &OrderStatusReport| {
+            let cache = self.core.cache();
             let cached_filled = report
                 .client_order_id
-                .and_then(|id| self.core.cache().order(&id).map(|order| order.filled_qty()))
-                .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
-            report.filled_qty > cached_filled
-        });
-        let confirmed_fills = if needs_confirmed_fills {
-            match self
-                .http_client
-                .get_trades(GetTradesParams::default())
-                .await
-            {
-                Ok(trades) => {
-                    let (fills, _) = build_fill_reports_from_trades(
-                        &trades,
-                        &ctx,
-                        &self.shared_token_instruments,
-                        FillReportScope::new(cmd.instrument_id, None),
-                        self.clock.get_time_ns(),
-                        collection_load_ids,
-                    )?;
-                    confirmed_filled_quantities(&fills)
-                }
-                Err(e) => {
-                    log::warn!("Failed to fetch confirmed fills for open-order check: {e}");
-                    Default::default()
-                }
-            }
-        } else {
-            Default::default()
-        };
-
-        for report in &mut reports {
-            let cached_filled = report
-                .client_order_id
-                .and_then(|id| self.core.cache().order(&id).map(|order| order.filled_qty()))
+                .and_then(|id| cache.order(&id).map(|order| order.filled_qty()))
                 .or_else(|| {
-                    self.core
-                        .cache()
+                    cache
                         .client_order_id(&report.venue_order_id)
-                        .and_then(|id| self.core.cache().order(id).map(|order| order.filled_qty()))
+                        .and_then(|id| cache.order(id).map(|order| order.filled_qty()))
                 })
                 .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
             let tracked_filled = self
                 .fill_tracker
                 .get_cumulative_filled(&report.venue_order_id)
                 .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
+            cached_filled.max(tracked_filled)
+        };
+        let needs_confirmed_fills = reports
+            .iter()
+            .any(|report| report.filled_qty > local_filled_for_report(report));
+        let confirmed_fills = if needs_confirmed_fills {
+            let trades = self
+                .http_client
+                .get_trades(GetTradesParams::default())
+                .await
+                .context("failed to fetch confirmed fills for open-order check")?;
+            let (fills, discards) = build_fill_reports_from_trades(
+                &trades,
+                &ctx,
+                &self.shared_token_instruments,
+                FillReportScope::new(cmd.instrument_id, None),
+                self.clock.get_time_ns(),
+                collection_load_ids,
+            )?;
+            anyhow::ensure!(
+                discards.reports_complete(),
+                "incomplete confirmed fill reports for open-order check",
+            );
+            confirmed_filled_quantities(&fills)
+        } else {
+            Default::default()
+        };
+
+        for report in &mut reports {
+            let local_filled = local_filled_for_report(report);
             cap_order_report_filled_qty(
                 report,
-                cached_filled.max(tracked_filled),
+                local_filled,
                 confirmed_fills.get(&report.venue_order_id).copied(),
             );
         }
