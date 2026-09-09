@@ -13443,7 +13443,7 @@ fn test_reconcile_positions_rejects_invalid_engine_before_query(
     let engine = if borrow_engine {
         ctx.exec_engine.clone()
     } else {
-        other.exec_engine.clone()
+        other.exec_engine
     };
     let held_borrow = borrow_engine.then(|| engine.borrow());
 
