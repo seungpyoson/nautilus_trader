@@ -1559,7 +1559,7 @@ fn instrument_id_from_market_token(market: &str, token_id: &str) -> InstrumentId
     InstrumentId::from(format!("{market}-{token_id}.POLYMARKET").as_str())
 }
 
-fn instrument_in_load_ids_scope(
+pub(super) fn instrument_in_load_ids_scope(
     instrument_id: InstrumentId,
     load_ids: Option<&[InstrumentId]>,
 ) -> bool {

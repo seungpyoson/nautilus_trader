@@ -13469,6 +13469,203 @@ fn test_reconcile_positions_rejects_invalid_engine_before_query(
     );
 }
 
+#[rstest]
+#[case::foreign_account(false, true)]
+#[case::unhandled_venue(true, false)]
+#[case::same_account_routing(true, true)]
+#[tokio::test]
+async fn test_position_query_empty_requires_account_and_venue_ownership(
+    #[case] owns_account: bool,
+    #[case] handles_venue: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-QUERY-ABSENCE"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(instrument);
+    ctx.add_position(&position);
+    let client = MockPositionExecutionClient::configured(
+        ClientId::from("IB-QUERY"),
+        if owns_account {
+            test_account_id()
+        } else {
+            AccountId::from("BINANCE-OTHER")
+        },
+        Venue::from("IB"),
+        if handles_venue {
+            IndexSet::from([instrument_id.venue])
+        } else {
+            IndexSet::from([Venue::from("BITMEX")])
+        },
+        false,
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    let covered = owns_account && handles_venue;
+    assert_eq!(summary.position_keys, 1);
+    assert_eq!(summary.failed_queries, 0);
+    assert_eq!(summary.matched, usize::from(covered));
+    assert_eq!(summary.deferred, usize::from(!covered));
+    assert_eq!(summary.unresolved, 0);
+    assert_eq!(summary.incomplete_events, 0);
+    let cache = ctx.cache.borrow();
+    let net: Decimal = cache
+        .positions_open(
+            None,
+            Some(&instrument_id),
+            None,
+            Some(&test_account_id()),
+            None,
+        )
+        .iter()
+        .map(|position| position.signed_decimal_qty())
+        .sum();
+
+    if covered {
+        assert!(summary.applied_events > 0);
+        assert_eq!(net, Decimal::ZERO);
+    } else {
+        assert_eq!(summary.applied_events, 0);
+        assert_eq!(net, dec!(5));
+        assert!(cache.orders(None, None, None, None, None).is_empty());
+        let retained = cache.position(&position.id).unwrap();
+        assert_eq!(retained.event_count(), position.event_count());
+        assert_eq!(
+            ctx.manager
+                .position_recon_retry_count(&(instrument_id, test_account_id())),
+            0,
+        );
+    }
+}
+
+#[rstest]
+#[case::foreign_account_only(true, false)]
+#[case::foreign_account_after_valid(true, true)]
+#[case::unhandled_venue_only(false, false)]
+#[case::unhandled_venue_after_valid(false, true)]
+#[tokio::test]
+async fn test_position_query_rejects_entire_malformed_source_batch(
+    #[case] foreign_account: bool,
+    #[case] include_valid_prefix: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let other_instrument = if foreign_account {
+        InstrumentAny::CurrencyPair(currency_pair_btcusdt())
+    } else {
+        test_instrument2()
+    };
+    let other_account = AccountId::from("BINANCE-OTHER");
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-QUERY-MALFORMED"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    let healthy_position = create_test_position_for_account(
+        &instrument,
+        PositionId::from("P-QUERY-HEALTHY"),
+        OrderSide::Buy,
+        "2.0",
+        "3000.00",
+        other_account,
+    );
+    ctx.add_instrument(instrument);
+    ctx.add_instrument(other_instrument.clone());
+    ctx.add_margin_account(other_account);
+    ctx.add_position(&position);
+    ctx.add_position(&healthy_position);
+    let make_report = |account, instrument, quantity| {
+        PositionStatusReport::new(
+            account,
+            instrument,
+            PositionSideSpecified::Long,
+            Quantity::from(quantity),
+            UnixNanos::from(1_000_000),
+            UnixNanos::from(1_000_000),
+            None,
+            None,
+            Some(dec!(3000)),
+        )
+    };
+    let mut reports = Vec::new();
+
+    if include_valid_prefix {
+        reports.push(make_report(test_account_id(), instrument_id, "3.0"));
+    }
+    reports.push(make_report(
+        if foreign_account {
+            other_account
+        } else {
+            test_account_id()
+        },
+        other_instrument.id(),
+        "7.0",
+    ));
+    let malformed_client = MockPositionExecutionClient::new(vec![], reports);
+    let healthy_client = MockPositionExecutionClient::configured(
+        ClientId::from("BINANCE-OTHER"),
+        other_account,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    )
+    .with_position_reports(vec![make_report(other_account, instrument_id, "2.0")]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&malformed_client, &healthy_client];
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.failed_queries, 1);
+    assert_eq!(summary.position_keys, 2);
+    assert_eq!(summary.deferred, 1);
+    assert_eq!(summary.matched, 1);
+    assert_eq!(summary.unresolved, 0);
+    assert_eq!(summary.applied_events, 0);
+    assert_eq!(summary.incomplete_events, 0);
+    let cache = ctx.cache.borrow();
+    assert!(cache.orders(None, None, None, None, None).is_empty());
+    assert!(
+        cache
+            .positions_open(None, Some(&other_instrument.id()), None, None, None)
+            .is_empty()
+    );
+
+    for original in [&position, &healthy_position] {
+        let retained = cache.position(&original.id).unwrap();
+        assert_eq!(retained.signed_decimal_qty(), original.signed_decimal_qty());
+        assert_eq!(retained.event_count(), original.event_count());
+        assert_eq!(
+            ctx.manager
+                .position_recon_retry_count(&(original.instrument_id, original.account_id)),
+            0,
+        );
+    }
+}
+
 struct MockPositionExecutionClient {
     client_id: ClientId,
     account_id: AccountId,
@@ -13583,6 +13780,10 @@ impl ExecutionClient for MockPositionExecutionClient {
 
     fn position_reconciliation_tolerance(&self) -> Decimal {
         self.position_reconciliation_tolerance
+    }
+
+    fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
+        true
     }
 
     fn generate_account_state(
@@ -15032,8 +15233,21 @@ async fn test_position_check_retries_independent_per_account() {
     ctx.add_position(&pos_a);
     ctx.add_position(&pos_b);
 
-    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
-    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+    let client_a = MockPositionExecutionClient::configured(
+        ClientId::from(account_a.as_str()),
+        account_a,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
+    let client_b = MockPositionExecutionClient::configured(
+        ClientId::from(account_b.as_str()),
+        account_b,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client_a, &client_b];
 
     ctx.manager.check_positions_consistency(&clients).await;
 
@@ -15088,7 +15302,13 @@ async fn test_position_check_activity_throttle_independent_per_account() {
         .record_position_activity(instrument_id, account_a);
 
     // No venue report for B: treated as flat, so a discrepancy.
-    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
+    let mock_client = MockPositionExecutionClient::configured(
+        ClientId::from(account_b.as_str()),
+        account_b,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_positions_consistency(&clients).await;
@@ -15167,7 +15387,14 @@ async fn test_position_check_grace_survives_accelerated_trading_clock() {
         None, // venue_position_id
         Some(dec!(3000.00)),
     );
-    let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
+    let mock_client = MockPositionExecutionClient::configured(
+        ClientId::from(account.as_str()),
+        account,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    )
+    .with_position_reports(vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_positions_consistency(&clients).await;
@@ -15239,7 +15466,14 @@ async fn test_position_check_grace_expires_on_monotonic_clock() {
         None,
         Some(dec!(3000.00)),
     );
-    let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
+    let mock_client = MockPositionExecutionClient::configured(
+        ClientId::from(account.as_str()),
+        account,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    )
+    .with_position_reports(vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_positions_consistency(&clients).await;
@@ -15303,8 +15537,22 @@ async fn test_check_positions_consistency_processes_only_discrepant_account() {
         None,
         Some(dec!(3000.00)),
     );
-    let mock_client = MockPositionExecutionClient::new(vec![], vec![report_a]);
-    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+    let client_a = MockPositionExecutionClient::configured(
+        ClientId::from(account_a.as_str()),
+        account_a,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    )
+    .with_position_reports(vec![report_a]);
+    let client_b = MockPositionExecutionClient::configured(
+        ClientId::from(account_b.as_str()),
+        account_b,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client_a, &client_b];
 
     let events = ctx.manager.check_positions_consistency(&clients).await;
 
@@ -15366,8 +15614,21 @@ async fn test_position_check_stale_retries_pruned_per_account() {
     ctx.add_position(&pos_a);
     ctx.add_position(&pos_b);
 
-    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
-    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+    let client_a = MockPositionExecutionClient::configured(
+        ClientId::from(account_a.as_str()),
+        account_a,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
+    let client_b = MockPositionExecutionClient::configured(
+        ClientId::from(account_b.as_str()),
+        account_b,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client_a, &client_b];
 
     // Cycle 1: both keys reach the failed-retry path, so counters land at 1 each.
     ctx.manager.check_positions_consistency(&clients).await;
