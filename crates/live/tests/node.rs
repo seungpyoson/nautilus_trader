@@ -2376,7 +2376,10 @@ mod serial_tests {
     #[case::start(false)]
     #[case::run(true)]
     #[tokio::test(flavor = "current_thread")]
-    async fn test_startup_processes_queued_execution_before_actor_start(#[case] run: bool) {
+    async fn test_startup_processes_queued_execution_before_actor_start(
+        #[case] run: bool,
+        #[values(false, true)] rejected_child: bool,
+    ) {
         let config = LiveNodeConfig {
             delay_post_stop: Duration::ZERO,
             timeout_disconnection: Duration::from_millis(50),
@@ -2425,9 +2428,18 @@ mod serial_tests {
             UnixNanos::from(1),
             None,
         ));
+        let mut accepted_batch = vec![accepted];
+
+        if rejected_child {
+            let mut missing_order = accepted;
+            missing_order.client_order_id = ClientOrderId::from("O-STARTUP-MISSING");
+            missing_order.venue_order_id = VenueOrderId::from("V-STARTUP-MISSING");
+            accepted_batch.insert(0, missing_order);
+        }
+
         *state.queued_exec_events.lock().unwrap() = vec![
             ExecutionEvent::Account(startup_queued_account_state(account_id)),
-            ExecutionEvent::OrderAcceptedBatch(OrderAcceptedBatch::new(vec![accepted])),
+            ExecutionEvent::OrderAcceptedBatch(OrderAcceptedBatch::new(accepted_batch)),
             ExecutionEvent::Order(canceled),
         ];
         let observed = Arc::new(Mutex::new(None));
@@ -2484,6 +2496,17 @@ mod serial_tests {
             .as_ref()
             .expect("summary must precede actor startup");
         assert_eq!(summary.outcome, StartupReconciliationOutcome::Finished);
+        assert_eq!(summary.pending_execution.applied, 3);
+        assert_eq!(
+            summary.pending_execution.incomplete,
+            u64::from(rejected_child)
+        );
+        assert_eq!(summary.pending_execution.unacknowledged, 0);
+        assert!(!summary.pending_execution.overflowed);
+        assert_eq!(
+            summary.pending_execution.all_applications_confirmed(),
+            !rejected_child
+        );
         assert!(summary.ts_finished >= ts_dispatch);
         assert!(Arc::ptr_eq(
             summary,

@@ -27,7 +27,7 @@ use nautilus_model::{
     },
 };
 
-use crate::execution::manager::ReconciliationSummary;
+use crate::{execution::manager::ReconciliationSummary, runner::ExecutionApplicationSummary};
 
 /// How the startup reconciliation attempt ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,9 +182,9 @@ pub struct ClientReconciliationSummary {
 /// It survives stop for diagnosis and is cleared when the node enters Starting. Failures before
 /// that transition and cancellation of the reconciliation future do not publish a new result.
 /// This is not a live readiness permit: the pending-message pass does not establish queue
-/// quiescence or acknowledge successful application. Collection declarations and per-report
-/// observations do not establish query-class coverage, omitted inventory, final cache agreement,
-/// historical economics, persistence, or fresh valuation.
+/// quiescence. Pending execution acknowledgements cover the bounded pass only.
+/// Collection declarations and per-report observations do not establish agreement with all
+/// retained inventory, complete historical economics, persistence, or fresh valuation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartupReconciliationSummary {
     /// How the native attempt ended, distinct from individual report reconciliation.
@@ -195,6 +195,8 @@ pub struct StartupReconciliationSummary {
     pub ts_started: UnixNanos,
     /// Native timestamp when the terminal summary was published.
     pub ts_finished: UnixNanos,
+    /// Acknowledgements for direct execution messages in the bounded pending-message pass.
+    pub pending_execution: ExecutionApplicationSummary,
     /// One result per client registered at the beginning of this attempt.
     pub clients: Vec<ClientReconciliationSummary>,
 }
