@@ -2575,7 +2575,7 @@ mod serial_tests {
             )));
         let callback_count = Rc::new(Cell::new(0));
         let handler = ShareableMessageHandler::from_typed({
-            let engine = node.kernel().exec_engine();
+            let engine = node.kernel().exec_engine().clone();
             let callback_count = callback_count.clone();
             move |_report: &OrderStatusReport| {
                 if add_client {
@@ -3129,7 +3129,7 @@ mod serial_tests {
             fill.order_side,
             fill.last_qty,
             fill.last_px,
-            fill.commission,
+            fill.commission.expect("filled fixture includes commission"),
             fill.liquidity_side,
             Some(fill.client_order_id),
             fill.position_id,
