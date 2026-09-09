@@ -2382,15 +2382,7 @@ mod serial_tests {
             &handle.startup_reconciliation_summary().unwrap()
         ));
 
-        if !enabled {
-            assert_eq!(summary.outcome, StartupReconciliationOutcome::Disabled);
-            assert_eq!(
-                summary.clients[0].collection,
-                MassStatusCollection::NotRequested
-            );
-            assert!(summary.clients[0].report.is_none());
-            assert!(!state.mass_status_requested.load(Ordering::Relaxed));
-        } else {
+        if enabled {
             assert_eq!(summary.outcome, StartupReconciliationOutcome::Finished);
             if matches!(behavior, StartupMassStatusBehavior::Available) {
                 assert_eq!(
@@ -2410,6 +2402,14 @@ mod serial_tests {
                 );
                 assert!(summary.clients[0].report.is_none());
             }
+        } else {
+            assert_eq!(summary.outcome, StartupReconciliationOutcome::Disabled);
+            assert_eq!(
+                summary.clients[0].collection,
+                MassStatusCollection::NotRequested
+            );
+            assert!(summary.clients[0].report.is_none());
+            assert!(!state.mass_status_requested.load(Ordering::Relaxed));
         }
         node.dispose();
     }
