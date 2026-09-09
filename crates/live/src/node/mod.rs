@@ -77,7 +77,9 @@
 //! maintenance below 100ms (defaults are seconds to minutes). Cadence drifts
 //! by at most one body duration per fire.
 
-use std::{collections::HashSet, fmt::Debug, future::Future, pin::Pin, time::Duration};
+use std::{
+    collections::HashSet, fmt::Debug, future::Future, ops::ControlFlow, pin::Pin, time::Duration,
+};
 
 use anyhow::Context;
 use indexmap::IndexSet;
@@ -130,7 +132,7 @@ use crate::{
             request_targeted_order_reports,
         },
     },
-    runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent},
+    runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent, RunnerReceivers},
     socket::{SocketReconnectLookup, SocketReconnectRegistry},
 };
 
@@ -342,8 +344,8 @@ impl LiveNode {
 
     /// Starts the live node without entering a select loop.
     ///
-    /// Connects clients, runs reconciliation, and starts the trader, but does
-    /// not consume the runner or drive channel receivers, so channel traffic arriving after
+    /// Connects clients, runs reconciliation, processes a bounded prefix of pending events,
+    /// and starts the trader. Retains the runner without driving a select loop, so traffic after
     /// startup is never serviced. This is a building block for tests and embedding, not a
     /// lifecycle: use [`run`](Self::run) or [`run_with_mode`](Self::run_with_mode) to run a node.
     ///
@@ -398,7 +400,7 @@ impl LiveNode {
                 .await;
         }
 
-        let (startup_system_events, startup_system_commands) =
+        let (mut startup_system_events, mut startup_system_commands) =
             if let Some(runner) = self.runner.as_mut() {
                 runner.flush_pending_data();
                 (
@@ -450,6 +452,21 @@ impl LiveNode {
             }
 
             return Err(e);
+        }
+
+        // Process only the bounded prefix queued before this poll. Socket notifications
+        // remain deferred until their trader/controller subscribers have started.
+        if self.startup_abort_reason().is_none()
+            && let Some(mut runner) = self.runner.take()
+        {
+            runner.poll_pending_until(|event| {
+                self.process_startup_runner_event(
+                    event,
+                    &mut startup_system_events,
+                    &mut startup_system_commands,
+                )
+            });
+            self.runner = Some(runner);
         }
 
         if let Some(reason) = self.startup_abort_reason() {
@@ -567,6 +584,25 @@ impl LiveNode {
         let processed = runner.poll_pending(|event| self.process_runner_event(event));
         self.runner = Some(runner);
         processed
+    }
+
+    fn process_startup_runner_event(
+        &mut self,
+        event: PendingRunnerEvent,
+        system_events: &mut Vec<SystemEvent>,
+        system_commands: &mut Vec<SystemCommand>,
+    ) -> ControlFlow<()> {
+        match event {
+            PendingRunnerEvent::SystemEvent(event) => system_events.push(event),
+            PendingRunnerEvent::SystemCommand(command) => system_commands.push(command),
+            event => self.process_runner_event(event),
+        }
+
+        if self.startup_abort_reason().is_some() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
     }
 
     fn process_runner_event(&mut self, event: PendingRunnerEvent) {
@@ -1275,6 +1311,26 @@ impl LiveNode {
             }
 
             return Err(e);
+        }
+
+        // Use the same bounded polling and node handlers as the retained-runner path.
+        if self.startup_abort_reason().is_none() {
+            RunnerReceivers {
+                time_evt: &mut time_evt_rx,
+                system_evt: &mut system_evt_rx,
+                system_cmd: &mut system_cmd_rx,
+                exec_evt: &mut exec_evt_rx,
+                exec_cmd: &mut exec_cmd_rx,
+                data_evt: &mut data_evt_rx,
+                data_cmd: &mut data_cmd_rx,
+            }
+            .poll_pending(|event| {
+                self.process_startup_runner_event(
+                    event,
+                    &mut startup_system_events,
+                    &mut startup_system_commands,
+                )
+            });
         }
 
         if let Some(reason) = self.startup_abort_reason() {
@@ -3286,16 +3342,6 @@ struct PositionReportQueryResult {
     reports: Vec<PositionStatusReport>,
     queried_clients: IndexSet<ClientId>,
     failed_clients: IndexSet<ClientId>,
-}
-
-struct RunnerReceivers<'a> {
-    time_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-    system_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-    system_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
-    exec_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    exec_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
-    data_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    data_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
 }
 
 /// Flushes data events and commands from both `pending` and the channel receivers

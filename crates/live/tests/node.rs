@@ -31,22 +31,28 @@ use std::{
 
 use async_trait::async_trait;
 use nautilus_common::{
-    actor::{DataActor, DataActorCore, data_actor::DataActorConfig},
+    actor::{DataActor, DataActorCore, DataActorNative, data_actor::DataActorConfig},
     cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
     component::Component,
     enums::Environment,
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
-    live::dst,
+    live::{
+        dst,
+        runner::{get_exec_event_sender, get_system_event_sender},
+    },
     messages::{
+        ExecutionEvent, SystemEvent,
         execution::{
             CancelOrder, GenerateOrderStatusReport, GenerateOrderStatusReports,
             GeneratePositionStatusReports, QueryOrder,
         },
-        system::{QueueStateChanged, ShutdownSystem},
+        system::{
+            QueueStateChanged, ShutdownSystem, SocketState, SocketStateChange, SocketStateChanged,
+        },
     },
-    msgbus::{self, MessagingSwitchboard, ShareableMessageHandler, switchboard},
+    msgbus::{self, MessagingSwitchboard, ShareableMessageHandler, TypedHandler, switchboard},
     nautilus_actor,
     testing::{wait_until, wait_until_async},
 };
@@ -61,8 +67,8 @@ use nautilus_live::{
 };
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
-    events::OrderEventAny,
+    enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
+    events::{AccountState, OrderAcceptedBatch, OrderEventAny},
     identifiers::{
         AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, StrategyId, TraderId,
         Venue, VenueOrderId,
@@ -70,7 +76,7 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
     orders::{Order, OrderAny, OrderTestBuilder, stubs::TestOrderEventStubs},
     reports::{ExecutionMassStatus, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Price, Quantity},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_trading::{
     ExecutionAlgorithmConfig, ExecutionAlgorithmCore, nautilus_execution_algorithm,
@@ -112,6 +118,44 @@ impl DataActor for ReconciliationSummaryActor {
 }
 
 nautilus_actor!(ReconciliationSummaryActor);
+
+#[derive(Debug)]
+struct StartupCacheObservation {
+    status: Option<OrderStatus>,
+    event_count: usize,
+    account_present: bool,
+}
+
+#[derive(Debug)]
+struct StartupCacheActor {
+    core: DataActorCore,
+    handle: LiveNodeHandle,
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    observed: Arc<Mutex<Option<StartupCacheObservation>>>,
+}
+
+impl DataActor for StartupCacheActor {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        let observation = {
+            let cache = self.cache_ref();
+            let (status, event_count) = match cache.order_ref(&self.client_order_id) {
+                Some(order) => (Some(order.status()), order.event_count()),
+                None => (None, 0),
+            };
+            StartupCacheObservation {
+                status,
+                event_count,
+                account_present: cache.account(&self.account_id).is_some(),
+            }
+        };
+        *self.observed.lock().unwrap() = Some(observation);
+        self.handle.stop();
+        Ok(())
+    }
+}
+
+nautilus_actor!(StartupCacheActor);
 
 #[derive(Debug)]
 struct TestStrategy {
@@ -324,6 +368,9 @@ mod serial_tests {
         factory_trader_id: Arc<Mutex<Option<TraderId>>>,
         mass_status_requested: Arc<AtomicBool>,
         mass_status: Arc<Mutex<Option<ExecutionMassStatus>>>,
+        queued_exec_events: Arc<Mutex<Vec<ExecutionEvent>>>,
+        connect_system_events: Arc<Mutex<Vec<SystemEvent>>>,
+        queued_system_events: Arc<Mutex<Vec<SystemEvent>>>,
         registered_external_orders: Arc<Mutex<Vec<ClientOrderId>>>,
         cancel_orders_received: Arc<AtomicUsize>,
         cancel_orders_while_connected: Arc<AtomicBool>,
@@ -838,6 +885,9 @@ mod serial_tests {
 
         async fn connect(&mut self) -> anyhow::Result<()> {
             self.state.connected.store(true, Ordering::Relaxed);
+            for event in self.state.connect_system_events.lock().unwrap().drain(..) {
+                get_system_event_sender().send(event).unwrap();
+            }
             Ok(())
         }
 
@@ -856,6 +906,14 @@ mod serial_tests {
             self.state
                 .mass_status_requested
                 .store(true, Ordering::Relaxed);
+
+            for event in self.state.queued_exec_events.lock().unwrap().drain(..) {
+                get_exec_event_sender().send(event).unwrap();
+            }
+
+            for event in self.state.queued_system_events.lock().unwrap().drain(..) {
+                get_system_event_sender().send(event).unwrap();
+            }
 
             match self.behavior {
                 StartupMassStatusBehavior::Available => Ok(self
@@ -2310,6 +2368,297 @@ mod serial_tests {
             "run() should complete within 5 seconds after stop"
         );
         assert_eq!(handle.state(), NodeState::Stopped);
+    }
+
+    #[rstest]
+    #[case::start(false)]
+    #[case::run(true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_processes_queued_execution_before_actor_start(#[case] run: bool) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupQueuedExecutionNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let account_id = AccountId::from("STARTUP-MASS-STATUS-001");
+        let client_id = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let client_order_id = ClientOrderId::from("O-STARTUP-QUEUED");
+        let venue_order_id = VenueOrderId::from("V-STARTUP-QUEUED");
+        let mut order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(node.kernel().trader_id())
+            .instrument_id(instrument_id)
+            .client_order_id(client_order_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+        order
+            .apply(TestOrderEventStubs::submitted(&order, account_id))
+            .unwrap();
+        let OrderEventAny::Accepted(accepted) =
+            TestOrderEventStubs::accepted(&order, account_id, venue_order_id)
+        else {
+            unreachable!()
+        };
+        let canceled = TestOrderEventStubs::canceled(&order, account_id, Some(venue_order_id));
+        {
+            let cache = node.kernel().cache();
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument).unwrap();
+            cache
+                .add_order(order, None, Some(client_id), false)
+                .unwrap();
+            assert!(cache.account(&account_id).is_none());
+        }
+        *state.mass_status.lock().unwrap() = Some(ExecutionMassStatus::new(
+            client_id,
+            account_id,
+            instrument_id.venue,
+            UnixNanos::from(1),
+            None,
+        ));
+        *state.queued_exec_events.lock().unwrap() = vec![
+            ExecutionEvent::Account(startup_queued_account_state(account_id)),
+            ExecutionEvent::OrderAcceptedBatch(OrderAcceptedBatch::new(vec![accepted])),
+            ExecutionEvent::Order(canceled),
+        ];
+        let observed = Arc::new(Mutex::new(None));
+        let handle = node.handle();
+        node.add_actor(StartupCacheActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: handle.clone(),
+            client_order_id,
+            account_id,
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        assert!(result.is_ok(), "startup failed: {result:#?}");
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        let observation = observed.lock().unwrap();
+        let observation = observation
+            .as_ref()
+            .expect("actor must observe startup cache");
+        assert_eq!(observation.status, Some(OrderStatus::Canceled));
+        assert_eq!(observation.event_count, 4);
+        assert!(observation.account_present);
+        assert_eq!(handle.state(), NodeState::Stopped);
+    }
+
+    fn startup_queued_account_state(account_id: AccountId) -> AccountState {
+        AccountState::new(
+            account_id,
+            AccountType::Margin,
+            vec![AccountBalance::new(
+                Money::from("1000 USDT"),
+                Money::from("0 USDT"),
+                Money::from("1000 USDT"),
+            )],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            Some(Currency::USDT()),
+        )
+    }
+
+    #[rstest]
+    #[case::start_stop(false, false)]
+    #[case::run_stop(true, false)]
+    #[case::start_shutdown(false, true)]
+    #[case::run_shutdown(true, true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_queued_execution_callback_aborts_before_actor_start(
+        #[case] run: bool,
+        #[case] shutdown: bool,
+    ) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupQueuedAbortNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let account_id = AccountId::from("STARTUP-MASS-STATUS-001");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let client_order_id = ClientOrderId::from("O-STARTUP-ABORT");
+        let venue_order_id = VenueOrderId::from("V-STARTUP-ABORT");
+        let mut order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(node.kernel().trader_id())
+            .instrument_id(instrument_id)
+            .client_order_id(client_order_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+        order
+            .apply(TestOrderEventStubs::submitted(&order, account_id))
+            .unwrap();
+        order
+            .apply(TestOrderEventStubs::accepted(
+                &order,
+                account_id,
+                venue_order_id,
+            ))
+            .unwrap();
+        let canceled = TestOrderEventStubs::canceled(&order, account_id, Some(venue_order_id));
+        {
+            let cache = node.kernel().cache();
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument).unwrap();
+            cache
+                .add_order(
+                    order,
+                    None,
+                    Some(ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID)),
+                    false,
+                )
+                .unwrap();
+        }
+        *state.queued_exec_events.lock().unwrap() = vec![
+            ExecutionEvent::Account(startup_queued_account_state(account_id)),
+            ExecutionEvent::Order(canceled),
+        ];
+        let handle = node.handle();
+        let trader_id = node.kernel().trader_id();
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let handler = TypedHandler::from({
+            let handle = handle.clone();
+            let callback_count = callback_count.clone();
+            move |_event: &OrderEventAny| {
+                callback_count.fetch_add(1, Ordering::Relaxed);
+
+                if shutdown {
+                    let command = ShutdownSystem::new(
+                        trader_id,
+                        ustr::Ustr::from("StartupQueuedAbort"),
+                        None,
+                        UUID4::new(),
+                        UnixNanos::from(1),
+                        None,
+                    );
+                    msgbus::publish_any(
+                        MessagingSwitchboard::shutdown_system_topic(),
+                        command.as_any(),
+                    );
+                } else {
+                    handle.stop();
+                }
+            }
+        });
+        let topic = switchboard::get_order_canceled_topic(instrument_id);
+        msgbus::subscribe_order_events(topic.to_string().into(), handler.clone(), None);
+        let observed = Arc::new(Mutex::new(None));
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: handle.clone(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        msgbus::unsubscribe_order_events(topic.to_string().into(), &handler);
+        assert!(result.is_ok(), "startup abort failed: {result:#?}");
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        assert_eq!(callback_count.load(Ordering::Relaxed), 1);
+        assert!(
+            observed.lock().unwrap().is_none(),
+            "actor must not start after queued abort"
+        );
+        assert_eq!(handle.state(), NodeState::Stopped);
+    }
+
+    #[rstest]
+    #[case::start(false)]
+    #[case::run(true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_keeps_socket_notifications_deferred_and_ordered(#[case] run: bool) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupDeferredSocketNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let socket_event = |socket_state| {
+            SystemEvent::SocketState(SocketStateChange::new(
+                ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID),
+                Some(Venue::from("BINANCE")),
+                ustr::Ustr::from("startup-test-socket"),
+                socket_state,
+            ))
+        };
+        state
+            .connect_system_events
+            .lock()
+            .unwrap()
+            .push(socket_event(SocketState::Connected));
+        state
+            .queued_system_events
+            .lock()
+            .unwrap()
+            .push(socket_event(SocketState::Disconnected));
+        let observed = Arc::new(Mutex::new(None));
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let handler = ShareableMessageHandler::from_typed({
+            let observed = observed.clone();
+            let notifications = notifications.clone();
+            move |event: &SocketStateChanged| {
+                notifications
+                    .lock()
+                    .unwrap()
+                    .push((event.state, observed.lock().unwrap().is_some()));
+            }
+        });
+        let topic = MessagingSwitchboard::socket_state_changed_topic();
+        msgbus::subscribe_any(topic.to_string().into(), handler.clone(), None);
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: node.handle(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        msgbus::unsubscribe_any(topic.to_string().into(), &handler);
+        assert!(result.is_ok(), "startup failed: {result:#?}");
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        assert_eq!(
+            *notifications.lock().unwrap(),
+            vec![
+                (SocketState::Connected, true),
+                (SocketState::Disconnected, true)
+            ]
+        );
     }
 
     #[rstest]
