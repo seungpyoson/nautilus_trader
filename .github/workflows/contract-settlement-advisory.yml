@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: a4d76e0996789b73874336018d621bfb03b8b1a7
+      REVIEWED_SHA: 859fd4058df4c631784aad1a29230eb83d7a22fa
       CONTROL_SHA: 0bfa8b4b9380fb95664d800f5275e9eac040c367
       CONTROL_TEST_SHA: bb57d0af7a225891c96c213511149f792b842181
       CARGO_BUILD_JOBS: "2"
@@ -32,7 +32,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: a4d76e0996789b73874336018d621bfb03b8b1a7
+          ref: 859fd4058df4c631784aad1a29230eb83d7a22fa
           fetch-depth: 0
           persist-credentials: false
 
@@ -51,7 +51,7 @@ jobs:
       - name: Affected native components Clippy
         shell: bash
         run: |
-          cargo clippy --locked --profile ci-pr \
+          cargo clippy --locked --keep-going --profile ci-pr \
             -p nautilus-live -p nautilus-execution -p nautilus-common \
             -p nautilus-portfolio -p nautilus-polymarket \
             --lib --tests -- -D warnings \
