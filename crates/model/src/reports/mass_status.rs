@@ -103,6 +103,24 @@ impl ExecutionMassStatus {
         self.position_reports.clone()
     }
 
+    /// Borrows the order reports without cloning their state.
+    #[must_use]
+    pub const fn order_reports_ref(&self) -> &IndexMap<VenueOrderId, OrderStatusReport> {
+        &self.order_reports
+    }
+
+    /// Borrows the fill reports without cloning their histories.
+    #[must_use]
+    pub const fn fill_reports_ref(&self) -> &IndexMap<VenueOrderId, Vec<FillReport>> {
+        &self.fill_reports
+    }
+
+    /// Borrows the position reports without cloning their state.
+    #[must_use]
+    pub const fn position_reports_ref(&self) -> &IndexMap<InstrumentId, Vec<PositionStatusReport>> {
+        &self.position_reports
+    }
+
     /// Returns the lower timestamp bound applied to historical reports.
     #[must_use]
     pub const fn lookback_start(&self) -> Option<UnixNanos> {

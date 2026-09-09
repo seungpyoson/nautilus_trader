@@ -688,6 +688,197 @@ async fn test_reconcile_mass_status_with_empty_reports() {
         .await;
 
     assert!(result.events.is_empty());
+    assert!(result.summary.all_received_reports_reconciled());
+}
+
+#[rstest]
+#[case::unknown_client(true)]
+#[case::foreign_account(false)]
+#[tokio::test]
+async fn test_mass_status_summary_records_invalid_source_without_application(
+    #[case] unknown_client: bool,
+) {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let mut report = create_order_status_report(
+        None,
+        VenueOrderId::from("V-BAD-SOURCE"),
+        test_instrument_id(),
+        OrderStatus::Accepted,
+        Quantity::from("1.0"),
+        Quantity::from("0"),
+    );
+
+    if !unknown_client {
+        report.account_id = AccountId::from("OTHER-001");
+    }
+    let mut mass_status = create_mass_status(vec![report], vec![]);
+    if unknown_client {
+        mass_status.client_id = ClientId::from("UNKNOWN");
+    }
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert!(result.events.is_empty());
+    assert!(!result.summary.source_valid);
+    assert_eq!(result.summary.orders.received, 1);
+    assert_eq!(result.summary.orders.unresolved, 1);
+    assert_eq!(result.summary.orders.reconciled, 0);
+    assert!(!result.summary.all_received_reports_reconciled());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_mass_status_rejects_wrong_envelope_venue_without_indexing_orders() {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let venue_order_id = VenueOrderId::from("V-WRONG-VENUE");
+    let report = create_order_status_report(
+        None,
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Accepted,
+        Quantity::from("1.0"),
+        Quantity::from("0"),
+    );
+    let mut mass_status = create_mass_status(vec![report], vec![]);
+    mass_status.venue = Venue::from("SIM");
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert!(result.events.is_empty());
+    assert!(!result.summary.source_valid);
+    assert_eq!(result.summary.orders.received, 1);
+    assert_eq!(result.summary.orders.unresolved, 1);
+    assert_eq!(result.summary.orders.reconciled, 0);
+    assert!(!result.summary.all_received_reports_reconciled());
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_received_report_summary_does_not_certify_unreported_cached_inventory() {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let order = create_accepted_order(
+        "O-UNREPORTED",
+        test_instrument_id(),
+        OrderSide::Buy,
+        "1.0",
+        "3000.00",
+        VenueOrderId::from("V-UNREPORTED"),
+    );
+    let order_id = order.client_order_id();
+    ctx.add_order(order);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(
+            create_mass_status(vec![], vec![]),
+            ctx.exec_engine.clone(),
+        )
+        .await;
+
+    assert!(result.summary.all_received_reports_reconciled());
+    assert_eq!(result.summary.orders.received, 0);
+    assert!(ctx.get_order(&order_id).unwrap().is_open());
+}
+
+#[rstest]
+#[case::canceled_retained_duplicate(OrderStatus::Canceled, true)]
+#[case::expired_retained_duplicate(OrderStatus::Expired, true)]
+#[case::canceled_direct_failure(OrderStatus::Canceled, false)]
+#[case::expired_direct_failure(OrderStatus::Expired, false)]
+#[tokio::test]
+async fn test_mass_status_summary_preserves_full_fill_and_reports_terminal_application_failure(
+    #[case] terminal: OrderStatus,
+    #[case] include_fill: bool,
+) {
+    let mut ctx = TestContext::new();
+    let instrument = test_instrument();
+    ctx.add_instrument(instrument.clone());
+    let venue_order_id = VenueOrderId::from("V-FULL-TERMINAL");
+    let trade_id = TradeId::from("T-FULL-TERMINAL");
+    let order = create_accepted_order(
+        "O-FULL-TERMINAL",
+        instrument.id(),
+        OrderSide::Buy,
+        "1.0",
+        "3000.00",
+        venue_order_id,
+    );
+    let order_id = order.client_order_id();
+    let event = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(trade_id),
+        None,
+        Some(Price::from("3000.00")),
+        Some(Quantity::from("1.0")),
+        Some(LiquiditySide::Maker),
+        Some(Money::from("0.50 USDT")),
+        Some(UnixNanos::from(1_000_000)),
+        Some(test_account_id()),
+    );
+    ctx.add_order(order);
+    ctx.exec_engine.borrow_mut().process(&event);
+    assert_eq!(
+        ctx.get_order(&order_id).unwrap().status(),
+        OrderStatus::Filled
+    );
+    let report = create_order_status_report(
+        Some(order_id),
+        venue_order_id,
+        instrument.id(),
+        terminal,
+        Quantity::from("1.0"),
+        Quantity::from("1.0"),
+    );
+    let fills = if include_fill {
+        vec![create_fill_report(
+            order_id,
+            venue_order_id,
+            instrument.id(),
+            trade_id,
+            "1.0",
+        )]
+    } else {
+        vec![]
+    };
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(
+            create_mass_status(vec![report], fills),
+            ctx.exec_engine.clone(),
+        )
+        .await;
+
+    assert_eq!(
+        ctx.get_order(&order_id).unwrap().status(),
+        OrderStatus::Filled
+    );
+    assert_eq!(result.summary.orders.reconciled, 1);
+    if include_fill {
+        assert_eq!(result.summary.incomplete_events, 0);
+        assert!(result.summary.all_received_reports_reconciled());
+    } else {
+        // The direct native path still attempts the terminal event on a filled order.
+        // Matching final state must not hide that failed application.
+        assert_eq!(result.summary.incomplete_events, 1);
+        assert!(!result.summary.all_received_reports_reconciled());
+    }
 }
 
 #[tokio::test]
@@ -722,6 +913,9 @@ async fn test_reconcile_mass_status_creates_external_order_accepted() {
         .await;
 
     assert_eq!(result.events.len(), 1);
+    assert!(result.summary.all_received_reports_reconciled());
+    assert_eq!(result.summary.orders.received, 1);
+    assert_eq!(result.summary.orders.reconciled, 1);
     assert!(matches!(result.events[0], OrderEventAny::Accepted(_)));
 
     // Verify order was added to cache
@@ -895,6 +1089,10 @@ async fn test_reconcile_mass_status_warns_on_untrusted_cached_client_origin(
     msgbus::unsubscribe_any(raw_pattern, &raw_handler);
 
     assert_eq!(result.events.len(), 1);
+    assert_eq!(
+        result.summary.source_valid,
+        cached_client_id != Some("OTHER")
+    );
     assert!(result.external_orders.is_empty());
     assert_eq!(
         ctx.get_order(&client_order_id).unwrap().status(),
@@ -971,6 +1169,7 @@ async fn test_reconcile_mass_status_warns_on_venue_only_fill_from_other_client()
     msgbus::unsubscribe_any(raw_pattern, &raw_handler);
 
     assert_eq!(result.events.len(), 1);
+    assert!(!result.summary.source_valid);
     assert!(matches!(result.events[0], OrderEventAny::Filled(_)));
     assert!(result.external_orders.is_empty());
     assert_eq!(raw_saver.get_messages().len(), 1);
@@ -1820,6 +2019,10 @@ async fn test_reconcile_mass_status_skips_external_when_filtered() {
         .await;
 
     assert!(result.events.is_empty());
+    assert_eq!(result.summary.orders.received, 1);
+    assert_eq!(result.summary.orders.excluded, 1);
+    assert_eq!(result.summary.orders.unresolved, 0);
+    assert!(!result.summary.all_received_reports_reconciled());
 }
 
 #[tokio::test]
@@ -2317,6 +2520,10 @@ async fn test_reconciliation_fill_dispatch_rejection_does_not_commit() {
             .contains(&&trade_id)
     );
 
+    assert_eq!(rejected.summary.incomplete_events, 1);
+    assert_eq!(rejected.summary.fills.unresolved, 1);
+    assert!(!rejected.summary.all_received_reports_reconciled());
+
     let order = ctx.get_order(&client_order_id).unwrap();
     let submitted = TestOrderEventStubs::submitted(&order, test_account_id());
     let order = ctx.cache.borrow_mut().update_order(&submitted).unwrap();
@@ -2331,6 +2538,9 @@ async fn test_reconciliation_fill_dispatch_rejection_does_not_commit() {
         )
         .await;
 
+    assert_eq!(retry.summary.fills.reconciled, 1);
+    assert_eq!(retry.summary.incomplete_events, 0);
+    assert!(retry.summary.all_received_reports_reconciled());
     assert_eq!(
         retry
             .events
@@ -4781,9 +4991,20 @@ async fn test_fill_before_retained_netting_lifecycle_projects_order_only() {
     mass_status.add_fill_reports(vec![old_fill_report, current_fill_report]);
     mass_status.add_position_reports(vec![position_report]);
 
-    ctx.manager
+    let first = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status.clone(), ctx.exec_engine.clone())
+        .await;
+    assert_eq!(first.summary.fills.reconciled, 2);
+    assert_eq!(first.summary.fills.unresolved, 0);
+
+    let repeated = ctx
+        .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+    assert!(repeated.events.is_empty());
+    assert_eq!(repeated.summary.fills.reconciled, 2);
+    assert_eq!(repeated.summary.fills.unresolved, 0);
 
     let cache = ctx.cache.borrow();
     let old_order = cache.order(&old_order_id).unwrap();
@@ -4889,6 +5110,9 @@ async fn test_reconcile_mass_status_skips_order_without_instrument() {
         .await;
 
     assert!(result.events.is_empty());
+    assert_eq!(result.summary.orders.received, 1);
+    assert_eq!(result.summary.orders.unresolved, 1);
+    assert!(!result.summary.all_received_reports_reconciled());
 }
 
 #[tokio::test]
@@ -6694,7 +6918,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_accepted_orders()
     order.apply(accepted).unwrap();
     ctx.add_order(order.clone());
 
-    let report = create_order_status_report(
+    let mut report = create_order_status_report(
         Some(client_order_id),
         venue_order_id,
         instrument_id,
@@ -6703,19 +6927,31 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_accepted_orders()
         Quantity::from("0.0"),
     );
 
+    report.order_type = OrderType::Market;
+    report.price = None;
+
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![report]);
 
-    let _events = ctx
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+
+    let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     assert_eq!(
         ctx.cache.borrow().client_order_id(&venue_order_id),
@@ -6747,16 +6983,25 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_external_orders()
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![report]);
 
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+
     let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     assert!(
         !result.events.is_empty(),
@@ -6812,7 +7057,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_filled_orders() {
     order.apply(filled).unwrap();
     ctx.add_order(order.clone());
 
-    let report = create_order_status_report(
+    let mut report = create_order_status_report(
         Some(client_order_id),
         venue_order_id,
         instrument_id,
@@ -6821,19 +7066,31 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_filled_orders() {
         Quantity::from("1.0"),
     );
 
+    report.order_type = OrderType::Market;
+    report.price = None;
+
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![report]);
 
-    let _events = ctx
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+
+    let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     let cache_borrow = ctx.cache.borrow();
     assert_eq!(
@@ -6852,7 +7109,7 @@ async fn test_reconcile_mass_status_skips_orders_without_loaded_instruments() {
     let loaded_instrument = test_instrument();
     ctx.add_instrument(loaded_instrument.clone());
 
-    let unloaded_instrument_id = InstrumentId::from("BTCUSDT.SIM");
+    let unloaded_instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
 
     let loaded_venue_order_id = VenueOrderId::from("V-LOADED");
     let unloaded_venue_order_id = VenueOrderId::from("V-UNLOADED");
@@ -6878,16 +7135,18 @@ async fn test_reconcile_mass_status_skips_orders_without_loaded_instruments() {
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![loaded_report, unloaded_report]);
 
-    let _events = ctx
+    let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     let cache_borrow = ctx.cache.borrow();
     let loaded_client_id = cache_borrow.client_order_id(&loaded_venue_order_id);
