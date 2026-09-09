@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: 6e4b97397b5461db51828bdeaf8516eb7bedc899
+      REVIEWED_SHA: 431a2fd752eeeda41e69643e0d5d37bb6037b800
       CARGO_BUILD_JOBS: "2"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -31,7 +31,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 6e4b97397b5461db51828bdeaf8516eb7bedc899
+          ref: 431a2fd752eeeda41e69643e0d5d37bb6037b800
           persist-credentials: false
 
       - name: Verify reviewed commit
@@ -68,14 +68,38 @@ jobs:
           cargo nextest run --locked --cargo-profile ci-pr --profile ci
           -p nautilus-common -p nautilus-polymarket --lib --tests --no-fail-fast
 
-      - name: Model common execution live and Polymarket Clippy
+      - name: Account risk backtest and sandbox consumers
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        shell: bash
+        run: >-
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci
+          -p nautilus-portfolio -p nautilus-risk -p nautilus-backtest -p nautilus-sandbox
+          --lib --tests --no-fail-fast
+
+      - name: Model report serialization including Python dictionary roundtrip
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        shell: bash
+        run: >-
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci
+          -p nautilus-model --features python --lib
+          -E 'test(reports::mass_status::)' --no-fail-fast
+
+      - name: Affected native components Clippy
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
         run: >-
           cargo clippy --locked --profile ci-pr
           -p nautilus-model -p nautilus-common -p nautilus-execution
-          -p nautilus-live -p nautilus-polymarket
-          --lib --tests -- -D warnings
+          -p nautilus-live -p nautilus-polymarket -p nautilus-portfolio
+          -p nautilus-risk -p nautilus-backtest -p nautilus-sandbox
+          --features nautilus-model/python --lib --tests -- -D warnings
+
+      - name: Standalone live runner Clippy
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        shell: bash
+        run: >-
+          cargo clippy --locked --profile ci-pr -p nautilus-live
+          --no-default-features --lib -- -D warnings
 
       - name: Verify source remained unchanged
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
