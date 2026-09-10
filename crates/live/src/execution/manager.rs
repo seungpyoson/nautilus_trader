@@ -66,7 +66,6 @@ use nautilus_model::{
     data::InstrumentClose,
     events::{OrderAccepted, OrderSubmitted},
     orders::{MarketOrder, OrderCore},
-    position::PositionReplayEvent,
     types::{money::MoneyRaw, quantity::QuantityRaw},
 };
 use nautilus_model::{
@@ -80,7 +79,7 @@ use nautilus_model::{
     },
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny, TRIGGERABLE_ORDER_TYPES},
-    position::Position,
+    position::{Position, PositionReplayEvent},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Money, Price, Quantity},
 };
@@ -2269,7 +2268,14 @@ impl ExecutionManager {
         let mut netting_lifecycle_starts = IndexMap::new();
 
         for position in positions {
-            for fill in &position.events {
+            for fill in position
+                .replay_events
+                .iter()
+                .filter_map(|event| match event {
+                    PositionReplayEvent::Filled(fill) => Some(fill),
+                    PositionReplayEvent::Adjusted(_) => None,
+                })
+            {
                 fill_keys.insert((position.account_id, position.instrument_id, fill.trade_id));
                 if cache.order(&fill.client_order_id).is_none() {
                     missing_order_ids.insert((
@@ -6606,8 +6612,8 @@ impl ExecutionManager {
                 && position.instrument_id == report.instrument_id
                 && position.strategy_id == order.strategy_id()
                 && position
-                    .events
-                    .iter()
+                    .fill_fragments(order.client_order_id(), report.trade_id)
+                    .into_iter()
                     .any(|fill| Self::fill_matches_report(cache, order, fill, report))
         })
     }
