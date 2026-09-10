@@ -131,13 +131,13 @@ fn execution_requires_portfolio_fee_conversion_but_preserves_executed_position(
 ) {
     let (_portfolio, engine, order) = funded_execution(account_type);
     let cache = Rc::clone(engine.borrow().cache());
-    let instrument = cache.borrow().instrument(&order.instrument_id()).unwrap();
+    let instrument_id = order.instrument_id();
     let account_id = order.account_id().unwrap();
     let endpoint = MessagingSwitchboard::exec_engine_process();
     if conversion_available {
         let conversion = InstrumentAny::CurrencyPair(default_fx_ccy(
             Symbol::from("GBP/USD"),
-            Some(instrument.id().venue),
+            Some(instrument_id.venue),
         ));
         let quote = QuoteTick::new(
             conversion.id(),
@@ -152,7 +152,7 @@ fn execution_requires_portfolio_fee_conversion_but_preserves_executed_position(
         cache.borrow_mut().add_quote(quote).unwrap();
     }
     let fill = OrderFilledSpec::builder()
-        .instrument_id(instrument.id())
+        .instrument_id(instrument_id)
         .client_order_id(order.client_order_id())
         .account_id(account_id)
         .venue_order_id(VenueOrderId::from("V-APPLICATION"))
@@ -194,8 +194,7 @@ fn execution_requires_portfolio_fee_conversion_but_preserves_executed_position(
         cache.order(&order.client_order_id()).unwrap().status(),
         OrderStatus::Filled
     );
-    let positions =
-        cache.positions_open(None, Some(&instrument.id()), None, Some(&account_id), None);
+    let positions = cache.positions_open(None, Some(&instrument_id), None, Some(&account_id), None);
     assert_eq!(positions.len(), 1);
     assert_eq!(positions[0].quantity, Quantity::from("10"));
     assert_eq!(
