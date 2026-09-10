@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: 8aa8871df8d01009272f13980af090b86ad13ad3
+      REVIEWED_SHA: 1e6f9336db623de59de81dd9bc72de1d43a1ecf3
       CARGO_BUILD_JOBS: "2"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -31,7 +31,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 8aa8871df8d01009272f13980af090b86ad13ad3
+          ref: 1e6f9336db623de59de81dd9bc72de1d43a1ecf3
           persist-credentials: false
 
       - name: Verify reviewed commit
@@ -55,7 +55,7 @@ jobs:
           set -o pipefail
           cargo nextest run --locked --cargo-profile ci-pr --profile ci \
             -p nautilus-model -p nautilus-common -p nautilus-execution -p nautilus-event-store \
-            -p nautilus-portfolio -p nautilus-system -p nautilus-live -p nautilus-backtest \
+            -p nautilus-portfolio -p nautilus-system -p nautilus-live -p nautilus-backtest -p nautilus-trading \
             --lib --tests --no-fail-fast \
             2>&1 | tee "$RUNNER_TEMP/native-position-construction.log"
 
@@ -67,10 +67,20 @@ jobs:
           path: ${{ runner.temp }}/native-position-construction.log
           if-no-files-found: error
 
+      - name: Isolated cache test support
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        shell: bash
+        run: cargo check --locked --profile ci-pr -p nautilus-testkit --no-default-features --features cache --lib
+
+      - name: Trading Python bridge compatibility
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        shell: bash
+        run: cargo check --locked --profile ci-pr -p nautilus-trading --features python --lib
+
       - name: Affected library and test Clippy
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
-        run: cargo clippy --locked --profile ci-pr -p nautilus-model -p nautilus-common -p nautilus-execution -p nautilus-event-store -p nautilus-portfolio -p nautilus-system -p nautilus-live -p nautilus-backtest --lib --tests -- -D warnings
+        run: cargo clippy --locked --profile ci-pr -p nautilus-model -p nautilus-common -p nautilus-execution -p nautilus-event-store -p nautilus-portfolio -p nautilus-system -p nautilus-live -p nautilus-backtest -p nautilus-trading --lib --tests -- -D warnings
 
       - name: Standalone live library Clippy
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
