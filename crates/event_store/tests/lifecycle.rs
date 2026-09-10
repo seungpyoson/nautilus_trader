@@ -335,7 +335,10 @@ fn replay_fill_corrections_match_live_accounting(
         for (index, bytes) in archives.iter().enumerate() {
             replay
                 .restore_snapshot_blob(
-                    &format!("cache://position-snapshots/{position_id}/{index}"),
+                    &cache
+                        .position_snapshot_blob_ref(&position_id, index)
+                        .unwrap()
+                        .unwrap(),
                     Bytes::copy_from_slice(bytes),
                 )
                 .expect("seed native archive");
@@ -625,13 +628,19 @@ fn kernel_start_installs_snapshot_anchorer_for_execution_snapshots() {
         );
     }
 
-    let snapshot = {
+    let (snapshot, blob_ref) = {
         let cache = kernel.cache.borrow();
         let frames = cache
             .position_snapshot_bytes(&position_id)
             .expect("position snapshot");
         assert_eq!(frames.len(), 1);
-        frames[0].clone()
+        (
+            frames[0].clone(),
+            cache
+                .position_snapshot_blob_ref(&position_id, 0)
+                .unwrap()
+                .unwrap(),
+        )
     };
 
     kernel.dispose();
@@ -644,10 +653,7 @@ fn kernel_start_installs_snapshot_anchorer_for_execution_snapshots() {
         .expect("anchor present");
     let durable_high_watermark = reader.high_watermark().expect("high watermark");
 
-    assert_eq!(
-        anchor.blob_ref,
-        format!("cache://position-snapshots/{}/0", position_id.as_str()),
-    );
+    assert_eq!(anchor.blob_ref, blob_ref);
     assert_eq!(
         anchor.content_hash,
         compute_snapshot_content_hash(&snapshot),

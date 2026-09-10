@@ -164,10 +164,8 @@ impl Cache {
     /// purging the frames those cycles produced in the same operation. Settling cannot detect the
     /// shortfall, because frames carry no cycle identity to match against the retained log.
     ///
-    /// Known limitation, shared with [`Self::purge_position`]: frame indices restart from zero,
-    /// so a later cycle can overwrite bytes an event store anchor already recorded, failing its
-    /// content-hash check on restore. Frames need an identity independent of their vector
-    /// position to fix it.
+    /// Frame indices restart from zero, but each frame's reference includes its unique snapshot
+    /// ID, so replacing frames cannot reuse a previously issued durable reference.
     pub fn settle_position_snapshots(
         &mut self,
         position: &Position,
@@ -203,15 +201,16 @@ impl Cache {
         let position_id = position.id;
 
         let mut copied_position = position.clone();
-        let new_id = format!("{}-{}", position_id.as_str(), UUID4::new());
+        let snapshot_uuid = UUID4::new();
+        let new_id = format!("{}-{snapshot_uuid}", position_id.as_str());
         copied_position.id = PositionId::new(new_id);
         copied_position.replay_events.clear();
         copied_position.fill_voids.clear();
 
-        let blob_ref = format!(
-            "cache://position-snapshots/{}/{}",
-            position_id.as_str(),
+        let blob_ref = position_snapshot_blob_ref(
+            &position_id,
             self.position_snapshot_count(&position_id),
+            snapshot_uuid,
         );
 
         (blob_ref, PositionSnapshotFrame::new(copied_position, kind))
@@ -300,11 +299,15 @@ impl Cache {
     }
 
     fn position_snapshot_frame(&self, blob_ref: &str) -> Option<&PositionSnapshotFrame> {
-        let (position_id, snapshot_index) = parse_position_snapshot_blob_ref(blob_ref).ok()?;
+        let (position_id, snapshot_index, snapshot_uuid) =
+            parse_position_snapshot_blob_ref(blob_ref).ok()?;
 
         self.position_snapshots
             .get(&position_id)
             .and_then(|frames| frames.get(snapshot_index))
+            .filter(|frame| {
+                position_snapshot_uuid(&position_id, &frame.position).ok() == Some(snapshot_uuid)
+            })
     }
 
     /// Loads the cache-owned snapshot blob stored under `blob_ref`.
@@ -336,11 +339,27 @@ impl Cache {
     ///
     /// Returns an error if the blob reference is unsupported, malformed, skips earlier
     /// snapshot frames, conflicts with an existing frame, or does not decode to the expected
-    /// position snapshot. Legacy blobs without a frame kind are rejected because a cycle and a
+    /// position snapshot. Index-only references are rejected because replacement frames can reuse
+    /// an index. Legacy blobs without a frame kind are rejected because a cycle and a
     /// rebuilt prior-cycle total cannot be distinguished from position fields alone.
+    /// Previously loaded bytes remain authoritative after their frame is removed. This method
+    /// does not load backing database entries; anchored restore loads and checks those first.
     pub fn restore_snapshot_blob(&mut self, blob_ref: &str, blob: Bytes) -> anyhow::Result<()> {
-        let (position_id, snapshot_index) = parse_position_snapshot_blob_ref(blob_ref)?;
-        let restored = decode_position_snapshot_blob(&position_id, blob.as_ref())?;
+        let (position_id, snapshot_index, snapshot_uuid) =
+            parse_position_snapshot_blob_ref(blob_ref)?;
+        let restored: PositionSnapshotFrame = serde_json::from_slice(&blob)?;
+        anyhow::ensure!(
+            position_snapshot_uuid(&position_id, &restored.position)? == snapshot_uuid,
+            "position snapshot id {} does not match blob_ref snapshot {snapshot_uuid}",
+            restored.position.id,
+        );
+
+        if let Some(existing) = self.general.get(blob_ref) {
+            anyhow::ensure!(
+                existing == &blob,
+                "position snapshot {blob_ref} already exists with different bytes",
+            );
+        }
 
         let frames = self.position_snapshots.entry(position_id).or_default();
         match frames.get(snapshot_index) {
@@ -364,6 +383,35 @@ impl Cache {
 
         self.general.insert(blob_ref.to_string(), blob);
         Ok(())
+    }
+
+    /// Returns the immutable reference of the frame at `index` without encoding it.
+    ///
+    /// The index selects a currently held frame; it is not a durable identity. Retain the
+    /// returned reference when recording an anchor or transferring a frame to another cache.
+    /// Use [`Self::load_snapshot_blob`] to read the bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the frame's snapshot ID is invalid.
+    pub fn position_snapshot_blob_ref(
+        &self,
+        position_id: &PositionId,
+        index: usize,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(frame) = self
+            .position_snapshots
+            .get(position_id)
+            .and_then(|frames| frames.get(index))
+        else {
+            return Ok(None);
+        };
+        let snapshot_uuid = position_snapshot_uuid(position_id, &frame.position)?;
+        Ok(Some(position_snapshot_blob_ref(
+            position_id,
+            index,
+            snapshot_uuid,
+        )))
     }
 
     fn snapshot_blob(&self, blob_ref: &str) -> Option<Bytes> {
@@ -519,12 +567,23 @@ impl Cache {
     }
 }
 
-fn parse_position_snapshot_blob_ref(blob_ref: &str) -> anyhow::Result<(PositionId, usize)> {
+fn position_snapshot_blob_ref(
+    position_id: &PositionId,
+    index: usize,
+    snapshot_uuid: UUID4,
+) -> String {
+    format!("cache://position-snapshots/{position_id}/{index}/{snapshot_uuid}")
+}
+
+fn parse_position_snapshot_blob_ref(blob_ref: &str) -> anyhow::Result<(PositionId, usize, UUID4)> {
     let Some(rest) = blob_ref.strip_prefix("cache://position-snapshots/") else {
         anyhow::bail!("unsupported cache snapshot blob_ref {blob_ref}");
     };
 
-    let Some((position_id, snapshot_index)) = rest.rsplit_once('/') else {
+    let Some((position_index, snapshot_uuid)) = rest.rsplit_once('/') else {
+        anyhow::bail!("malformed position snapshot blob_ref {blob_ref}");
+    };
+    let Some((position_id, snapshot_index)) = position_index.rsplit_once('/') else {
         anyhow::bail!("malformed position snapshot blob_ref {blob_ref}");
     };
 
@@ -536,15 +595,14 @@ fn parse_position_snapshot_blob_ref(blob_ref: &str) -> anyhow::Result<(PositionI
         anyhow::anyhow!("position snapshot blob_ref {blob_ref} has invalid frame index: {e}")
     })?;
 
-    Ok((PositionId::new(position_id), snapshot_index))
+    let snapshot_uuid = UUID4::from_str(snapshot_uuid).map_err(|e| {
+        anyhow::anyhow!("position snapshot blob_ref {blob_ref} has invalid snapshot UUID: {e}")
+    })?;
+
+    Ok((PositionId::new(position_id), snapshot_index, snapshot_uuid))
 }
 
-fn decode_position_snapshot_blob(
-    position_id: &PositionId,
-    blob: &[u8],
-) -> anyhow::Result<PositionSnapshotFrame> {
-    let frame = serde_json::from_slice::<PositionSnapshotFrame>(blob)?;
-    let snapshot = &frame.position;
+fn position_snapshot_uuid(position_id: &PositionId, snapshot: &Position) -> anyhow::Result<UUID4> {
     let expected_prefix = format!("{}-", position_id.as_str());
 
     let Some(snapshot_uuid) = snapshot.id.as_str().strip_prefix(&expected_prefix) else {
@@ -554,12 +612,10 @@ fn decode_position_snapshot_blob(
         );
     };
 
-    if UUID4::from_str(snapshot_uuid).is_err() {
-        anyhow::bail!(
+    UUID4::from_str(snapshot_uuid).map_err(|_| {
+        anyhow::anyhow!(
             "position snapshot id {} does not match blob_ref position {position_id}",
             snapshot.id
-        );
-    }
-
-    Ok(frame)
+        )
+    })
 }

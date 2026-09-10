@@ -6010,7 +6010,10 @@ fn test_rebuilt_prior_cycles_count_even_when_current_cycle_identity_and_pnl_matc
                 .remove(0);
             cache
                 .restore_snapshot_blob(
-                    &format!("cache://position-snapshots/{}/0", position.id),
+                    &source
+                        .position_snapshot_blob_ref(&position.id, 0)
+                        .unwrap()
+                        .unwrap(),
                     blob.into(),
                 )
                 .unwrap();

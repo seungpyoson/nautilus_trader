@@ -13111,7 +13111,10 @@ fn test_snapshot_anchorer_runs_on_netting_flip(mut execution_engine: ExecutionEn
     assert_eq!(anchors.len(), 1);
     assert_eq!(
         anchors[0].blob_ref,
-        format!("cache://position-snapshots/{}/0", position_id.as_str()),
+        cache
+            .position_snapshot_blob_ref(&position_id, 0)
+            .unwrap()
+            .unwrap(),
     );
     assert_eq!(anchors[0].blob.as_ref(), frames[0].as_slice());
     assert_eq!(position.side, PositionSide::Short);
@@ -13183,7 +13186,10 @@ fn test_snapshot_anchorer_error_does_not_stop_netting_reopen(
     assert_eq!(anchors.len(), 1);
     assert_eq!(
         anchors[0].blob_ref,
-        format!("cache://position-snapshots/{}/0", position_id.as_str()),
+        cache
+            .position_snapshot_blob_ref(&position_id, 0)
+            .unwrap()
+            .unwrap(),
     );
     assert_eq!(anchors[0].blob.as_ref(), frames[0].as_slice());
     assert_eq!(position.side, PositionSide::Long);
@@ -18105,9 +18111,12 @@ fn test_netting_reopen_leaves_snapshot_unencoded_without_anchorer(
     mut execution_engine: ExecutionEngine,
 ) {
     let position_id = run_netting_reopen(&mut execution_engine);
-    let blob_ref = format!("cache://position-snapshots/{}/0", position_id.as_str());
 
     let cache = execution_engine.cache().borrow();
+    let blob_ref = cache
+        .position_snapshot_blob_ref(&position_id, 0)
+        .unwrap()
+        .unwrap();
 
     // With no anchorer installed nothing needs the encoded frame, and
     // `snapshot_position_encoded` is the only path that stores a generic entry.
