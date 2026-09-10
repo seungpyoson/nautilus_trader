@@ -36,6 +36,7 @@ use ahash::AHashSet;
 use config::ExecutionEngineConfig;
 use futures::future::join_all;
 use indexmap::{IndexMap, IndexSet};
+pub use nautilus_common::messages::execution::EventApplicationOutcome;
 use nautilus_common::{
     cache::{Cache, PositionRef},
     clients::ExecutionClient,
@@ -68,7 +69,8 @@ use nautilus_core::{
 use nautilus_model::{
     accounts::Account,
     enums::{
-        AccountType, ContingencyType, OmsType, OrderStatus, OrderType, PositionSide, TimeInForce,
+        AccountType, ContingencyType, InstrumentCloseType, OmsType, OrderStatus, OrderType,
+        PositionSide, TimeInForce,
     },
     events::{
         OrderAccepted, OrderDenied, OrderDeniedReason, OrderEvent, OrderEventAny, OrderFillVoided,
@@ -95,7 +97,8 @@ use crate::{
     reconciliation::{
         check_position_reconciliation, generate_external_order_status_events,
         generate_reconciliation_order_events, generate_reconciliation_order_pre_fill_events,
-        generate_reconciliation_order_snapshot_events, reconcile_fill_report as reconcile_fill,
+        generate_reconciliation_order_snapshot_events, order_report_is_reconciled,
+        reconcile_fill_report as reconcile_fill,
     },
 };
 
@@ -121,6 +124,7 @@ pub struct ExecutionEngine {
     pos_id_generator: PositionIdGenerator,
     config: ExecutionEngineConfig,
     command_count: Cell<u64>,
+    halt_reason: Option<String>,
     event_count: u64,
     report_count: u64,
     filtered_unclaimed_external_order_count: u64,
@@ -159,6 +163,7 @@ impl ExecutionEngine {
             pos_id_generator: PositionIdGenerator::new(trader_id, clock),
             config: config.unwrap_or_default(),
             command_count: Cell::new(0),
+            halt_reason: None,
             event_count: 0,
             report_count: 0,
             filtered_unclaimed_external_order_count: 0,
@@ -200,9 +205,9 @@ impl ExecutionEngine {
         msgbus::register_order_event_endpoint(
             MessagingSwitchboard::exec_engine_process(),
             TypedIntoHandler::from(move |event: OrderEventAny| {
-                if let Some(rc) = weak2.upgrade() {
-                    rc.borrow_mut().process(&event);
-                }
+                let rc = weak2.upgrade()?;
+                let outcome = rc.borrow_mut().process_with_outcome(&event);
+                Some(outcome)
             }),
         );
 
@@ -210,9 +215,11 @@ impl ExecutionEngine {
         msgbus::register_execution_report_endpoint(
             MessagingSwitchboard::exec_engine_reconcile_execution_report(),
             TypedIntoHandler::from(move |report: ExecutionReport| {
-                if let Some(rc) = weak3.upgrade() {
-                    rc.borrow_mut().reconcile_execution_report(&report);
-                }
+                let rc = weak3.upgrade()?;
+                let outcome = rc
+                    .borrow_mut()
+                    .reconcile_execution_report_with_outcome(&report);
+                Some(outcome)
             }),
         );
     }
@@ -1004,25 +1011,37 @@ impl ExecutionEngine {
 
     /// Reconciles an execution report.
     pub fn reconcile_execution_report(&mut self, report: &ExecutionReport) {
+        let _ = self.reconcile_execution_report_with_outcome(report);
+    }
+
+    /// Returns the native application outcome of a runtime execution report.
+    ///
+    /// Incomplete includes partial application and unconfirmed duplicate fills.
+    /// Collection coverage, historical economics and subscriber acceptance are separate.
+    #[must_use]
+    pub fn reconcile_execution_report_with_outcome(
+        &mut self,
+        report: &ExecutionReport,
+    ) -> EventApplicationOutcome {
         if !matches!(report, ExecutionReport::MassStatus(_)) {
             self.report_count += 1;
         }
 
         match report {
             ExecutionReport::Order(order_report) => {
-                self.reconcile_order_status_report(order_report);
+                self.reconcile_order_status_report_with_outcome(order_report)
             }
             ExecutionReport::Fill(fill_report) => {
-                self.reconcile_fill_report(fill_report);
+                self.reconcile_fill_report_with_outcome(fill_report)
             }
             ExecutionReport::OrderWithFills(order_report, fills) => {
-                self.reconcile_order_with_fills(order_report, fills);
+                self.reconcile_order_with_fills_with_outcome(order_report, fills)
             }
             ExecutionReport::Position(position_report) => {
-                self.reconcile_position_report(position_report);
+                self.reconcile_position_report_with_outcome(position_report)
             }
             ExecutionReport::MassStatus(mass_status) => {
-                self.reconcile_execution_mass_status(mass_status);
+                self.reconcile_execution_mass_status_with_outcome(mass_status)
             }
         }
     }
@@ -1037,6 +1056,17 @@ impl ExecutionEngine {
     /// This handles exchange-generated orders (liquidation, ADL, settlement) that were
     /// not submitted locally.
     pub fn reconcile_order_status_report(&mut self, report: &OrderStatusReport) {
+        let _ = self.reconcile_order_status_report_with_outcome(report);
+    }
+
+    /// Returns native event application and final order agreement for this report.
+    ///
+    /// A matching order snapshot cannot erase an earlier event application failure.
+    #[must_use]
+    pub fn reconcile_order_status_report_with_outcome(
+        &mut self,
+        report: &OrderStatusReport,
+    ) -> EventApplicationOutcome {
         msgbus::publish_any(
             MessagingSwitchboard::reconciliation_raw_order_status_report_topic(),
             report,
@@ -1062,11 +1092,10 @@ impl ExecutionEngine {
             let events =
                 generate_reconciliation_order_events(&order, report, instrument.as_ref(), ts_now);
 
-            for event in &events {
-                self.handle_event(event);
-            }
+            let applied = self.apply_reconciliation_events(&events);
+            self.order_report_application_outcome(report, applied)
         } else {
-            self.create_external_order(report, instrument.as_ref());
+            self.create_external_order(report, instrument.as_ref())
         }
     }
 
@@ -1074,18 +1103,18 @@ impl ExecutionEngine {
         &mut self,
         report: &OrderStatusReport,
         instrument: Option<&InstrumentAny>,
-    ) {
+    ) -> EventApplicationOutcome {
         let Some(instrument) = instrument else {
             log::warn!(
                 "Cannot create external order for venue_order_id={}: instrument {} not found",
                 report.venue_order_id,
                 report.instrument_id
             );
-            return;
+            return EventApplicationOutcome::Incomplete;
         };
 
         let Some(order) = self.materialize_external_order_from_status(report) else {
-            return;
+            return EventApplicationOutcome::Incomplete;
         };
 
         let ts_now = self.clock.borrow().timestamp_ns();
@@ -1097,9 +1126,8 @@ impl ExecutionEngine {
             ts_now,
         );
 
-        for event in &events {
-            self.handle_event(event);
-        }
+        let applied = self.apply_reconciliation_events(&events);
+        self.order_report_application_outcome(report, applied)
     }
 
     /// Builds and registers an external order from an [`OrderStatusReport`] without
@@ -1409,6 +1437,17 @@ impl ExecutionEngine {
     /// closures (e.g. Hyperliquid liquidations) that arrive without a companion order
     /// status report still update the local position.
     pub fn reconcile_fill_report(&mut self, report: &FillReport) {
+        let _ = self.reconcile_fill_report_with_outcome(report);
+    }
+
+    /// Returns the fill's native order and position application outcome.
+    ///
+    /// A duplicate trade ID alone cannot confirm prior position application.
+    #[must_use]
+    pub fn reconcile_fill_report_with_outcome(
+        &mut self,
+        report: &FillReport,
+    ) -> EventApplicationOutcome {
         msgbus::publish_any(
             MessagingSwitchboard::reconciliation_raw_fill_report_topic(),
             report,
@@ -1435,14 +1474,15 @@ impl ExecutionEngine {
                 report.venue_order_id,
                 report.instrument_id
             );
-            return;
+            return EventApplicationOutcome::Incomplete;
         };
 
+        let mut applied = true;
         let order = match order {
             Some(order) => order,
             None => {
                 let Some(order) = self.materialize_external_order_from_fill(report) else {
-                    return;
+                    return EventApplicationOutcome::Incomplete;
                 };
                 let ts_now = self.clock.borrow().timestamp_ns();
                 let accepted = OrderAccepted::new(
@@ -1457,7 +1497,8 @@ impl ExecutionEngine {
                     ts_now,
                     true, // reconciliation
                 );
-                self.handle_event(&OrderEventAny::Accepted(accepted));
+                applied &= self.process_with_outcome(&OrderEventAny::Accepted(accepted))
+                    == EventApplicationOutcome::Applied;
                 self.cache
                     .borrow()
                     .order(&order.client_order_id())
@@ -1475,7 +1516,16 @@ impl ExecutionEngine {
             ts_now,
             self.config.allow_overfills,
         ) {
-            self.handle_event(&event);
+            applied &= self.process_with_outcome(&event) == EventApplicationOutcome::Applied;
+        } else {
+            // An order's duplicate trade ID does not prove prior position application
+            applied = false;
+        }
+
+        if applied {
+            EventApplicationOutcome::Applied
+        } else {
+            EventApplicationOutcome::Incomplete
         }
     }
 
@@ -1488,6 +1538,18 @@ impl ExecutionEngine {
     /// Adapters use this to emit ADL / liquidation / settlement events without
     /// losing real fill metadata.
     pub fn reconcile_order_with_fills(&mut self, report: &OrderStatusReport, fills: &[FillReport]) {
+        let _ = self.reconcile_order_with_fills_with_outcome(report, fills);
+    }
+
+    /// Returns native application and final order agreement for the bundled reports.
+    ///
+    /// Later matching snapshots cannot erase a failed or unconfirmed companion fill.
+    #[must_use]
+    pub fn reconcile_order_with_fills_with_outcome(
+        &mut self,
+        report: &OrderStatusReport,
+        fills: &[FillReport],
+    ) -> EventApplicationOutcome {
         msgbus::publish_any(
             MessagingSwitchboard::reconciliation_raw_order_status_report_topic(),
             report,
@@ -1524,22 +1586,20 @@ impl ExecutionEngine {
                 let events =
                     generate_reconciliation_order_snapshot_events(&order, report, None, ts_now);
 
-                for event in &events {
-                    self.handle_event(event);
-                }
+                let applied = self.apply_reconciliation_events(&events);
+                return self.order_report_application_outcome(report, applied);
             }
-            return;
+            return EventApplicationOutcome::Incomplete;
         };
 
         // Bootstrap the external order with only OrderAccepted; defer fill events to
         // the per-fill loop so real fill metadata is preserved.
+        let mut applied = true;
         let mut order = match order {
             Some(order) => {
                 let ts_now = self.clock.borrow().timestamp_ns();
                 let events = generate_reconciliation_order_pre_fill_events(&order, report, ts_now);
-                for event in &events {
-                    self.handle_event(event);
-                }
+                applied &= self.apply_reconciliation_events(&events);
                 self.cache
                     .borrow()
                     .order(&order.client_order_id())
@@ -1548,7 +1608,7 @@ impl ExecutionEngine {
             }
             None => {
                 let Some(order) = self.materialize_external_order_from_status(report) else {
-                    return;
+                    return EventApplicationOutcome::Incomplete;
                 };
                 let ts_now = self.clock.borrow().timestamp_ns();
                 let accepted = OrderAccepted::new(
@@ -1563,7 +1623,8 @@ impl ExecutionEngine {
                     ts_now,
                     true, // reconciliation
                 );
-                self.handle_event(&OrderEventAny::Accepted(accepted));
+                applied &= self.process_with_outcome(&OrderEventAny::Accepted(accepted))
+                    == EventApplicationOutcome::Applied;
                 self.cache
                     .borrow()
                     .order(&order.client_order_id())
@@ -1584,7 +1645,9 @@ impl ExecutionEngine {
                 ts_now,
                 self.config.allow_overfills,
             ) {
-                self.handle_event(&event);
+                applied &= self.process_with_outcome(&event) == EventApplicationOutcome::Applied;
+            } else {
+                applied = false;
             }
 
             // Refresh order after fill to keep filled_qty accurate for the next iteration.
@@ -1606,9 +1669,8 @@ impl ExecutionEngine {
             ts_now,
         );
 
-        for event in &events {
-            self.handle_event(event);
-        }
+        applied &= self.apply_reconciliation_events(&events);
+        self.order_report_application_outcome(report, applied)
     }
 
     /// Reconciles a position status report received at runtime.
@@ -1616,6 +1678,17 @@ impl ExecutionEngine {
     /// Compares the venue-reported position with cached positions and logs any discrepancies.
     /// Handles both hedging (with `venue_position_id`) and netting (without) modes.
     pub fn reconcile_position_report(&mut self, report: &PositionStatusReport) {
+        let _ = self.reconcile_position_report_with_outcome(report);
+    }
+
+    /// Returns native quantity agreement using the existing hedging or netting rules.
+    ///
+    /// This does not establish valuation or historical position economics.
+    #[must_use]
+    pub fn reconcile_position_report_with_outcome(
+        &mut self,
+        report: &PositionStatusReport,
+    ) -> EventApplicationOutcome {
         msgbus::publish_any(
             MessagingSwitchboard::reconciliation_raw_position_status_report_topic(),
             report,
@@ -1627,14 +1700,24 @@ impl ExecutionEngine {
             .instrument(&report.instrument_id)
             .map(InstrumentAny::size_precision);
 
-        if report.venue_position_id.is_some() {
-            self.reconcile_position_report_hedging(report, &cache);
+        let matched = if report.venue_position_id.is_some() {
+            self.reconcile_position_report_hedging(report, &cache)
         } else {
-            self.reconcile_position_report_netting(report, &cache, size_precision);
+            self.reconcile_position_report_netting(report, &cache, size_precision)
+        };
+
+        if matched {
+            EventApplicationOutcome::Applied
+        } else {
+            EventApplicationOutcome::Incomplete
         }
     }
 
-    fn reconcile_position_report_hedging(&self, report: &PositionStatusReport, cache: &Cache) {
+    fn reconcile_position_report_hedging(
+        &self,
+        report: &PositionStatusReport,
+        cache: &Cache,
+    ) -> bool {
         let venue_position_id = report.venue_position_id.as_ref().unwrap();
 
         log::debug!(
@@ -1649,8 +1732,17 @@ impl ExecutionEngine {
             }
 
             log::error!("Cannot reconcile position: {venue_position_id} not found in cache");
-            return;
+            return false;
         };
+
+        if position.account_id != report.account_id
+            || position.instrument_id != report.instrument_id
+        {
+            log::error!(
+                "Cannot reconcile position: {venue_position_id} has different account or instrument"
+            );
+            return false;
+        }
 
         let cached_signed_qty = match position.side {
             PositionSide::Long => position.quantity.as_decimal(),
@@ -1668,6 +1760,8 @@ impl ExecutionEngine {
                 venue_signed_qty
             );
         }
+
+        cached_signed_qty == venue_signed_qty
     }
 
     fn reconcile_position_report_netting(
@@ -1675,7 +1769,7 @@ impl ExecutionEngine {
         report: &PositionStatusReport,
         cache: &Cache,
         size_precision: Option<u8>,
-    ) {
+    ) -> bool {
         log::debug!("Reconciling NET position for {}", report.instrument_id);
 
         let positions_open = Self::netting_positions_open_for_report(cache, report);
@@ -1703,7 +1797,7 @@ impl ExecutionEngine {
             cached_signed_qty
         );
 
-        let _ = check_position_reconciliation(report, cached_signed_qty, size_precision);
+        check_position_reconciliation(report, cached_signed_qty, size_precision)
     }
 
     fn netting_positions_open_for_report<'a>(
@@ -1752,6 +1846,18 @@ impl ExecutionEngine {
     /// in the mass status. Order reports are paired with their companion fills so
     /// real trade IDs and commissions are applied before any residual inferred fill.
     pub fn reconcile_execution_mass_status(&mut self, mass_status: &ExecutionMassStatus) {
+        let _ = self.reconcile_execution_mass_status_with_outcome(mass_status);
+    }
+
+    /// Returns whether every child report's native application was confirmed.
+    ///
+    /// Later children can change earlier observed state. Collection coverage and final
+    /// inventory agreement must be checked separately.
+    #[must_use]
+    pub fn reconcile_execution_mass_status_with_outcome(
+        &mut self,
+        mass_status: &ExecutionMassStatus,
+    ) -> EventApplicationOutcome {
         self.report_count += 1;
 
         log::info!(
@@ -1761,18 +1867,21 @@ impl ExecutionEngine {
             mass_status.venue
         );
 
-        let order_reports = mass_status.order_reports();
-        let fill_reports = mass_status.fill_reports();
+        let order_reports = mass_status.order_reports_ref();
+        let fill_reports = mass_status.fill_reports_ref();
         let mut paired_venue_ids = AHashSet::new();
+        let mut applied = true;
 
         for order_report in order_reports.values() {
             if let Some(fills) = fill_reports.get(&order_report.venue_order_id)
                 && !fills.is_empty()
             {
-                self.reconcile_order_with_fills(order_report, fills);
+                applied &= self.reconcile_order_with_fills_with_outcome(order_report, fills)
+                    == EventApplicationOutcome::Applied;
                 paired_venue_ids.insert(order_report.venue_order_id);
             } else {
-                self.reconcile_order_status_report(order_report);
+                applied &= self.reconcile_order_status_report_with_outcome(order_report)
+                    == EventApplicationOutcome::Applied;
             }
         }
 
@@ -1782,30 +1891,70 @@ impl ExecutionEngine {
                     continue;
                 }
 
-                self.reconcile_fill_report(fill_report);
+                applied &= self.reconcile_fill_report_with_outcome(fill_report)
+                    == EventApplicationOutcome::Applied;
             }
         }
 
-        for position_reports in mass_status.position_reports().values() {
+        for position_reports in mass_status.position_reports_ref().values() {
             for position_report in position_reports {
-                self.reconcile_position_report(position_report);
+                applied &= self.reconcile_position_report_with_outcome(position_report)
+                    == EventApplicationOutcome::Applied;
             }
         }
 
         log::info!(
             "Mass status reconciliation complete: {} orders, {} fills, {} positions",
-            mass_status.order_reports().len(),
+            mass_status.order_reports_ref().len(),
             mass_status
-                .fill_reports()
+                .fill_reports_ref()
                 .values()
                 .map(Vec::len)
                 .sum::<usize>(),
             mass_status
-                .position_reports()
+                .position_reports_ref()
                 .values()
                 .map(Vec::len)
                 .sum::<usize>()
         );
+
+        if applied {
+            EventApplicationOutcome::Applied
+        } else {
+            EventApplicationOutcome::Incomplete
+        }
+    }
+
+    fn apply_reconciliation_events(&mut self, events: &[OrderEventAny]) -> bool {
+        let mut applied = true;
+
+        for event in events {
+            applied &= self.process_with_outcome(event) == EventApplicationOutcome::Applied;
+        }
+
+        applied
+    }
+
+    fn order_report_application_outcome(
+        &self,
+        report: &OrderStatusReport,
+        applied: bool,
+    ) -> EventApplicationOutcome {
+        let cache = self.cache.borrow();
+        let order = report
+            .client_order_id
+            .and_then(|id| cache.order(&id))
+            .or_else(|| {
+                cache
+                    .client_order_id(&report.venue_order_id)
+                    .and_then(|id| cache.order(id))
+            });
+
+        if applied && order.is_some_and(|order| order_report_is_reconciled(&order, report)) {
+            EventApplicationOutcome::Applied
+        } else {
+            EventApplicationOutcome::Incomplete
+        }
     }
 
     /// Executes a trading command by routing it to the appropriate execution client.
@@ -1813,14 +1962,52 @@ impl ExecutionEngine {
         self.execute_command(command);
     }
 
+    /// Permanently blocks submit and modify commands after a fatal execution fault.
+    ///
+    /// The first reason is retained for the lifetime of this engine, including across reset.
+    /// Cancel/query commands and execution events remain available for orderly shutdown.
+    pub fn halt(&mut self, reason: String) {
+        if self.halt_reason.is_none() {
+            log::error!("Execution halted: {reason}");
+            self.halt_reason = Some(reason);
+        }
+    }
+
+    /// Returns the fatal reason preventing further submissions and modifications.
+    #[must_use]
+    pub fn halt_reason(&self) -> Option<&str> {
+        self.halt_reason.as_deref()
+    }
+
     /// Processes an order event, updating internal state and routing as needed.
     pub fn process(&mut self, event: &OrderEventAny) {
         self.handle_event(event);
     }
 
+    /// Processes an order event and returns its native application outcome.
+    ///
+    /// Success covers the configured order and position application only.
+    /// An incomplete outcome can include partial mutations. Message-bus consumers and external
+    /// persistence are outside this result; their acceptance is not acknowledged by the engine.
+    #[must_use]
+    pub fn process_with_outcome(&mut self, event: &OrderEventAny) -> EventApplicationOutcome {
+        self.handle_event_with_position_application(event, true)
+    }
+
     /// Projects a reconciled fill onto its order without applying position or portfolio economics.
     pub fn project_reconciliation_fill(&mut self, fill: &OrderFilled) {
-        self.handle_event_with_position_application(&OrderEventAny::Filled(fill.clone()), false);
+        let _ = self.project_reconciliation_fill_with_outcome(fill);
+    }
+
+    /// Projects a reconciled fill and returns its order-only application outcome.
+    ///
+    /// Success does not indicate that position or portfolio economics were applied.
+    #[must_use]
+    pub fn project_reconciliation_fill_with_outcome(
+        &mut self,
+        fill: &OrderFilled,
+    ) -> EventApplicationOutcome {
+        self.handle_event_with_position_application(&OrderEventAny::Filled(fill.clone()), false)
     }
 
     /// Starts the execution engine and all registered execution clients.
@@ -1866,6 +2053,7 @@ impl ExecutionEngine {
 
     /// Resets the execution engine and all registered execution clients to initial state.
     ///
+    /// A fatal execution halt is retained; only a new engine can accept submissions again.
     /// Cancels engine-owned timers (snapshot, purge) but leaves timers owned by
     /// other components on the shared clock untouched.
     pub fn reset(&mut self) {
@@ -1907,6 +2095,25 @@ impl ExecutionEngine {
 
     fn execute_command(&self, command: TradingCommand) {
         self.command_count.set(self.command_count.get() + 1);
+
+        if let Some(reason) = &self.halt_reason {
+            match &command {
+                TradingCommand::SubmitOrder(_)
+                | TradingCommand::SubmitOrderList(_)
+                | TradingCommand::ModifyOrder(_)
+                | TradingCommand::ModifyOrders(_) => {
+                    log::error!(
+                        "Blocking command after fatal execution fault ({reason}): {command}"
+                    );
+                    return;
+                }
+                TradingCommand::CancelOrder(_)
+                | TradingCommand::CancelOrders(_)
+                | TradingCommand::CancelAllOrders(_)
+                | TradingCommand::QueryOrder(_)
+                | TradingCommand::QueryAccount(_) => {}
+            }
+        }
 
         if self.config.debug {
             log::debug!("{RECV}{CMD} {command}");
@@ -2764,14 +2971,14 @@ impl ExecutionEngine {
     }
 
     fn handle_event(&mut self, event: &OrderEventAny) {
-        self.handle_event_with_position_application(event, true);
+        let _ = self.process_with_outcome(event);
     }
 
     fn handle_event_with_position_application(
         &mut self,
         event: &OrderEventAny,
         apply_position: bool,
-    ) {
+    ) -> EventApplicationOutcome {
         self.event_count += 1;
 
         if self.config.debug {
@@ -2801,7 +3008,7 @@ impl ExecutionEngine {
                     "Cannot apply event to any order: {} not found in the cache with no VenueOrderId",
                     event.client_order_id()
                 );
-                return;
+                return EventApplicationOutcome::Incomplete;
             };
 
             // Look up client order ID from venue order ID
@@ -2809,6 +3016,7 @@ impl ExecutionEngine {
                 *id
             } else {
                 if let OrderEventAny::Filled(fill) = event
+                    && apply_position
                     && is_leg_fill
                 {
                     log::info!(
@@ -2817,15 +3025,14 @@ impl ExecutionEngine {
                         fill.instrument_id
                     );
                     drop(cache);
-                    self.handle_leg_fill_without_order(fill.clone());
-                    return;
+                    return self.handle_leg_fill_without_order(fill.clone());
                 }
 
                 log::error!(
                     "Cannot apply event to any order: {} and {venue_order_id} not found in the cache",
                     event.client_order_id(),
                 );
-                return;
+                return EventApplicationOutcome::Incomplete;
             };
 
             // Get order using found client order ID
@@ -2834,6 +3041,7 @@ impl ExecutionEngine {
                 client_order_id
             } else {
                 if let OrderEventAny::Filled(fill) = event
+                    && apply_position
                     && is_leg_fill
                 {
                     log::info!(
@@ -2842,14 +3050,13 @@ impl ExecutionEngine {
                         fill.instrument_id
                     );
                     drop(cache);
-                    self.handle_leg_fill_without_order(fill.clone());
-                    return;
+                    return self.handle_leg_fill_without_order(fill.clone());
                 }
 
                 log::error!(
                     "Cannot apply event to any order: {client_order_id} and {venue_order_id} not found in cache",
                 );
-                return;
+                return EventApplicationOutcome::Incomplete;
             }
         };
         let order_before_fill = if matches!(event, OrderEventAny::Filled(_)) {
@@ -2873,13 +3080,13 @@ impl ExecutionEngine {
                         "Cannot apply fill: order {} not found in the cache",
                         fill.client_order_id()
                     );
-                    return;
+                    return EventApplicationOutcome::Incomplete;
                 };
                 let configured_oms_type = self.determine_oms_type(fill);
                 let Some(position_id) =
                     self.determine_position_id(fill, configured_oms_type, Some(&order_before_fill))
                 else {
-                    return;
+                    return EventApplicationOutcome::Incomplete;
                 };
                 let oms_type = self
                     .cache
@@ -2901,17 +3108,19 @@ impl ExecutionEngine {
                     let Some(order) =
                         self.update_cached_order(client_order_id, &event, apply_position)
                     else {
-                        return;
+                        return EventApplicationOutcome::Incomplete;
                     };
 
-                    let position_events = if apply_position {
+                    let (position_events, outcome) = if apply_position {
                         self.handle_order_fill(&order, fill, oms_type)
                     } else {
-                        Vec::new()
+                        (Vec::new(), EventApplicationOutcome::Applied)
                     };
                     self.publish_order_event(&event);
                     self.publish_position_events(position_events);
+                    return outcome;
                 }
+                return EventApplicationOutcome::Incomplete;
             }
             OrderEventAny::FillVoided(voided) => {
                 let mut voided = voided.clone();
@@ -2922,7 +3131,7 @@ impl ExecutionEngine {
                     .map(|order| order.clone())
                 else {
                     log::error!("Cannot apply fill void: order {client_order_id} not found");
-                    return;
+                    return EventApplicationOutcome::Incomplete;
                 };
                 let original_fill = order_before_void
                     .events()
@@ -2946,11 +3155,11 @@ impl ExecutionEngine {
                         log::warn!(
                             "Duplicate fill void rejected at order level: trade_id={trade_id}"
                         );
-                        return;
+                        return EventApplicationOutcome::Incomplete;
                     }
                     Err(e) => {
                         log::error!("Cannot apply fill void to order: {e}");
-                        return;
+                        return EventApplicationOutcome::Incomplete;
                     }
                 }
 
@@ -2963,7 +3172,7 @@ impl ExecutionEngine {
                         Ok(positions) => positions,
                         Err(e) => {
                             log::error!("Cannot apply fill void to positions: {e}");
-                            return;
+                            return EventApplicationOutcome::Incomplete;
                         }
                     }
                 } else {
@@ -2981,7 +3190,7 @@ impl ExecutionEngine {
                 {
                     if let Err(e) = self.cache.borrow_mut().update_position(&position) {
                         log::error!("Cannot apply fill void to position {}: {e}", position.id);
-                        return;
+                        return EventApplicationOutcome::Incomplete;
                     }
 
                     if absorbed_prior_cycles {
@@ -3011,7 +3220,7 @@ impl ExecutionEngine {
                     .update_cached_order(client_order_id, &event, true)
                     .is_none()
                 {
-                    return;
+                    return EventApplicationOutcome::Incomplete;
                 }
 
                 if original_fill.is_some() {
@@ -3027,12 +3236,15 @@ impl ExecutionEngine {
                     .is_some()
                 {
                     self.publish_order_event(&event);
+                } else {
+                    return EventApplicationOutcome::Incomplete;
                 }
             }
         }
+        EventApplicationOutcome::Applied
     }
 
-    fn handle_leg_fill_without_order(&mut self, mut fill: OrderFilled) {
+    fn handle_leg_fill_without_order(&mut self, mut fill: OrderFilled) -> EventApplicationOutcome {
         let instrument =
             if let Some(instrument) = self.cache.borrow().instrument(&fill.instrument_id) {
                 instrument.clone()
@@ -3041,12 +3253,12 @@ impl ExecutionEngine {
                     "Cannot handle leg fill: no instrument found for {}, {fill}",
                     fill.instrument_id,
                 );
-                return;
+                return EventApplicationOutcome::Incomplete;
             };
 
         if let Err(e) = self.cache.borrow().try_account(&fill.account_id) {
             log::error!("Cannot handle leg fill: {e}, {fill}");
-            return;
+            return EventApplicationOutcome::Incomplete;
         }
 
         let oms_type = self.determine_oms_type(&fill);
@@ -3054,7 +3266,7 @@ impl ExecutionEngine {
         fill.position_id = Some(position_id);
 
         if !self.validate_fill_for_position(position_id, &fill) {
-            return;
+            return EventApplicationOutcome::Incomplete;
         }
 
         let duplicate_position_fill = self.position_contains_trade_id(position_id, fill.trade_id);
@@ -3068,14 +3280,15 @@ impl ExecutionEngine {
                 fill.trade_id,
                 position_id
             );
-            return;
+            return EventApplicationOutcome::Incomplete;
         }
 
         let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
         msgbus::send_order_event(portfolio_endpoint, event.clone());
-        let position_events = self.handle_position_update(&instrument, fill, oms_type);
+        let (position_events, outcome) = self.handle_position_update(&instrument, fill, oms_type);
         self.publish_order_event(&event);
         self.publish_position_events(position_events);
+        outcome
     }
 
     fn determine_leg_fill_position_id(
@@ -3755,7 +3968,7 @@ impl ExecutionEngine {
         order: &OrderAny,
         fill: OrderFilled,
         oms_type: OmsType,
-    ) -> Vec<PositionEvent> {
+    ) -> (Vec<PositionEvent>, EventApplicationOutcome) {
         let instrument =
             if let Some(instrument) = self.cache.borrow().instrument(&fill.instrument_id) {
                 instrument.clone()
@@ -3764,7 +3977,7 @@ impl ExecutionEngine {
                     "Cannot handle order fill: no instrument found for {}, {fill}",
                     fill.instrument_id,
                 );
-                return Vec::new();
+                return (Vec::new(), EventApplicationOutcome::Incomplete);
             };
 
         let is_margin_account = {
@@ -3773,7 +3986,7 @@ impl ExecutionEngine {
                 Ok(account) => account,
                 Err(e) => {
                     log::error!("Cannot handle order fill: {e}, {fill}");
-                    return Vec::new();
+                    return (Vec::new(), EventApplicationOutcome::Incomplete);
                 }
             };
 
@@ -3787,10 +4000,11 @@ impl ExecutionEngine {
             msgbus::send_order_event(portfolio_endpoint, OrderEventAny::Filled(fill.clone()));
         }
 
-        let (position, position_events) = if instrument.is_spread() {
-            (None, Vec::new())
+        let (position, position_events, mut outcome) = if instrument.is_spread() {
+            (None, Vec::new(), EventApplicationOutcome::Applied)
         } else {
-            let position_events = self.handle_position_update(&instrument, fill.clone(), oms_type);
+            let (position_events, outcome) =
+                self.handle_position_update(&instrument, fill.clone(), oms_type);
             let position_id = fill.position_id.unwrap();
             (
                 self.cache
@@ -3798,6 +4012,7 @@ impl ExecutionEngine {
                     .position(&position_id)
                     .map(|position| position.clone_without_events()),
                 position_events,
+                outcome,
             )
         };
 
@@ -3839,6 +4054,7 @@ impl ExecutionEngine {
                         )
                     {
                         log::error!("Failed to add position ID: {e}");
+                        outcome = EventApplicationOutcome::Incomplete;
                     }
                 }
             }
@@ -3850,7 +4066,7 @@ impl ExecutionEngine {
         let event = OrderEventAny::Filled(fill);
         msgbus::publish_order_event(topic, &event);
 
-        position_events
+        (position_events, outcome)
     }
 
     fn prepare_order_fill_void_positions(
@@ -4104,7 +4320,7 @@ impl ExecutionEngine {
         instrument: &InstrumentAny,
         fill: OrderFilled,
         oms_type: OmsType,
-    ) -> Vec<PositionEvent> {
+    ) -> (Vec<PositionEvent>, EventApplicationOutcome) {
         enum Action {
             Open,
             Reopen(Position),
@@ -4116,7 +4332,7 @@ impl ExecutionEngine {
             position_id
         } else {
             log::error!("Cannot handle position update: no position ID found for fill {fill}");
-            return Vec::new();
+            return (Vec::new(), EventApplicationOutcome::Incomplete);
         };
 
         let action = {
@@ -4135,27 +4351,42 @@ impl ExecutionEngine {
         match action {
             Action::Open => {
                 if self.reject_reduce_only_position_open(&fill, oms_type) {
-                    return Vec::new();
+                    return (Vec::new(), EventApplicationOutcome::Incomplete);
                 }
 
-                self.open_position(instrument, None, fill, oms_type)
-                    .unwrap_or_default()
+                Self::position_application(self.open_position(instrument, None, fill, oms_type))
             }
             Action::Reopen(position) => {
                 if self.reject_reduce_only_position_open(&fill, oms_type) {
-                    return Vec::new();
+                    return (Vec::new(), EventApplicationOutcome::Incomplete);
                 }
 
-                self.open_position(instrument, Some(&position), fill, oms_type)
-                    .unwrap_or_default()
+                Self::position_application(self.open_position(
+                    instrument,
+                    Some(&position),
+                    fill,
+                    oms_type,
+                ))
             }
             Action::Flip(mut position) => {
                 self.flip_position(instrument, &mut position, &fill, oms_type)
             }
-            Action::Update => self
-                .update_position_from_fill(position_id, &fill)
-                .into_iter()
-                .collect(),
+            Action::Update => match self.update_position_from_fill(position_id, &fill) {
+                Some(event) => (vec![event], EventApplicationOutcome::Applied),
+                None => (Vec::new(), EventApplicationOutcome::Incomplete),
+            },
+        }
+    }
+
+    fn position_application(
+        result: anyhow::Result<Vec<PositionEvent>>,
+    ) -> (Vec<PositionEvent>, EventApplicationOutcome) {
+        match result {
+            Ok(events) => (events, EventApplicationOutcome::Applied),
+            Err(e) => {
+                log::error!("Failed to apply position: {e}");
+                (Vec::new(), EventApplicationOutcome::Incomplete)
+            }
         }
     }
 
@@ -4166,6 +4397,15 @@ impl ExecutionEngine {
         };
 
         if !order.is_reduce_only() {
+            return false;
+        }
+
+        // A venue fill can arrive after the contract's accounting close. Retain its
+        // economics even for a reduce-only order; the live node settles the residual.
+        if cache
+            .instrument_close(&fill.instrument_id)
+            .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+        {
             return false;
         }
 
@@ -4425,8 +4665,9 @@ impl ExecutionEngine {
         position: &mut Position,
         fill: &OrderFilled,
         oms_type: OmsType,
-    ) -> Vec<PositionEvent> {
+    ) -> (Vec<PositionEvent>, EventApplicationOutcome) {
         let mut position_events = Vec::new();
+        let mut outcome = EventApplicationOutcome::Applied;
 
         if fill.commission.is_none() {
             log::warn!(
@@ -4451,6 +4692,8 @@ impl ExecutionEngine {
 
         if let Some(position_event) = self.update_position(position, &fill_split1) {
             position_events.push(position_event);
+        } else {
+            outcome = EventApplicationOutcome::Incomplete;
         }
 
         // Snapshot closed position before reusing ID (NETTING mode)
@@ -4458,6 +4701,7 @@ impl ExecutionEngine {
             && let Err(e) = self.snapshot_position(position)
         {
             log::warn!("Failed to snapshot position during flip: {e:?}");
+            outcome = EventApplicationOutcome::Incomplete;
         }
 
         if oms_type == OmsType::Hedging
@@ -4471,10 +4715,13 @@ impl ExecutionEngine {
         // Open flipped position
         match self.open_position(instrument, None, fill_split2, oms_type) {
             Ok(opened_events) => position_events.extend(opened_events),
-            Err(e) => log::error!("Failed to open flipped position: {e:?}"),
+            Err(e) => {
+                log::error!("Failed to open flipped position: {e:?}");
+                outcome = EventApplicationOutcome::Incomplete;
+            }
         }
 
-        position_events
+        (position_events, outcome)
     }
 
     /// Sets the internal position ID generator counts based on existing cached positions.

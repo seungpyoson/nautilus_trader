@@ -31,9 +31,7 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use indexmap::IndexMap;
 use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
-use nautilus_core::{
-    UUID4, UnixNanos, collections::AtomicMap, string::secret::REDACTED, time::AtomicTime,
-};
+use nautilus_core::{UUID4, UnixNanos, string::secret::REDACTED, time::AtomicTime};
 use nautilus_live::{ExecutionEventEmitter, execution::context::OrderContext};
 use nautilus_model::{
     enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
@@ -66,7 +64,9 @@ use crate::{
     },
     execution::{
         context::OrderContextRegistry,
-        get_pusd_currency, is_post_only_crossing,
+        get_pusd_currency,
+        instruments::TokenInstrumentLookup,
+        is_post_only_crossing,
         order_fill_tracker::{BufferedFill, FillCorrectionMetadata, OrderFillTrackerMap},
         parse::{
             build_maker_fill_report, compute_commission, determine_order_side,
@@ -510,7 +510,7 @@ struct PendingTerminalOrder {
 
 /// Immutable context borrowed from the async block's owned values.
 pub(crate) struct WsDispatchContext<'a> {
-    pub token_instruments: &'a AtomicMap<Ustr, InstrumentAny>,
+    pub token_instruments: &'a dyn TokenInstrumentLookup,
     pub fill_tracker: &'a OrderFillTrackerMap,
     pub pending_submits: &'a PendingSubmitTracker,
     pub order_contexts: &'a OrderContextRegistry,
@@ -567,8 +567,7 @@ fn dispatch_order_update(
         return;
     };
 
-    let instruments = ctx.token_instruments.load();
-    let instrument = match instruments.get(&order.asset_id) {
+    let instrument = match ctx.token_instruments.get_cloned(&order.asset_id) {
         Some(i) => i,
         None => {
             log::warn!("Unknown asset_id in order update: {}", order.asset_id);
@@ -584,7 +583,7 @@ fn dispatch_order_update(
         order,
         status,
         order_type,
-        instrument,
+        &instrument,
         ctx.account_id,
         ts_event,
         ts_init,
@@ -987,16 +986,14 @@ fn void_failed_trade(
 }
 
 fn has_unknown_trade_instrument(trade: &PolymarketUserTrade, ctx: &WsDispatchContext<'_>) -> bool {
-    let instruments = ctx.token_instruments.load();
-
     if trade.trader_side == PolymarketLiquiditySide::Maker {
         trade
             .maker_orders
             .iter()
             .filter(|order| is_user_maker_order(order, ctx))
-            .any(|order| !instruments.contains_key(&order.asset_id))
+            .any(|order| ctx.token_instruments.get_cloned(&order.asset_id).is_none())
     } else {
-        !instruments.contains_key(&trade.asset_id)
+        ctx.token_instruments.get_cloned(&trade.asset_id).is_none()
     }
 }
 
@@ -1085,7 +1082,6 @@ fn build_ws_maker_fill_reports(
         return Ok(Vec::new());
     }
 
-    let instruments = ctx.token_instruments.load();
     let liquidity_side = parse_liquidity_side(trade.trader_side);
     let ts_event = parse_timestamp_ms(&trade.timestamp).unwrap_or_else(|_| ctx.clock.get_time_ns());
     let ts_init = ctx.clock.get_time_ns();
@@ -1093,8 +1089,9 @@ fn build_ws_maker_fill_reports(
 
     for mo in user_orders {
         let asset_id = mo.asset_id;
-        let instrument = instruments
-            .get(&asset_id)
+        let instrument = ctx
+            .token_instruments
+            .get_cloned(&asset_id)
             .with_context(|| format!("unknown asset_id in maker order: {asset_id}"))?;
         let mut report = build_maker_fill_report(
             mo,
@@ -1194,9 +1191,9 @@ fn build_ws_taker_fill_report_for_trade(
     trade: &PolymarketUserTrade,
     ctx: &WsDispatchContext<'_>,
 ) -> anyhow::Result<FillReport> {
-    let instruments = ctx.token_instruments.load();
-    let instrument = instruments
-        .get(&trade.asset_id)
+    let instrument = ctx
+        .token_instruments
+        .get_cloned(&trade.asset_id)
         .with_context(|| format!("unknown asset_id in trade: {}", trade.asset_id))?;
     let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
     let liquidity_side = parse_liquidity_side(trade.trader_side);
@@ -1205,7 +1202,7 @@ fn build_ws_taker_fill_report_for_trade(
 
     let mut report = build_ws_taker_fill_report(
         trade,
-        instrument,
+        &instrument,
         ctx.account_id,
         liquidity_side,
         ts_event,
@@ -1819,7 +1816,7 @@ fn emit_order_rejected(
 #[cfg(test)]
 mod tests {
     use nautilus_common::messages::{ExecutionEvent, ExecutionReport};
-    use nautilus_core::time::AtomicTime;
+    use nautilus_core::{collections::AtomicMap, time::AtomicTime};
     use nautilus_live::execution::context::OrderIdentity;
     use nautilus_model::{
         enums::{AccountType, OrderSide, OrderStatus},
@@ -2704,6 +2701,142 @@ mod tests {
 
         assert!(result.is_none());
         assert!(fill_tracker.pending_fills_for(&venue_order_id).is_empty());
+    }
+
+    #[rstest]
+    #[case(PolymarketLiquiditySide::Taker)]
+    #[case(PolymarketLiquiditySide::Maker)]
+    fn test_dispatch_late_fill_uses_native_lookup_after_close_and_empty_inventory(
+        #[case] liquidity: PolymarketLiquiditySide,
+    ) {
+        use nautilus_common::cache::Cache;
+        use nautilus_model::{
+            data::InstrumentClose, enums::InstrumentCloseType, identifiers::Symbol,
+        };
+
+        use crate::execution::{
+            instruments::PolymarketInstrumentLookup,
+            reconciliation::build_reconciliation_position_reports,
+        };
+
+        let mut cache = Cache::default();
+        let venue = test_instrument().id().venue;
+        let lookup = PolymarketInstrumentLookup::new(cache.instrument_read_view(), venue);
+
+        for cycle in 0..3 {
+            let InstrumentAny::BinaryOption(mut option) = test_instrument() else {
+                unreachable!();
+            };
+            option.id = InstrumentId::new(
+                Symbol::from(format!("condition-token-{cycle}").as_str()),
+                venue,
+            );
+            option.raw_symbol = Symbol::from(format!("token-{cycle}").as_str());
+            option.taker_fee = dec!(0.02);
+            option.info.get_or_insert_default().insert(
+                "fee_schedule".to_string(),
+                serde_json::json!({"exponent": "1"}),
+            );
+            let instrument = InstrumentAny::BinaryOption(option);
+            let id = instrument.id();
+            cache.add_instrument(instrument.clone()).unwrap();
+            cache
+                .add_instrument_close(InstrumentClose::new(
+                    id,
+                    Price::from("1.00"),
+                    InstrumentCloseType::ContractExpired,
+                    UnixNanos::from(2_000_000_000),
+                    UnixNanos::from(2_000_000_000),
+                ))
+                .unwrap();
+            let account_id = AccountId::from("POLY-001");
+            assert!(
+                build_reconciliation_position_reports(
+                    &[],
+                    account_id,
+                    UnixNanos::from(3_000_000_000),
+                    &lookup,
+                    Some(id),
+                    None,
+                )
+                .unwrap()
+                .is_empty()
+            );
+
+            // The venue can deliver a genuine pre-close trade after reporting empty inventory
+            let mut trade: PolymarketUserTrade = load("ws_user_trade.json");
+            trade.trader_side = liquidity;
+            trade.asset_id = Ustr::from(instrument.raw_symbol().as_str());
+            trade.timestamp = "1000".to_string();
+            trade.maker_orders[0].asset_id = trade.asset_id;
+            let user_address = trade.maker_orders[0].maker_address.clone();
+            let venue_order_id = if liquidity == PolymarketLiquiditySide::Maker {
+                trade.side = PolymarketOrderSide::Sell;
+                VenueOrderId::from(trade.maker_orders[0].order_id.as_str())
+            } else {
+                VenueOrderId::from(trade.taker_order_id.as_str())
+            };
+            let fill_tracker = OrderFillTrackerMap::new();
+            fill_tracker.register(
+                venue_order_id,
+                Quantity::from("100"),
+                OrderSide::Buy,
+                id,
+                instrument.size_precision(),
+                instrument.price_precision(),
+            );
+            let pending_submits = PendingSubmitTracker::default();
+            let order_contexts = OrderContextRegistry::default();
+            register_context(&order_contexts, venue_order_id, id, "O-LATE");
+            order_contexts.mark_accepted(venue_order_id);
+            let mut emitter = test_emitter();
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            emitter.set_sender(sender);
+            let ctx = WsDispatchContext {
+                token_instruments: &lookup,
+                fill_tracker: &fill_tracker,
+                pending_submits: &pending_submits,
+                order_contexts: &order_contexts,
+                emitter: &emitter,
+                account_id,
+                clock: nautilus_core::time::get_atomic_clock_realtime(),
+                user_address: &user_address,
+                user_api_key: "test-key",
+            };
+            let mut state = WsDispatchState::default();
+            dispatch_user_message(&UserWsMessage::Trade(trade.clone()), &ctx, &mut state);
+            let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = receiver.try_recv().unwrap()
+            else {
+                panic!("expected delayed fill");
+            };
+            assert_eq!(fill.instrument_id, id);
+            assert_eq!(fill.last_qty.as_decimal(), dec!(25));
+            assert_eq!(fill.last_px.as_decimal(), dec!(0.5));
+            assert_eq!(fill.ts_event, UnixNanos::from(1_000_000_000));
+            assert_eq!(
+                fill.commission,
+                Some(Money::new(
+                    if liquidity == PolymarketLiquiditySide::Maker {
+                        0.0
+                    } else {
+                        0.125
+                    },
+                    Currency::pUSD(),
+                ))
+            );
+            dispatch_user_message(&UserWsMessage::Trade(trade.clone()), &ctx, &mut state);
+            assert!(
+                receiver.try_recv().is_err(),
+                "duplicate delivery must not rebook"
+            );
+
+            // Once the canonical owner purges metadata, the view cannot serve a stale definition
+            cache.purge_instrument(id);
+            assert!(lookup.get_cloned(&trade.asset_id).is_none());
+            assert!(has_unknown_trade_instrument(&trade, &ctx));
+            assert!(cache.instrument_ids(Some(&venue)).is_empty());
+            assert!(!cache.has_instrument_close(&id));
+        }
     }
 
     #[rstest]

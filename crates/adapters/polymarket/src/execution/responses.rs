@@ -1825,7 +1825,6 @@ mod tests {
             FillReportScope::new(None, None),
             UnixNanos::from(1_000_000_000u64),
             None,
-            None,
         )
         .expect("non-confirmed trades do not build fill reports");
 
@@ -1872,7 +1871,6 @@ mod tests {
             FillReportScope::new(None, None),
             UnixNanos::from(1_000_000_000u64),
             None,
-            None,
         )
         .expect("owned confirmed maker trade builds a fill report");
 
@@ -1912,7 +1910,6 @@ mod tests {
             &instruments,
             FillReportScope::new(None, None),
             UnixNanos::from(1_000_000_000u64),
-            None,
             None,
         )
         .expect("unmapped instruments are counted rather than parsed");
@@ -1954,7 +1951,6 @@ mod tests {
             &instruments,
             FillReportScope::new(None, None),
             UnixNanos::from(1_000_000_000u64),
-            None,
             None,
         )
         .expect("unowned maker trades are counted rather than parsed");
@@ -2001,7 +1997,6 @@ mod tests {
             FillReportScope::new(None, None),
             UnixNanos::from(1_000_000_000u64),
             None,
-            None,
         )
         .expect("maker commission is zero and representable");
         let result = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2010,7 +2005,6 @@ mod tests {
             &instruments,
             FillReportScope::new(None, None),
             UnixNanos::from(1_000_000_000u64),
-            None,
             None,
         );
 

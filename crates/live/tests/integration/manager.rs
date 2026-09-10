@@ -42,7 +42,7 @@ use nautilus_common::{
         },
     },
     msgbus::{
-        self, MessagingSwitchboard,
+        self, MessagingSwitchboard, TypedIntoHandler,
         stubs::{
             TypedMessageSavingHandler, get_any_saving_handler,
             get_typed_into_message_saving_handler, get_typed_message_saving_handler,
@@ -725,6 +725,197 @@ async fn test_reconcile_mass_status_with_empty_reports() {
         .await;
 
     assert!(result.events.is_empty());
+    assert!(result.summary.all_received_reports_reconciled());
+}
+
+#[rstest]
+#[case::unknown_client(true)]
+#[case::foreign_account(false)]
+#[tokio::test]
+async fn test_mass_status_summary_records_invalid_source_without_application(
+    #[case] unknown_client: bool,
+) {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let mut report = create_order_status_report(
+        None,
+        VenueOrderId::from("V-BAD-SOURCE"),
+        test_instrument_id(),
+        OrderStatus::Accepted,
+        Quantity::from("1.0"),
+        Quantity::from("0"),
+    );
+
+    if !unknown_client {
+        report.account_id = AccountId::from("OTHER-001");
+    }
+    let mut mass_status = create_mass_status(vec![report], vec![]);
+    if unknown_client {
+        mass_status.client_id = ClientId::from("UNKNOWN");
+    }
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert!(result.events.is_empty());
+    assert!(!result.summary.source_valid);
+    assert_eq!(result.summary.orders.received, 1);
+    assert_eq!(result.summary.orders.unresolved, 1);
+    assert_eq!(result.summary.orders.reconciled, 0);
+    assert!(!result.summary.all_received_reports_reconciled());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_mass_status_rejects_wrong_envelope_venue_without_indexing_orders() {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let venue_order_id = VenueOrderId::from("V-WRONG-VENUE");
+    let report = create_order_status_report(
+        None,
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Accepted,
+        Quantity::from("1.0"),
+        Quantity::from("0"),
+    );
+    let mut mass_status = create_mass_status(vec![report], vec![]);
+    mass_status.venue = Venue::from("SIM");
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert!(result.events.is_empty());
+    assert!(!result.summary.source_valid);
+    assert_eq!(result.summary.orders.received, 1);
+    assert_eq!(result.summary.orders.unresolved, 1);
+    assert_eq!(result.summary.orders.reconciled, 0);
+    assert!(!result.summary.all_received_reports_reconciled());
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_received_report_summary_does_not_certify_unreported_cached_inventory() {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let order = create_accepted_order(
+        "O-UNREPORTED",
+        test_instrument_id(),
+        OrderSide::Buy,
+        "1.0",
+        "3000.00",
+        VenueOrderId::from("V-UNREPORTED"),
+    );
+    let order_id = order.client_order_id();
+    ctx.add_order(order);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(
+            create_mass_status(vec![], vec![]),
+            ctx.exec_engine.clone(),
+        )
+        .await;
+
+    assert!(result.summary.all_received_reports_reconciled());
+    assert_eq!(result.summary.orders.received, 0);
+    assert!(ctx.get_order(&order_id).unwrap().is_open());
+}
+
+#[rstest]
+#[case::canceled_retained_duplicate(OrderStatus::Canceled, true)]
+#[case::expired_retained_duplicate(OrderStatus::Expired, true)]
+#[case::canceled_direct_failure(OrderStatus::Canceled, false)]
+#[case::expired_direct_failure(OrderStatus::Expired, false)]
+#[tokio::test]
+async fn test_mass_status_summary_preserves_full_fill_and_reports_terminal_application_failure(
+    #[case] terminal: OrderStatus,
+    #[case] include_fill: bool,
+) {
+    let mut ctx = TestContext::new();
+    let instrument = test_instrument();
+    ctx.add_instrument(instrument.clone());
+    let venue_order_id = VenueOrderId::from("V-FULL-TERMINAL");
+    let trade_id = TradeId::from("T-FULL-TERMINAL");
+    let order = create_accepted_order(
+        "O-FULL-TERMINAL",
+        instrument.id(),
+        OrderSide::Buy,
+        "1.0",
+        "3000.00",
+        venue_order_id,
+    );
+    let order_id = order.client_order_id();
+    let event = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(trade_id),
+        None,
+        Some(Price::from("3000.00")),
+        Some(Quantity::from("1.0")),
+        Some(LiquiditySide::Maker),
+        Some(Money::from("0.50 USDT")),
+        Some(UnixNanos::from(1_000_000)),
+        Some(test_account_id()),
+    );
+    ctx.add_order(order);
+    ctx.exec_engine.borrow_mut().process(&event);
+    assert_eq!(
+        ctx.get_order(&order_id).unwrap().status(),
+        OrderStatus::Filled
+    );
+    let report = create_order_status_report(
+        Some(order_id),
+        venue_order_id,
+        instrument.id(),
+        terminal,
+        Quantity::from("1.0"),
+        Quantity::from("1.0"),
+    );
+    let fills = if include_fill {
+        vec![create_fill_report(
+            order_id,
+            venue_order_id,
+            instrument.id(),
+            trade_id,
+            "1.0",
+        )]
+    } else {
+        vec![]
+    };
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(
+            create_mass_status(vec![report], fills),
+            ctx.exec_engine.clone(),
+        )
+        .await;
+
+    assert_eq!(
+        ctx.get_order(&order_id).unwrap().status(),
+        OrderStatus::Filled
+    );
+    assert_eq!(result.summary.orders.reconciled, 1);
+    if include_fill {
+        assert_eq!(result.summary.incomplete_events, 0);
+        assert!(result.summary.all_received_reports_reconciled());
+    } else {
+        // The direct native path still attempts the terminal event on a filled order.
+        // Matching final state must not hide that failed application.
+        assert_eq!(result.summary.incomplete_events, 1);
+        assert!(!result.summary.all_received_reports_reconciled());
+    }
 }
 
 #[tokio::test]
@@ -759,6 +950,9 @@ async fn test_reconcile_mass_status_creates_external_order_accepted() {
         .await;
 
     assert_eq!(result.events.len(), 1);
+    assert!(result.summary.all_received_reports_reconciled());
+    assert_eq!(result.summary.orders.received, 1);
+    assert_eq!(result.summary.orders.reconciled, 1);
     assert!(matches!(result.events[0], OrderEventAny::Accepted(_)));
 
     // Verify order was added to cache
@@ -932,6 +1126,10 @@ async fn test_reconcile_mass_status_warns_on_untrusted_cached_client_origin(
     msgbus::unsubscribe_any(raw_pattern, &raw_handler);
 
     assert_eq!(result.events.len(), 1);
+    assert_eq!(
+        result.summary.source_valid,
+        cached_client_id != Some("OTHER")
+    );
     assert!(result.external_orders.is_empty());
     assert_eq!(
         ctx.get_order(&client_order_id).unwrap().status(),
@@ -1008,6 +1206,7 @@ async fn test_reconcile_mass_status_warns_on_venue_only_fill_from_other_client()
     msgbus::unsubscribe_any(raw_pattern, &raw_handler);
 
     assert_eq!(result.events.len(), 1);
+    assert!(!result.summary.source_valid);
     assert!(matches!(result.events[0], OrderEventAny::Filled(_)));
     assert!(result.external_orders.is_empty());
     assert_eq!(raw_saver.get_messages().len(), 1);
@@ -1868,6 +2067,10 @@ async fn test_reconcile_mass_status_skips_external_when_filtered(
             .orders(None, None, None, None, None)
             .is_empty()
     );
+    assert_eq!(result.summary.orders.received, 1);
+    assert_eq!(result.summary.orders.excluded, 1);
+    assert_eq!(result.summary.orders.unresolved, 0);
+    assert!(!result.summary.all_received_reports_reconciled());
 }
 
 #[tokio::test]
@@ -2471,6 +2674,10 @@ async fn test_reconciliation_fill_dispatch_rejection_does_not_commit() {
             .contains(&&trade_id)
     );
 
+    assert_eq!(rejected.summary.incomplete_events, 1);
+    assert_eq!(rejected.summary.fills.unresolved, 1);
+    assert!(!rejected.summary.all_received_reports_reconciled());
+
     let order = ctx.get_order(&client_order_id).unwrap();
     let submitted = TestOrderEventStubs::submitted(&order, test_account_id());
     let order = ctx.cache.borrow_mut().update_order(&submitted).unwrap();
@@ -2485,6 +2692,9 @@ async fn test_reconciliation_fill_dispatch_rejection_does_not_commit() {
         )
         .await;
 
+    assert_eq!(retry.summary.fills.reconciled, 1);
+    assert_eq!(retry.summary.incomplete_events, 0);
+    assert!(retry.summary.all_received_reports_reconciled());
     assert_eq!(
         retry
             .events
@@ -3486,7 +3696,13 @@ async fn test_split_lighter_reduce_only_lifecycle_does_not_apply_economics() {
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -3643,7 +3859,13 @@ async fn test_bounded_complete_lifecycle_applies_beside_split_close() {
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let (mut opening_order, opening_fill) = create_bounded_fill_lifecycle(
         instrument_id,
@@ -3843,7 +4065,13 @@ async fn test_bounded_hedge_fill_applies_economics_once() {
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4060,7 +4288,13 @@ async fn test_bounded_reduce_only_fill_requires_sufficient_correlated_position(
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4186,7 +4420,13 @@ async fn test_incomplete_bounded_reports_project_fills_order_only(#[case] has_fi
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4281,7 +4521,13 @@ async fn test_bounded_active_partial_order_keeps_order_without_economics() {
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4377,7 +4623,13 @@ async fn test_bounded_nonflat_position_requires_coherent_historical_fill(
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4487,7 +4739,13 @@ async fn test_bounded_complete_reports_require_unambiguous_position_coverage(
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4600,7 +4858,13 @@ async fn test_bounded_interleaved_multi_fill_orders_project_economics_order_only
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4711,7 +4975,13 @@ async fn test_bounded_same_timestamp_orders_project_economics_order_only() {
     let (portfolio_handler, portfolio_events) =
         get_typed_into_message_saving_handler::<OrderEventAny>(None);
     let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-    msgbus::register_order_event_endpoint(portfolio_endpoint, portfolio_handler);
+    msgbus::register_order_event_endpoint(portfolio_endpoint, {
+        let receiver = portfolio_handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let result = ctx
         .manager
@@ -4935,9 +5205,20 @@ async fn test_fill_before_retained_netting_lifecycle_projects_order_only() {
     mass_status.add_fill_reports(vec![old_fill_report, current_fill_report]);
     mass_status.add_position_reports(vec![position_report]);
 
-    ctx.manager
+    let first = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status.clone(), ctx.exec_engine.clone())
+        .await;
+    assert_eq!(first.summary.fills.reconciled, 2);
+    assert_eq!(first.summary.fills.unresolved, 0);
+
+    let repeated = ctx
+        .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+    assert!(repeated.events.is_empty());
+    assert_eq!(repeated.summary.fills.reconciled, 2);
+    assert_eq!(repeated.summary.fills.unresolved, 0);
 
     let cache = ctx.cache.borrow();
     let old_order = cache.order(&old_order_id).unwrap();
@@ -5043,6 +5324,9 @@ async fn test_reconcile_mass_status_skips_order_without_instrument() {
         .await;
 
     assert!(result.events.is_empty());
+    assert_eq!(result.summary.orders.received, 1);
+    assert_eq!(result.summary.orders.unresolved, 1);
+    assert!(!result.summary.all_received_reports_reconciled());
 }
 
 #[tokio::test]
@@ -6885,7 +7169,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_accepted_orders()
     order.apply(accepted).unwrap();
     ctx.add_order(order.clone());
 
-    let report = create_order_status_report(
+    let mut report = create_order_status_report(
         Some(client_order_id),
         venue_order_id,
         instrument_id,
@@ -6894,19 +7178,31 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_accepted_orders()
         Quantity::from("0.0"),
     );
 
+    report.order_type = OrderType::Market;
+    report.price = None;
+
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![report]);
 
-    let _events = ctx
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+
+    let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     assert_eq!(
         ctx.cache.borrow().client_order_id(&venue_order_id),
@@ -6938,16 +7234,25 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_external_orders()
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![report]);
 
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+
     let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     assert!(
         !result.events.is_empty(),
@@ -7003,7 +7308,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_filled_orders() {
     order.apply(filled).unwrap();
     ctx.add_order(order.clone());
 
-    let report = create_order_status_report(
+    let mut report = create_order_status_report(
         Some(client_order_id),
         venue_order_id,
         instrument_id,
@@ -7012,19 +7317,31 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_filled_orders() {
         Quantity::from("1.0"),
     );
 
+    report.order_type = OrderType::Market;
+    report.price = None;
+
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![report]);
 
-    let _events = ctx
+    assert!(
+        ctx.cache
+            .borrow()
+            .client_order_id(&venue_order_id)
+            .is_none()
+    );
+
+    let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     let cache_borrow = ctx.cache.borrow();
     assert_eq!(
@@ -7043,7 +7360,7 @@ async fn test_reconcile_mass_status_skips_orders_without_loaded_instruments() {
     let loaded_instrument = test_instrument();
     ctx.add_instrument(loaded_instrument.clone());
 
-    let unloaded_instrument_id = InstrumentId::from("BTCUSDT.SIM");
+    let unloaded_instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
 
     let loaded_venue_order_id = VenueOrderId::from("V-LOADED");
     let unloaded_venue_order_id = VenueOrderId::from("V-UNLOADED");
@@ -7069,16 +7386,18 @@ async fn test_reconcile_mass_status_skips_orders_without_loaded_instruments() {
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
         test_account_id(),
-        Venue::from("SIM"),
+        test_venue(),
         UnixNanos::default(),
         Some(UUID4::new()),
     );
     mass_status.add_order_reports(vec![loaded_report, unloaded_report]);
 
-    let _events = ctx
+    let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert!(result.summary.source_valid);
 
     let cache_borrow = ctx.cache.borrow();
     let loaded_client_id = cache_borrow.client_order_id(&loaded_venue_order_id);
@@ -13899,20 +14218,19 @@ async fn test_position_check_retries_stops_after_max() {
     // return None on the cache.instrument() lookup
     ctx.add_position(&position);
 
-    let mock_client = MockExecutionClient::new(vec![]);
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
-    // First attempt: detects discrepancy, can't reconcile, retry count -> 1
-    let events = ctx.manager.check_positions_consistency(&clients).await;
-    assert!(events.is_empty());
-
-    // Second attempt: retry count -> 2 (= max), logs error
-    let events = ctx.manager.check_positions_consistency(&clients).await;
-    assert!(events.is_empty());
-
-    // Third attempt: retries exhausted, silently skipped
-    let events = ctx.manager.check_positions_consistency(&clients).await;
-    assert!(events.is_empty());
+    // Failed reconciliation consumes one attempt until the configured limit.
+    for expected_retries in [1, 2, 2] {
+        let events = ctx.manager.check_positions_consistency(&clients).await;
+        assert!(events.is_empty());
+        assert_eq!(
+            ctx.manager
+                .position_recon_retry_count(&(instrument.id(), test_account_id())),
+            expected_retries,
+        );
+    }
 }
 
 #[tokio::test]
@@ -13931,7 +14249,7 @@ async fn test_position_check_retries_clears_when_discrepancy_resolves() {
 
     // First: add position without instrument to force a failed retry
     ctx.add_position(&position);
-    let mock_client = MockExecutionClient::new(vec![]);
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_positions_consistency(&clients).await;
@@ -13965,7 +14283,7 @@ async fn test_position_check_stale_retries_pruned_when_position_closed() {
     let position = create_test_position(&instrument, position_id, OrderSide::Buy, "5.0", "3000.00");
     ctx.add_position(&position);
 
-    let mock_client = MockExecutionClient::new(vec![]);
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     // First call: reconciliation succeeds (generates events to match venue=flat)
@@ -14030,6 +14348,670 @@ enum PositionRequestMutation {
         cache: Rc<RefCell<Cache>>,
         position: Position,
     },
+}
+
+#[rstest]
+#[case::already_matched(PositionSideSpecified::Long, "5.0", Some(dec!(3000)), dec!(5), true)]
+#[case::applied_adjustment(PositionSideSpecified::Long, "3.0", Some(dec!(3000)), dec!(3), true)]
+#[case::partial_cross_zero(PositionSideSpecified::Short, "3.0", None, dec!(0), false)]
+#[tokio::test]
+async fn test_reconcile_positions_reports_final_native_quantities(
+    #[case] side: PositionSideSpecified,
+    #[case] quantity: &str,
+    #[case] avg_px: Option<Decimal>,
+    #[case] expected_net: Decimal,
+    #[case] expected_match: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-TERMINAL-QUANTITY"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(instrument);
+    ctx.add_position(&position);
+    let report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        side,
+        Quantity::from(quantity),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        avg_px,
+    );
+    let client = MockPositionExecutionClient::new(vec![], vec![report]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    let cache = ctx.cache.borrow();
+    let net: Decimal = cache
+        .positions_open(
+            None,
+            Some(&instrument_id),
+            None,
+            Some(&test_account_id()),
+            None,
+        )
+        .iter()
+        .map(|position| position.signed_decimal_qty())
+        .sum();
+    assert_eq!(net, expected_net);
+    assert_eq!(summary.position_keys, 1);
+    assert_eq!(summary.matched, usize::from(expected_match));
+    assert_eq!(summary.unresolved, usize::from(!expected_match));
+    assert_eq!(summary.deferred, 0);
+    assert_eq!(summary.failed_queries, 0);
+    assert_eq!(summary.incomplete_events, 0);
+
+    if expected_net == dec!(5) {
+        assert_eq!(summary.applied_events, 0);
+    } else {
+        assert!(summary.applied_events > 0);
+    }
+}
+
+#[rstest]
+#[case::failed(false)]
+#[case::unsupported(true)]
+#[tokio::test]
+async fn test_reconcile_positions_query_failure_preserves_exposure(#[case] unsupported: bool) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-TERMINAL-QUERY"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(instrument);
+    ctx.add_position(&position);
+    let failing_client = MockPositionExecutionClient::failing_position_reports();
+    let unsupported_client = MockExecutionClient::new(vec![]);
+    let client: &dyn ExecutionClient = if unsupported {
+        &unsupported_client
+    } else {
+        &failing_client
+    };
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&[client], ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.position_keys, 1);
+    assert_eq!(summary.failed_queries, 1);
+    assert_eq!(summary.matched, 0);
+    assert_eq!(summary.deferred, 1);
+    assert_eq!(summary.unresolved, 0);
+    assert_eq!(summary.applied_events, 0);
+    assert_eq!(summary.incomplete_events, 0);
+    {
+        let cache = ctx.cache.borrow();
+        let retained = cache.position(&position.id).unwrap();
+        assert_eq!(retained.signed_decimal_qty(), position.signed_decimal_qty());
+        assert_eq!(retained.event_count(), position.event_count());
+    }
+    assert_eq!(
+        ctx.manager
+            .position_recon_retry_count(&(instrument_id, test_account_id())),
+        0,
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_reconcile_positions_missing_instrument_and_exhaustion_are_not_matches() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_retries: 1,
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-TERMINAL-EXHAUSTED"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_position(&position);
+    let client = MockPositionExecutionClient::new(vec![], vec![]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+
+    for _ in 0..2 {
+        let summary = ctx
+            .manager
+            .reconcile_positions(&clients, ctx.exec_engine.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(summary.position_keys, 1);
+        assert_eq!(summary.matched, 0);
+        assert_eq!(summary.deferred, 0);
+        assert_eq!(summary.unresolved, 1);
+        assert_eq!(summary.failed_queries, 0);
+        assert_eq!(summary.applied_events, 0);
+        assert_eq!(summary.incomplete_events, 0);
+        {
+            let cache = ctx.cache.borrow();
+            let retained = cache.position(&position.id).unwrap();
+            assert_eq!(retained.signed_decimal_qty(), position.signed_decimal_qty());
+            assert_eq!(retained.event_count(), position.event_count());
+        }
+        assert_eq!(
+            ctx.manager
+                .position_recon_retry_count(&(instrument_id, test_account_id())),
+            1,
+        );
+    }
+}
+
+#[rstest]
+#[case::unmatched(false)]
+#[case::matched_by_callback(true)]
+#[tokio::test]
+async fn test_reconcile_positions_preserves_incomplete_native_application(
+    #[case] close_in_callback: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    // Retain the registered execution client, but omit its native account so that
+    // generated order events cannot complete their position application.
+    ctx.cache.borrow_mut().reset();
+    let instrument = test_instrument();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-TERMINAL-INCOMPLETE"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(instrument.clone());
+    ctx.add_position(&position);
+    assert!(ctx.cache.borrow().account(&test_account_id()).is_none());
+    let client = MockPositionExecutionClient::new(vec![], vec![]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+    let closed = close_test_long_position(
+        position.clone(),
+        &instrument,
+        "5.0",
+        TradeId::from("T-INCOMPLETE-CALLBACK-CLOSE"),
+    );
+    let callback_count = Rc::new(Cell::new(0));
+    let handler = msgbus::TypedHandler::from({
+        let cache = ctx.cache.clone();
+        let callback_count = callback_count.clone();
+        move |event: &OrderEventAny| {
+            if matches!(event, OrderEventAny::Filled(_)) {
+                callback_count.set(callback_count.get() + 1);
+
+                if close_in_callback {
+                    cache.borrow_mut().update_position(&closed).unwrap();
+                }
+            }
+        }
+    });
+    // The strategy topic still publishes the order fill when its position
+    // application failed before the instrument-specific filled publication.
+    let topic = switchboard::get_event_order_topic(StrategyId::from("EXTERNAL"));
+    msgbus::subscribe_order_events(topic.into(), handler.clone(), None);
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    msgbus::unsubscribe_order_events(topic.into(), &handler);
+    assert_eq!(callback_count.get(), 1);
+    assert_eq!(summary.position_keys, 1);
+    assert_eq!(summary.matched, usize::from(close_in_callback));
+    assert_eq!(summary.unresolved, usize::from(!close_in_callback));
+    assert_eq!(summary.deferred, 0);
+    assert_eq!(summary.failed_queries, 0);
+    assert!(summary.incomplete_events > 0);
+    {
+        let cache = ctx.cache.borrow();
+        let retained = cache.position(&position.id).unwrap();
+        assert_eq!(
+            retained.signed_decimal_qty(),
+            if close_in_callback { dec!(0) } else { dec!(5) },
+        );
+        assert_eq!(
+            retained.event_count(),
+            position.event_count() + usize::from(close_in_callback),
+        );
+    }
+    assert!(
+        ctx.cache
+            .borrow()
+            .orders(None, None, None, Some(&test_account_id()), None)
+            .iter()
+            .any(|order| order.status() == OrderStatus::Filled),
+        "order-only application must not masquerade as position reconciliation",
+    );
+}
+
+#[rstest]
+#[cfg_attr(
+    not(all(feature = "simulation", madsim)),
+    tokio::test(start_paused = true)
+)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+async fn test_reconcile_positions_defers_unreported_position_opened_during_query() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-TERMINAL-NEW-UNREPORTED"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(instrument);
+    let client = MockPositionExecutionClient::new(vec![], vec![]).with_position_request_mutation(
+        PositionRequestMutation::Add {
+            cache: ctx.cache.clone(),
+            position: position.clone(),
+        },
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.position_keys, 1);
+    assert_eq!(summary.deferred, 1);
+    assert_eq!(summary.matched, 0);
+    assert_eq!(summary.unresolved, 0);
+    assert_eq!(summary.failed_queries, 0);
+    assert_eq!(summary.applied_events, 0);
+    assert_eq!(summary.incomplete_events, 0);
+    let cache = ctx.cache.borrow();
+    let retained = cache.position(&position.id).unwrap();
+    assert_eq!(retained.signed_decimal_qty(), dec!(5));
+    assert_eq!(retained.event_count(), position.event_count());
+    assert_eq!(
+        ctx.manager
+            .position_recon_retry_count(&(instrument_id, test_account_id())),
+        0,
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_reconcile_positions_rechecks_initial_match_after_application_callback() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let matched_instrument = test_instrument();
+    let adjusted_instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+    let matched_position = create_test_position(
+        &matched_instrument,
+        PositionId::from("P-TERMINAL-CALLBACK-MATCH"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    let adjusted_position = create_test_position(
+        &adjusted_instrument,
+        PositionId::from("P-TERMINAL-CALLBACK-ADJUST"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(matched_instrument.clone());
+    ctx.add_instrument(adjusted_instrument.clone());
+    ctx.add_position(&matched_position);
+    ctx.add_position(&adjusted_position);
+    let reports = [(&matched_instrument, "5.0"), (&adjusted_instrument, "3.0")]
+        .into_iter()
+        .map(|(instrument, quantity)| {
+            PositionStatusReport::new(
+                test_account_id(),
+                instrument.id(),
+                PositionSideSpecified::Long,
+                Quantity::from(quantity),
+                UnixNanos::from(1_000_000),
+                UnixNanos::from(1_000_000),
+                None,
+                None,
+                Some(dec!(3000)),
+            )
+        })
+        .collect();
+    let client = MockPositionExecutionClient::new(vec![], reports);
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+    let closed = close_test_long_position(
+        matched_position.clone(),
+        &matched_instrument,
+        "5.0",
+        TradeId::from("T-TERMINAL-CALLBACK-CLOSE"),
+    );
+    let callback_count = Rc::new(Cell::new(0));
+    let handler = msgbus::TypedHandler::from({
+        let cache = ctx.cache.clone();
+        let callback_count = callback_count.clone();
+        move |_event: &OrderEventAny| {
+            callback_count.set(callback_count.get() + 1);
+            cache.borrow_mut().update_position(&closed).unwrap();
+        }
+    });
+    let topic = switchboard::get_order_filled_topic(adjusted_instrument.id());
+    msgbus::subscribe_order_events(topic.into(), handler.clone(), None);
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    msgbus::unsubscribe_order_events(topic.into(), &handler);
+    assert_eq!(callback_count.get(), 1);
+    assert!(
+        ctx.cache
+            .borrow()
+            .position(&matched_position.id)
+            .unwrap()
+            .is_closed()
+    );
+    assert_eq!(summary.position_keys, 2);
+    assert_eq!(summary.matched, 1);
+    assert_eq!(summary.unresolved, 1);
+    assert_eq!(summary.deferred, 0);
+    assert_eq!(summary.failed_queries, 0);
+    assert!(summary.applied_events > 0);
+    assert_eq!(summary.incomplete_events, 0);
+}
+
+#[rstest]
+#[case::different_cache(false, "must share the manager's cache")]
+#[case::borrowed_engine(true, "requires an unborrowed engine")]
+fn test_reconcile_positions_rejects_invalid_engine_before_query(
+    #[case] borrow_engine: bool,
+    #[case] expected_error: &str,
+) {
+    use std::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+
+    let mut ctx = TestContext::new();
+    let other = TestContext::new();
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-INVALID-ENGINE-QUERY"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    let position_id = position.id;
+    ctx.add_instrument(instrument);
+    let client = MockPositionExecutionClient::new(vec![], vec![]).with_position_request_mutation(
+        PositionRequestMutation::Add {
+            cache: ctx.cache.clone(),
+            position,
+        },
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+    let engine = if borrow_engine {
+        ctx.exec_engine.clone()
+    } else {
+        other.exec_engine
+    };
+    let held_borrow = borrow_engine.then(|| engine.borrow());
+
+    // A single poll must reject before the mock consumes its query mutation.
+    let result = {
+        let mut future = pin!(ctx.manager.reconcile_positions(&clients, engine.clone()));
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+    };
+
+    drop(held_borrow);
+    let Poll::Ready(Err(error)) = result else {
+        panic!("invalid engine must fail immediately before querying");
+    };
+    assert!(error.to_string().contains(expected_error));
+    assert!(client.position_request_mutation.borrow().is_some());
+    assert!(ctx.cache.borrow().position(&position_id).is_none());
+    assert_eq!(
+        ctx.manager
+            .position_recon_retry_count(&(instrument_id, test_account_id())),
+        0,
+    );
+}
+
+#[rstest]
+#[case::foreign_account(false, true)]
+#[case::unhandled_venue(true, false)]
+#[case::same_account_routing(true, true)]
+#[tokio::test]
+async fn test_position_query_empty_requires_account_and_venue_ownership(
+    #[case] owns_account: bool,
+    #[case] handles_venue: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-QUERY-ABSENCE"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_instrument(instrument);
+    ctx.add_position(&position);
+    let client = MockPositionExecutionClient::configured(
+        ClientId::from("IB-QUERY"),
+        if owns_account {
+            test_account_id()
+        } else {
+            AccountId::from("BINANCE-OTHER")
+        },
+        Venue::from("IB"),
+        if handles_venue {
+            IndexSet::from([instrument_id.venue])
+        } else {
+            IndexSet::from([Venue::from("BITMEX")])
+        },
+        false,
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client];
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    let covered = owns_account && handles_venue;
+    assert_eq!(summary.position_keys, 1);
+    assert_eq!(summary.failed_queries, 0);
+    assert_eq!(summary.matched, usize::from(covered));
+    assert_eq!(summary.deferred, usize::from(!covered));
+    assert_eq!(summary.unresolved, 0);
+    assert_eq!(summary.incomplete_events, 0);
+    let cache = ctx.cache.borrow();
+    let net: Decimal = cache
+        .positions_open(
+            None,
+            Some(&instrument_id),
+            None,
+            Some(&test_account_id()),
+            None,
+        )
+        .iter()
+        .map(|position| position.signed_decimal_qty())
+        .sum();
+
+    if covered {
+        assert!(summary.applied_events > 0);
+        assert_eq!(net, Decimal::ZERO);
+    } else {
+        assert_eq!(summary.applied_events, 0);
+        assert_eq!(net, dec!(5));
+        assert!(cache.orders(None, None, None, None, None).is_empty());
+        let retained = cache.position(&position.id).unwrap();
+        assert_eq!(retained.event_count(), position.event_count());
+        assert_eq!(
+            ctx.manager
+                .position_recon_retry_count(&(instrument_id, test_account_id())),
+            0,
+        );
+    }
+}
+
+#[rstest]
+#[case::foreign_account_only(true, false)]
+#[case::foreign_account_after_valid(true, true)]
+#[case::unhandled_venue_only(false, false)]
+#[case::unhandled_venue_after_valid(false, true)]
+#[tokio::test]
+async fn test_position_query_rejects_entire_malformed_source_batch(
+    #[case] foreign_account: bool,
+    #[case] include_valid_prefix: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let other_instrument = if foreign_account {
+        InstrumentAny::CurrencyPair(currency_pair_btcusdt())
+    } else {
+        test_instrument2()
+    };
+    let other_account = AccountId::from("BINANCE-OTHER");
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-QUERY-MALFORMED"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    let healthy_position = create_test_position_for_account(
+        &instrument,
+        PositionId::from("P-QUERY-HEALTHY"),
+        OrderSide::Buy,
+        "2.0",
+        "3000.00",
+        other_account,
+    );
+    ctx.add_instrument(instrument);
+    ctx.add_instrument(other_instrument.clone());
+    ctx.add_margin_account(other_account);
+    ctx.add_position(&position);
+    ctx.add_position(&healthy_position);
+    let make_report = |account, instrument, quantity| {
+        PositionStatusReport::new(
+            account,
+            instrument,
+            PositionSideSpecified::Long,
+            Quantity::from(quantity),
+            UnixNanos::from(1_000_000),
+            UnixNanos::from(1_000_000),
+            None,
+            None,
+            Some(dec!(3000)),
+        )
+    };
+    let mut reports = Vec::new();
+
+    if include_valid_prefix {
+        reports.push(make_report(test_account_id(), instrument_id, "3.0"));
+    }
+    reports.push(make_report(
+        if foreign_account {
+            other_account
+        } else {
+            test_account_id()
+        },
+        other_instrument.id(),
+        "7.0",
+    ));
+    let malformed_client = MockPositionExecutionClient::new(vec![], reports);
+    let healthy_client = MockPositionExecutionClient::configured(
+        ClientId::from("BINANCE-OTHER"),
+        other_account,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    )
+    .with_position_reports(vec![make_report(other_account, instrument_id, "2.0")]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&malformed_client, &healthy_client];
+
+    let summary = ctx
+        .manager
+        .reconcile_positions(&clients, ctx.exec_engine.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.failed_queries, 1);
+    assert_eq!(summary.position_keys, 2);
+    assert_eq!(summary.deferred, 1);
+    assert_eq!(summary.matched, 1);
+    assert_eq!(summary.unresolved, 0);
+    assert_eq!(summary.applied_events, 0);
+    assert_eq!(summary.incomplete_events, 0);
+    let cache = ctx.cache.borrow();
+    assert!(cache.orders(None, None, None, None, None).is_empty());
+    assert!(
+        cache
+            .positions_open(None, Some(&other_instrument.id()), None, None, None)
+            .is_empty()
+    );
+
+    for original in [&position, &healthy_position] {
+        let retained = cache.position(&original.id).unwrap();
+        assert_eq!(retained.signed_decimal_qty(), original.signed_decimal_qty());
+        assert_eq!(retained.event_count(), original.event_count());
+        assert_eq!(
+            ctx.manager
+                .position_recon_retry_count(&(original.instrument_id, original.account_id)),
+            0,
+        );
+    }
 }
 
 struct MockPositionExecutionClient {
@@ -14146,6 +15128,10 @@ impl ExecutionClient for MockPositionExecutionClient {
 
     fn position_reconciliation_tolerance(&self) -> Decimal {
         self.position_reconciliation_tolerance
+    }
+
+    fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
+        true
     }
 
     fn generate_account_state(
@@ -14571,8 +15557,11 @@ async fn test_position_check_reconciles_at_client_tolerance_boundary() {
         .any(|event| matches!(event, OrderEventAny::Filled(fill) if fill.last_qty == Quantity::from("0.010000"))));
 }
 
+#[rstest]
+#[case::failed(false)]
+#[case::unsupported(true)]
 #[tokio::test]
-async fn test_position_check_failed_client_query_skips_cached_position() {
+async fn test_position_check_failed_client_query_skips_cached_position(#[case] unsupported: bool) {
     let config = ExecutionManagerConfig {
         position_check_retries: 3,
         position_check_threshold_ns: DurationNanos::ZERO,
@@ -14603,7 +15592,13 @@ async fn test_position_check_failed_client_query_skips_cached_position() {
 
     ctx.add_instrument(instrument);
     let failing_client = MockPositionExecutionClient::failing_position_reports();
-    let clients: Vec<&dyn ExecutionClient> = vec![&failing_client];
+    let unsupported_client = MockExecutionClient::new(vec![]);
+    let client: &dyn ExecutionClient = if unsupported {
+        &unsupported_client
+    } else {
+        &failing_client
+    };
+    let clients = vec![client];
     let events = ctx.manager.check_positions_consistency(&clients).await;
 
     assert!(
@@ -15350,23 +16345,31 @@ async fn test_position_check_dedup_skips_second_hedge_position_same_instrument()
     ctx.add_position(&pos_long);
     ctx.add_position(&pos_short);
 
-    let mock_client = MockExecutionClient::new(vec![]);
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
-    // Three cycles: each increments retry by 1 (not 2) thanks to dedup
-    ctx.manager.check_positions_consistency(&clients).await;
-    ctx.manager.check_positions_consistency(&clients).await;
-    let events = ctx.manager.check_positions_consistency(&clients).await;
-    assert!(events.is_empty());
+    // Each cycle consumes exactly one retry across both hedge legs.
+    for expected_retries in 1..=3 {
+        let events = ctx.manager.check_positions_consistency(&clients).await;
+        assert!(events.is_empty());
+        assert_eq!(
+            ctx.manager
+                .position_recon_retry_count(&(instrument.id(), test_account_id())),
+            expected_retries,
+        );
+    }
 
-    // With correct dedup retry count is 3 (= max), so adding the instrument
-    // now should still be suppressed. If dedup were broken (2 per cycle),
-    // retries would have hit 6 instead.
+    // Retries remain exhausted after adding the instrument.
     ctx.add_instrument(instrument.clone());
     let events = ctx.manager.check_positions_consistency(&clients).await;
     assert!(
         events.is_empty(),
         "Expected retries to be exhausted after 3 cycles with dedup"
+    );
+    assert_eq!(
+        ctx.manager
+            .position_recon_retry_count(&(instrument.id(), test_account_id())),
+        3,
     );
 }
 
@@ -15578,8 +16581,21 @@ async fn test_position_check_retries_independent_per_account() {
     ctx.add_position(&pos_a);
     ctx.add_position(&pos_b);
 
-    let mock_client = MockExecutionClient::new(vec![]);
-    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+    let client_a = MockPositionExecutionClient::configured(
+        ClientId::from(account_a.as_str()),
+        account_a,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
+    let client_b = MockPositionExecutionClient::configured(
+        ClientId::from(account_b.as_str()),
+        account_b,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client_a, &client_b];
 
     ctx.manager.check_positions_consistency(&clients).await;
 
@@ -15634,7 +16650,13 @@ async fn test_position_check_activity_throttle_independent_per_account() {
         .record_position_activity(instrument_id, account_a);
 
     // No venue report for B: treated as flat, so a discrepancy.
-    let mock_client = MockPositionExecutionClient::new(vec![], vec![]);
+    let mock_client = MockPositionExecutionClient::configured(
+        ClientId::from(account_b.as_str()),
+        account_b,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_positions_consistency(&clients).await;
@@ -15713,7 +16735,14 @@ async fn test_position_check_grace_survives_accelerated_trading_clock() {
         None, // venue_position_id
         Some(dec!(3000.00)),
     );
-    let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
+    let mock_client = MockPositionExecutionClient::configured(
+        ClientId::from(account.as_str()),
+        account,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    )
+    .with_position_reports(vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_positions_consistency(&clients).await;
@@ -15785,7 +16814,14 @@ async fn test_position_check_grace_expires_on_monotonic_clock() {
         None,
         Some(dec!(3000.00)),
     );
-    let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
+    let mock_client = MockPositionExecutionClient::configured(
+        ClientId::from(account.as_str()),
+        account,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    )
+    .with_position_reports(vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_positions_consistency(&clients).await;
@@ -15849,8 +16885,22 @@ async fn test_check_positions_consistency_processes_only_discrepant_account() {
         None,
         Some(dec!(3000.00)),
     );
-    let mock_client = MockPositionExecutionClient::new(vec![], vec![report_a]);
-    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+    let client_a = MockPositionExecutionClient::configured(
+        ClientId::from(account_a.as_str()),
+        account_a,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    )
+    .with_position_reports(vec![report_a]);
+    let client_b = MockPositionExecutionClient::configured(
+        ClientId::from(account_b.as_str()),
+        account_b,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client_a, &client_b];
 
     let events = ctx.manager.check_positions_consistency(&clients).await;
 
@@ -15912,8 +16962,21 @@ async fn test_position_check_stale_retries_pruned_per_account() {
     ctx.add_position(&pos_a);
     ctx.add_position(&pos_b);
 
-    let mock_client = MockExecutionClient::new(vec![]);
-    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+    let client_a = MockPositionExecutionClient::configured(
+        ClientId::from(account_a.as_str()),
+        account_a,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
+    let client_b = MockPositionExecutionClient::configured(
+        ClientId::from(account_b.as_str()),
+        account_b,
+        test_venue(),
+        IndexSet::from([instrument_id.venue]),
+        false,
+    );
+    let clients: Vec<&dyn ExecutionClient> = vec![&client_a, &client_b];
 
     // Cycle 1: both keys reach the failed-retry path, so counters land at 1 each.
     ctx.manager.check_positions_consistency(&clients).await;

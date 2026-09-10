@@ -45,7 +45,7 @@ use nautilus_common::{
             TypedIntoMessageSavingHandler, get_any_saving_handler,
             get_typed_into_message_saving_handler, get_typed_message_saving_handler,
         },
-        typed_handler::TypedHandler,
+        typed_handler::{TypedHandler, TypedIntoHandler},
     },
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos, datetime::get_timezone};
@@ -346,7 +346,13 @@ fn test_liquidation_closes_all_breached_currencies_in_one_pass(
     add_fx_quote(&exchange, &cache, audusd.id(), "1.00000", "1.00010");
     add_fx_quote(&exchange, &cache, usdjpy.id(), "100.00000", "100.00010");
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     {
         let cache = cache.borrow();
@@ -1184,7 +1190,13 @@ fn test_option_resting_limit_order_fills_as_maker_when_bbo_trades_through(
 
 fn register_order_event_saving_handler() -> TypedIntoMessageSavingHandler<OrderEventAny> {
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     saving_handler
 }
 
@@ -1621,7 +1633,13 @@ fn test_accounting() {
     let account_type = AccountType::Margin;
     let mut cache = Cache::default();
     let (handler, saving_handler) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     let margin_account = MarginAccount::new(
         AccountState::new(
             AccountId::from("SIM-001"),
@@ -1683,7 +1701,13 @@ fn test_adjust_account_overflow_emits_no_state() {
     let maximum = Money::from_raw(MONEY_RAW_MAX, usd);
     let mut cache = Cache::default();
     let (handler, saving_handler) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     let margin_account = MarginAccount::new(
         AccountState::new(
             AccountId::from("SIM-001"),
@@ -1757,7 +1781,13 @@ fn test_process_funding_rate_settles_open_position(crypto_perpetual_ethusdt: Cry
 
     let cache = Rc::new(RefCell::new(cache));
     let (account_handler, account_saver) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), account_handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = account_handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     let (position_handler, position_saver) =
         get_typed_message_saving_handler::<PositionEvent>(None);
     msgbus::subscribe_position_events("events.position.*".into(), position_handler, None);
@@ -2100,7 +2130,13 @@ fn test_process_funding_rate_uses_midpoint_and_credits_short_position(
 
     let cache = Rc::new(RefCell::new(cache));
     let (account_handler, account_saver) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), account_handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = account_handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     let exchange = build_exchange_with_options(
         Venue::new("BINANCE"),
         AccountType::Margin,
@@ -2190,7 +2226,13 @@ fn test_process_funding_rate_without_open_positions_emits_no_settlement(
 
     let cache = Rc::new(RefCell::new(cache));
     let (account_handler, account_saver) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), account_handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = account_handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     let (position_handler, position_saver) =
         get_typed_message_saving_handler::<PositionEvent>(None);
     msgbus::subscribe_position_events("events.position.*".into(), position_handler, None);
@@ -2273,7 +2315,13 @@ fn test_process_funding_rate_does_not_double_settle_boundary_update(
 
     let cache = Rc::new(RefCell::new(cache));
     let (account_handler, account_saver) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), account_handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = account_handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     let exchange = build_exchange_with_options(
         Venue::new("BINANCE"),
         AccountType::Margin,
@@ -2361,7 +2409,13 @@ fn test_process_funding_rate_settles_only_on_interval_boundary(
 
     let cache = Rc::new(RefCell::new(cache));
     let (account_handler, account_saver) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), account_handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = account_handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     let exchange = build_exchange_with_options(
         Venue::new("BINANCE"),
         AccountType::Margin,
@@ -2485,7 +2539,13 @@ fn pre_populate_margin_account_with_balance(cache: &mut Cache, account_id: &str,
 fn test_initialize_account_enables_calculate_account_state() {
     let mut cache = Cache::default();
     let (handler, _saving_handler) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     pre_populate_margin_account(&mut cache, "SIM-001");
 
     let cache = Rc::new(RefCell::new(cache));
@@ -2535,7 +2595,13 @@ fn pre_populate_cash_account(cache: &mut Cache, account_id: &str) {
 fn test_initialize_account_applies_allow_cash_borrowing() {
     let mut cache = Cache::default();
     let (handler, _saving_handler) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     pre_populate_cash_account(&mut cache, "SIM-001");
 
     let cache = Rc::new(RefCell::new(cache));
@@ -2563,7 +2629,13 @@ fn test_initialize_account_applies_allow_cash_borrowing() {
 fn test_initialize_account_frozen_disables_calculate_account_state() {
     let mut cache = Cache::default();
     let (handler, _saving_handler) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     pre_populate_margin_account(&mut cache, "SIM-001");
 
     let cache = Rc::new(RefCell::new(cache));
@@ -2590,7 +2662,13 @@ fn test_inflight_commands_process_fifo_for_same_timestamp(
     crypto_perpetual_ethusdt: CryptoPerpetual,
 ) {
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let latency_model = StaticLatencyModel::new(
         DurationNanos::default(),
@@ -2663,7 +2741,13 @@ fn test_due_inflight_commands_drain_after_queued_commands(
     crypto_perpetual_ethusdt: CryptoPerpetual,
 ) {
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let exchange = get_exchange(
         Venue::new("BINANCE"),
@@ -2885,7 +2969,13 @@ fn test_process_without_latency_model(crypto_perpetual_ethusdt: CryptoPerpetual)
 #[rstest]
 fn test_modify_submitted_order_generates_updated_event(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let cache = Rc::new(RefCell::new(Cache::default()));
     let exchange = get_exchange(
@@ -2962,7 +3052,13 @@ fn test_modify_pending_update_from_submitted_order_generates_updated_event(
     crypto_perpetual_ethusdt: CryptoPerpetual,
 ) {
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let cache = Rc::new(RefCell::new(Cache::default()));
     let exchange = get_exchange(
@@ -3048,7 +3144,13 @@ fn test_modify_pending_update_from_submitted_order_generates_updated_event(
 #[rstest]
 fn test_modify_accepted_order_routes_to_matching_engine(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let cache = Rc::new(RefCell::new(Cache::default()));
     let exchange = get_exchange(
@@ -3155,7 +3257,13 @@ fn test_modify_pending_update_from_accepted_order_routes_to_matching_engine(
     crypto_perpetual_ethusdt: CryptoPerpetual,
 ) {
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let cache = Rc::new(RefCell::new(Cache::default()));
     let exchange = get_exchange(
@@ -3277,7 +3385,13 @@ fn test_modify_pending_update_from_accepted_order_routes_to_matching_engine(
 #[rstest]
 fn test_process_with_latency_model(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     // StaticLatencyModel adds base_latency to each operation latency
     // base=100, insert=200 -> effective insert latency = 300
@@ -3640,7 +3754,13 @@ fn get_exchange_with_modules(
 
     // Register msgbus handler so generate_account_state works during reset
     let (handler, _saving_handler) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     let config = SimulatedVenueConfig::builder()
         .venue(venue)
@@ -3862,7 +3982,13 @@ fn test_process_modules_skips_when_account_adjustments_are_unavailable(
     }
 
     let (handler, account_saver) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     exchange
         .borrow_mut()
@@ -3910,14 +4036,17 @@ fn test_process_modules_forwards_real_outcomes_after_shared_snapshot() {
     // the shared-snapshot contract it must come after every module's
     // process call, not between them.
     let handler_sequence = sequence.clone();
-    msgbus::register_account_state_endpoint(
-        "Portfolio.update_account".into(),
-        TypedHandler::from(move |_: &AccountState| {
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = TypedHandler::from(move |_: &AccountState| {
             handler_sequence
                 .borrow_mut()
                 .push("account-state".to_string());
-        }),
-    );
+        });
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 
     exchange
         .borrow_mut()
@@ -4139,7 +4268,13 @@ fn test_cfd_swap_exact_long_short_and_triple_roll_balances(
     exchange.borrow_mut().process_quote_tick(&quote).unwrap();
 
     let (handler, saver) = get_typed_message_saving_handler::<AccountState>(None);
-    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), handler);
+    msgbus::register_account_state_endpoint("Portfolio.update_account".into(), {
+        let receiver = handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
     exchange
         .borrow_mut()
         .process_modules(cfd_rollover_timestamp(2020, 1, day))

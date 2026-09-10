@@ -19,6 +19,7 @@ use nautilus_analysis::{Returns, analyzer::Statistic, statistic::PortfolioStatis
 use nautilus_common::{
     cache::Cache,
     clock::{Clock, TestClock},
+    messages::execution::EventApplicationOutcome,
     msgbus::{self, MessageBus, MessagingSwitchboard, TypedHandler},
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos, approx_eq, datetime::NANOSECONDS_IN_DAY};
@@ -4055,7 +4056,7 @@ fn test_position_records_account_currency_realized_pnl(
         Price::new(100.0, 2),
         position_id,
     );
-    let position = Position::new(&instrument_audusd, fill);
+    let position = Position::new(&instrument_audusd, fill.clone());
     let closed_position = Position {
         side: PositionSide::Flat,
         signed_qty: 0.0,
@@ -4096,17 +4097,19 @@ fn test_position_records_account_currency_realized_pnl(
         .unwrap();
     assert_eq!(*eur_record, (position_id, UnixNanos::from(1), 11.11));
 
-    // A NETTING reopen reuses the position ID under a new `ts_opened`, so this is a
-    // distinct cycle whose close must record again rather than dedup against the first.
+    // Distinct fills can open separate NETTING cycles at the same venue timestamp,
+    // including partial fills of the same order. Delivery duplicates still record once.
+    let mut reopened_fill = fill;
+    reopened_fill.trade_id = TradeId::from("ACCOUNT-PNL-REOPEN");
+    let reopened_position = Position::new(&instrument_audusd, reopened_fill);
     let reopened_closed_position = Position {
         side: PositionSide::Flat,
         signed_qty: 0.0,
         quantity: Quantity::from("0"),
-        ts_opened: UnixNanos::from(2),
         ts_last: UnixNanos::from(3),
         ts_closed: Some(UnixNanos::from(3)),
         realized_pnl: Some(Money::from("20.00 USD")),
-        ..position
+        ..reopened_position
     };
     portfolio
         .cache()
@@ -5755,9 +5758,8 @@ fn test_realized_pnl_rejects_mixed_currency_snapshots(
     assert_eq!(mixed_realized_pnl, None);
 }
 
-/// Builds a cached NETTING position that is closed, with `prior_pnl` archived as an earlier
-/// cycle and `closed_pnl` archived as its own final cycle, so the last frame repeats the
-/// position's realized PnL.
+/// Builds a closed NETTING position with distinct archived cycle identities and an explicitly
+/// snapshotted or unsnapshotted final cycle.
 fn add_closed_netting_position_with_snapshots(
     portfolio: &Portfolio,
     instrument: &InstrumentAny,
@@ -5765,6 +5767,7 @@ fn add_closed_netting_position_with_snapshots(
     position_id: PositionId,
     archived_pnls: &[Money],
     closed_pnl: Money,
+    final_cycle_snapshotted: bool,
 ) {
     let fill = make_fill_for_account(
         instrument,
@@ -5778,7 +5781,8 @@ fn add_closed_netting_position_with_snapshots(
     position.side = PositionSide::Flat;
     position.ts_closed = Some(UnixNanos::from(1));
 
-    for archived_pnl in archived_pnls {
+    for (index, archived_pnl) in archived_pnls.iter().enumerate() {
+        position.events[0].trade_id = TradeId::new(format!("ARCHIVED-{index}"));
         position.realized_pnl = Some(*archived_pnl);
         portfolio
             .cache()
@@ -5787,8 +5791,9 @@ fn add_closed_netting_position_with_snapshots(
             .unwrap();
     }
 
-    // Matching the final archived entry models a cycle that was snapshotted; a different value
-    // models one that closed without being snapshotted.
+    if !final_cycle_snapshotted {
+        position.events[0].trade_id = TradeId::new("UNSNAPSHOTTED");
+    }
     position.realized_pnl = Some(closed_pnl);
     portfolio
         .cache()
@@ -5812,6 +5817,7 @@ fn test_realized_pnl_for_closed_cached_netting_position_counts_final_cycle_once(
         PositionId::new("P-CLOSED-CACHED-NETTING"),
         &[Money::from("16.00 USD"), Money::from("6.00 USD")],
         Money::from("6.00 USD"),
+        true,
     );
 
     let pnl = portfolio
@@ -5824,9 +5830,13 @@ fn test_realized_pnl_for_closed_cached_netting_position_counts_final_cycle_once(
 }
 
 #[rstest]
+#[case("7.00 USD", "29.00 USD")]
+#[case("6.00 USD", "28.00 USD")]
 fn test_realized_pnl_for_closed_cached_netting_position_adds_unsnapshotted_final_cycle(
     mut portfolio: Portfolio,
     instrument_audusd: InstrumentAny,
+    #[case] closed_pnl: &str,
+    #[case] expected: &str,
 ) {
     let account_state = get_margin_account(None);
     portfolio.update_account(&account_state);
@@ -5837,7 +5847,8 @@ fn test_realized_pnl_for_closed_cached_netting_position_adds_unsnapshotted_final
         AccountId::new("SIM-001"),
         PositionId::new("P-CLOSED-UNSNAPSHOTTED"),
         &[Money::from("16.00 USD"), Money::from("6.00 USD")],
-        Money::from("7.00 USD"),
+        Money::from(closed_pnl),
+        false,
     );
 
     let pnl = portfolio
@@ -5845,8 +5856,51 @@ fn test_realized_pnl_for_closed_cached_netting_position_adds_unsnapshotted_final
         .expect("realized_pnl should be Some");
 
     // The final cycle closed without being snapshotted, so no frame repeats it and every frame
-    // contributes alongside it: 16.00 + 6.00 + 7.00.
-    assert_eq!(pnl, Money::from("29.00 USD"));
+    // contributes alongside it, including when consecutive cycles have equal PnL.
+    assert_eq!(pnl, Money::from(expected));
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_realized_pnl_for_closed_netting_position_requires_cycle_identity(
+    mut portfolio: Portfolio,
+    instrument_audusd: InstrumentAny,
+    #[case] snapshot_missing_identity: bool,
+) {
+    portfolio.update_account(&get_margin_account(None));
+    let position_id = PositionId::new("P-MISSING-CYCLE");
+    add_closed_netting_position_with_snapshots(
+        &portfolio,
+        &instrument_audusd,
+        AccountId::new("SIM-001"),
+        position_id,
+        &[Money::from("6.00 USD")],
+        Money::from("6.00 USD"),
+        true,
+    );
+    let mut position = portfolio
+        .cache()
+        .borrow()
+        .position_owned(&position_id)
+        .unwrap();
+    position.events.clear();
+
+    if snapshot_missing_identity {
+        portfolio
+            .cache()
+            .borrow_mut()
+            .snapshot_position(&position)
+            .unwrap();
+    } else {
+        portfolio
+            .cache()
+            .borrow_mut()
+            .update_position(&position)
+            .unwrap();
+    }
+
+    assert_eq!(portfolio.realized_pnl(&instrument_audusd.id()), None);
 }
 
 #[rstest]
@@ -5894,6 +5948,7 @@ fn test_realized_pnl_for_closed_cached_netting_position_uses_mark_xrate(
         PositionId::new("P-CLOSED-CACHED-MARK-XRATE"),
         &[Money::from("16.00 USD"), Money::from("6.00 USD")],
         Money::from("6.00 USD"),
+        true,
     );
 
     let pnl = portfolio
@@ -5947,6 +6002,7 @@ fn test_realized_pnl_for_closed_cached_netting_position_without_base_conversion(
         PositionId::new("P-CLOSED-CACHED-NO-CONVERT"),
         &[Money::from("16.00 USD"), Money::from("6.00 USD")],
         Money::from("6.00 USD"),
+        true,
     );
 
     let pnl = portfolio
@@ -10175,4 +10231,52 @@ fn test_deregister_statistics_clears_defaults(simple_cache: Cache, clock: TestCl
 
     assert!(portfolio.registered_statistics().is_empty());
     assert!(portfolio.statistics().general.is_empty());
+}
+
+#[rstest]
+fn test_account_endpoint_acknowledges_native_application_and_rejects_negative_balance() {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let portfolio = Portfolio::new(clock, Rc::clone(&cache), None);
+    let account_id = AccountId::from("SIM-ACK");
+    let endpoint = MessagingSwitchboard::portfolio_update_account();
+    let state = |amount: &str| {
+        let total = Money::from(amount);
+        AccountState::new(
+            account_id,
+            AccountType::Cash,
+            vec![AccountBalance::new(
+                total,
+                Money::zero(Currency::USD()),
+                total,
+            )],
+            vec![],
+            true,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+            Some(Currency::USD()),
+        )
+    };
+    let initial = state("1000.00 USD");
+    let negative = state("-1.00 USD");
+
+    let first = msgbus::send_account_state_with_outcome(endpoint, &initial);
+    let duplicate = msgbus::send_account_state_with_outcome(endpoint, &initial);
+    let rejected = msgbus::send_account_state_with_outcome(endpoint, &negative);
+    let retained = cache
+        .borrow()
+        .account(&account_id)
+        .unwrap()
+        .last_event()
+        .unwrap()
+        .event_id;
+    drop(portfolio);
+    let gone = msgbus::send_account_state_with_outcome(endpoint, &initial);
+
+    assert_eq!(first, Some(EventApplicationOutcome::Applied));
+    assert_eq!(duplicate, Some(EventApplicationOutcome::Applied));
+    assert_eq!(rejected, Some(EventApplicationOutcome::Incomplete));
+    assert_eq!(retained, initial.event_id);
+    assert_eq!(gone, None);
 }

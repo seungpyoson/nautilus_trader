@@ -60,8 +60,8 @@ pub use orders::{
     generate_reconciliation_order_pre_fill_events, generate_reconciliation_order_snapshot_events,
     generate_reconciliation_order_snapshot_events_with_commission,
     incremental_inferred_fill_price_and_liquidity, inferred_fill_price_and_liquidity,
-    reconcile_fill_report, reconcile_order_report, reconcile_order_report_with_commission,
-    should_reconciliation_update,
+    order_report_is_reconciled, reconcile_fill_report, reconcile_order_report,
+    reconcile_order_report_with_commission, should_reconciliation_update,
 };
 pub use positions::{
     calculate_reconciliation_price, check_position_reconciliation,

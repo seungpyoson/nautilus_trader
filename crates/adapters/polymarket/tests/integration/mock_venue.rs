@@ -188,6 +188,7 @@ pub(super) struct TestServerState {
     pub(super) single_order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) single_order_get_count: Arc<AtomicUsize>,
     pub(super) trades_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
+    pub(super) filter_trade_time_bounds: Arc<AtomicBool>,
     pub(super) positions_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) user_frames: tokio::sync::broadcast::Sender<String>,
     pub(super) user_socket_count: Arc<AtomicUsize>,
@@ -261,6 +262,7 @@ impl Default for TestServerState {
             single_order_response: Arc::new(tokio::sync::Mutex::new(None)),
             single_order_get_count: Arc::new(AtomicUsize::new(0)),
             trades_response_override: Arc::new(tokio::sync::Mutex::new(None)),
+            filter_trade_time_bounds: Arc::new(AtomicBool::new(false)),
             positions_response_override: Arc::new(tokio::sync::Mutex::new(None)),
             book_response: Arc::new(tokio::sync::Mutex::new(Some(json!({
                 "bids": [
@@ -365,11 +367,32 @@ async fn handle_get_trades(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     *state.last_path.lock().await = uri.path().to_string();
-    *state.last_query.lock().await = query;
-    if let Some(override_value) = state.trades_response_override.lock().await.as_ref() {
-        return Json(override_value.clone()).into_response();
+    let mut response = state
+        .trades_response_override
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| load_json("http_trades_page.json"));
+
+    if state.filter_trade_time_bounds.load(Ordering::Relaxed) {
+        let before = query
+            .get("before")
+            .map(|value| value.parse::<u64>().unwrap());
+        let after = query
+            .get("after")
+            .map(|value| value.parse::<u64>().unwrap());
+        response["data"].as_array_mut().unwrap().retain(|trade| {
+            let timestamp = trade["match_time"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            before.is_none_or(|bound| timestamp < bound)
+                && after.is_none_or(|bound| timestamp > bound)
+        });
     }
-    Json(load_json("http_trades_page.json")).into_response()
+    *state.last_query.lock().await = query;
+    Json(response).into_response()
 }
 
 async fn handle_get_balance(

@@ -25,7 +25,11 @@ use super::{
     market_to_limit::MarketToLimitOrder, stop_limit::StopLimitOrder, stop_market::StopMarketOrder,
     trailing_stop_limit::TrailingStopLimitOrder, trailing_stop_market::TrailingStopMarketOrder,
 };
-use crate::{events::OrderEventAny, identifiers::OrderListId, types::Price};
+use crate::{
+    events::OrderEventAny,
+    identifiers::{OrderListId, TradeId},
+    types::Price,
+};
 
 /// Error returned when [`OrderAny::from_events`] cannot replay order events.
 #[derive(Debug, Error)]
@@ -96,6 +100,23 @@ impl OrderAny {
         }
 
         Ok(order)
+    }
+
+    /// Borrows the recorded trade identities without allocating an intermediate vector.
+    #[must_use]
+    pub fn trade_ids_ref(&self) -> &[TradeId] {
+        let order: &OrderCore = match self {
+            Self::Limit(order) => order,
+            Self::LimitIfTouched(order) => order,
+            Self::Market(order) => order,
+            Self::MarketIfTouched(order) => order,
+            Self::MarketToLimit(order) => order,
+            Self::StopLimit(order) => order,
+            Self::StopMarket(order) => order,
+            Self::TrailingStopLimit(order) => order,
+            Self::TrailingStopMarket(order) => order,
+        };
+        &order.trade_ids
     }
 
     /// Returns a reference to the [`crate::events::OrderInitialized`] event.

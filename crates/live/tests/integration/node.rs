@@ -32,47 +32,65 @@ use std::{
 
 use async_trait::async_trait;
 use nautilus_common::{
-    actor::{DataActor, DataActorCore, data_actor::DataActorConfig},
+    actor::{DataActor, DataActorCore, DataActorNative, data_actor::DataActorConfig},
     cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
     component::Component,
     enums::Environment,
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
-    live::{dst, runner::get_exec_event_sender},
+    live::{
+        dst,
+        runner::{get_exec_event_sender, get_system_event_sender},
+    },
     logging::logger::LoggerConfig,
     messages::{
-        ExecutionEvent,
+        ExecutionEvent, SystemEvent,
         execution::{
             CancelOrder, GenerateFillReports, GenerateOrderStatusReport,
             GenerateOrderStatusReports, GeneratePositionStatusReports, QueryOrder,
         },
-        system::{QueueStateChanged, ShutdownSystem},
+        system::{
+            QueueStateChanged, ShutdownSystem, SocketState, SocketStateChange, SocketStateChanged,
+        },
     },
-    msgbus::{self, MessagingSwitchboard, ShareableMessageHandler, switchboard},
+    msgbus::{self, MessagingSwitchboard, ShareableMessageHandler, TypedHandler, switchboard},
     nautilus_actor,
     testing::{wait_until, wait_until_async},
 };
-use nautilus_core::{Params, UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{
     builder::LiveNodeBuilder,
     config::{LiveExecutionEngineConfig, LiveNodeConfig},
-    node::{LiveNode, LiveNodeHandle, NodeState},
+    node::{
+        LiveNode, LiveNodeHandle, MassStatusCollection, NodeState, StartupReconciliationOutcome,
+        StartupReconciliationSummary,
+    },
 };
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
-    enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
-    events::{OrderEventAny, account::state::AccountState},
+    enums::{
+        AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
+        PositionSideSpecified, TimeInForce,
+    },
+    events::{AccountState, OrderAcceptedBatch, OrderEventAny},
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, StrategyId, TradeId,
-        TraderId, Venue, VenueOrderId,
+        AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId, StrategyId,
+        TradeId, TraderId, Venue, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
     orders::{
         Order, OrderAny, OrderTestBuilder,
         stubs::{OrderFilledTestBuilder, TestOrderEventStubs},
     },
-    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
+    position::Position,
+    reports::{
+        ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport,
+        mass_status::{
+            ConditionalOrderCoverage, ExecutionMassStatusCoverage, ExecutionReportCoverage,
+            ExecutionReportScope,
+        },
+    },
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_trading::{
@@ -104,6 +122,63 @@ impl TestActor {
 impl DataActor for TestActor {}
 
 nautilus_actor!(TestActor);
+
+#[derive(Debug)]
+struct ReconciliationSummaryActor {
+    core: DataActorCore,
+    handle: LiveNodeHandle,
+    observed: Arc<Mutex<Option<Arc<StartupReconciliationSummary>>>>,
+}
+
+impl DataActor for ReconciliationSummaryActor {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        *self.observed.lock() = self.handle.startup_reconciliation_summary();
+        self.handle.stop();
+        Ok(())
+    }
+}
+
+nautilus_actor!(ReconciliationSummaryActor);
+
+#[derive(Debug)]
+struct StartupCacheObservation {
+    status: Option<OrderStatus>,
+    event_count: usize,
+    account_present: bool,
+    summary: Option<Arc<StartupReconciliationSummary>>,
+}
+
+#[derive(Debug)]
+struct StartupCacheActor {
+    core: DataActorCore,
+    handle: LiveNodeHandle,
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    observed: Arc<Mutex<Option<StartupCacheObservation>>>,
+}
+
+impl DataActor for StartupCacheActor {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        let observation = {
+            let cache = self.cache_ref();
+            let (status, event_count) = match cache.order_ref(&self.client_order_id) {
+                Some(order) => (Some(order.status()), order.event_count()),
+                None => (None, 0),
+            };
+            StartupCacheObservation {
+                status,
+                event_count,
+                account_present: cache.account(&self.account_id).is_some(),
+                summary: self.handle.startup_reconciliation_summary(),
+            }
+        };
+        *self.observed.lock() = Some(observation);
+        self.handle.stop();
+        Ok(())
+    }
+}
+
+nautilus_actor!(StartupCacheActor);
 
 #[derive(Debug)]
 struct TestStrategy {
@@ -316,6 +391,9 @@ pub(crate) mod serial_tests {
         factory_trader_id: Arc<Mutex<Option<TraderId>>>,
         mass_status_requested: Arc<AtomicBool>,
         mass_status: Arc<Mutex<Option<ExecutionMassStatus>>>,
+        queued_exec_events: Arc<Mutex<Vec<ExecutionEvent>>>,
+        connect_system_events: Arc<Mutex<Vec<SystemEvent>>>,
+        queued_system_events: Arc<Mutex<Vec<SystemEvent>>>,
         registered_external_orders: Arc<Mutex<Vec<ClientOrderId>>>,
         cancel_orders_received: Arc<AtomicUsize>,
         cancel_orders_while_connected: Arc<AtomicBool>,
@@ -830,6 +908,9 @@ pub(crate) mod serial_tests {
 
         async fn connect(&mut self) -> anyhow::Result<()> {
             self.state.connected.store(true, Ordering::Relaxed);
+            for event in self.state.connect_system_events.lock().drain(..) {
+                get_system_event_sender().send(event).unwrap();
+            }
             Ok(())
         }
 
@@ -849,8 +930,23 @@ pub(crate) mod serial_tests {
                 .mass_status_requested
                 .store(true, Ordering::Relaxed);
 
+            for event in self.state.queued_exec_events.lock().drain(..) {
+                get_exec_event_sender().send(event).unwrap();
+            }
+
+            for event in self.state.queued_system_events.lock().drain(..) {
+                get_system_event_sender().send(event).unwrap();
+            }
+
             match self.behavior {
-                StartupMassStatusBehavior::Available => Ok(self.state.mass_status.lock().clone()),
+                StartupMassStatusBehavior::Available => {
+                    let mut report = self.state.mass_status.lock();
+
+                    if let Some(report) = report.as_mut() {
+                        report.ts_init = get_atomic_clock_realtime().get_time_ns();
+                    }
+                    Ok(report.clone())
+                }
                 StartupMassStatusBehavior::Unavailable => Ok(None),
                 StartupMassStatusBehavior::Error => Err(anyhow::anyhow!("mass status failed")),
                 StartupMassStatusBehavior::Pending => {
@@ -2506,6 +2602,1706 @@ pub(crate) mod serial_tests {
     }
 
     #[rstest]
+    #[case::held("10.00", true)]
+    #[case::redeemed("0.00", true)]
+    #[case::excess("11.00", false)]
+    #[case::partial_unexplained("5.00", false)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_settled_inventory_uses_native_closes(
+        #[case] reported_quantity: &str,
+        #[case] expected_reconciled: bool,
+        #[values(false, true)] run: bool,
+    ) {
+        use nautilus_common::messages::DataEvent;
+        use nautilus_live::runner::AsyncRunner;
+        use nautilus_model::{
+            accounts::CashAccount,
+            data::{Data, InstrumentClose},
+            enums::{InstrumentCloseType, PositionSide},
+            instruments::stubs::binary_option,
+        };
+
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let instrument_id = instrument.id();
+        let client_id = ClientId::from("SETTLEMENT-SOURCE");
+        let account_id = AccountId::from("POLYMARKET-001");
+        let position_id = PositionId::from("SETTLEMENT-OWNER");
+        let state = StartupMassStatusClientState::default();
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: true,
+                reconciliation_lookback_mins: None,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let factory = StartupMassStatusExecutionClientFactory::new(
+            state.clone(),
+            StartupMassStatusBehavior::Available,
+        )
+        .with_identity(client_id, account_id, instrument_id.venue);
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("StartupSettlementInventory")
+            .add_exec_client(
+                Some("settlement-source".to_string()),
+                Box::new(factory),
+                Box::new(StartupMassStatusExecutionClientConfig),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(node.trader_id())
+            .strategy_id(StrategyId::from("OWNER-001"))
+            .instrument_id(instrument_id)
+            .client_order_id(ClientOrderId::from("OPEN-SETTLEMENT"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("10.00"))
+            .price(Price::from("0.400"))
+            .build();
+        order
+            .apply(TestOrderEventStubs::accepted(
+                &order,
+                account_id,
+                VenueOrderId::from("VENUE-OPEN-SETTLEMENT"),
+            ))
+            .unwrap();
+        let OrderEventAny::Filled(fill) = TestOrderEventStubs::filled(
+            &order,
+            &instrument,
+            Some(TradeId::from("OPEN-SETTLEMENT")),
+            Some(position_id),
+            Some(Price::from("0.400")),
+            Some(Quantity::from("10.00")),
+            Some(LiquiditySide::Taker),
+            Some(Money::from("0.10 USDC")),
+            Some(UnixNanos::from(1)),
+            None,
+            Some(account_id),
+        ) else {
+            unreachable!()
+        };
+        order.apply(OrderEventAny::Filled(fill.clone())).unwrap();
+        let position = Position::new(&instrument, fill);
+        {
+            let cache = node.kernel().cache();
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            cache
+                .add_account(
+                    CashAccount::new(
+                        AccountState::new(
+                            account_id,
+                            AccountType::Cash,
+                            vec![AccountBalance::new(
+                                Money::from("100 USDC"),
+                                Money::from("0 USDC"),
+                                Money::from("100 USDC"),
+                            )],
+                            vec![],
+                            true,
+                            UUID4::new(),
+                            UnixNanos::from(1),
+                            UnixNanos::from(1),
+                            Some(Currency::USDC()),
+                        ),
+                        false,
+                        false,
+                    )
+                    .into(),
+                )
+                .unwrap();
+            cache
+                .add_order(order, Some(position_id), Some(client_id), false)
+                .unwrap();
+            cache.add_position(&position, OmsType::Netting).unwrap();
+        }
+        let mut report = ExecutionMassStatus::new(
+            client_id,
+            account_id,
+            instrument_id.venue,
+            UnixNanos::from(1),
+            None,
+        );
+        report.set_report_window(None, true);
+        report.set_coverage(ExecutionMassStatusCoverage {
+            orders: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            fills: ExecutionReportCoverage::History {
+                scope: ExecutionReportScope::Account,
+                start: None,
+                end: None,
+            },
+            positions: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            conditional_orders: ConditionalOrderCoverage::NotApplicable,
+        });
+        let quantity = Quantity::from(reported_quantity);
+        report.add_position_reports(vec![PositionStatusReport::new(
+            account_id,
+            instrument_id,
+            if quantity.is_zero() {
+                PositionSide::Flat
+            } else {
+                PositionSide::Long
+            },
+            quantity,
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+            None,
+            Some(Decimal::from_str_exact("0.4").unwrap()),
+        )]);
+        *state.mass_status.lock() = Some(report);
+        // Drive the native data path; settlement remains queued until the node's startup drain.
+        AsyncRunner::handle_data_event(DataEvent::Data(Data::InstrumentClose(
+            InstrumentClose::new(
+                instrument_id,
+                Price::from("1.000"),
+                InstrumentCloseType::ContractExpired,
+                instrument.expiration_ns().unwrap(),
+                instrument.expiration_ns().unwrap(),
+            ),
+        )));
+        let observed = Arc::new(Mutex::new(None));
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: node.handle(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+        assert!(result.is_ok(), "{result:#?}");
+        let summary = observed
+            .lock()
+            .clone()
+            .expect("trader observed the startup summary");
+        let collected = summary.clients[0].report.as_ref().unwrap();
+        assert!(collected.has_complete_account_collection(None));
+        assert_eq!(
+            collected.application.all_received_reports_reconciled(),
+            expected_reconciled
+        );
+        assert_eq!(
+            collected
+                .final_inventory
+                .unwrap()
+                .all_inventory_reconciled(),
+            expected_reconciled
+        );
+        assert_eq!(summary.all_clients_reconciled(), expected_reconciled);
+        let cache = node.kernel().cache();
+        let cache = cache.borrow();
+        let position = cache.position_ref(&position_id).unwrap();
+        assert!(position.is_closed());
+        assert_eq!(position.realized_pnl, Some(Money::from("5.90 USDC")));
+        assert_eq!(
+            cache.positions_total_count(None, Some(&instrument_id), None, Some(&account_id), None),
+            1
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RetainedOrderCase {
+        Empty,
+        Open,
+        Inflight,
+        UnassignedInflight,
+        MissingAccount,
+        MissingInstrument,
+        MissingSource,
+        ConflictingSource,
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_complete_startup_requires_publication_and_all_pending_applications(
+        #[values(false, true)] run: bool,
+        #[values(false, true)] incomplete_ingress: bool,
+    ) {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: true,
+                reconciliation_lookback_mins: None,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupCompleteEmptyNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let account_id = AccountId::from("STARTUP-MASS-STATUS-001");
+        let mut report = ExecutionMassStatus::new(
+            ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID),
+            account_id,
+            crypto_perpetual_ethusdt().id().venue,
+            UnixNanos::default(),
+            None,
+        );
+        report.set_report_window(None, true);
+        report.set_coverage(ExecutionMassStatusCoverage {
+            orders: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            fills: ExecutionReportCoverage::History {
+                scope: ExecutionReportScope::Account,
+                start: None,
+                end: None,
+            },
+            positions: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            conditional_orders: ConditionalOrderCoverage::NotApplicable,
+        });
+        *state.mass_status.lock() = Some(report);
+        state
+            .queued_exec_events
+            .lock()
+            .push(ExecutionEvent::Account(startup_queued_account_state(
+                account_id,
+            )));
+
+        if incomplete_ingress {
+            let missing = OrderTestBuilder::new(OrderType::Market)
+                .trader_id(node.kernel().trader_id())
+                .instrument_id(crypto_perpetual_ethusdt().id())
+                .client_order_id(ClientOrderId::from("O-UNREGISTERED-STARTUP"))
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("1.0"))
+                .build();
+            state.queued_exec_events.lock().push(ExecutionEvent::Order(
+                TestOrderEventStubs::accepted(
+                    &missing,
+                    AccountId::from("STARTUP-MASS-STATUS-001"),
+                    VenueOrderId::from("V-UNREGISTERED-STARTUP"),
+                ),
+            ));
+        }
+        let observed = Arc::new(Mutex::new(None));
+        let handle = node.handle();
+        assert!(handle.startup_reconciliation_summary().is_none());
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: handle.clone(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        assert!(
+            result.is_ok(),
+            "startup must reach the final boundary: {result:#?}"
+        );
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        let summary = observed
+            .lock()
+            .clone()
+            .expect("actor must observe final evidence");
+        let report = summary.clients[0].report.as_ref().unwrap();
+        assert!(report.has_complete_account_collection(None));
+        assert!(report.application.all_received_reports_reconciled());
+        assert!(report.final_inventory.unwrap().all_inventory_reconciled());
+        assert!(summary.client_identities_unchanged);
+        assert!(summary.ts_started <= report.ts_init && report.ts_init <= summary.ts_finished);
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
+        assert_eq!(
+            summary.pending_execution.incomplete,
+            u64::from(incomplete_ingress)
+        );
+        assert_eq!(summary.all_clients_reconciled(), !incomplete_ingress);
+        let mut unpublished = (*summary).clone();
+        unpublished.completion_sequence = None;
+        assert!(!unpublished.all_clients_reconciled());
+        assert!(Arc::ptr_eq(
+            &summary,
+            &handle.startup_reconciliation_summary().unwrap()
+        ));
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_complete_startup_rejects_an_unqueried_client_added_during_reconciliation(
+        #[values(false, true)] add_client: bool,
+        #[values(false, true)] run: bool,
+    ) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupClientIdentityNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let source = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+        let account = AccountId::from("STARTUP-MASS-STATUS-001");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let venue = instrument.id().venue;
+        node.kernel()
+            .cache()
+            .borrow_mut()
+            .add_instrument(instrument)
+            .unwrap();
+        let mut report =
+            ExecutionMassStatus::new(source, account, venue, UnixNanos::default(), None);
+        report.set_report_window(None, true);
+        report.set_coverage(ExecutionMassStatusCoverage {
+            orders: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            fills: ExecutionReportCoverage::History {
+                scope: ExecutionReportScope::Account,
+                start: None,
+                end: None,
+            },
+            positions: ExecutionReportCoverage::CurrentOpen {
+                scope: ExecutionReportScope::Account,
+            },
+            conditional_orders: ConditionalOrderCoverage::NotApplicable,
+        });
+        report.add_order_reports(vec![test_order_report(
+            account,
+            ClientOrderId::from("O-CLIENT-IDENTITY"),
+            VenueOrderId::from("V-CLIENT-IDENTITY"),
+            OrderStatus::Accepted,
+        )]);
+        *state.mass_status.lock() = Some(report);
+        state
+            .queued_exec_events
+            .lock()
+            .push(ExecutionEvent::Account(startup_queued_account_state(
+                account,
+            )));
+        let callback_count = Rc::new(Cell::new(0));
+        let handler = ShareableMessageHandler::from_typed({
+            let engine = node.kernel().exec_engine().clone();
+            let callback_count = callback_count.clone();
+            move |_report: &OrderStatusReport| {
+                if add_client {
+                    engine
+                        .borrow_mut()
+                        .register_client(Box::new(StartupMassStatusExecutionClient::new(
+                            StartupMassStatusClientState::default(),
+                            StartupMassStatusBehavior::Unavailable,
+                            ClientId::from("ADDED-CLIENT"),
+                            AccountId::from("ADDED-001"),
+                            Venue::from("ADDED"),
+                            false,
+                        )))
+                        .unwrap();
+                }
+                callback_count.set(callback_count.get() + 1);
+            }
+        });
+        let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+        msgbus::subscribe_any(topic.to_string().into(), handler.clone(), None);
+        let observed = Arc::new(Mutex::new(None));
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: node.handle(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        msgbus::unsubscribe_any(topic.to_string().into(), &handler);
+        assert!(
+            result.is_ok(),
+            "startup must reach the final boundary: {result:#?}"
+        );
+        assert_eq!(callback_count.get(), 1);
+        let summary = observed
+            .lock()
+            .clone()
+            .expect("actor must observe final evidence");
+        assert_eq!(summary.clients.len(), 1);
+        let report = summary.clients[0].report.as_ref().unwrap();
+        assert!(report.application.all_received_reports_reconciled());
+        assert!(report.final_inventory.unwrap().all_inventory_reconciled());
+        assert!(summary.pending_execution.all_applications_confirmed());
+        assert_eq!(summary.client_identities_unchanged, !add_client);
+        assert_eq!(summary.all_clients_reconciled(), !add_client);
+    }
+
+    #[rstest]
+    #[case::empty(RetainedOrderCase::Empty)]
+    #[case::open(RetainedOrderCase::Open)]
+    #[case::inflight(RetainedOrderCase::Inflight)]
+    #[case::unassigned_inflight(RetainedOrderCase::UnassignedInflight)]
+    #[case::missing_account(RetainedOrderCase::MissingAccount)]
+    #[case::missing_instrument(RetainedOrderCase::MissingInstrument)]
+    #[case::missing_source(RetainedOrderCase::MissingSource)]
+    #[case::conflicting_source(RetainedOrderCase::ConflictingSource)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_final_inventory_checks_cached_only_orders(
+        #[case] case: RetainedOrderCase,
+        #[values(false, true)] run: bool,
+    ) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupRetainedInventoryNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let account_id = AccountId::from("STARTUP-MASS-STATUS-001");
+        let client_id = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let inflight = matches!(
+            case,
+            RetainedOrderCase::Inflight | RetainedOrderCase::UnassignedInflight
+        );
+        let has_order = !matches!(
+            case,
+            RetainedOrderCase::Empty | RetainedOrderCase::MissingAccount
+        );
+        {
+            let cache = node.kernel().cache();
+            let mut cache = cache.borrow_mut();
+
+            if case != RetainedOrderCase::MissingInstrument {
+                cache.add_instrument(instrument).unwrap();
+            }
+
+            if has_order {
+                let mut order = OrderTestBuilder::new(OrderType::Limit)
+                    .trader_id(node.kernel().trader_id())
+                    .instrument_id(instrument_id)
+                    .client_order_id(ClientOrderId::from("O-RETAINED-ONLY"))
+                    .side(OrderSide::Buy)
+                    .quantity(Quantity::from("10.0"))
+                    .price(Price::from("100.0"))
+                    .build();
+                order
+                    .apply(TestOrderEventStubs::submitted(&order, account_id))
+                    .unwrap();
+
+                if !inflight {
+                    order
+                        .apply(TestOrderEventStubs::accepted(
+                            &order,
+                            account_id,
+                            VenueOrderId::from("V-RETAINED-ONLY"),
+                        ))
+                        .unwrap();
+                }
+
+                if case == RetainedOrderCase::UnassignedInflight {
+                    let OrderAny::Limit(limit) = &mut order else {
+                        unreachable!()
+                    };
+                    limit.account_id = None;
+                    assert!(order.is_inflight());
+                    assert!(order.account_id().is_none());
+                }
+                let source = match case {
+                    RetainedOrderCase::MissingSource => None,
+                    RetainedOrderCase::ConflictingSource => Some(ClientId::from("OTHER-CLIENT")),
+                    _ => Some(client_id),
+                };
+                cache.add_order(order, None, source, false).unwrap();
+                cache.build_index();
+                let id = ClientOrderId::from("O-RETAINED-ONLY");
+                assert_eq!(cache.is_order_inflight(&id), inflight);
+                assert_eq!(cache.is_order_open(&id), !inflight);
+            }
+        }
+        *state.mass_status.lock() = Some(ExecutionMassStatus::new(
+            client_id,
+            account_id,
+            instrument_id.venue,
+            UnixNanos::from(1),
+            None,
+        ));
+
+        if case != RetainedOrderCase::MissingAccount {
+            state
+                .queued_exec_events
+                .lock()
+                .push(ExecutionEvent::Account(startup_queued_account_state(
+                    account_id,
+                )));
+        }
+        let observed = Arc::new(Mutex::new(None));
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: node.handle(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        assert!(
+            result.is_ok(),
+            "startup must reach the final boundary: {result:#?}"
+        );
+        let summary = observed
+            .lock()
+            .clone()
+            .expect("actor must observe final evidence");
+        let report = summary.clients[0].report.as_ref().unwrap();
+        assert!(report.application.all_received_reports_reconciled());
+        let inventory = report.final_inventory.unwrap();
+        assert_eq!(
+            inventory.all_inventory_reconciled(),
+            case == RetainedOrderCase::Empty
+        );
+        assert_eq!(inventory.inflight_orders, usize::from(inflight));
+        assert_eq!(
+            inventory.unreported_open_orders,
+            usize::from(has_order && !inflight)
+        );
+        assert_eq!(inventory.unreported_open_positions, 0);
+        assert_eq!(inventory.unresolved_order_reports, 0);
+        assert_eq!(inventory.unresolved_position_reports, 0);
+        assert_eq!(
+            inventory.source_valid,
+            matches!(
+                case,
+                RetainedOrderCase::Empty | RetainedOrderCase::Open | RetainedOrderCase::Inflight
+            )
+        );
+    }
+
+    #[rstest]
+    #[case::unchanged(false, false, false)]
+    #[case::queued_cancellation(true, false, false)]
+    #[case::callback_adds_another_order(true, true, false)]
+    #[case::colliding_cached_venue_id(false, false, true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_final_inventory_observes_report_supersession_and_callback_mutations(
+        #[case] cancel: bool,
+        #[case] callback_order: bool,
+        #[case] colliding_venue_id: bool,
+        #[values(false, true)] run: bool,
+    ) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupFinalReportedInventoryNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let account_id = AccountId::from("STARTUP-MASS-STATUS-001");
+        let client_id = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let client_order_id = ClientOrderId::from("O-FINAL-REPORT");
+        let venue_order_id = VenueOrderId::from("V-FINAL-REPORT");
+        let make_order = |id, venue_id| {
+            let mut order = OrderTestBuilder::new(OrderType::Limit)
+                .trader_id(node.kernel().trader_id())
+                .instrument_id(instrument_id)
+                .client_order_id(id)
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("10.0"))
+                .price(Price::from("100.0"))
+                .build();
+            order
+                .apply(TestOrderEventStubs::submitted(&order, account_id))
+                .unwrap();
+            order
+                .apply(TestOrderEventStubs::accepted(&order, account_id, venue_id))
+                .unwrap();
+            order
+        };
+        let order = make_order(client_order_id, venue_order_id);
+        let other = make_order(
+            ClientOrderId::from("O-CALLBACK-ONLY"),
+            if colliding_venue_id {
+                venue_order_id
+            } else {
+                VenueOrderId::from("V-CALLBACK-ONLY")
+            },
+        );
+        let canceled = TestOrderEventStubs::canceled(&order, account_id, Some(venue_order_id));
+        {
+            let cache = node.kernel().cache();
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument).unwrap();
+            cache
+                .add_order(order, None, Some(client_id), false)
+                .unwrap();
+
+            if colliding_venue_id {
+                cache
+                    .add_order(other.clone(), None, Some(client_id), false)
+                    .unwrap();
+            }
+            cache.build_index();
+            assert!(cache.is_order_open(&client_order_id));
+        }
+        let mut mass_status = ExecutionMassStatus::new(
+            client_id,
+            account_id,
+            instrument_id.venue,
+            UnixNanos::from(1),
+            None,
+        );
+        mass_status.add_order_reports(vec![test_order_report(
+            account_id,
+            client_order_id,
+            venue_order_id,
+            OrderStatus::Accepted,
+        )]);
+        *state.mass_status.lock() = Some(mass_status);
+        state
+            .queued_exec_events
+            .lock()
+            .push(ExecutionEvent::Account(startup_queued_account_state(
+                account_id,
+            )));
+
+        if cancel {
+            state
+                .queued_exec_events
+                .lock()
+                .push(ExecutionEvent::Order(canceled));
+        }
+        let callback_count = Rc::new(Cell::new(0));
+        let handler = TypedHandler::from({
+            let cache = node.kernel().cache();
+            let callback_count = callback_count.clone();
+            move |_event: &OrderEventAny| {
+                let mut cache = cache.borrow_mut();
+                cache
+                    .add_order(other.clone(), None, Some(client_id), false)
+                    .unwrap();
+                cache.build_index();
+                assert!(cache.is_order_open(&other.client_order_id()));
+                callback_count.set(callback_count.get() + 1);
+            }
+        });
+        let topic = switchboard::get_order_canceled_topic(instrument_id);
+
+        if callback_order {
+            msgbus::subscribe_order_events(topic.to_string().into(), handler.clone(), None);
+        }
+        let observed = Arc::new(Mutex::new(None));
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: node.handle(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        if callback_order {
+            msgbus::unsubscribe_order_events(topic.to_string().into(), &handler);
+        }
+        assert!(
+            result.is_ok(),
+            "startup must reach the final boundary: {result:#?}"
+        );
+        assert_eq!(callback_count.get(), usize::from(callback_order));
+        let summary = observed
+            .lock()
+            .clone()
+            .expect("actor must observe final evidence");
+        assert!(summary.pending_execution.all_applications_confirmed());
+        assert_eq!(summary.pending_execution.applied, 1 + u64::from(cancel));
+        let report = summary.clients[0].report.as_ref().unwrap();
+        assert!(report.application.all_received_reports_reconciled());
+        let inventory = report.final_inventory.unwrap();
+        assert!(inventory.source_valid);
+        assert_eq!(inventory.unresolved_order_reports, usize::from(cancel));
+        assert_eq!(
+            inventory.unreported_open_orders,
+            usize::from(callback_order || colliding_venue_id)
+        );
+        assert_eq!(inventory.inflight_orders, 0);
+        assert_eq!(
+            inventory.all_inventory_reconciled(),
+            !cancel && !colliding_venue_id
+        );
+    }
+
+    #[rstest]
+    #[case::empty(0)]
+    #[case::unreported_long(1)]
+    #[case::unreported_offsetting(2)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_final_inventory_does_not_hide_unreported_positions(
+        #[case] position_count: usize,
+        #[values(false, true)] run: bool,
+    ) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupRetainedPositionNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let account_id = AccountId::from("STARTUP-MASS-STATUS-001");
+        let client_id = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let cache = node.kernel().cache();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+
+        for (side, position_id) in [
+            (OrderSide::Buy, PositionId::from("RETAINED-LONG")),
+            (OrderSide::Sell, PositionId::from("RETAINED-SHORT")),
+        ]
+        .into_iter()
+        .take(position_count)
+        {
+            let order = OrderTestBuilder::new(OrderType::Market)
+                .instrument_id(instrument.id())
+                .side(side)
+                .quantity(Quantity::from("1.0"))
+                .build();
+            let OrderEventAny::Filled(fill) = TestOrderEventStubs::filled(
+                &order,
+                &instrument,
+                None,
+                Some(position_id),
+                Some(Price::from("100.0")),
+                Some(Quantity::from("1.0")),
+                None,
+                None,
+                None,
+                Some(account_id),
+            ) else {
+                unreachable!()
+            };
+            let position = Position::new(&instrument, fill);
+            cache
+                .borrow_mut()
+                .add_position_without_order(&position, OmsType::Hedging)
+                .unwrap();
+        }
+        assert_eq!(
+            cache
+                .borrow()
+                .iter_position_open_ids(None, None, None, Some(&account_id))
+                .count(),
+            position_count
+        );
+        *state.mass_status.lock() = Some(ExecutionMassStatus::new(
+            client_id,
+            account_id,
+            instrument.id().venue,
+            UnixNanos::from(1),
+            None,
+        ));
+        state
+            .queued_exec_events
+            .lock()
+            .push(ExecutionEvent::Account(startup_queued_account_state(
+                account_id,
+            )));
+        let observed = Arc::new(Mutex::new(None));
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: node.handle(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        assert!(
+            result.is_ok(),
+            "startup must reach the final boundary: {result:#?}"
+        );
+        let summary = observed
+            .lock()
+            .clone()
+            .expect("actor must observe final evidence");
+        let report = summary.clients[0].report.as_ref().unwrap();
+        assert!(report.application.all_received_reports_reconciled());
+        let inventory = report.final_inventory.unwrap();
+        assert!(inventory.source_valid);
+        assert_eq!(inventory.unreported_open_positions, position_count);
+        assert_eq!(inventory.unresolved_position_reports, 0);
+        assert_eq!(inventory.all_inventory_reconciled(), position_count == 0);
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RetainedFillFixture {
+        Complete,
+        CompleteWithOrderReport,
+        FilledBeforeAccepted,
+        MissingOrderEffect,
+        MissingPositionEffect,
+        ChangedCommission,
+        ChangedCommissionWithOrderReport,
+        ChangedPrice,
+        ChangedAccount,
+        ChangedPositionPrice,
+        PartialPositionEffect,
+        ConflictingPositionBinding,
+    }
+
+    #[rstest]
+    #[case::same_source(false, RetainedFillFixture::Complete)]
+    #[case::same_source_with_order_report(false, RetainedFillFixture::CompleteWithOrderReport)]
+    #[case::filled_before_accepted(false, RetainedFillFixture::FilledBeforeAccepted)]
+    #[case::changed_closed_order_source(true, RetainedFillFixture::Complete)]
+    #[case::position_only_reconstructs_order(false, RetainedFillFixture::MissingOrderEffect)]
+    #[case::order_only_is_incomplete(false, RetainedFillFixture::MissingPositionEffect)]
+    #[case::changed_commission(false, RetainedFillFixture::ChangedCommission)]
+    #[case::changed_commission_with_order_report(
+        false,
+        RetainedFillFixture::ChangedCommissionWithOrderReport
+    )]
+    #[case::changed_price(false, RetainedFillFixture::ChangedPrice)]
+    #[case::changed_account(false, RetainedFillFixture::ChangedAccount)]
+    #[case::changed_position_price(false, RetainedFillFixture::ChangedPositionPrice)]
+    #[case::partial_position_effect(false, RetainedFillFixture::PartialPositionEffect)]
+    #[case::conflicting_position_binding(false, RetainedFillFixture::ConflictingPositionBinding)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_final_inventory_rechecks_fill_only_closed_order_sources(
+        #[case] change_source: bool,
+        #[case] fixture: RetainedFillFixture,
+        #[values(false, true)] run: bool,
+    ) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupFinalFillSourceNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let account_id = AccountId::from("STARTUP-MASS-STATUS-001");
+        let client_id = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let position_id = PositionId::from("RETAINED-FILL-POSITION");
+        let make_order = |id, venue_id, accepted| {
+            let mut order = OrderTestBuilder::new(OrderType::Limit)
+                .trader_id(node.kernel().trader_id())
+                .instrument_id(instrument.id())
+                .client_order_id(id)
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("1.0"))
+                .price(Price::from("100.0"))
+                .build();
+            order
+                .apply(TestOrderEventStubs::submitted(&order, account_id))
+                .unwrap();
+            if accepted {
+                order
+                    .apply(TestOrderEventStubs::accepted(&order, account_id, venue_id))
+                    .unwrap();
+            }
+            order
+        };
+        let mut historical = make_order(
+            ClientOrderId::from("O-FILL-HISTORY"),
+            VenueOrderId::from("V-FILL-HISTORY"),
+            fixture != RetainedFillFixture::FilledBeforeAccepted,
+        );
+        let trigger = make_order(
+            ClientOrderId::from("O-FILL-SOURCE-TRIGGER"),
+            VenueOrderId::from("V-FILL-SOURCE-TRIGGER"),
+            true,
+        );
+        let canceled =
+            TestOrderEventStubs::canceled(&trigger, account_id, trigger.venue_order_id());
+        let OrderEventAny::Filled(fill) = TestOrderEventStubs::filled(
+            &historical,
+            &instrument,
+            None,
+            Some(position_id),
+            Some(Price::from("100.0")),
+            Some(Quantity::from("1.0")),
+            None,
+            None,
+            None,
+            Some(account_id),
+        ) else {
+            unreachable!()
+        };
+        let mut fill_report = FillReport::new(
+            fill.account_id,
+            fill.instrument_id,
+            fill.venue_order_id,
+            fill.trade_id,
+            fill.order_side,
+            fill.last_qty,
+            fill.last_px,
+            fill.commission.expect("filled fixture includes commission"),
+            fill.liquidity_side,
+            Some(fill.client_order_id),
+            fill.position_id,
+            fill.ts_event,
+            fill.ts_init,
+            None,
+        );
+        if fixture != RetainedFillFixture::MissingOrderEffect {
+            historical
+                .apply(OrderEventAny::Filled(fill.clone()))
+                .unwrap();
+        }
+        match fixture {
+            RetainedFillFixture::ChangedCommission
+            | RetainedFillFixture::ChangedCommissionWithOrderReport => {
+                fill_report.commission = Money::new(3.0, fill_report.commission.currency);
+            }
+            RetainedFillFixture::ChangedPrice => fill_report.last_px = Price::from("101.0"),
+            RetainedFillFixture::ChangedAccount => {
+                fill_report.account_id = AccountId::from("OTHER-001");
+            }
+            _ => {}
+        }
+        let mut position_fill = fill;
+        if fixture == RetainedFillFixture::ChangedPositionPrice {
+            position_fill.last_px = Price::from("101.0");
+        } else if fixture == RetainedFillFixture::PartialPositionEffect {
+            position_fill.last_qty = Quantity::from("0.5");
+        }
+        let position = Position::new(&instrument, position_fill);
+        let cache = node.kernel().cache();
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            cache
+                .add_order(historical.clone(), None, Some(client_id), false)
+                .unwrap();
+            cache
+                .add_order(trigger, None, Some(client_id), false)
+                .unwrap();
+            if fixture != RetainedFillFixture::MissingPositionEffect {
+                cache.add_position(&position, OmsType::Hedging).unwrap();
+            }
+            cache.build_index();
+            if fixture == RetainedFillFixture::ConflictingPositionBinding {
+                cache
+                    .add_position_id(
+                        &PositionId::from("OTHER-POSITION"),
+                        &instrument.id().venue,
+                        &historical.client_order_id(),
+                        &historical.strategy_id(),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                cache.is_order_closed(&historical.client_order_id()),
+                fixture != RetainedFillFixture::MissingOrderEffect
+            );
+        }
+        let mut mass_status = ExecutionMassStatus::new(
+            client_id,
+            account_id,
+            instrument.id().venue,
+            UnixNanos::from(1),
+            None,
+        );
+        mass_status.add_fill_reports(vec![fill_report]);
+        if matches!(
+            fixture,
+            RetainedFillFixture::CompleteWithOrderReport
+                | RetainedFillFixture::ChangedCommissionWithOrderReport
+        ) {
+            let mut report = test_order_report(
+                account_id,
+                historical.client_order_id(),
+                historical.venue_order_id().unwrap(),
+                OrderStatus::Filled,
+            );
+            report.quantity = historical.quantity();
+            report.filled_qty = historical.filled_qty();
+            report.avg_px = historical.avg_px();
+            report.venue_position_id = Some(position_id);
+            mass_status.add_order_reports(vec![report]);
+        }
+        mass_status.add_position_reports(vec![PositionStatusReport::new(
+            account_id,
+            instrument.id(),
+            PositionSideSpecified::Long,
+            Quantity::from("1.0"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+            Some(position_id),
+            None,
+        )]);
+        *state.mass_status.lock() = Some(mass_status);
+        *state.queued_exec_events.lock() = vec![
+            ExecutionEvent::Account(startup_queued_account_state(account_id)),
+            ExecutionEvent::Order(canceled),
+        ];
+        let callback_count = Rc::new(Cell::new(0));
+        let handler = TypedHandler::from({
+            let cache = cache.clone();
+            let callback_count = callback_count.clone();
+            move |_event: &OrderEventAny| {
+                let source = if change_source {
+                    ClientId::from("OTHER-CLIENT")
+                } else {
+                    client_id
+                };
+                let current = cache
+                    .borrow()
+                    .order_owned(&historical.client_order_id())
+                    .unwrap();
+                cache
+                    .borrow_mut()
+                    .add_order(current, None, Some(source), true)
+                    .unwrap();
+                callback_count.set(callback_count.get() + 1);
+            }
+        });
+        let topic = switchboard::get_order_canceled_topic(instrument.id());
+        msgbus::subscribe_order_events(topic.to_string().into(), handler.clone(), None);
+        let observed = Arc::new(Mutex::new(None));
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: node.handle(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        msgbus::unsubscribe_order_events(topic.to_string().into(), &handler);
+        assert!(
+            result.is_ok(),
+            "startup must reach the final boundary: {result:#?}"
+        );
+        assert_eq!(callback_count.get(), 1);
+        let summary = observed
+            .lock()
+            .clone()
+            .expect("actor must observe final evidence");
+        assert!(summary.pending_execution.all_applications_confirmed());
+        let report = summary.clients[0].report.as_ref().unwrap();
+        let complete = matches!(
+            fixture,
+            RetainedFillFixture::Complete
+                | RetainedFillFixture::CompleteWithOrderReport
+                | RetainedFillFixture::FilledBeforeAccepted
+                | RetainedFillFixture::MissingOrderEffect
+        );
+        assert_eq!(
+            report.application.all_received_reports_reconciled(),
+            complete,
+            "{:#?}",
+            report.application
+        );
+        assert_eq!(report.application.fills.reconciled, usize::from(complete));
+        let inventory = report.final_inventory.unwrap();
+        assert_eq!(
+            inventory.source_valid,
+            !change_source && fixture != RetainedFillFixture::ChangedAccount
+        );
+        if complete {
+            assert_eq!(inventory.all_inventory_reconciled(), !change_source);
+        }
+    }
+
+    #[rstest]
+    #[case::start(false)]
+    #[case::run(true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_processes_queued_execution_before_actor_start(
+        #[case] run: bool,
+        #[values(false, true)] rejected_child: bool,
+    ) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupQueuedExecutionNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let account_id = AccountId::from("STARTUP-MASS-STATUS-001");
+        let client_id = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let client_order_id = ClientOrderId::from("O-STARTUP-QUEUED");
+        let venue_order_id = VenueOrderId::from("V-STARTUP-QUEUED");
+        let mut order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(node.kernel().trader_id())
+            .instrument_id(instrument_id)
+            .client_order_id(client_order_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+        order
+            .apply(TestOrderEventStubs::submitted(&order, account_id))
+            .unwrap();
+        let OrderEventAny::Accepted(accepted) =
+            TestOrderEventStubs::accepted(&order, account_id, venue_order_id)
+        else {
+            unreachable!()
+        };
+        let canceled = TestOrderEventStubs::canceled(&order, account_id, Some(venue_order_id));
+        {
+            let cache = node.kernel().cache();
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument).unwrap();
+            cache
+                .add_order(order, None, Some(client_id), false)
+                .unwrap();
+            assert!(cache.account(&account_id).is_none());
+        }
+        *state.mass_status.lock() = Some(ExecutionMassStatus::new(
+            client_id,
+            account_id,
+            instrument_id.venue,
+            UnixNanos::from(1),
+            None,
+        ));
+        let mut accepted_batch = vec![accepted];
+
+        if rejected_child {
+            let mut missing_order = accepted;
+            missing_order.client_order_id = ClientOrderId::from("O-STARTUP-MISSING");
+            missing_order.venue_order_id = VenueOrderId::from("V-STARTUP-MISSING");
+            accepted_batch.insert(0, missing_order);
+        }
+
+        *state.queued_exec_events.lock() = vec![
+            ExecutionEvent::Account(startup_queued_account_state(account_id)),
+            ExecutionEvent::OrderAcceptedBatch(OrderAcceptedBatch::new(accepted_batch)),
+            ExecutionEvent::Order(canceled),
+        ];
+        let observed = Arc::new(Mutex::new(None));
+        let handle = node.handle();
+        let during_dispatch = Arc::new(Mutex::new(None));
+        let handler = TypedHandler::from({
+            let handle = handle.clone();
+            let clock = node.kernel().clock();
+            let during_dispatch = during_dispatch.clone();
+            move |_event: &OrderEventAny| {
+                *during_dispatch.lock() = Some((
+                    handle.startup_reconciliation_summary().is_none(),
+                    clock.borrow().timestamp_ns(),
+                ));
+            }
+        });
+        let topic = switchboard::get_order_canceled_topic(instrument_id);
+        msgbus::subscribe_order_events(topic.to_string().into(), handler.clone(), None);
+        node.add_actor(StartupCacheActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: handle.clone(),
+            client_order_id,
+            account_id,
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        msgbus::unsubscribe_order_events(topic.to_string().into(), &handler);
+        assert!(result.is_ok(), "startup failed: {result:#?}");
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        let observation = observed.lock();
+        let observation = observation
+            .as_ref()
+            .expect("actor must observe startup cache");
+        assert_eq!(observation.status, Some(OrderStatus::Canceled));
+        assert_eq!(observation.event_count, 4);
+        assert!(observation.account_present);
+        let (unpublished, ts_dispatch) = during_dispatch
+            .lock()
+            .expect("queued cancellation must reach its native callback");
+        assert!(
+            unpublished,
+            "summary must remain unavailable during pending dispatch"
+        );
+        let summary = observation
+            .summary
+            .as_ref()
+            .expect("summary must precede actor startup");
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Finished);
+        assert_eq!(summary.pending_execution.applied, 3);
+        assert_eq!(
+            summary.pending_execution.incomplete,
+            u64::from(rejected_child)
+        );
+        assert_eq!(summary.pending_execution.unacknowledged, 0);
+        assert!(!summary.pending_execution.overflowed);
+        assert_eq!(
+            summary.pending_execution.all_applications_confirmed(),
+            !rejected_child
+        );
+        assert!(
+            summary.clients[0]
+                .report
+                .as_ref()
+                .unwrap()
+                .final_inventory
+                .unwrap()
+                .all_inventory_reconciled()
+        );
+        assert!(summary.ts_finished >= ts_dispatch);
+        assert!(Arc::ptr_eq(
+            summary,
+            &handle.startup_reconciliation_summary().unwrap(),
+        ));
+        assert_eq!(handle.state(), NodeState::Stopped);
+    }
+
+    fn startup_queued_account_state(account_id: AccountId) -> AccountState {
+        AccountState::new(
+            account_id,
+            AccountType::Margin,
+            vec![AccountBalance::new(
+                Money::from("1000 USDT"),
+                Money::from("0 USDT"),
+                Money::from("1000 USDT"),
+            )],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            Some(Currency::USDT()),
+        )
+    }
+
+    #[rstest]
+    #[case::start_stop(false, false, false)]
+    #[case::run_stop(true, false, false)]
+    #[case::start_shutdown(false, true, false)]
+    #[case::run_shutdown(true, true, false)]
+    #[case::start_stop_before_pending(false, false, true)]
+    #[case::run_stop_before_pending(true, false, true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_execution_callback_aborts_before_actor_start(
+        #[case] run: bool,
+        #[case] shutdown: bool,
+        #[case] stop_before_pending: bool,
+    ) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupQueuedAbortNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let account_id = AccountId::from("STARTUP-MASS-STATUS-001");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let client_order_id = ClientOrderId::from("O-STARTUP-ABORT");
+        let venue_order_id = VenueOrderId::from("V-STARTUP-ABORT");
+        let mut order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(node.kernel().trader_id())
+            .instrument_id(instrument_id)
+            .client_order_id(client_order_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+        order
+            .apply(TestOrderEventStubs::submitted(&order, account_id))
+            .unwrap();
+        order
+            .apply(TestOrderEventStubs::accepted(
+                &order,
+                account_id,
+                venue_order_id,
+            ))
+            .unwrap();
+        let canceled = TestOrderEventStubs::canceled(&order, account_id, Some(venue_order_id));
+        {
+            let cache = node.kernel().cache();
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument).unwrap();
+            cache
+                .add_order(
+                    order,
+                    None,
+                    Some(ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID)),
+                    false,
+                )
+                .unwrap();
+        }
+        *state.queued_exec_events.lock() = vec![
+            ExecutionEvent::Account(startup_queued_account_state(account_id)),
+            ExecutionEvent::Order(canceled),
+        ];
+        let handle = node.handle();
+        let during_reconciliation = Arc::new(Mutex::new(None));
+        let raw_handler = ShareableMessageHandler::from_typed({
+            let handle = handle.clone();
+            let clock = node.kernel().clock();
+            let during_reconciliation = during_reconciliation.clone();
+            move |_report: &OrderStatusReport| {
+                *during_reconciliation.lock() = Some((
+                    handle.startup_reconciliation_summary().is_none(),
+                    clock.borrow().timestamp_ns(),
+                ));
+                handle.stop();
+            }
+        });
+        let raw_topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+
+        if stop_before_pending {
+            let mut mass_status = ExecutionMassStatus::new(
+                ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID),
+                account_id,
+                instrument_id.venue,
+                UnixNanos::from(1),
+                None,
+            );
+            let mut report = test_order_report(
+                account_id,
+                client_order_id,
+                venue_order_id,
+                OrderStatus::Accepted,
+            );
+            {
+                let cache = node.kernel().cache();
+                let cache = cache.borrow();
+                let order = cache.order(&client_order_id).unwrap();
+                report.order_type = order.order_type();
+                report.time_in_force = order.time_in_force();
+                report.quantity = order.quantity();
+                report.price = order.price();
+            }
+            mass_status.add_order_reports(vec![report]);
+            *state.mass_status.lock() = Some(mass_status);
+            msgbus::subscribe_any(raw_topic.to_string().into(), raw_handler.clone(), None);
+        }
+        let trader_id = node.kernel().trader_id();
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let during_dispatch = Arc::new(Mutex::new(None));
+        let handler = TypedHandler::from({
+            let handle = handle.clone();
+            let callback_count = callback_count.clone();
+            let clock = node.kernel().clock();
+            let during_dispatch = during_dispatch.clone();
+            move |_event: &OrderEventAny| {
+                callback_count.fetch_add(1, Ordering::Relaxed);
+                *during_dispatch.lock() = Some((
+                    handle.startup_reconciliation_summary().is_none(),
+                    clock.borrow().timestamp_ns(),
+                ));
+
+                if stop_before_pending {
+                    // Shutdown may dispatch the skipped prefix after publication.
+                    return;
+                }
+
+                if shutdown {
+                    let command = ShutdownSystem::new(
+                        trader_id,
+                        ustr::Ustr::from("StartupQueuedAbort"),
+                        None,
+                        UUID4::new(),
+                        UnixNanos::from(1),
+                        None,
+                    );
+                    msgbus::publish_any(
+                        MessagingSwitchboard::shutdown_system_topic(),
+                        command.as_any(),
+                    );
+                } else {
+                    handle.stop();
+                }
+            }
+        });
+        let topic = switchboard::get_order_canceled_topic(instrument_id);
+        msgbus::subscribe_order_events(topic.to_string().into(), handler.clone(), None);
+        let observed = Arc::new(Mutex::new(None));
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: handle.clone(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        msgbus::unsubscribe_order_events(topic.to_string().into(), &handler);
+
+        if stop_before_pending {
+            msgbus::unsubscribe_any(raw_topic.to_string().into(), &raw_handler);
+        }
+        assert!(result.is_ok(), "startup abort failed: {result:#?}");
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Interrupted);
+        assert_eq!(summary.instance_id, node.instance_id());
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
+
+        if stop_before_pending {
+            let (unpublished, ts_reconciliation) = during_reconciliation.lock().unwrap();
+            assert!(
+                unpublished,
+                "summary must remain unavailable during reconciliation"
+            );
+            assert!(summary.ts_finished >= ts_reconciliation);
+
+            if let Some((unpublished, _)) = *during_dispatch.lock() {
+                assert!(
+                    !unpublished,
+                    "skipped events may only dispatch during later cleanup"
+                );
+            }
+        } else {
+            assert_eq!(callback_count.load(Ordering::Relaxed), 1);
+            let (unpublished, ts_dispatch) = during_dispatch.lock().unwrap();
+            assert!(
+                unpublished,
+                "summary must remain unavailable during pending dispatch"
+            );
+            assert!(summary.ts_finished >= ts_dispatch);
+        }
+        assert!(
+            observed.lock().is_none(),
+            "actor must not start after queued abort"
+        );
+        assert_eq!(handle.state(), NodeState::Stopped);
+    }
+
+    #[rstest]
+    #[case::start(false)]
+    #[case::run(true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_keeps_socket_notifications_deferred_and_ordered(#[case] run: bool) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "StartupDeferredSocketNode",
+            config,
+            StartupMassStatusBehavior::Available,
+        );
+        let socket_event = |socket_state| {
+            SystemEvent::SocketState(SocketStateChange::new(
+                ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID),
+                Some(Venue::from("BINANCE")),
+                ustr::Ustr::from("startup-test-socket"),
+                socket_state,
+            ))
+        };
+        state
+            .connect_system_events
+            .lock()
+            .push(socket_event(SocketState::Connected));
+        state
+            .queued_system_events
+            .lock()
+            .push(socket_event(SocketState::Disconnected));
+        let observed = Arc::new(Mutex::new(None));
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let handler = ShareableMessageHandler::from_typed({
+            let observed = observed.clone();
+            let notifications = notifications.clone();
+            move |event: &SocketStateChanged| {
+                notifications
+                    .lock()
+                    .push((event.state, observed.lock().is_some()));
+            }
+        });
+        let topic = MessagingSwitchboard::socket_state_changed_topic();
+        msgbus::subscribe_any(topic.to_string().into(), handler.clone(), None);
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: node.handle(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        msgbus::unsubscribe_any(topic.to_string().into(), &handler);
+        assert!(result.is_ok(), "startup failed: {result:#?}");
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        assert_eq!(
+            *notifications.lock(),
+            vec![
+                (SocketState::Connected, true),
+                (SocketState::Disconnected, true)
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case::start_complete(false, true, StartupMassStatusBehavior::Available, true)]
+    #[case::run_complete(true, true, StartupMassStatusBehavior::Available, true)]
+    #[case::start_incomplete_collection(false, true, StartupMassStatusBehavior::Available, false)]
+    #[case::run_incomplete_collection(true, true, StartupMassStatusBehavior::Available, false)]
+    #[case::start_unavailable(false, true, StartupMassStatusBehavior::Unavailable, false)]
+    #[case::run_unavailable(true, true, StartupMassStatusBehavior::Unavailable, false)]
+    #[case::start_disabled(false, false, StartupMassStatusBehavior::Available, true)]
+    #[case::run_disabled(true, false, StartupMassStatusBehavior::Available, true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_summary_is_visible_to_actor_and_survives_stop(
+        #[case] run: bool,
+        #[case] enabled: bool,
+        #[case] behavior: StartupMassStatusBehavior,
+        #[case] reports_complete: bool,
+    ) {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: enabled,
+                reconciliation_lookback_mins: Some(42),
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) =
+            live_node_with_startup_mass_status_client("StartupSummaryActorNode", config, behavior);
+        let client_id = ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID);
+        let mut report = ExecutionMassStatus::new(
+            client_id,
+            AccountId::from("STARTUP-MASS-STATUS-001"),
+            Venue::from("BINANCE"),
+            UnixNanos::from(8),
+            None,
+        );
+        report.set_report_window(Some(UnixNanos::from(7)), reports_complete);
+        let report_id = report.report_id;
+        *state.mass_status.lock() = Some(report);
+        let handle = node.handle();
+        let observed = Arc::new(Mutex::new(None));
+        assert!(handle.startup_reconciliation_summary().is_none());
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: handle.clone(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        assert!(result.is_ok(), "unexpected startup failure: {result:#?}");
+        let summary = observed
+            .lock()
+            .clone()
+            .expect("summary must be available during actor startup");
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert_eq!(summary.instance_id, node.instance_id());
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
+        assert_eq!(summary.requested_lookback_mins, Some(42));
+        assert_eq!(summary.clients.len(), 1);
+        assert_eq!(summary.clients[0].client_id, client_id);
+        assert!(Arc::ptr_eq(
+            &summary,
+            &handle.startup_reconciliation_summary().unwrap()
+        ));
+
+        if enabled {
+            assert_eq!(summary.outcome, StartupReconciliationOutcome::Finished);
+            if matches!(behavior, StartupMassStatusBehavior::Available) {
+                assert_eq!(
+                    summary.clients[0].collection,
+                    MassStatusCollection::Received
+                );
+                let received = summary.clients[0].report.as_ref().unwrap();
+                assert_eq!(received.report_id, report_id);
+                assert_eq!(received.lookback_start, Some(UnixNanos::from(7)));
+                assert_eq!(
+                    received.ts_init,
+                    state.mass_status.lock().as_ref().unwrap().ts_init
+                );
+                assert!(
+                    summary.ts_started <= received.ts_init
+                        && received.ts_init <= summary.ts_finished
+                );
+                assert_eq!(received.reports_complete, reports_complete);
+                assert!(received.application.all_received_reports_reconciled());
+                assert!(!received.has_complete_account_collection(Some(42)));
+            } else {
+                assert_eq!(
+                    summary.clients[0].collection,
+                    MassStatusCollection::Unavailable
+                );
+                assert!(summary.clients[0].report.is_none());
+            }
+        } else {
+            assert_eq!(summary.outcome, StartupReconciliationOutcome::Disabled);
+            assert_eq!(
+                summary.clients[0].collection,
+                MassStatusCollection::NotRequested
+            );
+            assert!(summary.clients[0].report.is_none());
+            assert!(!state.mass_status_requested.load(Ordering::Relaxed));
+        }
+        node.dispose();
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_start_continues_when_mass_status_unavailable() {
         let config = LiveNodeConfig {
@@ -2537,6 +4333,14 @@ pub(crate) mod serial_tests {
 
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Finished);
+        assert_eq!(
+            summary.clients[0].collection,
+            MassStatusCollection::Unavailable
+        );
+        assert!(summary.clients[0].report.is_none());
+
         assert!(node.kernel().trader().borrow().is_disposed());
         assert_eq!(node.kernel().trader().borrow().component_count(), 0);
     }
@@ -3063,6 +4867,13 @@ pub(crate) mod serial_tests {
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Finished);
+        assert_eq!(
+            summary.clients[0].collection,
+            MassStatusCollection::Unavailable
+        );
+        assert!(summary.clients[0].report.is_none());
     }
 
     #[rstest]
@@ -3093,6 +4904,12 @@ pub(crate) mod serial_tests {
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Failed);
+        assert_eq!(summary.instance_id, node.instance_id());
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
+        assert_eq!(summary.clients[0].collection, MassStatusCollection::Failed);
+        assert!(summary.clients[0].report.is_none());
     }
 
     #[rstest]
@@ -3123,6 +4940,12 @@ pub(crate) mod serial_tests {
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Failed);
+        assert_eq!(summary.instance_id, node.instance_id());
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
+        assert_eq!(summary.clients[0].collection, MassStatusCollection::Failed);
+        assert!(summary.clients[0].report.is_none());
     }
 
     #[rstest]
@@ -3165,6 +4988,15 @@ pub(crate) mod serial_tests {
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
+        let summary = handle.startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.outcome, StartupReconciliationOutcome::Failed);
+        assert_eq!(summary.instance_id, node.instance_id());
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
+        assert_eq!(
+            summary.clients[0].collection,
+            MassStatusCollection::TimedOut
+        );
+        assert!(summary.clients[0].report.is_none());
     }
 
     // The maintenance dispatcher is a single `select!` arm in `LiveNode::run`

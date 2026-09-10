@@ -21,4 +21,5 @@ mod live;
 mod mock_venue;
 mod node;
 mod python;
+mod settlement;
 mod websocket;

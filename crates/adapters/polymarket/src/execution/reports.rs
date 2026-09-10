@@ -19,20 +19,17 @@ use nautilus_common::messages::execution::{
     GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
     GeneratePositionStatusReports, QueryAccount, QueryOrder,
 };
-use nautilus_core::{
-    UnixNanos, collections::AtomicMap, string::secret::SecretString, time::AtomicTime,
-};
+use nautilus_core::{UnixNanos, string::secret::SecretString, time::AtomicTime};
 use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
     enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId, VenueOrderId},
-    instruments::{Instrument, InstrumentAny},
+    instruments::Instrument,
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Currency, Quantity},
 };
 use rust_decimal::Decimal;
-use ustr::Ustr;
 
 use super::{
     PolymarketExecutionClient,
@@ -41,15 +38,16 @@ use super::{
         weighted_average_price,
     },
     reconciliation::{
-        FillContext, FillReportScope, TargetOrderReportScope, apply_fill_time_filters,
-        build_fill_reports_from_trades, build_reconciliation_position_reports,
-        build_target_order_report, cap_order_report_filled_qty, confirmed_filled_quantities,
+        FillContext, FillReportScope, TargetOrderReportScope, build_fill_reports_from_trades,
+        build_reconciliation_position_reports, build_target_order_report,
+        cap_order_report_filled_qty, confirmed_filled_quantities,
         normalize_terminal_order_report_quantity, venue_leg_filled_before_and_quantity,
     },
     responses::confirm_modify_replacement,
 };
 use crate::{
     common::enums::SignatureType,
+    execution::instruments::TokenInstrumentLookup,
     http::{
         clob::PolymarketClobHttpClient,
         query::{GetBalanceAllowanceParams, GetTradesParams},
@@ -227,12 +225,11 @@ impl PolymarketExecutionClient {
         let (mut order_fills, fill_discards) = build_fill_reports_from_trades(
             &trades,
             &ctx,
-            &self.shared_token_instruments,
+            &self.instrument_lookup,
             FillReportScope::new(Some(instrument_id), Some(venue_order_id))
                 .with_expected_order_side(expected_order_side),
             ts_init,
             self.config.reconciliation_load_ids(),
-            None,
         )?;
 
         if fill_discards.has_pending_target {
@@ -413,7 +410,7 @@ impl PolymarketExecutionClient {
 
         let http_client = self.http_client.clone();
         let fill_tracker = self.fill_tracker.clone();
-        let token_instruments = self.shared_token_instruments.clone();
+        let token_instruments = self.instrument_lookup.clone();
         let emitter = self.emitter.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
         let clock = self.clock;
@@ -548,7 +545,7 @@ impl PolymarketExecutionClient {
         let report = if let Some(order) = order {
             let mut report = build_target_order_report(
                 &order,
-                &self.shared_token_instruments,
+                &self.instrument_lookup,
                 &self.fill_context(),
                 TargetOrderReportScope::new(
                     instrument_id,
@@ -582,7 +579,7 @@ impl PolymarketExecutionClient {
                 fetch_confirmed_fill_reports(
                     &self.http_client,
                     &self.fill_context(),
-                    &self.shared_token_instruments,
+                    &self.instrument_lookup,
                     GetTradesParams::default(),
                     FillReportScope::new(Some(instrument_id), Some(venue_order_id))
                         .with_expected_order_side(report.order_side),
@@ -689,7 +686,7 @@ impl PolymarketExecutionClient {
         };
         let (mut reports, _) = super::reconciliation::build_order_reports_from_orders(
             &orders,
-            &self.shared_token_instruments,
+            &self.instrument_lookup,
             &ctx,
             cmd.instrument_id,
             self.clock.get_time_ns(),
@@ -833,11 +830,10 @@ impl PolymarketExecutionClient {
                     let (fills, _) = build_fill_reports_from_trades(
                         &trades,
                         &ctx,
-                        &self.shared_token_instruments,
+                        &self.instrument_lookup,
                         FillReportScope::new(cmd.instrument_id, None),
                         self.clock.get_time_ns(),
                         collection_load_ids,
-                        None,
                     )?;
                     confirmed_filled_quantities(&fills)
                 }
@@ -949,20 +945,27 @@ impl PolymarketExecutionClient {
         } else {
             self.config.reconciliation_load_ids()
         };
-        let (mut reports, _) = build_fill_reports_from_trades(
+        let (mut reports, discards) = build_fill_reports_from_trades(
             &trades,
             &ctx,
-            &self.shared_token_instruments,
+            &self.instrument_lookup,
             FillReportScope::new(scope_instrument_id, cmd.venue_order_id)
-                .with_expected_order_side(expected_order_side),
+                .with_expected_order_side(expected_order_side)
+                .with_time_window(cmd.start, cmd.end),
             self.clock.get_time_ns(),
             collection_load_ids,
-            None,
         )?;
 
-        self.fill_tracker.snap_fill_reports(&mut reports);
+        anyhow::ensure!(
+            discards.reports_complete(),
+            "incomplete fill reports: {} in-scope unmapped fills, {} unattributed maker trades, \
+             {} trades with invalid timestamps",
+            discards.in_scope_historical,
+            discards.unowned_maker_trades,
+            discards.untimestamped_trades,
+        );
 
-        let reports = apply_fill_time_filters(reports, cmd.start, cmd.end);
+        self.fill_tracker.snap_fill_reports(&mut reports);
 
         log::debug!("Generated {} fill reports", reports.len());
         Ok(reports)
@@ -980,11 +983,11 @@ impl PolymarketExecutionClient {
             .context("failed to fetch positions from Data API")?;
 
         let ts_now = self.clock.get_time_ns();
-        let reports = build_reconciliation_position_reports(
+        let (reports, _) = build_reconciliation_position_reports(
             &positions,
             self.core.account_id,
             ts_now,
-            &self.shared_token_instruments,
+            &self.instrument_lookup,
             cmd.instrument_id,
             self.config.reconciliation_load_ids(),
         )?;
@@ -1001,7 +1004,7 @@ impl PolymarketExecutionClient {
         super::reconciliation::generate_mass_status(
             &self.http_client,
             &self.data_api_client,
-            &self.shared_token_instruments,
+            &self.instrument_lookup,
             &self.fill_tracker,
             &ctx,
             self.core.client_id,
@@ -1017,7 +1020,7 @@ impl PolymarketExecutionClient {
 async fn fetch_confirmed_fill_reports(
     http_client: &PolymarketClobHttpClient,
     ctx: &FillContext<'_>,
-    token_instruments: &AtomicMap<Ustr, InstrumentAny>,
+    token_instruments: &dyn TokenInstrumentLookup,
     params: GetTradesParams,
     scope: FillReportScope,
     ts_init: UnixNanos,
@@ -1030,15 +1033,8 @@ async fn fetch_confirmed_fill_reports(
             return Ok(None);
         }
     };
-    let (reports, _) = build_fill_reports_from_trades(
-        &trades,
-        ctx,
-        token_instruments,
-        scope,
-        ts_init,
-        load_ids,
-        None,
-    )?;
+    let (reports, _) =
+        build_fill_reports_from_trades(&trades, ctx, token_instruments, scope, ts_init, load_ids)?;
     Ok(Some(reports))
 }
 

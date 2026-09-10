@@ -3566,6 +3566,7 @@ fn test_generate_reconciliation_order_events_full_fill_supersedes_terminal_statu
     assert!(matches!(events[0], OrderEventAny::Filled(_)));
     assert_eq!(reconciled.filled_qty(), Quantity::from(100));
     assert_eq!(reconciled.status(), OrderStatus::Filled);
+    assert!(order_report_is_reconciled(&reconciled, &report));
 }
 
 #[rstest]
@@ -5962,6 +5963,69 @@ fn test_reconcile_closed_order_within_tolerance_is_noop(instrument: InstrumentAn
         result.is_none(),
         "closed order with sub-tolerance jitter must not emit a new fill",
     );
+    assert!(order_report_is_reconciled(&order, &report));
+}
+
+#[rstest]
+#[case(false, "9.99", true, false)]
+#[case(false, "9.98", false, false)]
+#[case(false, "10.00", true, false)]
+#[case(false, "10.01", false, true)]
+#[case(true, "9.99", true, false)]
+#[case(true, "9.98", false, false)]
+#[case(true, "10.01", true, false)]
+#[case(true, "10.02", false, false)]
+fn test_order_report_postcondition_preserves_native_fill_tolerance(
+    instrument: InstrumentAny,
+    #[case] closed: bool,
+    #[case] reported_filled: &str,
+    #[case] reconciled: bool,
+    #[case] generates_fill: bool,
+) {
+    let client_order_id = ClientOrderId::from("O-TOLERANCE");
+    let venue_order_id = VenueOrderId::from("V-TOLERANCE");
+    let quantity = Quantity::from(if closed { "10.00" } else { "20.00" });
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(quantity)
+        .build();
+    submit_accept(&mut order, AccountId::from("SIM-001"), venue_order_id);
+    apply_fill(
+        &mut order,
+        &instrument,
+        TradeId::from("T-TOLERANCE"),
+        Quantity::from("10.00"),
+        Price::from("1.00000"),
+    );
+    assert_eq!(order.is_closed(), closed);
+    let mut report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Market,
+        order.status(),
+        quantity,
+        Quantity::from(reported_filled),
+    );
+    report.avg_px = Some(dec!(1.0));
+
+    let event = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::default());
+    if generates_fill {
+        assert!(matches!(event, Some(OrderEventAny::Filled(_))));
+    } else {
+        assert!(event.is_none());
+    }
+    assert_eq!(order_report_is_reconciled(&order, &report), reconciled);
+
+    if reconciled {
+        report.quantity = Quantity::from("30.00");
+        assert!(!order_report_is_reconciled(&order, &report));
+        report.quantity = quantity;
+        report.account_id = AccountId::from("SIM-OTHER");
+        assert!(!order_report_is_reconciled(&order, &report));
+    }
 }
 
 fn apply_events(order: &OrderAny, events: &[OrderEventAny]) -> OrderAny {

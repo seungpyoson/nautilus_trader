@@ -59,6 +59,8 @@
 //!   thread. `bind_senders` overwrites any existing TLS contents on the
 //!   thread, so the last caller wins.
 
+#[cfg(feature = "node")]
+use std::ops::ControlFlow;
 use std::{fmt::Debug, sync::Arc};
 
 use nautilus_common::{
@@ -67,8 +69,9 @@ use nautilus_common::{
         replace_system_event_sender,
     },
     messages::{
-        DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent, data::DataCommand,
-        execution::TradingCommand,
+        DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent,
+        data::DataCommand,
+        execution::{EventApplicationOutcome, TradingCommand},
     },
     msgbus::{self, MessagingSwitchboard},
     runner::{
@@ -78,6 +81,65 @@ use nautilus_common::{
     },
 };
 use nautilus_model::events::OrderEventAny;
+
+/// Application acknowledgements for direct execution messages handled by this dispatcher.
+///
+/// Batches count each child dispatch; a report (including mass status) counts once.
+/// Nested endpoint calls and other callback paths are not counted, even when they use the same
+/// endpoints. These counts do not establish queue quiescence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionApplicationSummary {
+    /// Dispatches whose configured native application completed.
+    pub applied: u64,
+    /// Dispatches with failed or unconfirmed native application.
+    pub incomplete: u64,
+    /// Dispatches that had no acknowledging handler, or were suppressed before dispatch.
+    pub unacknowledged: u64,
+    /// At least one counter could not represent its full count.
+    pub overflowed: bool,
+}
+
+impl ExecutionApplicationSummary {
+    /// Returns whether all observed applications were acknowledged as completed.
+    ///
+    /// An empty set satisfies this predicate; it does not establish startup completion.
+    #[must_use]
+    pub const fn all_applications_confirmed(&self) -> bool {
+        self.incomplete == 0 && self.unacknowledged == 0 && !self.overflowed
+    }
+
+    pub(crate) fn record(&mut self, outcome: Option<EventApplicationOutcome>) {
+        let count = match outcome {
+            Some(EventApplicationOutcome::Applied) => &mut self.applied,
+            Some(EventApplicationOutcome::Incomplete) => &mut self.incomplete,
+            None => &mut self.unacknowledged,
+        };
+
+        if let Some(next) = count.checked_add(1) {
+            *count = next;
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    #[cfg(feature = "node")]
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.overflowed |= other.overflowed;
+
+        for (count, incoming) in [
+            (&mut self.applied, other.applied),
+            (&mut self.incomplete, other.incomplete),
+            (&mut self.unacknowledged, other.unacknowledged),
+        ] {
+            if let Some(next) = count.checked_add(incoming) {
+                *count = next;
+            } else {
+                *count = u64::MAX;
+                self.overflowed = true;
+            }
+        }
+    }
+}
 
 /// Asynchronous implementation of `DataCommandSender` for live environments.
 #[derive(Debug)]
@@ -469,111 +531,94 @@ impl AsyncRunner {
     /// Handles an execution event by sending to the appropriate engine endpoint.
     #[inline]
     pub fn handle_exec_event(event: ExecutionEvent) {
+        let _ = Self::handle_exec_event_with_outcome(event);
+    }
+
+    /// Dispatches through the normal endpoints and counts their application acknowledgements.
+    #[inline]
+    #[must_use]
+    pub fn handle_exec_event_with_outcome(event: ExecutionEvent) -> ExecutionApplicationSummary {
+        let mut summary = ExecutionApplicationSummary::default();
+
         match event {
             ExecutionEvent::Order(order_event) => {
-                msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), order_event);
+                summary.record(msgbus::send_order_event_with_outcome(
+                    MessagingSwitchboard::exec_engine_process(),
+                    order_event,
+                ));
             }
             ExecutionEvent::OrderSubmittedBatch(batch) => {
                 for submitted in batch {
-                    msgbus::send_order_event(
+                    summary.record(msgbus::send_order_event_with_outcome(
                         MessagingSwitchboard::exec_engine_process(),
                         OrderEventAny::Submitted(submitted),
-                    );
+                    ));
                 }
             }
             ExecutionEvent::OrderAcceptedBatch(batch) => {
                 for accepted in batch {
-                    msgbus::send_order_event(
+                    summary.record(msgbus::send_order_event_with_outcome(
                         MessagingSwitchboard::exec_engine_process(),
                         OrderEventAny::Accepted(accepted),
-                    );
+                    ));
                 }
             }
             ExecutionEvent::OrderCanceledBatch(batch) => {
                 for canceled in batch {
-                    msgbus::send_order_event(
+                    summary.record(msgbus::send_order_event_with_outcome(
                         MessagingSwitchboard::exec_engine_process(),
                         OrderEventAny::Canceled(canceled),
-                    );
+                    ));
                 }
             }
             ExecutionEvent::Report(report) => {
-                Self::handle_exec_report(report);
+                summary.record(msgbus::send_execution_report_with_outcome(
+                    MessagingSwitchboard::exec_engine_reconcile_execution_report(),
+                    report,
+                ));
             }
             ExecutionEvent::Account(ref account) => {
-                msgbus::send_account_state(
+                summary.record(msgbus::send_account_state_with_outcome(
                     MessagingSwitchboard::portfolio_update_account(),
                     account,
-                );
+                ));
             }
         }
+
+        summary
     }
 
     #[inline]
     pub fn handle_exec_report(report: ExecutionReport) {
-        let endpoint = MessagingSwitchboard::exec_engine_reconcile_execution_report();
-        msgbus::send_execution_report(endpoint, report);
+        let _ = Self::handle_exec_event_with_outcome(ExecutionEvent::Report(report));
     }
 }
 
 #[cfg(feature = "node")]
 impl AsyncRunner {
     pub(crate) fn poll_pending(&mut self, mut process: impl FnMut(PendingRunnerEvent)) -> usize {
+        self.poll_pending_until(|event| {
+            process(event);
+            ControlFlow::Continue(())
+        })
+    }
+
+    pub(crate) fn poll_pending_until(
+        &mut self,
+        process: impl FnMut(PendingRunnerEvent) -> ControlFlow<()>,
+    ) -> usize {
         self.bind_senders();
 
-        let pending = (
-            self.channels.time_evt_rx.len(),
-            self.channels.system_evt_rx.len(),
-            self.channels.system_cmd_rx.len(),
-            self.channels.exec_evt_rx.len(),
-            self.channels.exec_cmd_rx.len(),
-            self.channels.data_evt_rx.len(),
-            self.channels.data_cmd_rx.len(),
-        );
-        let mut processed = 0;
-        processed += poll_channel(
-            &mut self.channels.time_evt_rx,
-            pending.0,
-            PendingRunnerEvent::TimeEvent,
-            &mut process,
-        );
-        processed += poll_channel(
-            &mut self.channels.system_evt_rx,
-            pending.1,
-            PendingRunnerEvent::SystemEvent,
-            &mut process,
-        );
-        processed += poll_channel(
-            &mut self.channels.system_cmd_rx,
-            pending.2,
-            PendingRunnerEvent::SystemCommand,
-            &mut process,
-        );
-        processed += poll_channel(
-            &mut self.channels.exec_evt_rx,
-            pending.3,
-            PendingRunnerEvent::ExecEvent,
-            &mut process,
-        );
-        processed += poll_channel(
-            &mut self.channels.exec_cmd_rx,
-            pending.4,
-            PendingRunnerEvent::ExecCommand,
-            &mut process,
-        );
-        processed += poll_channel(
-            &mut self.channels.data_evt_rx,
-            pending.5,
-            PendingRunnerEvent::DataEvent,
-            &mut process,
-        );
-        processed += poll_channel(
-            &mut self.channels.data_cmd_rx,
-            pending.6,
-            PendingRunnerEvent::DataCommand,
-            &mut process,
-        );
-        processed
+        RunnerReceivers {
+            time_evt: &mut self.channels.time_evt_rx,
+            system_evt: &mut self.channels.system_evt_rx,
+            system_cmd: &mut self.channels.system_cmd_rx,
+            exec_evt: &mut self.channels.exec_evt_rx,
+            exec_cmd: &mut self.channels.exec_cmd_rx,
+            data_evt: &mut self.channels.data_evt_rx,
+            data_cmd: &mut self.channels.data_cmd_rx,
+        }
+        .poll_pending(process)
     }
 
     pub(crate) async fn recv(&mut self) -> Option<PendingRunnerEvent> {
@@ -607,20 +652,108 @@ impl AsyncRunner {
 }
 
 #[cfg(feature = "node")]
+pub(crate) struct RunnerReceivers<'a> {
+    pub(crate) time_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
+    pub(crate) system_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
+    pub(crate) system_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
+    pub(crate) exec_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    pub(crate) exec_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
+    pub(crate) data_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    pub(crate) data_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+}
+
+#[cfg(feature = "node")]
+impl RunnerReceivers<'_> {
+    /// Processes at most each channel's pending length captured before dispatch starts.
+    /// A break leaves all remaining messages queued for the next lifecycle phase.
+    pub(crate) fn poll_pending(
+        &mut self,
+        mut process: impl FnMut(PendingRunnerEvent) -> ControlFlow<()>,
+    ) -> usize {
+        let pending = (
+            self.time_evt.len(),
+            self.system_evt.len(),
+            self.system_cmd.len(),
+            self.exec_evt.len(),
+            self.exec_cmd.len(),
+            self.data_evt.len(),
+            self.data_cmd.len(),
+        );
+        let mut processed = 0;
+        let mut control = ControlFlow::Continue(());
+        processed += poll_channel(
+            self.time_evt,
+            pending.0,
+            PendingRunnerEvent::TimeEvent,
+            &mut process,
+            &mut control,
+        );
+        processed += poll_channel(
+            self.system_evt,
+            pending.1,
+            PendingRunnerEvent::SystemEvent,
+            &mut process,
+            &mut control,
+        );
+        processed += poll_channel(
+            self.system_cmd,
+            pending.2,
+            PendingRunnerEvent::SystemCommand,
+            &mut process,
+            &mut control,
+        );
+        processed += poll_channel(
+            self.exec_evt,
+            pending.3,
+            PendingRunnerEvent::ExecEvent,
+            &mut process,
+            &mut control,
+        );
+        processed += poll_channel(
+            self.exec_cmd,
+            pending.4,
+            PendingRunnerEvent::ExecCommand,
+            &mut process,
+            &mut control,
+        );
+        processed += poll_channel(
+            self.data_evt,
+            pending.5,
+            PendingRunnerEvent::DataEvent,
+            &mut process,
+            &mut control,
+        );
+        processed += poll_channel(
+            self.data_cmd,
+            pending.6,
+            PendingRunnerEvent::DataCommand,
+            &mut process,
+            &mut control,
+        );
+        processed
+    }
+}
+
+#[cfg(feature = "node")]
 fn poll_channel<T>(
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
     pending: usize,
     event: impl Fn(T) -> PendingRunnerEvent,
-    process: &mut impl FnMut(PendingRunnerEvent),
+    process: &mut impl FnMut(PendingRunnerEvent) -> ControlFlow<()>,
+    control: &mut ControlFlow<()>,
 ) -> usize {
     let mut processed = 0;
 
     for _ in 0..pending {
+        if control.is_break() {
+            break;
+        }
+
         let Ok(message) = receiver.try_recv() else {
             break;
         };
 
-        process(event(message));
+        *control = process(event(message));
         processed += 1;
     }
 
@@ -675,6 +808,30 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[cfg(feature = "node")]
+    fn test_application_counter_overflow_cannot_confirm_completion(#[case] merge: bool) {
+        let mut summary = ExecutionApplicationSummary {
+            applied: u64::MAX,
+            ..Default::default()
+        };
+
+        if merge {
+            summary.merge(ExecutionApplicationSummary {
+                applied: 1,
+                ..Default::default()
+            });
+        } else {
+            summary.record(Some(EventApplicationOutcome::Applied));
+        }
+
+        assert_eq!(summary.applied, u64::MAX);
+        assert!(summary.overflowed);
+        assert!(!summary.all_applications_confirmed());
+    }
 
     // Test fixture for creating test quotes
     fn test_quote() -> QuoteTick {
@@ -747,6 +904,37 @@ mod tests {
             signal_rx,
             signal_tx,
         }
+    }
+
+    #[cfg(feature = "node")]
+    #[rstest]
+    fn test_poll_pending_until_leaves_remaining_messages_queued() {
+        let mut runner = AsyncRunner::new();
+        runner.bind_senders();
+        get_system_event_sender().send(test_system_event()).unwrap();
+        get_system_event_sender().send(test_system_event()).unwrap();
+        get_exec_event_sender()
+            .send(ExecutionEvent::Order(OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder()
+                    .client_order_id(ClientOrderId::from("O-POLL-STOP"))
+                    .build(),
+            )))
+            .unwrap();
+
+        let first = runner.poll_pending_until(|event| {
+            assert!(matches!(event, PendingRunnerEvent::SystemEvent(_)));
+            ControlFlow::Break(())
+        });
+        assert_eq!(first, 1);
+
+        let mut remaining = Vec::new();
+        let second = runner.poll_pending(|event| match event {
+            PendingRunnerEvent::SystemEvent(_) => remaining.push("system"),
+            PendingRunnerEvent::ExecEvent(_) => remaining.push("execution"),
+            _ => panic!("unexpected queued event"),
+        });
+        assert_eq!(second, 2);
+        assert_eq!(remaining, ["system", "execution"]);
     }
 
     #[cfg(feature = "node")]

@@ -188,6 +188,9 @@ impl RiskEngine {
                 if let Some(rc) = weak_process.upgrade() {
                     rc.borrow_mut().process(event);
                 }
+
+                // Risk event processing is observational, not an application acknowledgement
+                None
             }),
         );
 

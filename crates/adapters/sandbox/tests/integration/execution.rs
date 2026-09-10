@@ -732,17 +732,26 @@ fn setup_order_event_handler() {
     let (handler, _saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(Some(
         Ustr::from("ExecEngine.process"),
     ));
-    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+        let receiver = handler;
+        TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 }
 
 fn setup_account_state_handler(cache: Rc<RefCell<Cache>>) {
     let handler = TypedHandler::from(move |state: &AccountState| {
         cache.borrow_mut().update_account_state(state).unwrap();
     });
-    msgbus::register_account_state_endpoint(
-        MessagingSwitchboard::portfolio_update_account(),
-        handler,
-    );
+    msgbus::register_account_state_endpoint(MessagingSwitchboard::portfolio_update_account(), {
+        let receiver = handler;
+        TypedHandler::from_with_id(receiver.id(), move |event| {
+            receiver.handle(event);
+            None
+        })
+    });
 }
 
 #[rstest]
@@ -2417,10 +2426,13 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
                 *opening_fill_for_handler.borrow_mut() = Some(fill);
             }
         });
-        msgbus::register_order_event_endpoint(
-            MessagingSwitchboard::exec_engine_process(),
-            order_handler,
-        );
+        msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), {
+            let receiver = order_handler;
+            TypedIntoHandler::from_with_id(receiver.id(), move |event| {
+                receiver.handle(event);
+                None
+            })
+        });
 
         let usd = Currency::USD();
         let config = SandboxExecutionClientConfig {

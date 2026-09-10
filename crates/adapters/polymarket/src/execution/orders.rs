@@ -34,6 +34,7 @@ use rust_decimal_macros::dec;
 use super::{
     PolymarketExecutionClient,
     cancellations::execute_deferred_cancel,
+    instruments::instrument_neg_risk,
     order_builder::PolymarketOrderBuilder,
     parse::{
         InvalidMarketPriceError, compute_commission, instrument_fee_exponent, instrument_taker_fee,
@@ -90,7 +91,7 @@ impl PolymarketExecutionClient {
             return;
         }
 
-        let neg_risk = self.get_neg_risk(&order.instrument_id());
+        let neg_risk = instrument_neg_risk(&instrument);
         let token_id = instrument.raw_symbol().to_string();
         let tick_decimals = u32::from(instrument.min_price_increment_precision());
         let price = order.price().unwrap();
@@ -249,7 +250,7 @@ impl PolymarketExecutionClient {
             None => return,
         };
 
-        let neg_risk = self.get_neg_risk(&order.instrument_id());
+        let neg_risk = instrument_neg_risk(&instrument);
         let token_id = instrument.raw_symbol().to_string();
         let tick_size = instrument.price_increment();
         let tick_decimals = u32::from(instrument.min_price_increment_precision());
@@ -536,7 +537,6 @@ impl PolymarketExecutionClient {
 
     pub(super) fn submit_order_list_command(&self, cmd: &SubmitOrderList) {
         let mut batch_orders = Vec::with_capacity(cmd.order_inits.len());
-        let neg_risk_index = self.neg_risk_index.load();
         let ts_now = self.clock.get_time_ns();
 
         for order_init in &cmd.order_inits {
@@ -607,10 +607,7 @@ impl PolymarketExecutionClient {
                     quote_quantity: order.is_quote_quantity(),
                     time_in_force: order.time_in_force(),
                     post_only: order.is_post_only(),
-                    neg_risk: Self::get_neg_risk_from_snapshot(
-                        &neg_risk_index,
-                        &order.instrument_id(),
-                    ),
+                    neg_risk: instrument_neg_risk(&instrument),
                     expire_time: order.expire_time(),
                     tick_decimals: u32::from(instrument.min_price_increment_precision()),
                     size_precision: instrument.size_precision(),
@@ -961,11 +958,6 @@ impl PolymarketExecutionClient {
             );
         }
 
-        self.shared_token_instruments.insert(
-            ustr::Ustr::from(instrument.raw_symbol().as_str()),
-            instrument.clone(),
-        );
-
         let submitter = self.submitter.clone();
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
@@ -973,7 +965,7 @@ impl PolymarketExecutionClient {
         let fill_tracker = self.fill_tracker.clone();
         let order_contexts = self.order_contexts.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
-        let token_instruments = self.shared_token_instruments.clone();
+        let token_instruments = self.instrument_lookup.clone();
         let pending_cancels = self.pending_cancels.clone();
         let account_id = self.core.account_id;
         let client_order_id = cmd.client_order_id;
@@ -981,7 +973,7 @@ impl PolymarketExecutionClient {
         let token_id = instrument.raw_symbol().to_string();
         let tick_decimals = u32::from(instrument.min_price_increment_precision());
         let size_precision = instrument.size_precision();
-        let neg_risk = self.get_neg_risk(&instrument_id);
+        let neg_risk = instrument_neg_risk(&instrument);
         let user_address = self
             .secrets
             .funder
