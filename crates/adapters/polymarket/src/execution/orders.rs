@@ -1170,7 +1170,6 @@ impl PolymarketExecutionClient {
                     .with_expected_order_side(Some(order.order_side())),
                 clock.get_time_ns(),
                 load_ids.as_deref(),
-                None,
             ) {
                 Ok(result) => result,
                 Err(e) => {

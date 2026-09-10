@@ -596,19 +596,7 @@ impl AsyncRunner {
 
 #[cfg(feature = "node")]
 impl AsyncRunner {
-    pub(crate) fn poll_pending(&mut self, mut process: impl FnMut(PendingRunnerEvent)) -> usize {
-        self.poll_pending_until(|event| {
-            process(event);
-            ControlFlow::Continue(())
-        })
-    }
-
-    pub(crate) fn poll_pending_until(
-        &mut self,
-        process: impl FnMut(PendingRunnerEvent) -> ControlFlow<()>,
-    ) -> usize {
-        self.bind_senders();
-
+    pub(crate) fn receivers(&mut self) -> RunnerReceivers<'_> {
         RunnerReceivers {
             time_evt: &mut self.channels.time_evt_rx,
             system_evt: &mut self.channels.system_evt_rx,
@@ -618,7 +606,6 @@ impl AsyncRunner {
             data_evt: &mut self.channels.data_evt_rx,
             data_cmd: &mut self.channels.data_cmd_rx,
         }
-        .poll_pending(process)
     }
 
     pub(crate) async fn recv(&mut self) -> Option<PendingRunnerEvent> {
@@ -637,14 +624,14 @@ impl AsyncRunner {
             Some(event) = self.channels.exec_evt_rx.recv() => {
                 Some(PendingRunnerEvent::ExecEvent(event))
             }
-            Some(command) = self.channels.exec_cmd_rx.recv() => {
-                Some(PendingRunnerEvent::ExecCommand(command))
-            }
             Some(event) = self.channels.data_evt_rx.recv() => {
                 Some(PendingRunnerEvent::DataEvent(event))
             }
             Some(command) = self.channels.data_cmd_rx.recv() => {
                 Some(PendingRunnerEvent::DataCommand(command))
+            }
+            Some(command) = self.channels.exec_cmd_rx.recv() => {
+                Some(PendingRunnerEvent::ExecCommand(command))
             }
             else => None,
         }
@@ -664,7 +651,7 @@ pub(crate) struct RunnerReceivers<'a> {
 
 #[cfg(feature = "node")]
 impl RunnerReceivers<'_> {
-    /// Processes at most each channel's pending length captured before dispatch starts.
+    /// Processes a bounded snapshot, including data queued by callbacks before trading.
     /// A break leaves all remaining messages queued for the next lifecycle phase.
     pub(crate) fn poll_pending(
         &mut self,
@@ -710,13 +697,6 @@ impl RunnerReceivers<'_> {
             &mut control,
         );
         processed += poll_channel(
-            self.exec_cmd,
-            pending.4,
-            PendingRunnerEvent::ExecCommand,
-            &mut process,
-            &mut control,
-        );
-        processed += poll_channel(
             self.data_evt,
             pending.5,
             PendingRunnerEvent::DataEvent,
@@ -730,6 +710,57 @@ impl RunnerReceivers<'_> {
             &mut process,
             &mut control,
         );
+        if control.is_continue() {
+            processed += self.poll_trading_commands(pending.4, process);
+        }
+        processed
+    }
+
+    /// Drains finite callback residuals before terminal lifecycle health is checked.
+    pub(crate) fn drain_pending(&mut self, mut process: impl FnMut(PendingRunnerEvent)) -> usize {
+        let mut total = 0;
+        loop {
+            let processed = self.poll_pending(|event| {
+                process(event);
+                ControlFlow::Continue(())
+            });
+            total += processed;
+            if processed == 0 {
+                return total;
+            }
+        }
+    }
+
+    /// Data callbacks can enqueue further data, so each trading boundary takes one
+    /// fresh snapshot and leaves commands queued if that snapshot replenishes itself.
+    pub(crate) fn poll_trading_commands(
+        &mut self,
+        pending: usize,
+        mut process: impl FnMut(PendingRunnerEvent) -> ControlFlow<()>,
+    ) -> usize {
+        let mut processed = 0;
+        let mut control = ControlFlow::Continue(());
+        for index in 0..=pending {
+            let data_pending = self.data_evt.len();
+            processed += poll_channel(
+                self.data_evt,
+                data_pending,
+                PendingRunnerEvent::DataEvent,
+                &mut process,
+                &mut control,
+            );
+            if control.is_break() || !self.data_evt.is_empty() || index == pending {
+                break;
+            }
+            let Ok(command) = self.exec_cmd.try_recv() else {
+                break;
+            };
+            control = process(PendingRunnerEvent::ExecCommand(command));
+            processed += 1;
+            if control.is_break() {
+                break;
+            }
+        }
         processed
     }
 }
@@ -921,17 +952,20 @@ mod tests {
             )))
             .unwrap();
 
-        let first = runner.poll_pending_until(|event| {
+        let first = runner.receivers().poll_pending(|event| {
             assert!(matches!(event, PendingRunnerEvent::SystemEvent(_)));
             ControlFlow::Break(())
         });
         assert_eq!(first, 1);
 
         let mut remaining = Vec::new();
-        let second = runner.poll_pending(|event| match event {
-            PendingRunnerEvent::SystemEvent(_) => remaining.push("system"),
-            PendingRunnerEvent::ExecEvent(_) => remaining.push("execution"),
-            _ => panic!("unexpected queued event"),
+        let second = runner.receivers().poll_pending(|event| {
+            match event {
+                PendingRunnerEvent::SystemEvent(_) => remaining.push("system"),
+                PendingRunnerEvent::ExecEvent(_) => remaining.push("execution"),
+                _ => panic!("unexpected queued event"),
+            }
+            ControlFlow::Continue(())
         });
         assert_eq!(second, 2);
         assert_eq!(remaining, ["system", "execution"]);
@@ -939,7 +973,7 @@ mod tests {
 
     #[cfg(feature = "node")]
     #[rstest]
-    fn test_poll_pending_processes_entry_snapshot_across_channels() {
+    fn test_poll_pending_defers_trading_when_data_snapshot_is_replenished() {
         let (time_evt_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel();
         let (data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel();
         let (data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1017,50 +1051,60 @@ mod tests {
         let mut processed_by_channel = [0; 7];
         let mut processed_order = Vec::new();
 
-        let first = runner.poll_pending(|event| match event {
-            PendingRunnerEvent::TimeEvent(_) => {
-                processed_by_channel[0] += 1;
-                processed_order.push("time");
+        let first = runner.receivers().poll_pending(|event| {
+            match event {
+                PendingRunnerEvent::TimeEvent(_) => {
+                    processed_by_channel[0] += 1;
+                    processed_order.push("time");
+                }
+                PendingRunnerEvent::SystemEvent(_) => {
+                    processed_by_channel[1] += 1;
+                    processed_order.push("system_event");
+                }
+                PendingRunnerEvent::SystemCommand(_) => {
+                    processed_by_channel[2] += 1;
+                    processed_order.push("system_command");
+                }
+                PendingRunnerEvent::ExecEvent(_) => {
+                    processed_by_channel[3] += 1;
+                    processed_order.push("exec_event");
+                }
+                PendingRunnerEvent::ExecCommand(_) => {
+                    processed_by_channel[4] += 1;
+                    processed_order.push("exec_command");
+                }
+                PendingRunnerEvent::DataEvent(_) => {
+                    processed_by_channel[5] += 1;
+                    processed_order.push("data_event");
+                    data_evt_tx
+                        .send(DataEvent::Data(Data::Quote(test_quote())))
+                        .unwrap();
+                }
+                PendingRunnerEvent::DataCommand(_) => {
+                    processed_by_channel[6] += 1;
+                    processed_order.push("data_command");
+                }
             }
-            PendingRunnerEvent::SystemEvent(_) => {
-                processed_by_channel[1] += 1;
-                processed_order.push("system_event");
-            }
-            PendingRunnerEvent::SystemCommand(_) => {
-                processed_by_channel[2] += 1;
-                processed_order.push("system_command");
-            }
-            PendingRunnerEvent::ExecEvent(_) => {
-                processed_by_channel[3] += 1;
-                processed_order.push("exec_event");
-            }
-            PendingRunnerEvent::ExecCommand(_) => {
-                processed_by_channel[4] += 1;
-                processed_order.push("exec_command");
-            }
-            PendingRunnerEvent::DataEvent(_) => {
-                processed_by_channel[5] += 1;
-                processed_order.push("data_event");
-                data_evt_tx
-                    .send(DataEvent::Data(Data::Quote(test_quote())))
-                    .unwrap();
-            }
-            PendingRunnerEvent::DataCommand(_) => {
-                processed_by_channel[6] += 1;
-                processed_order.push("data_command");
-            }
+            ControlFlow::Continue(())
         });
-        let second = runner.poll_pending(|event| match event {
-            PendingRunnerEvent::DataEvent(_) => {
-                processed_by_channel[5] += 1;
-                processed_order.push("data_event");
+        let second = runner.receivers().poll_pending(|event| {
+            match event {
+                PendingRunnerEvent::ExecCommand(_) => {
+                    processed_by_channel[4] += 1;
+                    processed_order.push("exec_command");
+                }
+                PendingRunnerEvent::DataEvent(_) => {
+                    processed_by_channel[5] += 1;
+                    processed_order.push("data_event");
+                }
+                _ => panic!("Unexpected runner event"),
             }
-            _ => panic!("Unexpected runner event"),
+            ControlFlow::Continue(())
         });
 
         assert_eq!(first, 8);
-        assert_eq!(second, 1);
-        assert_eq!(processed_by_channel, [1, 2, 1, 1, 1, 2, 1]);
+        assert_eq!(second, 2);
+        assert_eq!(processed_by_channel, [1, 2, 1, 1, 1, 3, 1]);
         assert_eq!(
             processed_order,
             [
@@ -1069,10 +1113,11 @@ mod tests {
                 "system_event",
                 "system_command",
                 "exec_event",
-                "exec_command",
                 "data_event",
                 "data_command",
                 "data_event",
+                "data_event",
+                "exec_command",
             ]
         );
     }

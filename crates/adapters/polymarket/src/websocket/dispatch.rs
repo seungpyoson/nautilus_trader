@@ -2750,18 +2750,17 @@ mod tests {
                 ))
                 .unwrap();
             let account_id = AccountId::from("POLY-001");
-            assert!(
-                build_reconciliation_position_reports(
-                    &[],
-                    account_id,
-                    UnixNanos::from(3_000_000_000),
-                    &lookup,
-                    Some(id),
-                    None,
-                )
-                .unwrap()
-                .is_empty()
-            );
+            let (reports, complete) = build_reconciliation_position_reports(
+                &[],
+                account_id,
+                UnixNanos::from(3_000_000_000),
+                &lookup,
+                Some(id),
+                None,
+            )
+            .unwrap();
+            assert!(reports.is_empty());
+            assert!(complete);
 
             // The venue can deliver a genuine pre-close trade after reporting empty inventory
             let mut trade: PolymarketUserTrade = load("ws_user_trade.json");

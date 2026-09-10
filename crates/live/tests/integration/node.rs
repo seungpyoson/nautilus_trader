@@ -395,6 +395,7 @@ pub(crate) mod serial_tests {
         connect_system_events: Arc<Mutex<Vec<SystemEvent>>>,
         queued_system_events: Arc<Mutex<Vec<SystemEvent>>>,
         registered_external_orders: Arc<Mutex<Vec<ClientOrderId>>>,
+        submitted_orders: Arc<AtomicUsize>,
         cancel_orders_received: Arc<AtomicUsize>,
         cancel_orders_while_connected: Arc<AtomicBool>,
     }
@@ -903,6 +904,14 @@ pub(crate) mod serial_tests {
                 self.state.connected.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
+            Ok(())
+        }
+
+        fn submit_order(
+            &self,
+            _cmd: nautilus_common::messages::execution::SubmitOrder,
+        ) -> anyhow::Result<()> {
+            self.state.submitted_orders.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
 
@@ -2168,8 +2177,7 @@ pub(crate) mod serial_tests {
     #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_zero_timeout_connection_starts_without_clients() {
         // A zero `timeout_connection` with no clients must still start: the empty
-        // connect completes on the first poll. Regression for the pre-stage bail
-        // that rejected a zero budget before ever attempting the connect.
+        // connect and reconciliation complete on their first ready pass.
         let config = LiveNodeConfig {
             exec_engine: LiveExecutionEngineConfig {
                 reconciliation: false,
@@ -2177,6 +2185,7 @@ pub(crate) mod serial_tests {
             },
             delay_post_stop: Duration::ZERO,
             timeout_connection: Duration::ZERO,
+            timeout_reconciliation: Duration::ZERO,
             timeout_disconnection: Duration::ZERO,
             ..Default::default()
         };
@@ -2824,6 +2833,265 @@ pub(crate) mod serial_tests {
             cache.positions_total_count(None, Some(&instrument_id), None, Some(&account_id), None),
             1
         );
+    }
+
+    #[rstest]
+    #[case::healthy(false, false)]
+    #[case::conflicting(true, false)]
+    #[case::timeout_with_conflicting_residual(true, true)]
+    #[tokio::test(start_paused = true)]
+    async fn test_startup_completes_callback_settlement_before_trader(
+        #[case] conflicting: bool,
+        #[case] timeout: bool,
+        #[values(
+            None,
+            Some(nautilus_live::node::NodeRunMode::Owned),
+            Some(nautilus_live::node::NodeRunMode::Hosted)
+        )]
+        mode: Option<nautilus_live::node::NodeRunMode>,
+    ) {
+        use nautilus_common::{
+            live::runner::get_data_event_sender,
+            messages::{
+                DataEvent,
+                execution::{SubmitOrder, TradingCommand},
+            },
+            runner::{TradingCommandMessage, try_get_trading_cmd_sender},
+        };
+        use nautilus_model::{
+            accounts::CashAccount,
+            data::{Data, InstrumentClose},
+            enums::InstrumentCloseType,
+            instruments::stubs::binary_option,
+        };
+
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let instrument_id = instrument.id();
+        let client_id = ClientId::from("SETTLEMENT-SOURCE");
+        let account_id = AccountId::from("POLYMARKET-001");
+        let budget = Duration::from_millis(250);
+        let state = StartupMassStatusClientState::default();
+        let factory = StartupMassStatusExecutionClientFactory::new(
+            state.clone(),
+            StartupMassStatusBehavior::Available,
+        )
+        .with_identity(client_id, account_id, instrument_id.venue);
+        let mut node = LiveNodeBuilder::from_config(LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: true,
+                ..Default::default()
+            },
+            timeout_reconciliation: budget,
+            delay_post_stop: Duration::ZERO,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_name("StartupSettlementCallbacks")
+        .add_exec_client(
+            Some("settlement-source".to_string()),
+            Box::new(factory),
+            Box::new(StartupMassStatusExecutionClientConfig),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let mut canceled_order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(node.trader_id())
+            .instrument_id(instrument_id)
+            .client_order_id(ClientOrderId::from("CALLBACK"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.00"))
+            .price(Price::from("0.400"))
+            .build();
+        let venue_order_id = VenueOrderId::from("CALLBACK");
+        canceled_order
+            .apply(TestOrderEventStubs::submitted(&canceled_order, account_id))
+            .unwrap();
+        canceled_order
+            .apply(TestOrderEventStubs::accepted(
+                &canceled_order,
+                account_id,
+                venue_order_id,
+            ))
+            .unwrap();
+        let canceled =
+            TestOrderEventStubs::canceled(&canceled_order, account_id, Some(venue_order_id));
+        let submitted_order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(node.trader_id())
+            .instrument_id(instrument_id)
+            .client_order_id(ClientOrderId::from("DEFERRED-SUBMIT"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.00"))
+            .price(Price::from("0.400"))
+            .build();
+        let submit = SubmitOrder::from_order(
+            &submitted_order,
+            node.trader_id(),
+            Some(client_id),
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+        );
+        {
+            let cache = node.kernel().cache();
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            cache
+                .add_account(
+                    CashAccount::new(
+                        AccountState::new(
+                            account_id,
+                            AccountType::Cash,
+                            vec![AccountBalance::new(
+                                Money::from("100 USDC"),
+                                Money::from("0 USDC"),
+                                Money::from("100 USDC"),
+                            )],
+                            vec![],
+                            true,
+                            UUID4::new(),
+                            UnixNanos::from(1),
+                            UnixNanos::from(1),
+                            Some(Currency::USDC()),
+                        ),
+                        false,
+                        false,
+                    )
+                    .into(),
+                )
+                .unwrap();
+            cache
+                .add_order(canceled_order, None, Some(client_id), false)
+                .unwrap();
+            cache
+                .add_order(submitted_order, None, Some(client_id), false)
+                .unwrap();
+        }
+        let mut report = ExecutionMassStatus::new(
+            client_id,
+            account_id,
+            instrument_id.venue,
+            UnixNanos::from(1),
+            None,
+        );
+        report.add_order_reports(vec![OrderStatusReport::new(
+            account_id,
+            instrument_id,
+            Some(ClientOrderId::from("CALLBACK")),
+            venue_order_id,
+            OrderSide::Buy.into(),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("1.00"),
+            Quantity::from("0.00"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        )]);
+        *state.mass_status.lock() = Some(report);
+        state
+            .queued_exec_events
+            .lock()
+            .push(ExecutionEvent::Order(canceled));
+
+        let close = InstrumentClose::new(
+            instrument_id,
+            Price::from("1.000"),
+            InstrumentCloseType::ContractExpired,
+            instrument.expiration_ns().unwrap(),
+            instrument.expiration_ns().unwrap(),
+        );
+        let order_handler = TypedHandler::from(move |event: &OrderEventAny| {
+            if matches!(event, OrderEventAny::Canceled(canceled) if canceled.client_order_id == ClientOrderId::from("CALLBACK"))
+            {
+                get_data_event_sender()
+                    .send(DataEvent::Data(Data::InstrumentClose(close)))
+                    .unwrap();
+                try_get_trading_cmd_sender()
+                    .unwrap()
+                    .execute(TradingCommandMessage::new(
+                        MessagingSwitchboard::exec_engine_execute(),
+                        TradingCommand::SubmitOrder(submit.clone()),
+                    ));
+            }
+        });
+        let callbacks = Rc::new(Cell::new(0));
+        let captured = callbacks.clone();
+        let continuation_ready = Arc::new(tokio::sync::Notify::new());
+        let ready = continuation_ready.clone();
+        let close_handler = ShareableMessageHandler::from_typed(move |_: &InstrumentClose| {
+            captured.set(captured.get() + 1);
+            if captured.get() == 1 {
+                get_data_event_sender()
+                    .send(DataEvent::Data(Data::InstrumentClose(InstrumentClose {
+                        close_price: Price::from(if conflicting { "0.000" } else { "1.000" }),
+                        ..close
+                    })))
+                    .unwrap();
+                ready.notify_one();
+            }
+        });
+        msgbus::subscribe_order_events("events.order.*".into(), order_handler.clone(), None);
+        msgbus::subscribe_instrument_close("data.close.*".into(), close_handler.clone(), None);
+        let expiry_task = timeout.then(|| {
+            tokio::spawn(async move {
+                continuation_ready.notified().await;
+                tokio::time::advance(budget).await;
+            })
+        });
+        let observed = Arc::new(Mutex::new(None));
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: node.handle(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = match mode {
+            Some(mode) => node.run_with_mode(mode).await,
+            None => node.start().await,
+        };
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        assert_eq!(callbacks.get(), 2);
+        if let Some(task) = expiry_task {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            state.submitted_orders.load(Ordering::Relaxed),
+            usize::from(!conflicting)
+        );
+        assert_eq!(observed.lock().is_some(), !conflicting);
+        let summary = node.handle().startup_reconciliation_summary().unwrap();
+        assert_eq!(summary.completion_sequence.unwrap().get(), 1);
+        assert_eq!(
+            summary.outcome,
+            if timeout {
+                StartupReconciliationOutcome::Failed
+            } else if conflicting {
+                StartupReconciliationOutcome::Interrupted
+            } else {
+                StartupReconciliationOutcome::Finished
+            }
+        );
+        if conflicting {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("Conflicting contract close"), "{error}");
+            assert_eq!(
+                error.contains(
+                    "Startup reconciliation timeout reached while processing pending data"
+                ),
+                timeout,
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(node.state(), NodeState::Stopped);
+        msgbus::unsubscribe_order_events("events.order.*".into(), &order_handler);
+        msgbus::unsubscribe_instrument_close("data.close.*".into(), &close_handler);
+        node.dispose();
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

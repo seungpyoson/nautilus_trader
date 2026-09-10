@@ -13,10 +13,18 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
-use nautilus_common::messages::execution::{
-    BatchModifyOrders, CancelAllOrders, ModifyOrder, SubmitOrder, SubmitOrderList,
+use nautilus_common::{
+    actor::{DataActor, DataActorCore, data_actor::DataActorConfig},
+    messages::execution::{
+        BatchModifyOrders, CancelAllOrders, ModifyOrder, QueryAccount, SubmitOrder, SubmitOrderList,
+    },
+    msgbus::TypedIntoHandler,
+    nautilus_actor,
 };
 use nautilus_core::UnixNanos;
 use nautilus_execution::engine::stubs::StubExecutionClient;
@@ -69,6 +77,7 @@ impl Fixture {
                 position_check_threshold_ms: 0,
                 ..Default::default()
             },
+            delay_post_stop: Duration::ZERO,
             ..Default::default()
         };
         let node = LiveNode::build("ContractSettlement".to_string(), Some(config)).unwrap();
@@ -684,30 +693,75 @@ async fn contract_settlement_failure_blocks_queued_trading_and_returns_error(
 #[rstest]
 #[case::healthy("1.000", None)]
 #[case::conflicting("0.000", Some("Conflicting contract close"))]
-#[tokio::test]
+#[cfg_attr(
+    not(all(feature = "simulation", madsim)),
+    tokio::test(start_paused = true)
+)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
 async fn contract_settlement_final_drain_gates_queued_trading(
     #[case] price: &str,
     #[case] expected_error: Option<&str>,
-    #[values(false, true)] already_pending: bool,
+    #[values("queued", "settlement", "callback")] delivery: &str,
+    #[values("retained", "borrowed", "buffered", "retained_grace", "borrowed_grace")]
+    drain_path: &str,
 ) {
     let mut f = Fixture::new();
     f.fill("OWNER-001", "OPEN", OrderSide::Buy, "10.00", "0.400");
     f.close("1.000", InstrumentCloseType::ContractExpired);
     f.node.runner.as_ref().unwrap().bind_senders();
-    let event = DataEvent::Data(Data::InstrumentClose(InstrumentClose::new(
+    let close = InstrumentClose::new(
         f.instrument.id(),
         Price::from(price),
         InstrumentCloseType::ContractExpired,
         f.instrument.expiration_ns().unwrap(),
         f.instrument.expiration_ns().unwrap(),
-    )));
-
-    if already_pending {
-        AsyncRunner::handle_data_event(event);
-    } else {
-        nautilus_common::live::runner::get_data_event_sender()
-            .send(event)
-            .unwrap();
+    );
+    let callback_delivery = delivery == "callback";
+    let data_sender = nautilus_common::live::runner::get_data_event_sender();
+    // A native order callback queues data after the initial data pass. Its first close
+    // queues another close, requiring bounded deferral and a subsequent terminal pass.
+    let callbacks = Rc::new(Cell::new(0));
+    let captured = callbacks.clone();
+    let close_sender = data_sender.clone();
+    let close_handler = ShareableMessageHandler::from_typed(move |_: &InstrumentClose| {
+        if callback_delivery && captured.get() == 0 {
+            captured.set(1);
+            close_sender
+                .send(DataEvent::Data(Data::InstrumentClose(close)))
+                .unwrap();
+        }
+    });
+    msgbus::subscribe_instrument_close("data.close.*".into(), close_handler.clone(), None);
+    let callback_sender = data_sender.clone();
+    let order_handler = TypedHandler::from(move |event: &OrderEventAny| {
+        if callback_delivery
+            && matches!(event, OrderEventAny::Canceled(canceled) if canceled.client_order_id == ClientOrderId::from("CALLBACK"))
+        {
+            callback_sender
+                .send(DataEvent::Data(Data::InstrumentClose(InstrumentClose {
+                    close_price: Price::from("1.000"),
+                    ..close
+                })))
+                .unwrap();
+        }
+    });
+    msgbus::subscribe_order_events("events.order.*".into(), order_handler.clone(), None);
+    match delivery {
+        "settlement" => {
+            AsyncRunner::handle_data_event(DataEvent::Data(Data::InstrumentClose(close)))
+        }
+        "queued" => data_sender
+            .send(DataEvent::Data(Data::InstrumentClose(close)))
+            .unwrap(),
+        "callback" => {
+            let order = f.accept_order("OWNER-001", "CALLBACK", OrderSide::Buy, "1.00", "0.400");
+            let canceled =
+                TestOrderEventStubs::canceled(&order, f.account_id, order.venue_order_id());
+            nautilus_common::live::runner::get_exec_event_sender()
+                .send(ExecutionEvent::Order(canceled))
+                .unwrap();
+        }
+        _ => unreachable!(),
     }
     let sender = nautilus_common::runner::try_get_trading_cmd_sender().unwrap();
     for command in f.trading_commands() {
@@ -717,28 +771,61 @@ async fn contract_settlement_final_drain_gates_queued_trading(
 
     // Finalization stops clients before draining; the shared halt must still gate dispatch
     f.node.kernel.exec_engine.borrow_mut().stop();
-    let AsyncRunnerChannels {
-        mut time_evt_rx,
-        mut system_evt_rx,
-        mut system_cmd_rx,
-        mut exec_evt_rx,
-        mut exec_cmd_rx,
-        mut data_evt_rx,
-        mut data_cmd_rx,
-    } = f.node.runner.take().unwrap().take_channels();
-    f.node.drain_channels(&mut RunnerReceivers {
-        time_evt: &mut time_evt_rx,
-        system_evt: &mut system_evt_rx,
-        system_cmd: &mut system_cmd_rx,
-        exec_evt: &mut exec_evt_rx,
-        exec_cmd: &mut exec_cmd_rx,
-        data_evt: &mut data_evt_rx,
-        data_cmd: &mut data_cmd_rx,
-    });
+    match drain_path {
+        "retained" => {
+            f.node.drain_runner_pending();
+        }
+        "retained_grace" => {
+            f.node.process_runner_for(Duration::from_millis(1)).await;
+        }
+        "borrowed" | "buffered" | "borrowed_grace" => {
+            let AsyncRunnerChannels {
+                mut time_evt_rx,
+                mut system_evt_rx,
+                mut system_cmd_rx,
+                mut exec_evt_rx,
+                mut exec_cmd_rx,
+                mut data_evt_rx,
+                mut data_cmd_rx,
+            } = f.node.runner.take().unwrap().take_channels();
+            let mut receivers = RunnerReceivers {
+                time_evt: &mut time_evt_rx,
+                system_evt: &mut system_evt_rx,
+                system_cmd: &mut system_cmd_rx,
+                exec_evt: &mut exec_evt_rx,
+                exec_cmd: &mut exec_cmd_rx,
+                data_evt: &mut data_evt_rx,
+                data_cmd: &mut data_cmd_rx,
+            };
+            match drain_path {
+                "borrowed" => f.node.drain_channels(&mut receivers),
+                "buffered" => {
+                    flush_all_pending(&mut f.node, &mut PendingEvents::default(), &mut receivers);
+                    if callback_delivery {
+                        assert!(f.submitted.borrow().is_empty());
+                        assert!(f.modified.borrow().is_empty());
+                        assert!(f.cancels.borrow().is_empty());
+                        assert!(!receivers.exec_cmd.is_empty());
+                    }
+                    f.node.drain_channels(&mut receivers);
+                }
+                "borrowed_grace" => {
+                    f.node
+                        .process_receivers_for(Duration::from_millis(1), &mut receivers)
+                        .await;
+                }
+                _ => unreachable!(),
+            }
+        }
+        _ => unreachable!(),
+    }
     let expected_dispatches = if expected_error.is_some() { 0 } else { 2 };
     assert_eq!(f.submitted.borrow().len(), expected_dispatches);
     assert_eq!(f.modified.borrow().len(), expected_dispatches);
     assert_eq!(f.cancels.borrow().len(), 1);
+    assert_eq!(callbacks.get(), usize::from(callback_delivery));
+    msgbus::unsubscribe_order_events("events.order.*".into(), &order_handler);
+    msgbus::unsubscribe_instrument_close("data.close.*".into(), &close_handler);
     let result = f.node.finalize_stop().await;
 
     match expected_error {
@@ -1069,6 +1156,222 @@ async fn contract_settlement_startup_abort_reports_final_drain_fault(
         result.unwrap();
         f.node.check_execution_health().unwrap();
     }
+}
+
+#[derive(Debug)]
+struct FailingSettlementActor {
+    core: DataActorCore,
+    closes: [InstrumentClose; 2],
+    already_pending: bool,
+}
+
+impl DataActor for FailingSettlementActor {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        for close in self.closes {
+            let event = DataEvent::Data(Data::InstrumentClose(close));
+            if self.already_pending {
+                AsyncRunner::handle_data_event(event);
+            } else {
+                nautilus_common::live::runner::get_data_event_sender()
+                    .send(event)
+                    .unwrap();
+            }
+        }
+        anyhow::bail!("settlement actor start failed")
+    }
+}
+
+nautilus_actor!(FailingSettlementActor);
+
+#[rstest]
+#[case(None)]
+#[case(Some(NodeRunMode::Owned))]
+#[case(Some(NodeRunMode::Hosted))]
+#[tokio::test]
+async fn contract_settlement_actor_start_failure_drains_and_preserves_errors(
+    #[case] mode: Option<NodeRunMode>,
+    #[values(false, true)] conflicting: bool,
+    #[values(false, true)] already_pending: bool,
+) {
+    let mut f = Fixture::new();
+    f.fill("OWNER-001", "OPEN", OrderSide::Buy, "10.00", "0.400");
+    f.node
+        .kernel
+        .exec_engine
+        .borrow_mut()
+        .deregister_client(f.client_id)
+        .unwrap();
+    let close = InstrumentClose::new(
+        f.instrument.id(),
+        Price::from("1.000"),
+        InstrumentCloseType::ContractExpired,
+        f.instrument.expiration_ns().unwrap(),
+        f.instrument.expiration_ns().unwrap(),
+    );
+    f.node
+        .add_actor(FailingSettlementActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            closes: [
+                close,
+                InstrumentClose {
+                    close_price: Price::from(if conflicting { "0.000" } else { "1.000" }),
+                    ..close
+                },
+            ],
+            already_pending,
+        })
+        .unwrap();
+
+    let result = match mode {
+        Some(mode) => f.node.run_with_mode(mode).await,
+        None => f.node.start().await,
+    };
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("settlement actor start failed"), "{error}");
+    assert_eq!(error.contains("Conflicting contract close"), conflicting);
+    assert_eq!(f.node.check_execution_health().is_err(), conflicting);
+    assert_eq!(f.node.state(), NodeState::Stopped);
+    assert!(f.node.settlement.receiver.is_empty());
+    assert!(f.submitted.borrow().is_empty());
+    assert!(
+        f.node
+            .kernel
+            .cache
+            .borrow()
+            .is_position_closed(&f.position_id("OWNER-001"))
+    );
+    assert_eq!(
+        f.node
+            .kernel
+            .portfolio
+            .borrow_mut()
+            .realized_pnl(&f.instrument.id()),
+        Some(Money::from("5.90 USDC"))
+    );
+    assert_eq!(
+        f.positions
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, PositionEvent::PositionClosed(_)))
+            .count(),
+        1
+    );
+    f.node.dispose();
+}
+
+#[derive(Debug)]
+struct LifecycleQueueActor {
+    core: DataActorCore,
+    close: InstrumentClose,
+}
+
+impl LifecycleQueueActor {
+    fn queue(&self, account_id: AccountId) {
+        let data_sender = nautilus_common::live::runner::get_data_event_sender();
+        for _ in 0..4 {
+            data_sender
+                .send(DataEvent::Data(Data::InstrumentClose(self.close)))
+                .unwrap();
+        }
+        nautilus_common::runner::try_get_trading_cmd_sender()
+            .unwrap()
+            .execute(TradingCommandMessage::new(
+                "SettlementScheduling.execute".into(),
+                TradingCommand::QueryAccount(QueryAccount::new(
+                    self.core.trader_id().unwrap(),
+                    None,
+                    account_id,
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    None,
+                    None,
+                )),
+            ));
+    }
+}
+
+impl DataActor for LifecycleQueueActor {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.queue(AccountId::from("START-001"));
+        Ok(())
+    }
+
+    fn on_stop(&mut self) -> anyhow::Result<()> {
+        self.queue(AccountId::from("STOP-001"));
+        Ok(())
+    }
+}
+
+nautilus_actor!(LifecycleQueueActor);
+
+#[rstest]
+#[cfg_attr(
+    not(all(feature = "simulation", madsim)),
+    tokio::test(start_paused = true)
+)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+async fn contract_settlement_run_preserves_running_priority_and_orders_residual_data() {
+    let mut node = LiveNode::build(
+        "SettlementScheduling".to_string(),
+        Some(LiveNodeConfig {
+            delay_post_stop: Duration::from_millis(20),
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+    let instrument = InstrumentAny::BinaryOption(binary_option());
+    node.kernel
+        .cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let observed_closes = Rc::new(Cell::new(0));
+    let captured = observed_closes.clone();
+    let close_handler = ShareableMessageHandler::from_typed(move |_: &InstrumentClose| {
+        captured.set(captured.get() + 1);
+    });
+    msgbus::subscribe_instrument_close("data.close.*".into(), close_handler.clone(), None);
+    let commands = Rc::new(RefCell::new(Vec::new()));
+    let captured = commands.clone();
+    let closes = observed_closes.clone();
+    let handle = node.handle();
+    msgbus::register_trading_command_endpoint(
+        "SettlementScheduling.execute".into(),
+        TypedIntoHandler::from(move |command: TradingCommand| {
+            let TradingCommand::QueryAccount(command) = command else {
+                panic!("unexpected scheduling command");
+            };
+            captured
+                .borrow_mut()
+                .push((command.account_id, handle.state(), closes.get()));
+            handle.stop();
+        }),
+    );
+    node.add_actor(LifecycleQueueActor {
+        core: DataActorCore::new(DataActorConfig::default()),
+        close: InstrumentClose::new(
+            instrument.id(),
+            Price::from("1.000"),
+            InstrumentCloseType::ContractExpired,
+            instrument.expiration_ns().unwrap(),
+            instrument.expiration_ns().unwrap(),
+        ),
+    })
+    .unwrap();
+
+    node.run_with_mode(NodeRunMode::Hosted).await.unwrap();
+
+    assert_eq!(
+        *commands.borrow(),
+        [
+            (AccountId::from("START-001"), NodeState::Running, 0),
+            (AccountId::from("STOP-001"), NodeState::ShuttingDown, 8),
+        ]
+    );
+    assert_eq!(observed_closes.get(), 8);
+    node.check_execution_health().unwrap();
+    msgbus::unsubscribe_instrument_close("data.close.*".into(), &close_handler);
+    node.dispose();
 }
 
 #[rstest]
