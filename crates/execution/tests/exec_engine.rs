@@ -146,6 +146,7 @@ fn test_order_application_distinguishes_no_account_from_unknown_account(
     let instrument = audusd_sim();
     let order = OrderTestBuilder::new(OrderType::Market)
         .instrument_id(instrument.id())
+        .quantity(Quantity::from("10"))
         .build();
     let account_id = AccountId::test_default();
     {

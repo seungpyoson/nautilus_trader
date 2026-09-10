@@ -57,7 +57,8 @@ use nautilus_execution::{
 };
 use nautilus_live::manager::{ExecutionManager, ExecutionManagerConfig};
 use nautilus_model::{
-    accounts::{AccountAny, MarginAccount},
+    accounts::{Account, AccountAny, MarginAccount},
+    data::QuoteTick,
     enums::{
         AccountType, ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
         PositionSideSpecified, TimeInForce, TriggerType,
@@ -83,6 +84,7 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
+use nautilus_portfolio::Portfolio;
 use rstest::rstest;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -150,6 +152,25 @@ impl TestContext {
             manager,
             exec_engine,
         }
+    }
+
+    fn create_portfolio(&self) -> Portfolio {
+        Portfolio::new(self.clock.clone(), self.cache.clone(), None)
+    }
+
+    fn add_quote(&self, instrument_id: InstrumentId, price: Price) {
+        self.cache
+            .borrow_mut()
+            .add_quote(QuoteTick::new(
+                instrument_id,
+                price,
+                price,
+                Quantity::from("1.0"),
+                Quantity::from("1.0"),
+                UnixNanos::default(),
+                UnixNanos::default(),
+            ))
+            .unwrap();
     }
 
     fn advance_time(&self, delta_nanos: u64) {
@@ -884,6 +905,7 @@ async fn test_mass_status_summary_preserves_full_fill_and_reports_terminal_appli
 #[tokio::test]
 async fn test_reconcile_mass_status_creates_external_order_accepted() {
     let mut ctx = TestContext::new();
+    let _portfolio = ctx.create_portfolio();
     let instrument_id = test_instrument_id();
     let client_id = test_client_id();
 
@@ -2475,6 +2497,7 @@ async fn test_rejected_reconciliation_fill_is_retried() {
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
 async fn test_reconciliation_fill_dispatch_rejection_does_not_commit() {
     let mut ctx = TestContext::new();
+    let _portfolio = ctx.create_portfolio();
     let instrument_id = test_instrument_id();
     let client_order_id = ClientOrderId::from("O-DISPATCH-RETRY");
     let venue_order_id = VenueOrderId::from("V-DISPATCH-RETRY");
@@ -2563,8 +2586,12 @@ async fn test_reconciliation_fill_dispatch_rejection_does_not_commit() {
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_applied_reconciliation_fill_is_committed() {
+async fn test_applied_reconciliation_fill_is_committed(
+    #[values(false, true)] portfolio_available: bool,
+) {
+    *msgbus::get_message_bus().borrow_mut() = msgbus::MessageBus::default();
     let mut ctx = TestContext::new();
+    let _portfolio = portfolio_available.then(|| ctx.create_portfolio());
     let instrument_id = test_instrument_id();
     let trade_id = TradeId::from("T-COMMITTED");
     let first_client_order_id = ClientOrderId::from("O-COMMITTED-1");
@@ -2607,6 +2634,54 @@ async fn test_applied_reconciliation_fill_is_committed() {
         )
         .await;
     assert_eq!(first.events.len(), 1);
+    assert_eq!(
+        first.summary.incomplete_events,
+        usize::from(!portfolio_available)
+    );
+    assert_eq!(
+        first.summary.all_received_reports_reconciled(),
+        portfolio_available
+    );
+    assert_eq!(
+        ctx.get_order(&first_client_order_id).unwrap().status(),
+        OrderStatus::Filled
+    );
+    {
+        let cache = ctx.cache.borrow();
+        let account = cache.account(&test_account_id()).unwrap();
+        assert_eq!(
+            account.balance_total(Some(Currency::USDT())),
+            Some(Money::from(if portfolio_available {
+                "999999.50 USDT"
+            } else {
+                "1000000 USDT"
+            }))
+        );
+        let AccountAny::Margin(account) = &*account else {
+            panic!("margin fixture")
+        };
+        assert_eq!(
+            account.commission(&Currency::USDT()),
+            portfolio_available.then(|| Money::from("0.50 USDT"))
+        );
+    }
+    let before_positions = ctx
+        .cache
+        .borrow()
+        .positions(None, Some(&instrument_id), None, None, None)
+        .iter()
+        .map(|position| {
+            (
+                position.id,
+                position.quantity,
+                position.event_count(),
+                position.commissions(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(before_positions.len(), 1);
+    assert_eq!(before_positions[0].1, Quantity::from("1.0"));
+    assert_eq!(before_positions[0].3, vec![Money::from("0.50 USDT")]);
 
     let duplicate = ctx
         .manager
@@ -2625,12 +2700,49 @@ async fn test_applied_reconciliation_fill_is_committed() {
         )
         .await;
 
-    assert!(duplicate.events.is_empty());
-    assert!(
+    assert_eq!(duplicate.events.len(), usize::from(!portfolio_available));
+    assert_eq!(
         ctx.get_order(&second_client_order_id)
             .unwrap()
             .trade_ids()
-            .is_empty()
+            .is_empty(),
+        portfolio_available
+    );
+    // Without the required owner, the first application stayed incomplete. The retained
+    // position permits only an order projection on the second report, not financial repair.
+    assert_eq!(
+        duplicate.summary.projected_fills,
+        usize::from(!portfolio_available)
+    );
+    let cache = ctx.cache.borrow();
+    let after_positions = cache
+        .positions(None, Some(&instrument_id), None, None, None)
+        .iter()
+        .map(|position| {
+            (
+                position.id,
+                position.quantity,
+                position.event_count(),
+                position.commissions(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(after_positions, before_positions);
+    let account = cache.account(&test_account_id()).unwrap();
+    assert_eq!(
+        account.balance_total(Some(Currency::USDT())),
+        Some(Money::from(if portfolio_available {
+            "999999.50 USDT"
+        } else {
+            "1000000 USDT"
+        }))
+    );
+    let AccountAny::Margin(account) = &*account else {
+        panic!("margin fixture")
+    };
+    assert_eq!(
+        account.commission(&Currency::USDT()),
+        portfolio_available.then(|| Money::from("0.50 USDT"))
     );
 }
 
@@ -2810,6 +2922,7 @@ async fn test_processed_fill_retention(
         ..Default::default()
     };
     let mut ctx = TestContext::with_config(config);
+    let _portfolio = ctx.create_portfolio();
     let instrument_id = test_instrument_id();
     let trade_id = TradeId::from("T-RETENTION");
     let first_client_order_id = ClientOrderId::from("O-RETENTION-1");
@@ -13078,6 +13191,7 @@ async fn test_reconcile_positions_reports_final_native_quantities(
         position_check_threshold_ns: 0,
         ..Default::default()
     });
+    let _portfolio = ctx.create_portfolio();
     let instrument = test_instrument();
     let instrument_id = instrument.id();
     let position = create_test_position(
@@ -13088,6 +13202,7 @@ async fn test_reconcile_positions_reports_final_native_quantities(
         "3000.00",
     );
     ctx.add_instrument(instrument);
+    ctx.add_quote(instrument_id, Price::from("3000.00"));
     ctx.add_position(&position);
     let report = PositionStatusReport::new(
         test_account_id(),
@@ -13387,6 +13502,7 @@ async fn test_reconcile_positions_rechecks_initial_match_after_application_callb
         position_check_threshold_ns: 0,
         ..Default::default()
     });
+    let _portfolio = ctx.create_portfolio();
     let matched_instrument = test_instrument();
     let adjusted_instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
     let matched_position = create_test_position(
@@ -13405,6 +13521,8 @@ async fn test_reconcile_positions_rechecks_initial_match_after_application_callb
     );
     ctx.add_instrument(matched_instrument.clone());
     ctx.add_instrument(adjusted_instrument.clone());
+    ctx.add_quote(matched_instrument.id(), Price::from("3000.00"));
+    ctx.add_quote(adjusted_instrument.id(), Price::from("3000.00"));
     ctx.add_position(&matched_position);
     ctx.add_position(&adjusted_position);
     let reports = [(&matched_instrument, "5.0"), (&adjusted_instrument, "3.0")]
@@ -13542,6 +13660,7 @@ async fn test_position_query_empty_requires_account_and_venue_ownership(
         position_check_threshold_ns: 0,
         ..Default::default()
     });
+    let _portfolio = ctx.create_portfolio();
     let instrument = test_instrument();
     let instrument_id = instrument.id();
     let position = create_test_position(
@@ -13552,6 +13671,7 @@ async fn test_position_query_empty_requires_account_and_venue_ownership(
         "3000.00",
     );
     ctx.add_instrument(instrument);
+    ctx.add_quote(instrument_id, Price::from("3000.00"));
     ctx.add_position(&position);
     let client = MockPositionExecutionClient::configured(
         ClientId::from("IB-QUERY"),
