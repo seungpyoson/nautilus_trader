@@ -760,15 +760,12 @@ impl BacktestEngine {
             logging_clock_set_static_time(start_ns.as_u64());
 
             // Start kernel, then stop before trader startup for event-store replay
-            self.kernel.start();
+            self.kernel.start()?;
             if self.kernel.is_event_store_replay() {
                 self.log_pre_run();
                 return Ok(());
             }
 
-            if self.kernel.is_event_store_replay_configured() {
-                anyhow::bail!("event-store replay did not start");
-            }
             self.kernel.start_trader()?;
 
             // Drain on_start data subscriptions so aggregators subscribe before the first data
@@ -3009,6 +3006,44 @@ mod tests {
     }
 
     #[rstest]
+    fn test_run_after_reset_starts_strategy_again() {
+        let mut engine = create_engine();
+        let control = TestCacheDatabaseControl::default();
+        engine
+            .add_strategy(StateStrategy::new(
+                StrategyId::from("RESET-STRATEGY-001"),
+                control.clone(),
+                IndexMap::new(),
+            ))
+            .unwrap();
+
+        for run in 0..2 {
+            if run > 0 {
+                engine.reset().unwrap();
+            }
+
+            engine
+                .run(
+                    Some(UnixNanos::from(0)),
+                    Some(UnixNanos::from(1)),
+                    None,
+                    false,
+                )
+                .expect("initial and reset runs must both start");
+        }
+
+        assert_eq!(
+            control
+                .events()
+                .iter()
+                .filter(|event| *event == "strategy.on_start")
+                .count(),
+            2
+        );
+        engine.dispose();
+    }
+
+    #[rstest]
     fn test_run_impl_event_store_replay_config_failure_errors() {
         let mut engine = create_engine_with_replay_store(true);
 
@@ -3021,7 +3056,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert_eq!(error.to_string(), "event-store replay did not start");
+        assert!(format!("{error:#}").contains("replay restore failed"));
         assert!(engine.kernel.is_event_store_replay_configured());
         assert!(!engine.kernel.is_event_store_replay());
         assert!(!engine.kernel.trader.borrow().is_running());

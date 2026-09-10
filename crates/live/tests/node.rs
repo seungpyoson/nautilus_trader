@@ -32,7 +32,7 @@ use std::{
 use async_trait::async_trait;
 use nautilus_common::{
     actor::{DataActor, DataActorCore, DataActorNative, data_actor::DataActorConfig},
-    cache::CacheView,
+    cache::{Cache, CacheView},
     clients::{DataClient, ExecutionClient},
     clock::Clock,
     component::Component,
@@ -57,6 +57,7 @@ use nautilus_common::{
     testing::{wait_until, wait_until_async},
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_execution::engine::SnapshotAnchorer;
 use nautilus_live::{
     builder::LiveNodeBuilder,
     config::{LiveExecutionEngineConfig, LiveNodeConfig},
@@ -87,6 +88,7 @@ use nautilus_model::{
     },
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
+use nautilus_system::{KernelEventStore, RegisteredComponents};
 use nautilus_trading::{
     ExecutionAlgorithmConfig, ExecutionAlgorithmCore, nautilus_execution_algorithm,
     nautilus_strategy,
@@ -407,6 +409,60 @@ mod serial_tests {
         ConnectDelayedReadinessPending,
         DisconnectPending,
         DisconnectKeepsConnected,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EventStoreStartupFailure {
+        Restore,
+        Open,
+    }
+
+    #[derive(Debug)]
+    struct StartupEventStore {
+        failure: Option<EventStoreStartupFailure>,
+    }
+
+    impl KernelEventStore for StartupEventStore {
+        fn restore_parent_cache(
+            &mut self,
+            _instance_id: UUID4,
+            _cache: &mut Cache,
+        ) -> anyhow::Result<()> {
+            if matches!(self.failure, Some(EventStoreStartupFailure::Restore)) {
+                anyhow::bail!("injected event-store restore failure");
+            }
+            Ok(())
+        }
+
+        fn open(
+            &mut self,
+            _instance_id: UUID4,
+            _components: &RegisteredComponents,
+            _environment: Environment,
+        ) -> anyhow::Result<()> {
+            if matches!(self.failure, Some(EventStoreStartupFailure::Open)) {
+                anyhow::bail!("injected event-store open failure");
+            }
+            Ok(())
+        }
+
+        fn snapshot_anchorer(&self) -> Option<SnapshotAnchorer> {
+            None
+        }
+
+        fn seal(&mut self, _ts_init: UnixNanos) {}
+
+        fn run_id(&self) -> Option<&str> {
+            None
+        }
+
+        fn parent_run_id(&self) -> Option<&str> {
+            None
+        }
+
+        fn is_halted(&self) -> bool {
+            false
+        }
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -1563,6 +1619,101 @@ mod serial_tests {
             .add_instrument(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()))
             .unwrap();
         node
+    }
+
+    #[rstest]
+    #[case::healthy(None, false)]
+    #[case::restore_failure(Some(EventStoreStartupFailure::Restore), false)]
+    #[case::open_failure(Some(EventStoreStartupFailure::Open), false)]
+    #[case::restore_and_cleanup_failure(Some(EventStoreStartupFailure::Restore), true)]
+    #[tokio::test]
+    async fn test_kernel_startup_result_precedes_client_and_actor_start(
+        #[case] failure: Option<EventStoreStartupFailure>,
+        #[case] cleanup_fails: bool,
+        #[values(false, true)] run: bool,
+    ) {
+        let data_state = LifecycleClientState::default();
+        let exec_state = LifecycleClientState::default();
+        let mut node = LiveNodeBuilder::from_config(LiveNodeConfig {
+            load_state: true,
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            timeout_connection: Duration::from_secs(1),
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        })
+        .unwrap()
+        .with_event_store(move |_instance_id, _clock| {
+            Ok(Box::new(StartupEventStore { failure }) as Box<dyn KernelEventStore>)
+        })
+        .add_data_client(
+            Some("lifecycle-data".to_string()),
+            Box::new(LifecycleDataClientFactory::new(
+                data_state.clone(),
+                LifecycleClientBehavior::Connects,
+            )),
+            Box::new(LifecycleDataClientConfig),
+        )
+        .unwrap()
+        .add_exec_client(
+            Some("lifecycle-exec".to_string()),
+            Box::new(LifecycleExecutionClientFactory::new(
+                exec_state.clone(),
+                if cleanup_fails {
+                    LifecycleClientBehavior::DisconnectPending
+                } else {
+                    LifecycleClientBehavior::Connects
+                },
+            )),
+            Box::new(LifecycleExecutionClientConfig),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let handle = node.handle();
+        let observed = Arc::new(Mutex::new(None));
+        node.add_actor(ReconciliationSummaryActor {
+            core: DataActorCore::new(DataActorConfig::default()),
+            handle: handle.clone(),
+            observed: observed.clone(),
+        })
+        .unwrap();
+
+        let result = if run {
+            node.run().await
+        } else {
+            node.start().await
+        };
+
+        if let Some(failure) = failure {
+            let e = result.expect_err("kernel startup failure must reach the caller");
+            let expected = match failure {
+                EventStoreStartupFailure::Restore => "injected event-store restore failure",
+                EventStoreStartupFailure::Open => "injected event-store open failure",
+            };
+            assert!(format!("{e:#}").contains(expected), "{e:#}");
+
+            if cleanup_fails {
+                assert!(format!("{e:#}").contains("disconnect timeout"), "{e:#}");
+            }
+            assert!(!data_state.connect_attempted.load(Ordering::Relaxed));
+            assert!(!exec_state.connect_attempted.load(Ordering::Relaxed));
+            assert!(observed.lock().unwrap().is_none());
+            assert!(handle.startup_reconciliation_summary().is_none());
+        } else {
+            result.expect("healthy storage must permit client and actor startup");
+            assert!(data_state.connect_attempted.load(Ordering::Relaxed));
+            assert!(exec_state.connect_attempted.load(Ordering::Relaxed));
+            assert!(observed.lock().unwrap().is_some());
+            assert!(handle.startup_reconciliation_summary().is_some());
+        }
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert!(!data_state.connected.load(Ordering::Relaxed));
+        assert!(!exec_state.connected.load(Ordering::Relaxed));
+        node.dispose();
     }
 
     #[rstest]
