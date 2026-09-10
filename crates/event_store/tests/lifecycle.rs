@@ -552,9 +552,7 @@ fn kernel_start_requires_complete_cache_replay(
         let built = builder.build();
 
         if partial_snapshot && !configured_replay {
-            let error = built
-                .err()
-                .expect("unrestorable source must block construction");
+            let error = built.expect_err("unrestorable source must block construction");
             let expected = if legacy {
                 "decode snapshot anchor"
             } else {
