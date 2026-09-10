@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: 83898da567893f7829d5787e1c69522523aa9815
+      REVIEWED_SHA: 203592af3fc54f33026d9ad3a1eaac30339336ed
       CARGO_BUILD_JOBS: "2"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -31,7 +31,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 83898da567893f7829d5787e1c69522523aa9815
+          ref: 203592af3fc54f33026d9ad3a1eaac30339336ed
           persist-credentials: false
 
       - name: Verify reviewed commit
@@ -47,8 +47,8 @@ jobs:
           free-disk-space: "true"
           rust-cache-key: reconciliation-application-ci-pr
 
-      # Verify archive cycle identity, portfolio totals, and affected consumers.
-      - name: Archive cycle identity and affected consumer tests
+      # Verify stable snapshot references, corrected cycle fixtures, and affected consumers.
+      - name: Snapshot reference identity and affected consumer tests
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
         run: |
@@ -56,14 +56,14 @@ jobs:
           cargo nextest run --locked --cargo-profile ci-pr --profile ci \
             -p nautilus-system -p nautilus-live -p nautilus-backtest -p nautilus-event-store -p nautilus-execution -p nautilus-common -p nautilus-portfolio \
             --lib --tests --no-fail-fast \
-            2>&1 | tee "$RUNNER_TEMP/archive-cycle-identity-tests.log"
+            2>&1 | tee "$RUNNER_TEMP/snapshot-blob-identity-tests.log"
 
       - name: Preserve affected suite output
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: archive-cycle-identity-${{ env.REVIEWED_SHA }}
-          path: ${{ runner.temp }}/archive-cycle-identity-tests.log
+          name: snapshot-blob-identity-${{ env.REVIEWED_SHA }}
+          path: ${{ runner.temp }}/snapshot-blob-identity-tests.log
           if-no-files-found: error
 
       - name: Affected library and test Clippy
