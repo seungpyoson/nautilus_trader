@@ -66,7 +66,6 @@ struct PortfolioState {
     realized_pnls: IndexMap<InstrumentId, Money>,
     recorded_closed_position_cycles: AHashSet<(PositionId, UnixNanos)>,
     snapshot_sum_per_position: AHashMap<PositionId, Money>,
-    snapshot_last_per_position: AHashMap<PositionId, Money>,
     snapshot_currency_mismatches: AHashSet<PositionId>,
     snapshot_aggregation_overflows: AHashSet<PositionId>,
     snapshot_processed_counts: AHashMap<PositionId, usize>,
@@ -125,7 +124,6 @@ impl PortfolioState {
             realized_pnls: IndexMap::new(),
             recorded_closed_position_cycles: AHashSet::new(),
             snapshot_sum_per_position: AHashMap::new(),
-            snapshot_last_per_position: AHashMap::new(),
             snapshot_currency_mismatches: AHashSet::new(),
             snapshot_aggregation_overflows: AHashSet::new(),
             snapshot_processed_counts: AHashMap::new(),
@@ -157,7 +155,6 @@ impl PortfolioState {
         self.realized_pnls.clear();
         self.recorded_closed_position_cycles.clear();
         self.snapshot_sum_per_position.clear();
-        self.snapshot_last_per_position.clear();
         self.snapshot_currency_mismatches.clear();
         self.snapshot_aggregation_overflows.clear();
         self.snapshot_processed_counts.clear();
@@ -2398,7 +2395,6 @@ impl Portfolio {
                     .position_snapshots(Some(position_id), None);
 
                 let mut sum_pnl: Option<Money> = None;
-                let mut last_pnl: Option<Money> = None;
                 let mut snapshot_account_id: Option<AccountId> = None;
                 let mut currency_mismatch = false;
                 let mut aggregation_overflow = false;
@@ -2419,7 +2415,6 @@ impl Portfolio {
                         } else {
                             sum_pnl = Some(realized_pnl);
                         }
-                        last_pnl = Some(realized_pnl);
                     }
                 }
 
@@ -2427,13 +2422,8 @@ impl Portfolio {
 
                 if !aggregation_overflow && let Some(sum) = sum_pnl {
                     inner.snapshot_sum_per_position.insert(*position_id, sum);
-
-                    if let Some(last) = last_pnl {
-                        inner.snapshot_last_per_position.insert(*position_id, last);
-                    }
                 } else {
                     inner.snapshot_sum_per_position.remove(position_id);
-                    inner.snapshot_last_per_position.remove(position_id);
                 }
 
                 if currency_mismatch {
@@ -2492,12 +2482,6 @@ impl Portfolio {
                     .snapshot_sum_per_position
                     .get(position_id)
                     .copied();
-                let mut last_pnl = self
-                    .inner
-                    .borrow()
-                    .snapshot_last_per_position
-                    .get(position_id)
-                    .copied();
                 let mut snapshot_account_id: Option<AccountId> = None;
                 let mut currency_mismatch = self
                     .inner
@@ -2531,7 +2515,6 @@ impl Portfolio {
                         } else {
                             sum_pnl = Some(realized_pnl);
                         }
-                        last_pnl = Some(realized_pnl);
                     }
                 }
 
@@ -2539,10 +2522,6 @@ impl Portfolio {
 
                 if !aggregation_overflow && let Some(sum) = sum_pnl {
                     inner.snapshot_sum_per_position.insert(*position_id, sum);
-
-                    if let Some(last) = last_pnl {
-                        inner.snapshot_last_per_position.insert(*position_id, last);
-                    }
                 }
 
                 if currency_mismatch {
@@ -2552,7 +2531,6 @@ impl Portfolio {
                 if aggregation_overflow {
                     inner.snapshot_aggregation_overflows.insert(*position_id);
                     inner.snapshot_sum_per_position.remove(position_id);
-                    inner.snapshot_last_per_position.remove(position_id);
                 }
 
                 if let Some(account_id) = snapshot_account_id
@@ -2670,7 +2648,6 @@ impl Portfolio {
                         inner
                             .snapshot_sum_per_position
                             .get(position_id)
-                            .or_else(|| inner.snapshot_last_per_position.get(position_id))
                             .map(|pnl| pnl.currency)
                     })
                 })
@@ -2696,33 +2673,33 @@ impl Portfolio {
                     .get(position_id)
                     .copied();
 
-                // A closed position whose final cycle was snapshotted carries that cycle both in
-                // its last frame and in its own realized PnL, which the loop below adds; drop
-                // the frame here so the cycle lands once.
+                // A saved copy of the current closed cycle contributes only through the
+                // current position. Match its native opening fill, never its monetary amount.
                 let sum_pnl = if let Some(sum_pnl) = sum_pnl {
-                    let closed_position_pnl = position
-                        .filter(|position| !position.is_open())
-                        .and_then(|position| position.realized_pnl);
-                    let last_pnl = self
-                        .inner
-                        .borrow()
-                        .snapshot_last_per_position
-                        .get(position_id)
-                        .copied();
-
-                    Some(match (closed_position_pnl, last_pnl) {
-                        (Some(realized_pnl), Some(last_pnl)) if last_pnl == realized_pnl => {
-                            match sum_pnl.checked_sub(last_pnl) {
-                                Some(remaining) => remaining,
-                                None => {
-                                    log::error!(
-                                        "Cannot calculate realized PnL: snapshot adjustment exceeds Money bounds"
-                                    );
+                    let duplicate_pnl = match position {
+                        Some(position) => {
+                            match cache.position_snapshot_pnl_for_current_cycle(position) {
+                                Ok(pnl) => pnl,
+                                Err(error) => {
+                                    log::error!("Cannot calculate realized PnL: {error}");
                                     return None;
                                 }
                             }
                         }
-                        _ => sum_pnl,
+                        None => None,
+                    };
+
+                    Some(match duplicate_pnl {
+                        Some(duplicate_pnl) => match sum_pnl.checked_sub(duplicate_pnl) {
+                            Some(remaining) => remaining,
+                            None => {
+                                log::error!(
+                                    "Cannot calculate realized PnL: snapshot adjustment exceeds Money bounds"
+                                );
+                                return None;
+                            }
+                        },
+                        None => sum_pnl,
                     })
                 } else {
                     None

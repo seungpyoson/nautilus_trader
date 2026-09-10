@@ -25,11 +25,14 @@ use nautilus_core::{UUID4, UnixNanos, approx_eq};
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{Bar, BarType, MarkPriceUpdate, QuoteTick},
-    enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderType, PositionSide},
+    enums::{
+        AccountType, LiquiditySide, OmsType, OrderSide, OrderType, PositionAdjustmentType,
+        PositionSide,
+    },
     events::{
         AccountState, OrderAccepted, OrderEventAny, OrderFilled, OrderPendingCancel,
-        OrderPendingUpdate, OrderSubmitted, PortfolioSnapshot, PositionChanged, PositionClosed,
-        PositionEvent, PositionOpened,
+        OrderPendingUpdate, OrderSubmitted, PortfolioSnapshot, PositionAdjusted, PositionChanged,
+        PositionClosed, PositionEvent, PositionOpened,
         account::stubs::cash_account_state,
         order::{
             spec::{
@@ -5756,9 +5759,42 @@ fn test_realized_pnl_rejects_mixed_currency_snapshots(
     assert_eq!(mixed_realized_pnl, None);
 }
 
-/// Builds a cached NETTING position that is closed, with `prior_pnl` archived as an earlier
-/// cycle and `closed_pnl` archived as its own final cycle, so the last frame repeats the
-/// position's realized PnL.
+fn closed_netting_cycle(
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    position_id: PositionId,
+    pnl: Money,
+) -> Position {
+    let fill = |side, price| {
+        let event_id = UUID4::new();
+        OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .account_id(account_id)
+            .client_order_id(ClientOrderId::new(format!("O-{event_id}")))
+            .venue_order_id(VenueOrderId::new(format!("V-{event_id}")))
+            .trade_id(TradeId::new(format!("T-{event_id}")))
+            .event_id(event_id)
+            .position_id(position_id)
+            .order_side(side)
+            .last_qty(Quantity::from(100_000))
+            .last_px(price)
+            .currency(instrument.settlement_currency())
+            .commission(Money::from("2 USD"))
+            .build()
+    };
+    let mut position = Position::new(instrument, fill(OrderSide::Buy, Price::from("1.00000")));
+    let closing_price = Price::from_decimal_dp(
+        dec!(1) + (pnl.as_decimal() + dec!(4)) / dec!(100_000),
+        instrument.price_precision(),
+    )
+    .unwrap();
+    position.apply(&fill(OrderSide::Sell, closing_price));
+    assert!(position.is_closed());
+    assert_eq!(position.realized_pnl, Some(pnl));
+    position
+}
+
+/// Builds distinct closed cycles from native fills, optionally snapshotting the current one.
 fn add_closed_netting_position_with_snapshots(
     portfolio: &Portfolio,
     instrument: &InstrumentAny,
@@ -5766,31 +5802,26 @@ fn add_closed_netting_position_with_snapshots(
     position_id: PositionId,
     archived_pnls: &[Money],
     closed_pnl: Money,
+    snapshot_current: bool,
 ) {
-    let fill = make_fill_for_account(
-        instrument,
-        account_id,
-        OrderSide::Buy,
-        Quantity::from("1"),
-        Price::from("1.00"),
-        position_id,
-    );
-    let mut position = Position::new(instrument, fill);
-    position.side = PositionSide::Flat;
-    position.ts_closed = Some(UnixNanos::from(1));
-
     for archived_pnl in archived_pnls {
-        position.realized_pnl = Some(*archived_pnl);
+        let prior = closed_netting_cycle(instrument, account_id, position_id, *archived_pnl);
+        portfolio
+            .cache()
+            .borrow_mut()
+            .snapshot_position(&prior)
+            .unwrap();
+    }
+
+    let position = closed_netting_cycle(instrument, account_id, position_id, closed_pnl);
+
+    if snapshot_current {
         portfolio
             .cache()
             .borrow_mut()
             .snapshot_position(&position)
             .unwrap();
     }
-
-    // Matching the final archived entry models a cycle that was snapshotted; a different value
-    // models one that closed without being snapshotted.
-    position.realized_pnl = Some(closed_pnl);
     portfolio
         .cache()
         .borrow_mut()
@@ -5811,8 +5842,9 @@ fn test_realized_pnl_for_closed_cached_netting_position_counts_final_cycle_once(
         &instrument_audusd,
         AccountId::new("SIM-001"),
         PositionId::new("P-CLOSED-CACHED-NETTING"),
-        &[Money::from("16.00 USD"), Money::from("6.00 USD")],
+        &[Money::from("16.00 USD")],
         Money::from("6.00 USD"),
+        true,
     );
 
     let pnl = portfolio
@@ -5839,6 +5871,7 @@ fn test_realized_pnl_for_closed_cached_netting_position_adds_unsnapshotted_final
         PositionId::new("P-CLOSED-UNSNAPSHOTTED"),
         &[Money::from("16.00 USD"), Money::from("6.00 USD")],
         Money::from("7.00 USD"),
+        false,
     );
 
     let pnl = portfolio
@@ -5848,6 +5881,179 @@ fn test_realized_pnl_for_closed_cached_netting_position_adds_unsnapshotted_final
     // The final cycle closed without being snapshotted, so no frame repeats it and every frame
     // contributes alongside it: 16.00 + 6.00 + 7.00.
     assert_eq!(pnl, Money::from("29.00 USD"));
+}
+
+#[rstest]
+#[case::current_not_snapshotted(false)]
+#[case::current_also_snapshotted(true)]
+fn test_equal_losses_from_distinct_netting_cycles_both_count(
+    mut portfolio: Portfolio,
+    instrument_audusd: InstrumentAny,
+    #[case] snapshot_current: bool,
+) {
+    portfolio.update_account(&get_margin_account(None));
+    add_closed_netting_position_with_snapshots(
+        &portfolio,
+        &instrument_audusd,
+        AccountId::new("SIM-001"),
+        PositionId::new("P-EQUAL-LOSSES"),
+        &[Money::from("-4 USD")],
+        Money::from("-4 USD"),
+        snapshot_current,
+    );
+
+    // Each round trip charges 2 USD on entry and exit. Equal amounts do not make the
+    // first round trip a duplicate of the second.
+    assert_eq!(
+        portfolio.realized_pnl(&instrument_audusd.id()),
+        Some(Money::from("-8 USD"))
+    );
+}
+
+#[rstest]
+#[case::snapshot_after_close(false)]
+#[case::snapshot_before_close(true)]
+fn test_current_cycle_snapshot_is_not_recounted_after_funding_changes_its_pnl(
+    mut portfolio: Portfolio,
+    instrument_audusd: InstrumentAny,
+    #[case] archive_open: bool,
+) {
+    portfolio.update_account(&get_margin_account(None));
+    let mut position = closed_netting_cycle(
+        &instrument_audusd,
+        AccountId::new("SIM-001"),
+        PositionId::new("P-CYCLE-FUNDING"),
+        Money::from("-4 USD"),
+    );
+    let snapshot = if archive_open {
+        Position::new(&instrument_audusd, position.events[0].clone())
+    } else {
+        position.clone()
+    };
+    portfolio
+        .cache()
+        .borrow_mut()
+        .snapshot_position(&snapshot)
+        .unwrap();
+    position.apply_adjustment(PositionAdjusted::new(
+        position.trader_id,
+        position.strategy_id,
+        position.instrument_id,
+        position.id,
+        position.account_id,
+        PositionAdjustmentType::Funding,
+        None,
+        Some(Money::from("-1 USD")),
+        None,
+        UUID4::new(),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+    ));
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    assert_eq!(position.realized_pnl, Some(Money::from("-5 USD")));
+    assert_eq!(
+        portfolio.realized_pnl(&instrument_audusd.id()),
+        Some(Money::from("-5 USD"))
+    );
+}
+
+#[rstest]
+fn test_missing_current_cycle_pnl_cannot_erase_its_archived_loss(
+    mut portfolio: Portfolio,
+    instrument_audusd: InstrumentAny,
+) {
+    portfolio.update_account(&get_margin_account(None));
+    let mut position = closed_netting_cycle(
+        &instrument_audusd,
+        AccountId::new("SIM-001"),
+        PositionId::new("P-MISSING-CURRENT-PNL"),
+        Money::from("-4 USD"),
+    );
+    {
+        let mut cache = portfolio.cache().borrow_mut();
+        cache.snapshot_position(&position).unwrap();
+        position.realized_pnl = None;
+        cache.add_position(&position, OmsType::Netting).unwrap();
+    }
+    assert_eq!(portfolio.realized_pnl(&instrument_audusd.id()), None);
+}
+
+#[rstest]
+#[case::resident(false)]
+#[case::restored(true)]
+fn test_rebuilt_prior_cycles_count_even_when_current_cycle_identity_and_pnl_match(
+    mut portfolio: Portfolio,
+    instrument_audusd: InstrumentAny,
+    #[case] restore: bool,
+) {
+    portfolio.update_account(&get_margin_account(None));
+    let position = closed_netting_cycle(
+        &instrument_audusd,
+        AccountId::new("SIM-001"),
+        PositionId::new("P-REBUILT-PRIOR"),
+        Money::from("-4 USD"),
+    );
+    {
+        let mut cache = portfolio.cache().borrow_mut();
+
+        if restore {
+            let mut source = Cache::default();
+            source.settle_position_snapshots(&position, Some(Money::from("-4 USD")));
+            let blob = source
+                .position_snapshot_bytes(&position.id)
+                .unwrap()
+                .remove(0);
+            cache
+                .restore_snapshot_blob(
+                    &format!("cache://position-snapshots/{}/0", position.id),
+                    blob.into(),
+                )
+                .unwrap();
+        } else {
+            cache.settle_position_snapshots(&position, Some(Money::from("-4 USD")));
+        }
+        cache.add_position(&position, OmsType::Netting).unwrap();
+    }
+
+    assert_eq!(
+        portfolio.realized_pnl(&instrument_audusd.id()),
+        Some(Money::from("-8 USD"))
+    );
+}
+
+#[rstest]
+#[case::current_identity_missing(true)]
+#[case::archive_identity_missing(false)]
+fn test_closed_cycle_with_missing_identity_refuses_portfolio_pnl(
+    mut portfolio: Portfolio,
+    instrument_audusd: InstrumentAny,
+    #[case] omit_current: bool,
+) {
+    portfolio.update_account(&get_margin_account(None));
+    let position = closed_netting_cycle(
+        &instrument_audusd,
+        AccountId::new("SIM-001"),
+        PositionId::new("P-MISSING-CYCLE-IDENTITY"),
+        Money::from("-4 USD"),
+    );
+    let without_events = position.clone_without_events();
+    let (current, archive) = if omit_current {
+        (&without_events, &position)
+    } else {
+        (&position, &without_events)
+    };
+    {
+        let mut cache = portfolio.cache().borrow_mut();
+        cache.snapshot_position(archive).unwrap();
+        cache.add_position(current, OmsType::Netting).unwrap();
+    }
+
+    assert_eq!(portfolio.realized_pnl(&instrument_audusd.id()), None);
 }
 
 #[rstest]
@@ -5893,8 +6099,9 @@ fn test_realized_pnl_for_closed_cached_netting_position_uses_mark_xrate(
         &instrument_audusd,
         account_id,
         PositionId::new("P-CLOSED-CACHED-MARK-XRATE"),
-        &[Money::from("16.00 USD"), Money::from("6.00 USD")],
+        &[Money::from("16.00 USD")],
         Money::from("6.00 USD"),
+        true,
     );
 
     let pnl = portfolio
@@ -5946,8 +6153,9 @@ fn test_realized_pnl_for_closed_cached_netting_position_without_base_conversion(
         &instrument_audusd,
         account_id,
         PositionId::new("P-CLOSED-CACHED-NO-CONVERT"),
-        &[Money::from("16.00 USD"), Money::from("6.00 USD")],
+        &[Money::from("16.00 USD")],
         Money::from("6.00 USD"),
+        true,
     );
 
     let pnl = portfolio
