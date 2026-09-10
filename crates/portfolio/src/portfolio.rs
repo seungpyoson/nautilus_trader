@@ -323,20 +323,18 @@ impl Portfolio {
             let clock = Rc::clone(clock);
             let inner = inner_weak;
             TypedIntoHandler::from(move |event: OrderEventAny| {
-                if let Some(inner_rc) = inner.upgrade() {
-                    let inner_rc: Rc<RefCell<PortfolioState>> = inner_rc.into();
-                    update_order(
-                        &cache,
-                        &clock,
-                        &inner_rc,
-                        config,
-                        &event,
-                        OrderUpdateSource::Endpoint,
-                    );
-                }
+                let inner_rc = inner.upgrade()?;
+                let inner_rc: Rc<RefCell<PortfolioState>> = inner_rc.into();
 
-                // Portfolio calculations are outside order and position application acknowledgements
-                None
+                // Acknowledges this endpoint only, not later position notifications or valuation
+                Some(update_order(
+                    &cache,
+                    &clock,
+                    &inner_rc,
+                    config,
+                    &event,
+                    OrderUpdateSource::Endpoint,
+                ))
             })
         };
         msgbus::register_order_event_endpoint(
@@ -3324,8 +3322,29 @@ fn update_order(
     config: PortfolioConfig,
     event: &OrderEventAny,
     source: OrderUpdateSource,
-) {
+) -> EventApplicationOutcome {
+    let outcome = apply_order_update(cache, clock, inner, config, event, source);
+
+    if outcome == EventApplicationOutcome::Incomplete {
+        let mut inner = inner.borrow_mut();
+        inner.unrealized_pnls.shift_remove(&event.instrument_id());
+        inner.realized_pnls.shift_remove(&event.instrument_id());
+        inner.pending_calcs.insert(event.instrument_id());
+    }
+
+    outcome
+}
+
+fn apply_order_update(
+    cache: &Rc<RefCell<Cache>>,
+    clock: &Rc<RefCell<dyn Clock>>,
+    inner: &Rc<RefCell<PortfolioState>>,
+    config: PortfolioConfig,
+    event: &OrderEventAny,
+    source: OrderUpdateSource,
+) -> EventApplicationOutcome {
     let mut mark_pre_position_fill_event = None;
+    let mut outcome = EventApplicationOutcome::Applied;
 
     if let OrderEventAny::Filled(order_filled) = event {
         match source {
@@ -3338,7 +3357,7 @@ fn update_order(
                     .pre_position_fill_events
                     .remove(&order_filled.event_id)
                 {
-                    return;
+                    return EventApplicationOutcome::Applied;
                 }
             }
         }
@@ -3347,7 +3366,7 @@ fn update_order(
     let account_id = match event.account_id() {
         Some(account_id) => account_id,
         None => {
-            return; // No Account Assigned
+            return EventApplicationOutcome::Applied; // No Account Assigned
         }
     };
 
@@ -3359,7 +3378,7 @@ fn update_order(
             Ok(account) => account,
             Err(e) => {
                 log::error!("Cannot update order: {e}");
-                return;
+                return EventApplicationOutcome::Incomplete;
             }
         };
 
@@ -3377,7 +3396,7 @@ fn update_order(
         };
 
         if !calculate_account_state && !is_wallet {
-            return;
+            return EventApplicationOutcome::Applied;
         }
 
         match event {
@@ -3395,7 +3414,7 @@ fn update_order(
             | OrderEventAny::Filled(_)
             | OrderEventAny::FillVoided(_) => {}
             _ => {
-                return;
+                return EventApplicationOutcome::Applied;
             }
         }
 
@@ -3405,14 +3424,14 @@ fn update_order(
                 "Cannot update order: {} not found in the cache",
                 event.client_order_id()
             );
-            return; // No Order Found
+            return EventApplicationOutcome::Incomplete;
         }
 
         if !is_wallet
             && matches!(event, OrderEventAny::Rejected(_))
             && order.is_some_and(|order| order.order_type() != OrderType::StopLimit)
         {
-            return; // No change to account state
+            return EventApplicationOutcome::Applied; // No change to account state
         }
 
         let instrument = if let Some(instrument) = cache_ref.instrument(&event.instrument_id()) {
@@ -3422,7 +3441,7 @@ fn update_order(
                 "Cannot update order: no instrument found for {}",
                 event.instrument_id()
             );
-            return;
+            return EventApplicationOutcome::Incomplete;
         };
 
         let orders_open = if is_wallet {
@@ -3452,7 +3471,7 @@ fn update_order(
                 "Cannot update order: {}",
                 AccountLookupError::not_found(account_id)
             );
-            return;
+            return EventApplicationOutcome::Incomplete;
         }
     };
 
@@ -3460,15 +3479,26 @@ fn update_order(
         && calculate_account_state
     {
         if !instrument.is_spread() {
-            let (post_balance, _state) =
-                inner
-                    .borrow()
-                    .accounts
-                    .update_balances(working_account, &instrument, order_filled);
-            working_account = post_balance;
+            let result = inner.borrow().accounts.update_balances(
+                &mut working_account,
+                &instrument,
+                order_filled,
+            );
+
+            if let Err(e) = result {
+                cache.borrow_mut().cache_account_owned(working_account);
+
+                log::error!("Cannot update fill balances: {e}");
+                return EventApplicationOutcome::Incomplete;
+            }
         }
 
         cache.borrow_mut().cache_account_owned(working_account);
+
+        // Suppress the companion topic's balance application even if later calculations fail
+        if let Some(event_id) = mark_pre_position_fill_event.take() {
+            inner.borrow_mut().pre_position_fill_events.insert(event_id);
+        }
 
         let portfolio_clone = Portfolio {
             clock: Rc::clone(clock),
@@ -3494,6 +3524,7 @@ fn update_order(
                     "Failed to calculate unrealized PnL for instrument {}",
                     event.instrument_id()
                 );
+                outcome = EventApplicationOutcome::Incomplete;
             }
         }
 
@@ -3501,7 +3532,7 @@ fn update_order(
             log::error!(
                 "Cannot finish fill account update: account {account_id} could not be restored"
             );
-            return;
+            return EventApplicationOutcome::Incomplete;
         };
         working_account = restored_account;
     } else if let OrderEventAny::FillVoided(fill_voided) = event
@@ -3535,6 +3566,7 @@ fn update_order(
                 .borrow_mut()
                 .unrealized_pnls
                 .shift_remove(&fill_voided.instrument_id);
+            outcome = EventApplicationOutcome::Incomplete;
         }
 
         if let Some(pnl) = portfolio.calculate_realized_pnl(&fill_voided.instrument_id, None, None)
@@ -3548,18 +3580,19 @@ fn update_order(
                 .borrow_mut()
                 .realized_pnls
                 .shift_remove(&fill_voided.instrument_id);
+            outcome = EventApplicationOutcome::Incomplete;
         }
 
         if !is_wallet {
             log::debug!("Updated {event}");
-            return;
+            return outcome;
         }
 
         let Some(restored_account) = take_or_clone_account(cache, account_id) else {
             log::error!(
                 "Cannot recalculate Wallet reservations: account {account_id} was not restored after fill void"
             );
-            return;
+            return EventApplicationOutcome::Incomplete;
         };
         working_account = restored_account;
     }
@@ -3582,7 +3615,10 @@ fn update_order(
         && let Some(account_state) = account_state.as_ref()
         && let Err(e) = working_account.apply(account_state.clone())
     {
+        cache.borrow_mut().cache_account_owned(working_account);
+
         log::error!("Cannot apply generated account state: {e}");
+        return EventApplicationOutcome::Incomplete;
     }
 
     let updated_account_id = working_account.id();
@@ -3590,15 +3626,10 @@ fn update_order(
     if account_state.is_some() || matches!(event, OrderEventAny::Filled(_)) {
         if let Err(e) = cache.borrow_mut().update_account_owned(working_account) {
             log::error!("Cannot persist updated account {updated_account_id}: {e}");
-            return;
+            return EventApplicationOutcome::Incomplete;
         }
     } else {
         cache.borrow_mut().cache_account_owned(working_account);
-    }
-
-    // Consumed by the matching `events.order.*` topic handler; engine publishes after every endpoint send
-    if let Some(event_id) = mark_pre_position_fill_event {
-        inner.borrow_mut().pre_position_fill_events.insert(event_id);
     }
 
     if let Some(account_state) = account_state {
@@ -3611,9 +3642,16 @@ fn update_order(
     } else {
         log::debug!("Added pending calculation for {}", instrument.id());
         inner.borrow_mut().pending_calcs.insert(instrument.id());
+        return EventApplicationOutcome::Incomplete;
+    }
+
+    // Consumed by the matching `events.order.*` topic handler; engine publishes after every endpoint send
+    if let Some(event_id) = mark_pre_position_fill_event {
+        inner.borrow_mut().pre_position_fill_events.insert(event_id);
     }
 
     log::debug!("Updated {event}");
+    outcome
 }
 
 fn take_or_clone_account(cache: &Rc<RefCell<Cache>>, account_id: AccountId) -> Option<AccountAny> {
@@ -4212,11 +4250,466 @@ fn push_bounded(
 
 #[cfg(test)]
 mod tests {
+    use nautilus_common::{clock::TestClock, msgbus::MessageBus};
     use nautilus_core::{UUID4, UnixNanos};
-    use nautilus_model::{enums::AccountType, identifiers::AccountId};
+    use nautilus_model::{
+        data::QuoteTick,
+        enums::{AccountType, OrderSide},
+        events::order::spec::{OrderAcceptedSpec, OrderFilledSpec, OrderSubmittedSpec},
+        identifiers::{AccountId, PositionId, Symbol},
+        instruments::stubs::{audusd_sim, default_fx_ccy},
+        orders::OrderTestBuilder,
+        types::Quantity,
+    };
     use rstest::rstest;
 
     use super::*;
+
+    fn fill_endpoint_portfolio(account_type: AccountType) -> (Portfolio, InstrumentAny) {
+        *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        let mut portfolio = Portfolio::new(Rc::new(RefCell::new(TestClock::new())), cache, None);
+        let total = Money::from("1000.00 USD");
+        portfolio.update_account(&AccountState::new(
+            AccountId::from("SIM-001"),
+            account_type,
+            vec![AccountBalance::new(
+                total,
+                Money::zero(Currency::USD()),
+                total,
+            )],
+            vec![],
+            true,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+            Some(Currency::USD()),
+        ));
+        portfolio
+            .cache
+            .borrow_mut()
+            .account_mut(&AccountId::from("SIM-001"))
+            .unwrap()
+            .set_calculate_account_state(true);
+        (portfolio, instrument)
+    }
+
+    fn add_commission_quote(portfolio: &Portfolio) {
+        let instrument = InstrumentAny::CurrencyPair(default_fx_ccy(
+            Symbol::from("GBP/USD"),
+            Some(Venue::from("SIM")),
+        ));
+        let quote = QuoteTick::new(
+            instrument.id(),
+            Price::from("2.00000"),
+            Price::from("2.00000"),
+            Quantity::from("1"),
+            Quantity::from("1"),
+            0.into(),
+            0.into(),
+        );
+        let mut cache = portfolio.cache.borrow_mut();
+        cache.add_instrument(instrument).unwrap();
+        cache.add_quote(quote).unwrap();
+    }
+
+    #[rstest]
+    #[case(AccountType::Cash, OrderSide::Buy, "10", "986.00 USD")]
+    #[case(AccountType::Margin, OrderSide::Buy, "10", "996.00 USD")]
+    #[case(AccountType::Cash, OrderSide::Sell, "4", "1000.00 USD")]
+    fn fill_endpoint_acknowledges_balances_and_preserves_account_on_missing_fee_fx(
+        #[case] account_type: AccountType,
+        #[case] side: OrderSide,
+        #[case] quantity: &str,
+        #[case] expected_balance: &str,
+    ) {
+        let (mut portfolio, instrument) = fill_endpoint_portfolio(account_type);
+        let account_id = AccountId::from("SIM-001");
+        let endpoint = MessagingSwitchboard::portfolio_update_order();
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .account_id(account_id)
+            .order_side(side)
+            .last_qty(Quantity::from(quantity))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::from("P-FEE-FX"))
+            .commission(Money::from("2.00 GBP"))
+            .build();
+        let event = OrderEventAny::Filled(fill.clone());
+        let original = portfolio.cache.borrow().account_owned(&account_id).unwrap();
+        let captured = Rc::new(RefCell::new(Vec::<AccountState>::new()));
+        msgbus::subscribe_account_state(
+            "events.account.*".into(),
+            TypedHandler::from({
+                let captured = Rc::clone(&captured);
+                move |state: &AccountState| captured.borrow_mut().push(state.clone())
+            }),
+            None,
+        );
+        {
+            let mut inner = portfolio.inner.borrow_mut();
+            inner
+                .unrealized_pnls
+                .insert(instrument.id(), Money::from("9.00 USD"));
+            inner
+                .realized_pnls
+                .insert(instrument.id(), Money::from("7.00 USD"));
+        }
+
+        for _ in 0..2 {
+            assert_eq!(
+                msgbus::send_order_event_with_outcome(endpoint, event.clone()),
+                Some(EventApplicationOutcome::Incomplete)
+            );
+            let account = portfolio.cache.borrow().account_owned(&account_id).unwrap();
+            assert_eq!(account.balances(), original.balances());
+            assert_eq!(
+                account.last_event().unwrap().event_id,
+                original.last_event().unwrap().event_id
+            );
+            let inner = portfolio.inner.borrow();
+            assert!(!inner.unrealized_pnls.contains_key(&instrument.id()));
+            assert!(!inner.realized_pnls.contains_key(&instrument.id()));
+            assert!(inner.pending_calcs.contains(&instrument.id()));
+            assert!(!inner.pre_position_fill_events.contains(&fill.event_id));
+        }
+
+        let topic = msgbus::switchboard::get_event_order_topic(fill.strategy_id);
+        msgbus::publish_order_event(topic, &event);
+        assert!(captured.borrow().is_empty());
+        assert_eq!(
+            portfolio
+                .cache
+                .borrow()
+                .account(&account_id)
+                .unwrap()
+                .balances(),
+            original.balances()
+        );
+
+        add_commission_quote(&portfolio);
+        assert_eq!(
+            msgbus::send_order_event_with_outcome(endpoint, event.clone()),
+            Some(EventApplicationOutcome::Applied)
+        );
+        // The direct topic path and the actual bus notification cannot apply the fee again
+        portfolio.update_order(&event);
+        msgbus::publish_order_event(topic, &event);
+        let account = portfolio.cache.borrow().account_owned(&account_id).unwrap();
+        assert_eq!(
+            account.balance_total(Some(Currency::USD())),
+            Some(Money::from(expected_balance))
+        );
+        let commission = match account {
+            AccountAny::Cash(account) => account.commission(&Currency::USD()),
+            AccountAny::Margin(account) => account.commission(&Currency::USD()),
+            _ => unreachable!(),
+        };
+        assert_eq!(commission, Some(Money::from("4.00 USD")));
+        drop(portfolio);
+        assert_eq!(msgbus::send_order_event_with_outcome(endpoint, event), None);
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn fill_endpoint_rejects_missing_account_or_instrument(#[case] missing_account: bool) {
+        let (portfolio, instrument) = fill_endpoint_portfolio(AccountType::Cash);
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(if missing_account {
+                instrument.id()
+            } else {
+                "MISSING.SIM".into()
+            })
+            .account_id(if missing_account {
+                "SIM-MISSING".into()
+            } else {
+                "SIM-001".into()
+            })
+            .position_id(PositionId::from("P-MISSING"))
+            .build();
+
+        assert_eq!(
+            msgbus::send_order_event_with_outcome(
+                MessagingSwitchboard::portfolio_update_order(),
+                OrderEventAny::Filled(fill)
+            ),
+            Some(EventApplicationOutcome::Incomplete)
+        );
+        assert_eq!(
+            portfolio
+                .cache
+                .borrow()
+                .account(&AccountId::from("SIM-001"))
+                .unwrap()
+                .balance_total(Some(Currency::USD())),
+            Some(Money::from("1000.00 USD"))
+        );
+    }
+
+    #[rstest]
+    fn order_endpoint_reports_reservation_failure_without_repeating_applied_fill_balances() {
+        let (mut portfolio, instrument) = fill_endpoint_portfolio(AccountType::Cash);
+        let account_id = AccountId::from("SIM-001");
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("10"))
+            .price(Price::from("1.00000"))
+            .build();
+        order
+            .apply(OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder()
+                    .instrument_id(instrument.id())
+                    .client_order_id(order.client_order_id())
+                    .account_id(account_id)
+                    .build(),
+            ))
+            .unwrap();
+        let event = OrderEventAny::Accepted(
+            OrderAcceptedSpec::builder()
+                .instrument_id(instrument.id())
+                .client_order_id(order.client_order_id())
+                .account_id(account_id)
+                .build(),
+        );
+        portfolio
+            .cache
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+        // Apply acceptance through Cache so its open-order index matches the order state
+        portfolio.cache.borrow_mut().update_order(&event).unwrap();
+        assert_eq!(
+            portfolio
+                .cache
+                .borrow()
+                .orders_open(None, Some(&instrument.id()), None, Some(&account_id), None)
+                .len(),
+            1,
+        );
+        let endpoint = MessagingSwitchboard::portfolio_update_order();
+        let original = portfolio.cache.borrow().account_owned(&account_id).unwrap();
+
+        // Selling AUD reserves AUD, requiring a quote to convert the reserve to the USD account
+        assert_eq!(
+            msgbus::send_order_event_with_outcome(endpoint, event.clone()),
+            Some(EventApplicationOutcome::Incomplete)
+        );
+        let account = portfolio.cache.borrow().account_owned(&account_id).unwrap();
+        assert_eq!(account.balances(), original.balances());
+        assert_eq!(
+            account.last_event().unwrap().event_id,
+            original.last_event().unwrap().event_id
+        );
+        assert!(
+            portfolio
+                .inner
+                .borrow()
+                .pending_calcs
+                .contains(&instrument.id())
+        );
+
+        let fill = OrderEventAny::Filled(
+            OrderFilledSpec::builder()
+                .instrument_id(instrument.id())
+                .account_id(account_id)
+                .client_order_id("O-FILL".into())
+                .order_side(OrderSide::Buy)
+                .last_qty(Quantity::from("10"))
+                .last_px(Price::from("1.00000"))
+                .position_id(PositionId::from("P-RESERVATION"))
+                .commission(Money::from("2.00 USD"))
+                .build(),
+        );
+        assert_eq!(
+            msgbus::send_order_event_with_outcome(endpoint, fill.clone()),
+            Some(EventApplicationOutcome::Incomplete)
+        );
+        assert_eq!(
+            portfolio
+                .cache
+                .borrow()
+                .account(&account_id)
+                .unwrap()
+                .balance_total(Some(Currency::USD())),
+            Some(Money::from("988.00 USD"))
+        );
+
+        // The balance applied before the reservation failed; its companion must not debit again
+        portfolio.update_order(&fill);
+        msgbus::publish_order_event(
+            msgbus::switchboard::get_event_order_topic(fill.strategy_id()),
+            &fill,
+        );
+        assert_eq!(
+            portfolio
+                .cache
+                .borrow()
+                .account(&account_id)
+                .unwrap()
+                .balance_total(Some(Currency::USD())),
+            Some(Money::from("988.00 USD"))
+        );
+
+        portfolio
+            .cache
+            .borrow_mut()
+            .add_quote(QuoteTick::new(
+                instrument.id(),
+                Price::from("1.00000"),
+                Price::from("1.00000"),
+                Quantity::from("1"),
+                Quantity::from("1"),
+                0.into(),
+                0.into(),
+            ))
+            .unwrap();
+        assert_eq!(
+            msgbus::send_order_event_with_outcome(endpoint, event),
+            Some(EventApplicationOutcome::Applied)
+        );
+        assert_eq!(
+            portfolio
+                .cache
+                .borrow()
+                .account(&account_id)
+                .unwrap()
+                .balance_locked(Some(Currency::USD())),
+            Some(Money::from("10.00 USD"))
+        );
+    }
+
+    #[rstest]
+    fn fill_endpoint_acknowledges_reported_account_without_calculating_balances() {
+        let (portfolio, instrument) = fill_endpoint_portfolio(AccountType::Cash);
+        let account_id = AccountId::from("SIM-001");
+        portfolio
+            .cache
+            .borrow_mut()
+            .account_mut(&account_id)
+            .unwrap()
+            .set_calculate_account_state(false);
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .account_id(account_id)
+            .commission(Money::from("2.00 GBP"))
+            .build();
+
+        assert_eq!(
+            msgbus::send_order_event_with_outcome(
+                MessagingSwitchboard::portfolio_update_order(),
+                OrderEventAny::Filled(fill)
+            ),
+            Some(EventApplicationOutcome::Applied)
+        );
+        assert_eq!(
+            portfolio
+                .cache
+                .borrow()
+                .account(&account_id)
+                .unwrap()
+                .balance_total(Some(Currency::USD())),
+            Some(Money::from("1000.00 USD"))
+        );
+    }
+
+    #[rstest]
+    #[case(false, EventApplicationOutcome::Incomplete)]
+    #[case(true, EventApplicationOutcome::Applied)]
+    fn fill_endpoint_finishes_reservations_when_valuation_is_unavailable(
+        #[case] with_quote: bool,
+        #[case] expected: EventApplicationOutcome,
+    ) {
+        let (mut portfolio, instrument) = fill_endpoint_portfolio(AccountType::Cash);
+        let account_id = AccountId::from("SIM-001");
+        {
+            let mut cache = portfolio.cache.borrow_mut();
+            let mut account = cache.account_mut(&account_id).unwrap();
+            let AccountAny::Cash(account) = &mut *account else {
+                unreachable!()
+            };
+            account.update_balance_locked(instrument.id(), Money::from("10.00 USD"));
+        }
+
+        let entry = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .account_id(account_id)
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("1"))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::from("P-UNPRICED"))
+            .commission(Money::zero(Currency::USD()))
+            .build();
+        portfolio
+            .cache
+            .borrow_mut()
+            .add_position(&Position::new(&instrument, entry), OmsType::Netting)
+            .unwrap();
+
+        if with_quote {
+            portfolio
+                .cache
+                .borrow_mut()
+                .add_quote(QuoteTick::new(
+                    instrument.id(),
+                    Price::from("1.00000"),
+                    Price::from("1.00000"),
+                    Quantity::from("1"),
+                    Quantity::from("1"),
+                    0.into(),
+                    0.into(),
+                ))
+                .unwrap();
+        }
+
+        let fill = OrderEventAny::Filled(
+            OrderFilledSpec::builder()
+                .instrument_id(instrument.id())
+                .account_id(account_id)
+                .order_side(OrderSide::Buy)
+                .last_qty(Quantity::from("1"))
+                .last_px(Price::from("1.00000"))
+                .position_id(PositionId::from("P-UNPRICED"))
+                .commission(Money::from("2.00 USD"))
+                .build(),
+        );
+        assert_eq!(
+            msgbus::send_order_event_with_outcome(
+                MessagingSwitchboard::portfolio_update_order(),
+                fill.clone()
+            ),
+            Some(expected)
+        );
+        portfolio.update_order(&fill);
+        msgbus::publish_order_event(
+            msgbus::switchboard::get_event_order_topic(fill.strategy_id()),
+            &fill,
+        );
+        let cache = portfolio.cache.borrow();
+        let account = cache.account(&account_id).unwrap();
+        assert_eq!(
+            account.balance_total(Some(Currency::USD())),
+            Some(Money::from("997.00 USD"))
+        );
+        assert_eq!(
+            account.balance_free(Some(Currency::USD())),
+            Some(Money::from("997.00 USD"))
+        );
+        assert_eq!(
+            account.balance_locked(Some(Currency::USD())),
+            Some(Money::zero(Currency::USD()))
+        );
+        assert_eq!(
+            account.last_event().unwrap().balances[0].total,
+            Money::from("997.00 USD")
+        );
+    }
 
     fn mk_snapshot(seq: u64) -> PortfolioSnapshot {
         PortfolioSnapshot::new(
