@@ -18259,6 +18259,113 @@ fn test_prior_cycle_fill_void_rejected_without_carried_replay(
 }
 
 #[rstest]
+#[case::exact_split(100_000, 50_000, 200_000, "-2.50 USD", "-1.50 USD")]
+#[case::rounded_split(2_000, 1_000, 3_000, "-2.67 USD", "-1.33 USD")]
+fn test_entry_fill_void_preserves_native_flip_cycle_accounting(
+    #[case] original_entry_qty: u64,
+    #[case] corrected_entry_qty: u64,
+    #[case] exit_qty: u64,
+    #[case] archived_pnl: &str,
+    #[case] current_pnl: &str,
+) {
+    let instrument = audusd_sim();
+    let trader_id = TraderId::test_default();
+    let strategy_id = StrategyId::test_default();
+    let position_id = PositionId::new(format!("{}-{strategy_id}", instrument.id));
+    let run = |entry_qty| {
+        let mut engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(Cache::default())),
+            Some(ExecutionEngineConfig {
+                carry_replay_events_on_reopen: true,
+                ..Default::default()
+            }),
+        );
+        setup_netting_snapshot_engine(&mut engine, &instrument);
+
+        for (order, venue_order, trade, side, quantity) in [
+            (
+                "O-CYCLE-ENTRY",
+                "V-CYCLE-ENTRY",
+                "T-CYCLE-ENTRY",
+                OrderSide::Buy,
+                entry_qty,
+            ),
+            (
+                "O-CYCLE-FLIP",
+                "V-CYCLE-FLIP",
+                "T-CYCLE-FLIP",
+                OrderSide::Sell,
+                exit_qty,
+            ),
+        ] {
+            process_filled_order(
+                &mut engine,
+                trader_id,
+                strategy_id,
+                &instrument,
+                order,
+                venue_order,
+                trade,
+                side,
+                quantity,
+                position_id,
+            );
+        }
+        engine
+    };
+
+    // Native execution supplies the independent control. Each fill costs 2 USD at price 1.
+    // The 2k -> 1k entry correction also distinguishes splitting the original 2 USD exit fee
+    // once (closing 0.67) from re-splitting its rounded 1.33 USD closing fragment (0.66).
+    let (expected_current, expected_archive) = {
+        let engine = run(corrected_entry_qty);
+        let cache = engine.cache().borrow();
+        let current = cache.position_owned(&position_id).unwrap();
+        let archives = cache.position_snapshots(Some(&position_id), None);
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].realized_pnl, Some(Money::from(archived_pnl)));
+        assert_eq!(current.realized_pnl, Some(Money::from(current_pnl)));
+        assert_eq!(current.side, PositionSide::Short);
+        assert_eq!(
+            current.quantity,
+            Quantity::from(exit_qty - corrected_entry_qty)
+        );
+        (current, archives.into_iter().next().unwrap())
+    };
+
+    // Reach the same effective fills through a correction. The paid entry fee is not refunded.
+    let mut engine = run(original_entry_qty);
+    let event = build_fill_void_from_cached_fill(
+        &engine,
+        "O-CYCLE-ENTRY",
+        "T-CYCLE-ENTRY",
+        Quantity::from(original_entry_qty - corrected_entry_qty),
+    );
+    assert_eq!(
+        engine.process_with_outcome(&event),
+        EventApplicationOutcome::Applied
+    );
+    let cache = engine.cache().borrow();
+    let current = cache.position(&position_id).unwrap();
+    let archives = cache.position_snapshots(Some(&position_id), None);
+    assert_eq!(current.side, expected_current.side);
+    assert_eq!(current.quantity, expected_current.quantity);
+    assert_eq!(
+        archives.len(),
+        1,
+        "a correction must retain the cycle closed by the flip"
+    );
+    assert_eq!(archives[0].realized_pnl, expected_archive.realized_pnl);
+    assert_eq!(current.realized_pnl, expected_current.realized_pnl);
+    assert_eq!(current.buy_qty, expected_current.buy_qty);
+    assert_eq!(current.sell_qty, expected_current.sell_qty);
+    assert_eq!(current.opening_order_id, expected_current.opening_order_id);
+    assert_eq!(current.commissions(), expected_current.commissions());
+    assert_eq!(current.events.len(), expected_current.events.len());
+}
+
+#[rstest]
 fn test_prior_cycle_fill_void_applied_with_carried_replay() {
     let clock = Rc::new(RefCell::new(TestClock::new()));
     let cache = Rc::new(RefCell::new(Cache::default()));
