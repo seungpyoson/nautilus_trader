@@ -22,12 +22,35 @@ use indexmap::IndexMap;
 use nautilus_common::cache::{Cache, CacheSnapshotRef};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    events::{OrderEventAny, OrderFillVoided},
+    events::{OrderEventAny, OrderFillVoided, OrderFilled},
     identifiers::PositionId,
+    instruments::InstrumentAny,
     orders::{Order, OrderAny},
     position::{Position, PositionReplayEvent},
     types::{Money, Quantity},
 };
+
+pub(super) fn will_flip_position(position: &Position, fill: &OrderFilled) -> bool {
+    position.is_opposite_side(fill.order_side) && fill.last_qty.raw > position.quantity.raw
+}
+
+/// Builds the opening state after the caller has archived the previous cycle, if required.
+/// The caller resolves retained history after any archive callback has run.
+pub(super) fn build_open_position(
+    instrument: &InstrumentAny,
+    fill: OrderFilled,
+    prior: Option<Position>,
+) -> Position {
+    let mut position = Position::new(instrument, fill);
+    if let Some(mut prior) = prior
+        && prior.id == position.id
+    {
+        prior.replay_events.append(&mut position.replay_events);
+        position.replay_events = prior.replay_events;
+        position.fill_voids = prior.fill_voids;
+    }
+    position
+}
 
 /// Position state snapshot published to the `snapshots.position.{position_id}` topic.
 #[derive(Debug, Clone)]

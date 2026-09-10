@@ -200,13 +200,10 @@ impl Cache {
     ) -> (String, PositionSnapshotFrame) {
         let position_id = position.id;
 
-        let mut copied_position = position.clone();
+        let mut copied_position = position.clone_for_snapshot();
         let snapshot_uuid = UUID4::new();
         let new_id = format!("{}-{snapshot_uuid}", position_id.as_str());
         copied_position.id = PositionId::new(new_id);
-        copied_position.replay_events.clear();
-        copied_position.fill_voids.clear();
-
         let blob_ref = position_snapshot_blob_ref(
             &position_id,
             self.position_snapshot_count(&position_id),

@@ -4015,7 +4015,7 @@ impl ExecutionEngine {
                 ))
             }
             Some(mut pos) => {
-                if self.will_flip_position(&pos, &fill) {
+                if position::will_flip_position(&pos, &fill) {
                     self.flip_position(instrument, &mut pos, &fill, oms_type)
                 } else {
                     match self.update_position(&mut pos, &fill) {
@@ -4115,15 +4115,7 @@ impl ExecutionEngine {
         } else {
             None
         };
-        let mut position = Position::new(instrument, fill.clone());
-        if let Some(prior) = prior_position
-            && prior.id == position.id
-        {
-            let current_replay = position.replay_events.clone();
-            position.replay_events = prior.replay_events;
-            position.replay_events.extend(current_replay);
-            position.fill_voids = prior.fill_voids;
-        }
+        let position = position::build_open_position(instrument, fill.clone(), prior_position);
         let is_orderless_leg = self.is_leg_fill(&fill)
             && !self.cache.borrow().order_exists(&position.opening_order_id);
         if is_orderless_leg {
@@ -4230,10 +4222,6 @@ impl ExecutionEngine {
             let event = PositionChanged::create(position, fill, UUID4::new(), ts_init);
             Some(PositionEvent::PositionChanged(event))
         }
-    }
-
-    fn will_flip_position(&self, position: &Position, fill: &OrderFilled) -> bool {
-        position.is_opposite_side(fill.order_side) && (fill.last_qty.raw > position.quantity.raw)
     }
 
     fn position_signed_decimal_qty(position: &Position) -> Decimal {

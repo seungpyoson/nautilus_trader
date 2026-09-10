@@ -237,6 +237,19 @@ impl Position {
         }
     }
 
+    /// Copies the current cycle without copying retained replay history or fill corrections.
+    ///
+    /// Use this for archived state only. The copy does not contain the history required to
+    /// reconstruct corrections or to detect fills duplicated across earlier cycles.
+    #[must_use]
+    pub fn clone_for_snapshot(&self) -> Self {
+        let mut snapshot = self.clone_without_events();
+        snapshot.events.clone_from(&self.events);
+        snapshot.adjustments.clone_from(&self.adjustments);
+        snapshot.trade_ids.clone_from(&self.trade_ids);
+        snapshot
+    }
+
     /// Purges all order fill events for the given client order ID and recalculates derived state.
     ///
     /// # Warning
