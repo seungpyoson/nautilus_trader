@@ -733,7 +733,7 @@ impl NautilusKernel {
 
             match trader.state() {
                 ComponentState::PreInitialized => {
-                    trader.initialize().context("failed to initialize trader")?
+                    trader.initialize().context("failed to initialize trader")?;
                 }
                 ComponentState::Ready => {}
                 state => anyhow::bail!("Cannot start kernel with trader in {state} state"),
@@ -775,8 +775,10 @@ impl NautilusKernel {
     /// # Errors
     ///
     /// Returns an error if event-store restoration, run creation, or trader initialization fails.
+    #[allow(unknown_lints)]
     #[expect(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "keeps the public async kernel API shape stable"
     )]
     pub async fn start_async(&mut self) -> anyhow::Result<()> {
