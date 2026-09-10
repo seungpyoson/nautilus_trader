@@ -1318,7 +1318,7 @@ fn contract_settlement_inventory_survives_history_cleanup(
         assert!(cache.order_ref(&settlement_order_id).is_none());
     }
 
-    for (venue_qty, expected) in [("15.00", true), ("5.00", false), ("0.00", true)] {
+    for (venue_qty, expected) in [("5.00", false), ("15.00", true), ("0.00", true)] {
         let quantity = Quantity::from(venue_qty);
         let mut mass = ExecutionMassStatus::new(
             f.client_id,
@@ -1350,7 +1350,11 @@ fn contract_settlement_inventory_survives_history_cleanup(
             .node
             .exec_manager
             .check_mass_status_inventory(&mass, &f.node.kernel.exec_engine.borrow());
-        assert_eq!(result.summary.all_received_reports_reconciled(), expected);
+        assert_eq!(
+            result.summary.all_received_reports_reconciled(),
+            expected,
+            "venue quantity {venue_qty} after purge_all_orders={purge_all_orders}",
+        );
         assert_eq!(inventory.all_inventory_reconciled(), expected);
         assert!(result.events.is_empty());
     }
