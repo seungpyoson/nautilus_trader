@@ -61,22 +61,21 @@ impl AccountsManager {
 
     /// Updates the given account state based on a filled order.
     ///
-    /// Mutations are applied to `account` in place so the caller can persist
-    /// the recalculated balances and commissions back to the cache.
+    /// Updates balances and commissions in place. On failure, both are preserved and
+    /// no account state is generated. The caller retains ownership of the account.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the position list for the filled instrument is empty.
-    #[must_use]
+    /// Returns an error if the position cannot be resolved or a balance calculation fails.
     pub fn update_balances(
         &self,
-        mut account: AccountAny,
+        account: &mut AccountAny,
         instrument: &InstrumentAny,
         fill: &OrderFilled,
-    ) -> (AccountAny, AccountState) {
+    ) -> anyhow::Result<AccountState> {
         // Snapshot only what the balance update can mutate: cloning the account would
         // deep-copy its event log, which grows by one entry per fill.
-        let base = base_account(&account);
+        let base = base_account(account);
         let original_balances = base.balances.clone();
         let original_commissions = base.commissions.clone();
         let position_id = if let Some(position_id) = fill.position_id {
@@ -92,7 +91,7 @@ impl AccountsManager {
             );
             positions_open
                 .first()
-                .unwrap_or_else(|| panic!("List of Positions is empty"))
+                .ok_or_else(|| anyhow::anyhow!("no position found for fill {}", fill.trade_id))?
                 .id
         };
 
@@ -102,17 +101,7 @@ impl AccountsManager {
             .position(&position_id)
             .map(|position| position.clone_without_events());
 
-        let pnls = match account.calculate_pnls(instrument, fill, position) {
-            Ok(pnls) => pnls,
-            Err(e) => {
-                log::error!(
-                    "Cannot update balances for fill {}: failed to calculate PnL: {e}",
-                    fill.trade_id
-                );
-                let state = self.generate_account_state(&account, fill.ts_event);
-                return (account, state);
-            }
-        };
+        let pnls = account.calculate_pnls(instrument, fill, position)?;
 
         // Calculate final PnL including commissions
         let updated = match account.base_currency() {
@@ -122,25 +111,23 @@ impl AccountsManager {
                     .copied()
                     .unwrap_or_else(|| Money::zero(base_currency));
 
-                self.update_balance_single_currency(&mut account, fill, pnl)
+                self.update_balance_single_currency(account, fill, pnl)
             }
             None => {
                 let mut pnl_list = pnls;
-                self.update_balance_multi_currency(&mut account, fill, &mut pnl_list)
+                self.update_balance_multi_currency(account, fill, &mut pnl_list)
             }
         };
 
         if !updated {
-            let base = base_account_mut(&mut account);
+            let base = base_account_mut(account);
             base.balances = original_balances;
             base.commissions = original_commissions;
 
-            let state = self.generate_account_state(&account, fill.ts_event);
-            return (account, state);
+            anyhow::bail!("balance update failed for fill {}", fill.trade_id);
         }
 
-        let state = self.generate_account_state(&account, fill.ts_event);
-        (account, state)
+        Ok(self.generate_account_state(account, fill.ts_event))
     }
 
     /// Updates account balances based on open orders.
@@ -1025,7 +1012,7 @@ impl AccountsManager {
         }
 
         if pnl.is_zero() {
-            return true;
+            return update_account_commissions(account, commission);
         }
 
         let existing_balances = account.balances();
@@ -1058,27 +1045,13 @@ impl AccountsManager {
 
         balances.push(new_balance);
 
-        match account {
+        match &mut *account {
             AccountAny::Margin(margin) => {
                 margin.update_balances(&balances);
-
-                if let Some(comm) = commission
-                    && let Err(e) = margin.try_update_commissions(comm)
-                {
-                    log::error!("Cannot update margin account commissions: {e}");
-                    return false;
-                }
             }
             AccountAny::Cash(cash) => {
                 if let Err(e) = cash.update_balances(&balances) {
                     log::error!("Cannot update cash account balance: {e}");
-                    return false;
-                }
-
-                if let Some(comm) = commission
-                    && let Err(e) = cash.try_update_commissions(comm)
-                {
-                    log::error!("Cannot update cash account commissions: {e}");
                     return false;
                 }
             }
@@ -1087,29 +1060,15 @@ impl AccountsManager {
                     log::error!("Cannot update betting account balance: {e}");
                     return false;
                 }
-
-                if let Some(comm) = commission
-                    && let Err(e) = betting.try_update_commissions(comm)
-                {
-                    log::error!("Cannot update betting account commissions: {e}");
-                    return false;
-                }
             }
             AccountAny::Wallet(wallet) => {
                 if let Err(e) = wallet.update_balances(&balances) {
                     log::error!("Cannot update wallet account balance: {e}");
                     return false;
                 }
-
-                if let Some(comm) = commission
-                    && let Err(e) = wallet.try_update_commissions(comm)
-                {
-                    log::error!("Cannot update wallet account commissions: {e}");
-                    return false;
-                }
             }
         }
-        true
+        update_account_commissions(account, commission)
     }
 
     fn update_balance_multi_currency(
@@ -1235,30 +1194,16 @@ impl AccountsManager {
         }
 
         if new_balances.is_empty() {
-            return true;
+            return update_account_commissions(account, commission);
         }
 
-        match account {
+        match &mut *account {
             AccountAny::Margin(margin) => {
                 margin.update_balances(&new_balances);
-
-                if let Some(commission) = commission
-                    && let Err(e) = margin.try_update_commissions(commission)
-                {
-                    log::error!("Cannot update margin account commissions: {e}");
-                    return false;
-                }
             }
             AccountAny::Cash(cash) => {
                 if let Err(e) = cash.update_balances(&new_balances) {
                     log::error!("Cannot update cash account balance: {e}");
-                    return false;
-                }
-
-                if let Some(commission) = commission
-                    && let Err(e) = cash.try_update_commissions(commission)
-                {
-                    log::error!("Cannot update cash account commissions: {e}");
                     return false;
                 }
             }
@@ -1267,29 +1212,15 @@ impl AccountsManager {
                     log::error!("Cannot update betting account balance: {e}");
                     return false;
                 }
-
-                if let Some(commission) = commission
-                    && let Err(e) = betting.try_update_commissions(commission)
-                {
-                    log::error!("Cannot update betting account commissions: {e}");
-                    return false;
-                }
             }
             AccountAny::Wallet(wallet) => {
                 if let Err(e) = wallet.update_balances(&new_balances) {
                     log::error!("Cannot update wallet account balance: {e}");
                     return false;
                 }
-
-                if let Some(commission) = commission
-                    && let Err(e) = wallet.try_update_commissions(commission)
-                {
-                    log::error!("Cannot update wallet account commissions: {e}");
-                    return false;
-                }
             }
         }
-        true
+        update_account_commissions(account, commission)
     }
 
     fn is_sports_betting_fill(&self, instrument_id: InstrumentId) -> bool {
@@ -1460,6 +1391,17 @@ fn reservation_precisions_match(
     true
 }
 
+fn update_account_commissions(account: &mut AccountAny, commission: Option<Money>) -> bool {
+    if let Some(commission) = commission
+        && let Err(e) = base_account_mut(account).try_update_commissions(commission)
+    {
+        log::error!("Cannot update account commissions: {e}");
+        return false;
+    }
+
+    true
+}
+
 fn base_account(account: &AccountAny) -> &BaseAccount {
     match account {
         AccountAny::Margin(margin) => margin,
@@ -1514,6 +1456,79 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case(Some(Currency::USD()), false)]
+    #[case(None, false)]
+    #[case(Some(Currency::USD()), true)]
+    #[case(None, true)]
+    fn test_zero_net_fill_records_commission_or_reports_overflow(
+        #[case] base_currency: Option<Currency>,
+        #[case] overflow: bool,
+    ) {
+        let usd = Currency::USD();
+        let total = Money::from("1000.00 USD");
+        let state = AccountState::new(
+            AccountId::from("SIM-001"),
+            AccountType::Margin,
+            vec![AccountBalance::new(total, Money::zero(usd), total)],
+            vec![],
+            true,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+            base_currency,
+        );
+        let mut account = AccountAny::Margin(MarginAccount::new(state, true));
+
+        if overflow {
+            base_account_mut(&mut account)
+                .commissions
+                .insert(usd, Money::new(MONEY_MAX, usd));
+        }
+
+        let original_balances = account.balances();
+        let original_commissions = base_account(&account).commissions.clone();
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let entry = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("2"))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::from("P-ZERO-NET"))
+            .commission(Money::zero(usd))
+            .build();
+        let position = Position::new(&instrument, entry);
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Netting)
+            .unwrap();
+        let manager = AccountsManager::new(Rc::new(RefCell::new(TestClock::new())), cache);
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from("2"))
+            .last_px(Price::from("2.00000"))
+            .position_id(position.id)
+            .commission(Money::from("2.00 USD"))
+            .build();
+
+        // Gross realized PnL 2 minus commission 2 leaves the balance unchanged
+        let result = manager.update_balances(&mut account, &instrument, &fill);
+        assert_eq!(account.balances(), original_balances);
+
+        if overflow {
+            assert!(result.is_err());
+            assert_eq!(base_account(&account).commissions, original_commissions);
+        } else {
+            assert!(result.is_ok());
+            assert_eq!(
+                base_account(&account).commission(&usd),
+                Some(Money::from("2.00 USD"))
+            );
+        }
+    }
 
     #[rstest]
     fn test_update_balance_locked_with_base_currency_multiple_orders() {
@@ -3158,7 +3173,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_manager_update_balances_skips_update_on_negative_balance_error() {
+    fn test_manager_update_balances_reports_negative_balance_error() {
         let usd = Currency::USD();
         let account_state = AccountState::new(
             AccountId::new("SIM-001"),
@@ -3236,23 +3251,16 @@ mod tests {
             .position_id(PositionId::new("P-001"))
             .commission(Money::new(20.0, usd))
             .build();
-        let _state = manager.update_balances(
-            AccountAny::Cash(account),
+        let mut updated = AccountAny::Cash(account);
+        let result = manager.update_balances(
+            &mut updated,
             &InstrumentAny::CurrencyPair(instrument),
             &fill2,
         );
 
-        let account_after = cache
-            .borrow()
-            .account(&AccountId::new("SIM-001"))
-            .unwrap()
-            .clone();
-
-        if let AccountAny::Cash(cash) = account_after {
-            assert_eq!(cash.balance_total(Some(usd)), Some(initial_balance));
-        } else {
-            panic!("Expected CashAccount");
-        }
+        assert!(result.is_err());
+        assert_eq!(updated.balance_total(Some(usd)), Some(initial_balance));
+        assert!(base_account(&updated).commissions.is_empty());
     }
 
     #[rstest]
@@ -3479,11 +3487,14 @@ mod tests {
             .add_position(&position, OmsType::Netting)
             .unwrap();
 
-        let (updated, state) = manager.update_balances(
-            AccountAny::Cash(account),
+        let mut updated = AccountAny::Cash(account);
+        let result = manager.update_balances(
+            &mut updated,
             &InstrumentAny::CurrencyPair(instrument),
             &fill,
         );
+
+        let state = result.unwrap();
 
         // Buy 100k at 0.80 → 80,000 USD cost, 20 USD commission, expect 919,980 USD
         let expected = Money::new(919_980.0, usd);
@@ -3558,17 +3569,16 @@ mod tests {
             .commission(Money::new(20.0, usd))
             .build();
 
-        let (updated, state) =
-            manager.update_balances(AccountAny::Margin(account), &instrument_any, &closing);
+        let mut updated = AccountAny::Margin(account);
+        let result = manager.update_balances(&mut updated, &instrument_any, &closing);
+
+        assert!(result.is_err());
 
         let AccountAny::Margin(margin) = updated else {
             panic!("Expected MarginAccount");
         };
         assert_eq!(margin.balances, original_balances);
         assert_eq!(margin.commissions, original_commissions);
-        assert_eq!(state.balances.len(), 1);
-        assert_eq!(state.balances[0].total, Money::new(1_000_000.0, usd));
-        assert_eq!(state.balances[0].free, Money::new(1_000_000.0, usd));
     }
 
     #[rstest]
@@ -3612,8 +3622,9 @@ mod tests {
             .add_position(&position, OmsType::Netting)
             .unwrap();
 
-        let (updated, state) = manager.update_balances(
-            AccountAny::Cash(account),
+        let mut updated = AccountAny::Cash(account);
+        let result = manager.update_balances(
+            &mut updated,
             &InstrumentAny::CurrencyPair(instrument),
             &fill,
         );
@@ -3626,7 +3637,7 @@ mod tests {
             Some(Money::new(1_000_000.0, usd))
         );
         assert!(cash.commissions().is_empty());
-        assert_eq!(state.balances[0].total, Money::new(1_000_000.0, usd));
+        assert!(result.is_err());
     }
 
     fn wallet_precision_pair(
@@ -4028,11 +4039,14 @@ mod tests {
             .add_position(&position, OmsType::Netting)
             .unwrap();
 
-        let (updated, _state) = manager.update_balances(
-            AccountAny::Cash(account),
+        let mut updated = AccountAny::Cash(account);
+        let result = manager.update_balances(
+            &mut updated,
             &InstrumentAny::CurrencyPair(instrument),
             &fill,
         );
+
+        assert!(result.is_ok());
 
         match updated {
             AccountAny::Cash(cash) => {
@@ -4072,13 +4086,16 @@ mod tests {
             .add_position(&position, OmsType::Netting)
             .unwrap();
 
-        let (updated, _state) = manager.update_balances(
-            AccountAny::Cash(account),
+        let mut updated = AccountAny::Cash(account);
+        let result = manager.update_balances(
+            &mut updated,
             &InstrumentAny::CurrencyPair(instrument),
             &fill,
         );
 
         // Rejected by `cash.update_balances`: original balances preserved
+        assert!(result.is_err());
+
         match updated {
             AccountAny::Cash(cash) => {
                 assert_eq!(
@@ -4130,13 +4147,16 @@ mod tests {
             .add_position(&position, OmsType::Netting)
             .unwrap();
 
-        let (updated, _state) = manager.update_balances(
-            AccountAny::Cash(account),
+        let mut updated = AccountAny::Cash(account);
+        let result = manager.update_balances(
+            &mut updated,
             &InstrumentAny::CurrencyPair(instrument),
             &fill,
         );
 
         // Rejected at the no-existing-balance + negative-pnl branch (Python parity)
+        assert!(result.is_err());
+
         match updated {
             AccountAny::Cash(cash) => {
                 assert_eq!(
