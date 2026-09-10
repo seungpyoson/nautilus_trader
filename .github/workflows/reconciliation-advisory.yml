@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: d4f19b13902dcc0daca91b61f08e405592b5cc8e
+      REVIEWED_SHA: c7d978b3a58d673dcba2cf8106c673a421ea6a07
       CARGO_BUILD_JOBS: "2"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -31,7 +31,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: d4f19b13902dcc0daca91b61f08e405592b5cc8e
+          ref: c7d978b3a58d673dcba2cf8106c673a421ea6a07
           persist-credentials: false
 
       - name: Verify reviewed commit
@@ -47,29 +47,29 @@ jobs:
           free-disk-space: "true"
           rust-cache-key: reconciliation-application-ci-pr
 
-      # Verify snapshot coverage, startup retries, and affected consumers.
-      - name: Snapshot coverage and affected consumer tests
+      # Verify shared fill correction, replay accounting, and affected consumers.
+      - name: Shared fill correction and affected consumer tests
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
         run: |
           set -o pipefail
           cargo nextest run --locked --cargo-profile ci-pr --profile ci \
-            -p nautilus-system -p nautilus-live -p nautilus-backtest -p nautilus-event-store \
+            -p nautilus-system -p nautilus-live -p nautilus-backtest -p nautilus-event-store -p nautilus-execution \
             --lib --tests --no-fail-fast \
-            2>&1 | tee "$RUNNER_TEMP/snapshot-coverage-tests.log"
+            2>&1 | tee "$RUNNER_TEMP/shared-fill-correction-tests.log"
 
       - name: Preserve affected suite output
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: snapshot-coverage-${{ env.REVIEWED_SHA }}
-          path: ${{ runner.temp }}/snapshot-coverage-tests.log
+          name: shared-fill-correction-${{ env.REVIEWED_SHA }}
+          path: ${{ runner.temp }}/shared-fill-correction-tests.log
           if-no-files-found: error
 
       - name: Affected library and test Clippy
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
-        run: cargo clippy --locked --profile ci-pr -p nautilus-system -p nautilus-live -p nautilus-backtest -p nautilus-event-store --lib --tests -- -D warnings
+        run: cargo clippy --locked --profile ci-pr -p nautilus-system -p nautilus-live -p nautilus-backtest -p nautilus-event-store -p nautilus-execution --lib --tests -- -D warnings
 
       - name: Standalone live library Clippy
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
