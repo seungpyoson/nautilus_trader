@@ -249,11 +249,22 @@ impl Position {
     ///
     /// This operation recalculates the entire position from scratch after removing the specified
     /// order's fills. This is an expensive operation and should be used sparingly.
+    /// Positions containing contract settlements retain their complete replay history.
     ///
     /// # Panics
     ///
     /// Panics if after purging, no fills remain and the position cannot be reconstructed.
     pub fn purge_events_for_order(&mut self, client_order_id: ClientOrderId) {
+        if self.replay_events.iter().any(|event| {
+            matches!(event, PositionReplayEvent::Filled(fill) if fill.is_contract_settlement())
+        }) {
+            log::warn!(
+                "Position {} contains contract settlements, skipping event purge",
+                self.id,
+            );
+            return;
+        }
+
         self.replay_events.retain(|event| {
             !matches!(event, PositionReplayEvent::Filled(fill) if fill.client_order_id == client_order_id)
         });

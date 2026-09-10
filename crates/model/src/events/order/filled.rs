@@ -34,6 +34,9 @@ use crate::{
     types::{Currency, Money, Price, Quantity},
 };
 
+const INFO_RECONCILIATION_TYPE: &str = "reconciliation_type";
+const CONTRACT_SETTLEMENT: &str = "CONTRACT_SETTLEMENT";
+
 #[repr(C)]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -150,6 +153,27 @@ impl OrderFilled {
     #[must_use]
     pub fn is_sell(&self) -> bool {
         self.order_side == OrderSide::Sell
+    }
+
+    /// Marks this fill as a native contract settlement which leaves venue inventory unchanged.
+    #[must_use]
+    pub fn with_contract_settlement(mut self) -> Self {
+        self.reconciliation = true;
+        self.info.get_or_insert_default().insert(
+            Ustr::from(INFO_RECONCILIATION_TYPE),
+            Ustr::from(CONTRACT_SETTLEMENT),
+        );
+        self
+    }
+
+    /// Returns whether native contract settlement generated this fill.
+    #[must_use]
+    pub fn is_contract_settlement(&self) -> bool {
+        self.reconciliation
+            && self.info.as_ref().is_some_and(|info| {
+                info.get(&Ustr::from(INFO_RECONCILIATION_TYPE))
+                    == Some(&Ustr::from(CONTRACT_SETTLEMENT))
+            })
     }
 
     /// Splits an overfill into the fragment which closes the current position and the
@@ -544,6 +568,16 @@ mod tests {
 
         assert_eq!(deserialized.info, original.info);
         assert_eq!(deserialized, original);
+    }
+
+    #[rstest]
+    fn test_contract_settlement_provenance_survives_serialization(order_filled: OrderFilled) {
+        assert!(!order_filled.is_contract_settlement());
+        let marked = order_filled.with_contract_settlement();
+        let restored: OrderFilled =
+            serde_json::from_str(&serde_json::to_string(&marked).unwrap()).unwrap();
+        assert!(restored.is_contract_settlement());
+        assert_eq!(restored, marked);
     }
 
     #[rstest]

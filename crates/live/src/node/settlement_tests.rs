@@ -27,10 +27,11 @@ use nautilus_model::{
         AccountType, InstrumentCloseType, LiquiditySide, OmsType, OrderSide, OrderType,
         PositionSide,
     },
-    events::{AccountState, OrderDenied, OrderFilled},
+    events::{AccountState, OrderDenied, OrderFilled, order::spec::OrderFillVoidedSpec},
     identifiers::{AccountId, OrderListId, PositionId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny, stubs::binary_option},
     orders::{OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
+    position::PositionReplayEvent,
     reports::ExecutionMassStatus,
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
@@ -1284,6 +1285,196 @@ async fn contract_settlement_inventory_requires_matching_account_and_instrument(
         valid_account && valid_instrument
     );
     f.assert_settled("5.90 USDC", 1);
+}
+
+#[rstest]
+fn contract_settlement_inventory_survives_history_cleanup(
+    #[values(false, true)] purge_all_orders: bool,
+) {
+    let mut f = Fixture::new();
+    let opening = f.fill("OWNER-001", "OPEN", OrderSide::Buy, "10.00", "0.400");
+    f.close("1.000", InstrumentCloseType::ContractExpired);
+    let (position_id, settlement_order_id) = {
+        let cache = f.node.kernel.cache.borrow();
+        let position_id = *cache.position_id(&opening.client_order_id).unwrap();
+        let settlement_order_id = cache
+            .position_ref(&position_id)
+            .unwrap()
+            .closing_order_id
+            .unwrap();
+        (position_id, settlement_order_id)
+    };
+    f.fill("OWNER-001", "LATE", OrderSide::Buy, "2.00", "0.400");
+    f.fill("OWNER-002", "OTHER", OrderSide::Buy, "3.00", "0.400");
+    f.assert_settled("8.70 USDC", 3);
+
+    {
+        let mut cache = f.node.kernel.cache.borrow_mut();
+        if purge_all_orders {
+            cache.purge_closed_orders(UnixNanos::from(u64::MAX), 0);
+        } else {
+            cache.purge_order(settlement_order_id);
+        }
+        assert!(cache.order_ref(&settlement_order_id).is_none());
+    }
+
+    for (venue_qty, expected) in [("15.00", true), ("5.00", false), ("0.00", true)] {
+        let quantity = Quantity::from(venue_qty);
+        let mut mass = ExecutionMassStatus::new(
+            f.client_id,
+            f.account_id,
+            f.instrument.id().venue,
+            opening.ts_event,
+            None,
+        );
+        mass.add_position_reports(vec![PositionStatusReport::new(
+            f.account_id,
+            f.instrument.id(),
+            if quantity.is_zero() {
+                PositionSide::Flat
+            } else {
+                PositionSide::Long
+            },
+            quantity,
+            opening.ts_event,
+            opening.ts_event,
+            None,
+            None,
+            Some(dec!(0.4)),
+        )]);
+        let result = f
+            .node
+            .exec_manager
+            .reconcile_execution_mass_status_ref(&mass, &f.node.kernel.exec_engine);
+        let inventory = f
+            .node
+            .exec_manager
+            .check_mass_status_inventory(&mass, &f.node.kernel.exec_engine.borrow());
+        assert_eq!(result.summary.all_received_reports_reconciled(), expected);
+        assert_eq!(inventory.all_inventory_reconciled(), expected);
+        assert!(result.events.is_empty());
+    }
+
+    {
+        let mut cache = f.node.kernel.cache.borrow_mut();
+        let replay_len = cache
+            .position_ref(&position_id)
+            .unwrap()
+            .replay_events
+            .len();
+        cache
+            .position_mut(&position_id)
+            .unwrap()
+            .purge_events_for_order(settlement_order_id);
+        cache.purge_position(position_id);
+        cache.purge_closed_positions(UnixNanos::from(u64::MAX), 0);
+        assert_eq!(
+            cache
+                .position_ref(&position_id)
+                .unwrap()
+                .replay_events
+                .len(),
+            replay_len
+        );
+        assert_eq!(cache.iter_position_ids(None, None, None, None).count(), 2);
+    }
+    f.assert_settled("8.70 USDC", 3);
+
+    // Instrument retirement releases the complete retained position histories.
+    let mut cache = f.node.kernel.cache.borrow_mut();
+    cache.purge_instrument(f.instrument.id());
+    cache.purge_closed_positions(UnixNanos::from(u64::MAX), 0);
+    assert_eq!(cache.iter_position_ids(None, None, None, None).count(), 0);
+}
+
+#[rstest]
+fn contract_settlement_inventory_rejects_corrected_settlement_provenance(
+    #[values(false, true)] correct_settlement: bool,
+) {
+    let mut f = Fixture::new();
+    let opening = f.fill("OWNER-001", "OPEN", OrderSide::Buy, "10.00", "0.400");
+    f.close("1.000", InstrumentCloseType::ContractExpired);
+    let fill = {
+        let cache = f.node.kernel.cache.borrow();
+        let position_id = cache.position_id(&opening.client_order_id).unwrap();
+        cache
+            .position_ref(position_id)
+            .unwrap()
+            .replay_events
+            .iter()
+            .find_map(|event| match event {
+                PositionReplayEvent::Filled(fill)
+                    if fill.is_contract_settlement() == correct_settlement =>
+                {
+                    Some(fill.clone())
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    let voided = OrderFillVoidedSpec::builder()
+        .trader_id(fill.trader_id)
+        .strategy_id(fill.strategy_id)
+        .instrument_id(fill.instrument_id)
+        .client_order_id(fill.client_order_id)
+        .venue_order_id(fill.venue_order_id)
+        .account_id(fill.account_id)
+        .trade_id(fill.trade_id)
+        .voided_qty(Quantity::from("2.00"))
+        .order_side(fill.order_side)
+        .order_type(fill.order_type)
+        .last_px(fill.last_px)
+        .currency(fill.currency)
+        .liquidity_side(fill.liquidity_side)
+        .maybe_position_id(fill.position_id)
+        .build();
+    f.node
+        .process_exec_event(ExecutionEvent::Order(OrderEventAny::FillVoided(voided)));
+    f.node.process_pending_settlements();
+    {
+        let cache = f.node.kernel.cache.borrow();
+        let position = cache.position_ref(&fill.position_id.unwrap()).unwrap();
+        assert!(
+            position.is_closed(),
+            "the correction must reach native re-settlement"
+        );
+        assert!(position.fill_voids.iter().any(|correction| {
+            correction.event.client_order_id == fill.client_order_id
+                && correction.event.trade_id == fill.trade_id
+        }));
+    }
+    let mut mass = ExecutionMassStatus::new(
+        f.client_id,
+        f.account_id,
+        f.instrument.id().venue,
+        opening.ts_event,
+        None,
+    );
+    mass.add_position_reports(vec![PositionStatusReport::new(
+        f.account_id,
+        f.instrument.id(),
+        PositionSide::Long,
+        Quantity::from(if correct_settlement { "12.00" } else { "8.00" }),
+        opening.ts_event,
+        opening.ts_event,
+        None,
+        None,
+        Some(dec!(0.4)),
+    )]);
+    let result = f
+        .node
+        .exec_manager
+        .reconcile_execution_mass_status_ref(&mass, &f.node.kernel.exec_engine);
+    let inventory = f
+        .node
+        .exec_manager
+        .check_mass_status_inventory(&mass, &f.node.kernel.exec_engine.borrow());
+    assert_eq!(
+        result.summary.all_received_reports_reconciled(),
+        !correct_settlement
+    );
+    assert_eq!(inventory.all_inventory_reconciled(), !correct_settlement);
+    assert!(f.submitted.borrow().is_empty());
 }
 
 #[rstest]

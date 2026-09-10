@@ -74,8 +74,8 @@ use nautilus_model::{
         option_chain::OptionGreeks,
     },
     enums::{
-        AggregationSource, ContingencyType, InstrumentClass, OmsType, OrderSide, PositionSide,
-        PriceType,
+        AggregationSource, ContingencyType, InstrumentClass, InstrumentCloseType, OmsType,
+        OrderSide, PositionSide, PriceType,
     },
     events::{AccountState, OrderEventAny, OrderFilled},
     identifiers::{
@@ -3775,7 +3775,8 @@ impl Cache {
 
     /// Purges the position with the `position_id` from the cache (if found).
     ///
-    /// For safety, a position is prevented from being purged if it's open.
+    /// Open positions and positions whose contract close remains cached cannot be purged.
+    /// Retiring the instrument releases the contract history retention requirement.
     pub fn purge_position(&mut self, position_id: PositionId) {
         // Snapshot the position so we can release the borrow before mutating indexes.
         let position = self
@@ -3788,6 +3789,18 @@ impl Cache {
             && pos.is_open()
         {
             log::warn!("Position {position_id} found open when purging, skipping purge");
+            return;
+        }
+
+        if let Some(ref pos) = position
+            && self
+                .instrument_closes
+                .get(&pos.instrument_id)
+                .is_some_and(|close| close.close_type == InstrumentCloseType::ContractExpired)
+        {
+            log::warn!(
+                "Position {position_id} retains contract settlement history, skipping purge"
+            );
             return;
         }
 
