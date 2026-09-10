@@ -1998,9 +1998,9 @@ impl ExecutionEngine {
 
     /// Processes an order event and returns its native application outcome.
     ///
-    /// Success covers the configured order and position application only.
-    /// An incomplete outcome can include partial mutations. Message-bus consumers and external
-    /// persistence are outside this result; their acceptance is not acknowledged by the engine.
+    /// Success covers configured order/position application and required Portfolio order updates.
+    /// An incomplete outcome can include partial mutations. Position subscribers, complete
+    /// portfolio valuation and external persistence remain outside this result.
     #[must_use]
     pub fn process_with_outcome(&mut self, event: &OrderEventAny) -> EventApplicationOutcome {
         self.handle_event_with_position_application(event, true)
@@ -2986,22 +2986,29 @@ impl ExecutionEngine {
 
                 if validation.is_ok() {
                     let event = OrderEventAny::Filled(fill.clone());
-                    let Some(order) =
-                        self.update_cached_order(client_order_id, &event, apply_position)
-                    else {
+                    let Some(order) = self.update_cached_order(client_order_id, &event) else {
                         return EventApplicationOutcome::Incomplete;
                     };
 
-                    let (position_events, outcome) = if apply_position {
+                    let portfolio_outcome = if apply_position {
+                        self.send_order_update_to_portfolio(&event, None)
+                    } else {
+                        EventApplicationOutcome::Applied
+                    };
+                    let (position_events, mut outcome) = if apply_position {
                         self.handle_order_fill(&order, fill, oms_type)
                     } else {
                         (Vec::new(), EventApplicationOutcome::Applied)
                     };
+                    if portfolio_outcome == EventApplicationOutcome::Incomplete {
+                        outcome = EventApplicationOutcome::Incomplete;
+                    }
                     self.publish_order_event(&event);
                     self.publish_position_events(position_events);
-                    return outcome;
+                    outcome
+                } else {
+                    EventApplicationOutcome::Incomplete
                 }
-                return EventApplicationOutcome::Incomplete;
             }
             OrderEventAny::FillVoided(voided) => {
                 let mut voided = voided.clone();
@@ -3100,32 +3107,25 @@ impl ExecutionEngine {
                     ));
                 }
 
-                if self
-                    .update_cached_order(client_order_id, &event, true)
-                    .is_none()
-                {
+                if self.update_cached_order(client_order_id, &event).is_none() {
                     return EventApplicationOutcome::Incomplete;
                 }
 
-                if original_fill.is_some() {
-                    let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-                    msgbus::send_order_event(portfolio_endpoint, event.clone());
-                }
+                let outcome = self.send_order_update_to_portfolio(&event, original_fill.as_ref());
                 self.publish_order_event(&event);
                 self.publish_position_events(position_events);
+                outcome
             }
             _ => {
-                if self
-                    .update_cached_order(client_order_id, &event, true)
-                    .is_some()
-                {
+                if self.update_cached_order(client_order_id, &event).is_some() {
+                    let outcome = self.send_order_update_to_portfolio(&event, None);
                     self.publish_order_event(&event);
+                    outcome
                 } else {
-                    return EventApplicationOutcome::Incomplete;
+                    EventApplicationOutcome::Incomplete
                 }
             }
         }
-        EventApplicationOutcome::Applied
     }
 
     fn handle_leg_fill_without_order(&mut self, mut fill: OrderFilled) -> EventApplicationOutcome {
@@ -3167,9 +3167,12 @@ impl ExecutionEngine {
             return EventApplicationOutcome::Incomplete;
         }
 
-        let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-        msgbus::send_order_event(portfolio_endpoint, event.clone());
-        let (position_events, outcome) = self.handle_position_update(&instrument, fill, oms_type);
+        let portfolio_outcome = self.send_order_update_to_portfolio(&event, None);
+        let (position_events, mut outcome) =
+            self.handle_position_update(&instrument, fill, oms_type);
+        if portfolio_outcome == EventApplicationOutcome::Incomplete {
+            outcome = EventApplicationOutcome::Incomplete;
+        }
         self.publish_order_event(&event);
         self.publish_position_events(position_events);
         outcome
@@ -3578,7 +3581,6 @@ impl ExecutionEngine {
         &self,
         client_order_id: ClientOrderId,
         event: &OrderEventAny,
-        send_portfolio_update: bool,
     ) -> Option<OrderAny> {
         let result = { self.cache.borrow_mut().update_order(event) };
 
@@ -3683,44 +3685,61 @@ impl ExecutionEngine {
             self.create_order_state_snapshot(&order);
         }
 
-        if send_portfolio_update {
-            self.send_order_update_to_portfolio(event);
-        }
-
         Some(order)
     }
 
-    fn send_order_update_to_portfolio(&self, event: &OrderEventAny) {
-        let is_wallet = event.account_id().is_some_and(|account_id| {
-            self.cache
-                .borrow()
-                .account(&account_id)
-                .is_some_and(|account| account.account_type() == AccountType::Wallet)
-        });
-        let send_to_portfolio = match event {
-            OrderEventAny::Filled(fill) => self
-                .cache
-                .borrow()
-                .account(&fill.account_id)
-                .is_none_or(|account| !account.is_margin_account()),
-            OrderEventAny::Accepted(_)
-            | OrderEventAny::Canceled(_)
-            | OrderEventAny::Expired(_)
-            | OrderEventAny::Rejected(_)
-            | OrderEventAny::Updated(_) => true,
-            OrderEventAny::Submitted(_)
-            | OrderEventAny::Triggered(_)
-            | OrderEventAny::PendingUpdate(_)
-            | OrderEventAny::PendingCancel(_)
-            | OrderEventAny::ModifyRejected(_)
-            | OrderEventAny::CancelRejected(_)
-            | OrderEventAny::FillVoided(_) => is_wallet,
-            _ => false,
+    fn send_order_update_to_portfolio(
+        &self,
+        event: &OrderEventAny,
+        original_fill: Option<&OrderFilled>,
+    ) -> EventApplicationOutcome {
+        let Some(account_id) = event.account_id() else {
+            return EventApplicationOutcome::Applied;
         };
+        let account_type = self
+            .cache
+            .borrow()
+            .account(&account_id)
+            .map(|account| account.account_type());
+        let is_wallet = account_type == Some(AccountType::Wallet);
+        // Unknown ownership still reaches Portfolio, which owns failed-calculation invalidation.
+        let send_to_portfolio = account_type.is_none()
+            || match event {
+                OrderEventAny::Filled(fill) => {
+                    account_type != Some(AccountType::Margin)
+                        || self
+                            .cache
+                            .borrow()
+                            .instrument(&fill.instrument_id)
+                            .is_none_or(|instrument| !instrument.is_spread())
+                }
+                OrderEventAny::Accepted(_)
+                | OrderEventAny::Canceled(_)
+                | OrderEventAny::Expired(_)
+                | OrderEventAny::Rejected(_)
+                | OrderEventAny::Updated(_) => true,
+                OrderEventAny::Submitted(_)
+                | OrderEventAny::Triggered(_)
+                | OrderEventAny::PendingUpdate(_)
+                | OrderEventAny::PendingCancel(_)
+                | OrderEventAny::ModifyRejected(_)
+                | OrderEventAny::CancelRejected(_) => is_wallet,
+                OrderEventAny::FillVoided(_) => original_fill.is_some() || is_wallet,
+                _ => false,
+            };
 
         if send_to_portfolio {
             let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-            msgbus::send_order_event(portfolio_endpoint, event.clone());
+            let outcome = msgbus::send_order_event_with_outcome(portfolio_endpoint, event.clone())
+                .unwrap_or(EventApplicationOutcome::Incomplete);
+            if account_type.is_none() {
+                log::error!("Cannot complete Portfolio update: no account {account_id}");
+                EventApplicationOutcome::Incomplete
+            } else {
+                outcome
+            }
+        } else {
+            EventApplicationOutcome::Applied
         }
     }
 
@@ -3821,24 +3840,12 @@ impl ExecutionEngine {
                 return (Vec::new(), EventApplicationOutcome::Incomplete);
             };
 
-        let is_margin_account = {
+        {
             let cache = self.cache.borrow();
-            let account = match cache.try_account(&fill.account_id) {
-                Ok(account) => account,
-                Err(e) => {
-                    log::error!("Cannot handle order fill: {e}, {fill}");
-                    return (Vec::new(), EventApplicationOutcome::Incomplete);
-                }
-            };
-
-            account.is_margin_account()
-        };
-
-        // Skip portfolio position updates for combo fills (spread instruments)
-        // Combo fills are only used for order management, not portfolio updates
-        if !instrument.is_spread() && is_margin_account {
-            let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-            msgbus::send_order_event(portfolio_endpoint, OrderEventAny::Filled(fill.clone()));
+            if let Err(e) = cache.try_account(&fill.account_id) {
+                log::error!("Cannot handle order fill: {e}, {fill}");
+                return (Vec::new(), EventApplicationOutcome::Incomplete);
+            }
         }
 
         let (position, position_events, mut outcome) = if instrument.is_spread() {
@@ -4377,15 +4384,91 @@ mod tests {
     use nautilus_common::clock::TestClock;
     use nautilus_model::{
         enums::{LiquiditySide, OrderSide, OrderType, PositionSideSpecified},
-        events::order::spec::OrderFilledSpec,
+        events::{
+            AccountState,
+            order::spec::{OrderFillVoidedSpec, OrderFilledSpec},
+        },
         identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
-        instruments::{InstrumentAny, stubs::audusd_sim},
+        instruments::{
+            InstrumentAny,
+            stubs::{audusd_sim, futures_spread_es},
+        },
         orders::builder::OrderTestBuilder,
-        types::Price,
+        types::{Currency, Price},
     };
     use rstest::*;
 
     use super::*;
+
+    #[rstest]
+    #[case::margin_combo(AccountType::Margin, false, false, 0)]
+    #[case::cash_combo(AccountType::Cash, false, false, 1)]
+    #[case::wallet_combo(AccountType::Wallet, false, false, 1)]
+    #[case::cash_void_without_fill(AccountType::Cash, true, false, 0)]
+    #[case::wallet_void_without_fill(AccountType::Wallet, true, false, 1)]
+    #[case::cash_void_with_fill(AccountType::Cash, true, true, 1)]
+    #[case::wallet_void_with_fill(AccountType::Wallet, true, true, 1)]
+    fn portfolio_routing_preserves_combo_and_fill_void_modes(
+        #[case] account_type: AccountType,
+        #[case] is_void: bool,
+        #[case] original_present: bool,
+        #[case] expected_calls: usize,
+    ) {
+        *msgbus::get_message_bus().borrow_mut() = msgbus::MessageBus::default();
+        let instrument = InstrumentAny::FuturesSpread(futures_spread_es());
+        let account_id = AccountId::from("SIM-001");
+        let account_state = AccountState::new(
+            account_id,
+            account_type,
+            vec![],
+            vec![],
+            true,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+            (account_type != AccountType::Wallet).then_some(Currency::USD()),
+        );
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_account(account_state.into())
+            .unwrap();
+        let engine = ExecutionEngine::new(Rc::new(RefCell::new(TestClock::new())), cache, None);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        msgbus::register_order_event_endpoint(
+            MessagingSwitchboard::portfolio_update_order(),
+            TypedIntoHandler::from({
+                let received = Rc::clone(&received);
+                move |event: OrderEventAny| {
+                    received.borrow_mut().push(event);
+                    Some(EventApplicationOutcome::Applied)
+                }
+            }),
+        );
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .account_id(account_id)
+            .build();
+        let event = if is_void {
+            OrderEventAny::FillVoided(
+                OrderFillVoidedSpec::builder()
+                    .instrument_id(instrument.id())
+                    .account_id(account_id)
+                    .build(),
+            )
+        } else {
+            OrderEventAny::Filled(fill.clone())
+        };
+        assert_eq!(
+            engine.send_order_update_to_portfolio(&event, original_present.then_some(&fill)),
+            EventApplicationOutcome::Applied,
+        );
+        assert_eq!(received.borrow().len(), expected_calls);
+    }
 
     #[rstest]
     fn netting_positions_open_for_report_scopes_positions_by_account() {

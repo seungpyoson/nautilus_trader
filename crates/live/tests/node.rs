@@ -45,8 +45,8 @@ use nautilus_common::{
     messages::{
         ExecutionEvent, SystemEvent,
         execution::{
-            CancelOrder, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GeneratePositionStatusReports, QueryOrder,
+            CancelOrder, EventApplicationOutcome, GenerateOrderStatusReport,
+            GenerateOrderStatusReports, GeneratePositionStatusReports, QueryOrder,
         },
         system::{
             QueueStateChanged, ShutdownSystem, SocketState, SocketStateChange, SocketStateChanged,
@@ -2670,9 +2670,10 @@ mod serial_tests {
 
     #[rstest]
     #[tokio::test(flavor = "current_thread")]
-    async fn test_complete_startup_rejects_an_unqueried_client_added_during_reconciliation(
+    async fn test_complete_startup_requires_account_application_and_unchanged_clients(
         #[values(false, true)] add_client: bool,
         #[values(false, true)] run: bool,
+        #[values(false, true)] account_present_before_report: bool,
     ) {
         let config = LiveNodeConfig {
             delay_post_stop: Duration::ZERO,
@@ -2693,6 +2694,15 @@ mod serial_tests {
             .borrow_mut()
             .add_instrument(instrument)
             .unwrap();
+        if account_present_before_report {
+            assert_eq!(
+                msgbus::send_account_state_with_outcome(
+                    MessagingSwitchboard::portfolio_update_account(),
+                    &startup_queued_account_state(account),
+                ),
+                Some(EventApplicationOutcome::Applied),
+            );
+        }
         let mut report =
             ExecutionMassStatus::new(source, account, venue, UnixNanos::default(), None);
         report.set_report_window(None, true);
@@ -2774,11 +2784,27 @@ mod serial_tests {
             .expect("actor must observe final evidence");
         assert_eq!(summary.clients.len(), 1);
         let report = summary.clients[0].report.as_ref().unwrap();
-        assert!(report.application.all_received_reports_reconciled());
+        assert_eq!(
+            report.application.all_received_reports_reconciled(),
+            account_present_before_report
+        );
+        assert_eq!(
+            report.application.applied_events,
+            usize::from(account_present_before_report)
+        );
+        assert_eq!(
+            report.application.incomplete_events,
+            usize::from(!account_present_before_report)
+        );
+        assert!(node.kernel().cache().borrow().account(&account).is_some());
         assert!(report.final_inventory.unwrap().all_inventory_reconciled());
         assert!(summary.pending_execution.all_applications_confirmed());
         assert_eq!(summary.client_identities_unchanged, !add_client);
-        assert_eq!(summary.all_clients_reconciled(), !add_client);
+        // Applying the queued account later cannot repair the earlier order application.
+        assert_eq!(
+            summary.all_clients_reconciled(),
+            account_present_before_report && !add_client
+        );
     }
 
     #[rstest]

@@ -74,6 +74,7 @@ use nautilus_model::{
     stubs::TestDefault,
     types::{Currency, Money, Quantity},
 };
+use nautilus_portfolio::Portfolio;
 use nautilus_system::{KernelEventStore, NautilusKernelBuilder};
 use rstest::rstest;
 use tempfile::TempDir;
@@ -269,9 +270,12 @@ fn replay_fill_corrections_match_live_accounting(
     #[case] corrected_order: usize,
 ) {
     let _guard = lock_kernel_test();
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let _portfolio = Portfolio::new(clock.clone(), cache.clone(), None);
     let mut engine = ExecutionEngine::new(
-        Rc::new(RefCell::new(TestClock::new())),
-        Rc::new(RefCell::new(Cache::default())),
+        clock,
+        cache,
         Some(ExecutionEngineConfig {
             carry_replay_events_on_reopen: carry_history,
             ..Default::default()
