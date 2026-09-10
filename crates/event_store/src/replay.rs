@@ -32,7 +32,7 @@ use nautilus_common::{
         execution::SubmitOrderList,
     },
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::{OmsType, OrderSide, PositionSide},
@@ -43,7 +43,6 @@ use nautilus_model::{
     identifiers::PositionId,
     orders::{Order, OrderAny},
     position::Position,
-    types::{Money, Quantity},
 };
 use serde::de::DeserializeOwned;
 
