@@ -1220,8 +1220,10 @@ mod tests {
     }
 
     #[rstest]
-    fn roundtrip_snapshot_anchor() {
-        let anchor = SnapshotAnchor::new(10, "cache://run/10", "blake3:abcd");
+    #[case::partial(crate::SnapshotCoverage::Partial)]
+    #[case::full_cache(crate::SnapshotCoverage::FullCache)]
+    fn roundtrip_snapshot_anchor(#[case] coverage: crate::SnapshotCoverage) {
+        let anchor = SnapshotAnchor::new(10, "cache://run/10", "blake3:abcd", coverage);
 
         assert_eq!(roundtrip(&anchor), anchor);
     }

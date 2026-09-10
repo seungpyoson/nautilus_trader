@@ -62,7 +62,10 @@ impl RetentionRun {
         !matches!(
             self.manifest.status,
             RunStatus::Running | RunStatus::Quarantined
-        ) && matches!(&self.snapshot_anchor, SnapshotAnchorStatus::Valid(_))
+        ) && matches!(
+            &self.snapshot_anchor,
+            SnapshotAnchorStatus::Valid(anchor) if anchor.covers_full_cache()
+        )
     }
 }
 
@@ -210,6 +213,12 @@ fn snapshot_anchor_status(
         return SnapshotAnchorStatus::Missing;
     };
 
+    if !anchor.covers_full_cache() {
+        return SnapshotAnchorStatus::Invalid(
+            "partial snapshot cannot replace retained cache history".to_string(),
+        );
+    }
+
     // Validate against the durable watermark, not the manifest's: a tail-trimmed run
     // keeps its manifest value, and trusting it could anoint a restore point the
     // restore path itself rejects while everything else is reclaimed.
@@ -230,10 +239,32 @@ mod tests {
     use super::*;
 
     #[rstest]
+    fn snapshot_anchor_status_rejects_partial_coverage() {
+        let status = snapshot_anchor_status(
+            1,
+            Some(SnapshotAnchor::new(
+                1,
+                "opaque",
+                "hash",
+                crate::SnapshotCoverage::Partial,
+            )),
+        );
+
+        assert!(
+            matches!(status, SnapshotAnchorStatus::Invalid(message) if message.contains("partial"))
+        );
+    }
+
+    #[rstest]
     fn snapshot_anchor_status_rejects_anchor_past_durable_watermark() {
         let status = snapshot_anchor_status(
             1,
-            Some(SnapshotAnchor::new(2, "cache://snapshots/2", "blake3:abc")),
+            Some(SnapshotAnchor::new(
+                2,
+                "cache://snapshots/2",
+                "blake3:abc",
+                crate::SnapshotCoverage::FullCache,
+            )),
         );
 
         match status {

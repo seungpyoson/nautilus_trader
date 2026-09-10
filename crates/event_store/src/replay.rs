@@ -734,8 +734,9 @@ impl CacheReplayContext {
 
 /// Replays the cache snapshot tail after the caller restores the cache-owned snapshot blob.
 ///
-/// The restore hook runs before the tail iterator is consumed. When `anchor` is `Some`,
-/// the hook should fetch and apply the cache-owned blob identified by
+/// Partial anchors are rejected before the restore hook or cache mutation. The restore
+/// hook runs before the tail iterator is consumed. When `anchor` is `Some`, the hook
+/// must restore all cache state represented by the skipped prefix, using the blob identified by
 /// [`SnapshotAnchor::blob_ref`] and validate it against
 /// [`SnapshotAnchor::content_hash`]. When `anchor` is `None`, restore starts from
 /// event-store seq `1` and the hook may be a no-op.
@@ -909,9 +910,11 @@ where
 /// Restores cache state from a sealed run without publishing to the bus or touching live venues.
 ///
 /// The loader opens `<base_dir>/<instance_id>/<run_id>.redb` through the sealed-run reader path,
-/// rejects quarantined sources, restores the cache-owned snapshot blob when an anchor exists, and
-/// applies the event-store tail in `seq` order. It does not open adapters, reconcile against a
-/// venue, submit new entries, or query the data catalog.
+/// rejects quarantined sources and anchored checkpoints, and applies supported cache events
+/// in `seq` order. The native cache restores individual position archives, not full checkpoints;
+/// callers with a full checkpoint use [`restore_cache_snapshot_and_replay_tail`] and their own
+/// restore hook. This does not establish complete economic history. It does not open adapters,
+/// reconcile against a venue, submit new entries, or query the data catalog.
 ///
 /// # Errors
 ///
@@ -925,8 +928,15 @@ pub fn restore_cache_from_sealed_run(
     run_id: &str,
 ) -> Result<EventStoreReplayReport, CacheReplayError> {
     let (manifest, reader) = open_event_store_replay_source(base_dir, instance_id, run_id)?;
-    let cache_report =
-        restore_cache_snapshot_and_replay_tail(cache, &reader, restore_cache_snapshot_blob)?;
+    let cache_report = restore_cache_snapshot_and_replay_tail(cache, &reader, |_, anchor| {
+        if let Some(anchor) = anchor {
+            return Err(CacheReplayError::snapshot_restore(
+                anchor,
+                "native cache restore does not support full cache checkpoints",
+            ));
+        }
+        Ok(())
+    })?;
 
     Ok(EventStoreReplayReport {
         manifest,
@@ -2128,8 +2138,10 @@ mod tests {
         EventStoreReader::new(backend)
     }
 
-    fn reader_with_anchor(anchor_seq: u64) -> (EventStoreReader<MemoryBackend>, AccountState) {
-        let anchored = cash_account_state();
+    fn reader_with_anchor(
+        anchor_seq: u64,
+    ) -> (EventStoreReader<MemoryBackend>, AccountState, AccountState) {
+        let anchored = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
         let replayed = cash_account_state_million_usd("200 USD", "0 USD", "200 USD");
         let mut backend = MemoryBackend::new();
         backend.open_run(manifest("run-replay")).expect("open");
@@ -2140,9 +2152,14 @@ mod tests {
             ])
             .expect("append");
         backend
-            .record_snapshot_anchor(SnapshotAnchor::new(anchor_seq, "cache://account", "hash"))
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                anchor_seq,
+                "cache://account",
+                "hash",
+                crate::SnapshotCoverage::FullCache,
+            ))
             .expect("record anchor");
-        (EventStoreReader::new(backend), replayed)
+        (EventStoreReader::new(backend), anchored, replayed)
     }
 
     fn catalog_quote_record(ts_init: u64) -> CatalogReplayRecord {
@@ -3103,10 +3120,39 @@ mod tests {
     }
 
     #[rstest]
-    fn replay_restores_snapshot_before_applying_tail() {
-        let (reader, replayed) = reader_with_anchor(1);
+    fn partial_snapshot_rejected_before_restore_hook_or_cache_mutation() {
+        let state = cash_account_state();
+        let mut backend = MemoryBackend::new();
+        backend
+            .open_run(manifest("partial-snapshot"))
+            .expect("open");
+        backend
+            .append_batch(&[append_account_state(1, &state)])
+            .expect("append");
+        backend
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                1,
+                "opaque-partial-blob",
+                "hash",
+                crate::SnapshotCoverage::Partial,
+            ))
+            .expect("anchor");
+        let reader = EventStoreReader::new(backend);
         let mut cache = Cache::default();
-        let restored = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
+
+        let error = restore_cache_snapshot_and_replay_tail(&mut cache, &reader, |_, _| {
+            panic!("partial snapshot must not reach the restore hook");
+        })
+        .expect_err("partial snapshot");
+
+        assert!(error.to_string().contains("partial"));
+        assert!(cache.account_owned(&state.account_id).is_none());
+    }
+
+    #[rstest]
+    fn replay_restores_snapshot_before_applying_tail() {
+        let (reader, restored, replayed) = reader_with_anchor(1);
+        let mut cache = Cache::default();
         let restored_id = restored.account_id;
 
         let report =
@@ -3131,15 +3177,15 @@ mod tests {
 
     #[rstest]
     fn replay_does_not_apply_entries_at_or_below_anchor_watermark() {
-        let (reader, _) = reader_with_anchor(2);
+        let (reader, restored, replayed) = reader_with_anchor(2);
         let mut cache = Cache::default();
-        let restored = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
         let restored_id = restored.account_id;
+        let snapshot_events = vec![restored, replayed];
 
         let report =
             restore_cache_snapshot_and_replay_tail(&mut cache, &reader, |cache, anchor| {
                 assert_eq!(anchor.expect("anchor").high_watermark, 2);
-                let account = AccountAny::from_events(std::slice::from_ref(&restored))
+                let account = AccountAny::from_events(&snapshot_events)
                     .map_err(|e| CacheReplayError::snapshot_restore(anchor.unwrap(), e))?;
                 cache
                     .add_account(account)
@@ -3152,7 +3198,7 @@ mod tests {
         assert!(report.plan.is_empty());
         assert_eq!(report.applied_entries, 0);
         assert_eq!(report.ignored_entries, 0);
-        assert_eq!(account.events(), vec![restored]);
+        assert_eq!(account.events(), snapshot_events);
     }
 
     #[rstest]
@@ -4588,7 +4634,15 @@ mod tests {
     }
 
     #[rstest]
-    fn restore_cache_from_sealed_run_restores_snapshot_and_tail() {
+    #[case::partial(crate::SnapshotCoverage::Partial, "is partial")]
+    #[case::declared_full(
+        crate::SnapshotCoverage::FullCache,
+        "does not support full cache checkpoints"
+    )]
+    fn restore_cache_from_sealed_run_rejects_position_checkpoint(
+        #[case] coverage: crate::SnapshotCoverage,
+        #[case] expected_error: &str,
+    ) {
         let tmp = TempDir::new().expect("tempdir");
         let run_id = "sealed-replay";
         let instance_id = "trader-001";
@@ -4616,6 +4670,7 @@ mod tests {
                     1,
                     snapshot_ref.blob_ref.clone(),
                     compute_snapshot_content_hash(snapshot_ref.blob.as_ref()),
+                    coverage,
                 ))
                 .expect("record snapshot anchor");
             backend
@@ -4629,36 +4684,26 @@ mod tests {
             .add(&snapshot_ref.blob_ref, snapshot_ref.blob.clone())
             .expect("seed snapshot blob");
 
-        let report = restore_cache_from_sealed_run(
+        let error = restore_cache_from_sealed_run(
             &mut cache,
             tmp.path().to_path_buf(),
             instance_id,
             run_id,
         )
-        .expect("restore sealed run");
-
-        let frames = cache
-            .position_snapshot_bytes(&position.id)
-            .expect("restored position snapshot");
-        let account = cache
-            .account_owned(&replayed_state.account_id)
-            .expect("replayed account");
-
-        assert_eq!(report.manifest.run_id, run_id);
-        assert_eq!(report.manifest.status, RunStatus::Ended);
-        assert_eq!(report.cache.plan.from_seq, 2);
-        assert_eq!(report.cache.applied_entries, 1);
-        assert_eq!(report.cache.ignored_entries, 0);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].as_slice(), snapshot_ref.blob.as_ref());
-        assert_eq!(account.events(), vec![replayed_state]);
+        .expect_err("a position archive cannot restore a full cache");
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert!(cache.position_snapshot_bytes(&position.id).is_none());
+        assert!(cache.account_owned(&anchored_state.account_id).is_none());
+        assert_eq!(
+            cache
+                .load_snapshot_blob(&snapshot_ref.blob_ref)
+                .expect("load blob"),
+            Some(snapshot_ref.blob),
+        );
     }
 
     #[rstest]
-    fn restore_cache_from_sealed_run_rejects_snapshot_hash_mismatch() {
-        let tmp = TempDir::new().expect("tempdir");
-        let run_id = "sealed-replay-bad-snapshot";
-        let instance_id = "trader-001";
+    fn restore_cache_snapshot_blob_rejects_hash_mismatch() {
         let instrument = InstrumentAny::CurrencyPair(audusd_sim());
         let fill = OrderFilledSpec::builder()
             .instrument_id(instrument.id())
@@ -4670,18 +4715,12 @@ mod tests {
             .snapshot_position_encoded(&position)
             .expect("snapshot position");
 
-        {
-            let mut backend = RedbBackend::new(tmp.path().to_path_buf());
-            backend.open_run(manifest(run_id)).expect("open run");
-            backend
-                .record_snapshot_anchor(SnapshotAnchor::new(
-                    0,
-                    snapshot_ref.blob_ref.clone(),
-                    compute_snapshot_content_hash(snapshot_ref.blob.as_ref()),
-                ))
-                .expect("record snapshot anchor");
-            backend.seal(RunStatus::Ended).expect("seal run");
-        }
+        let anchor = SnapshotAnchor::new(
+            0,
+            snapshot_ref.blob_ref.clone(),
+            compute_snapshot_content_hash(snapshot_ref.blob.as_ref()),
+            crate::SnapshotCoverage::Partial,
+        );
 
         let mut cache = Cache::default();
         cache
@@ -4691,13 +4730,8 @@ mod tests {
             )
             .expect("seed tampered snapshot blob");
 
-        let err = restore_cache_from_sealed_run(
-            &mut cache,
-            tmp.path().to_path_buf(),
-            instance_id,
-            run_id,
-        )
-        .expect_err("hash mismatch");
+        let err =
+            restore_cache_snapshot_blob(&mut cache, Some(&anchor)).expect_err("hash mismatch");
 
         match err {
             CacheReplayError::SnapshotRestore { blob_ref, message } => {

@@ -134,15 +134,16 @@ impl<B: EventStore> EventStoreReader<B> {
 
     /// Builds the restore replay bounds from the latest snapshot anchor.
     ///
-    /// Restore callers fetch and validate the cache-owned snapshot blob first, then
+    /// Only anchors declaring full cache coverage can authorize skipping the prefix.
+    /// Restore callers fetch and validate that checkpoint blob first, then
     /// replay entries in `[from_seq, to_seq]`. When an anchor exists, `from_seq` is
     /// `anchor.high_watermark + 1`; without an anchor, restore replays from seq `1`.
     ///
     /// # Errors
     ///
-    /// Returns [`EventStoreError::Backend`] when no run is open or the backend does not
-    /// support snapshot anchors, and [`EventStoreError::Corrupted`] when the stored
-    /// anchor points past the durable high-watermark.
+    /// Returns [`EventStoreError::Backend`] when no run is open, snapshot anchors are
+    /// unsupported, or coverage is partial; returns [`EventStoreError::Corrupted`]
+    /// when the anchor points past the durable high-watermark.
     pub fn snapshot_replay_plan(&self) -> Result<SnapshotReplayPlan, EventStoreError> {
         let anchor = self.latest_snapshot_anchor()?;
         let to_seq = self.high_watermark()?;
@@ -151,6 +152,12 @@ impl<B: EventStore> EventStoreReader<B> {
                 return Err(EventStoreError::Corrupted(format!(
                     "snapshot anchor high_watermark {} exceeds durable high_watermark {to_seq}",
                     anchor.high_watermark,
+                )));
+            }
+            Some(anchor) if !anchor.covers_full_cache() => {
+                return Err(EventStoreError::Backend(format!(
+                    "snapshot {} is partial and cannot replace the cache replay prefix",
+                    anchor.blob_ref,
                 )));
             }
             Some(anchor) => anchor.high_watermark.saturating_add(1),
@@ -580,6 +587,7 @@ mod tests {
                 2,
                 "cache://snapshots/run-reader/2",
                 "blake3:abc",
+                crate::SnapshotCoverage::FullCache,
             )))
         }
 
@@ -621,7 +629,12 @@ mod tests {
         backend
             .append_batch(&[append_with(1, 101, Vec::new())])
             .expect("append");
-        let anchor = SnapshotAnchor::new(1, "cache://snapshots/run-anchor/1", "blake3:abc");
+        let anchor = SnapshotAnchor::new(
+            1,
+            "cache://snapshots/run-anchor/1",
+            "blake3:abc",
+            crate::SnapshotCoverage::FullCache,
+        );
         backend
             .record_snapshot_anchor(anchor.clone())
             .expect("record anchor");
@@ -663,7 +676,12 @@ mod tests {
                 append_with(3, 103, Vec::new()),
             ])
             .expect("append");
-        let anchor = SnapshotAnchor::new(2, "cache://snapshots/run-anchor/2", "blake3:abc");
+        let anchor = SnapshotAnchor::new(
+            2,
+            "cache://snapshots/run-anchor/2",
+            "blake3:abc",
+            crate::SnapshotCoverage::FullCache,
+        );
         backend
             .record_snapshot_anchor(anchor.clone())
             .expect("record anchor");
@@ -716,6 +734,7 @@ mod tests {
                 2,
                 "cache://snapshots/run-anchor/2",
                 "blake3:abc",
+                crate::SnapshotCoverage::FullCache,
             ))
             .expect("record anchor");
         let reader = EventStoreReader::new(backend);
@@ -744,6 +763,7 @@ mod tests {
                 2,
                 "cache://snapshots/run-anchor/2",
                 "blake3:abc",
+                crate::SnapshotCoverage::FullCache,
             ))
             .expect("record anchor");
         let reader = EventStoreReader::new(backend);

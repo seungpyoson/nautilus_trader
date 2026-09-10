@@ -241,7 +241,12 @@ fn record_snapshot_anchor(
     }
 
     let hwm = high_watermark.load(Ordering::Acquire);
-    let anchor = SnapshotAnchor::new(hwm, blob_ref, content_hash);
+    let anchor = SnapshotAnchor::new(
+        hwm,
+        blob_ref,
+        content_hash,
+        crate::SnapshotCoverage::Partial,
+    );
     let result = match backend.record_snapshot_anchor(anchor.clone()) {
         Ok(()) => Ok(anchor),
         Err(e) => {
