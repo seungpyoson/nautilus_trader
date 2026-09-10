@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: b3f990c9345d2115fa7a8fc476f8e8181e3f6fb3
+      REVIEWED_SHA: 7aaf2b64cfd8fd6a5aa4d7380a77694edbb78500
       CARGO_BUILD_JOBS: "2"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -31,7 +31,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: b3f990c9345d2115fa7a8fc476f8e8181e3f6fb3
+          ref: 7aaf2b64cfd8fd6a5aa4d7380a77694edbb78500
           persist-credentials: false
 
       - name: Verify reviewed commit
