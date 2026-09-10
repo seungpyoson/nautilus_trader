@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: 8be2446123c794c142b6565d7c86d04a07b94cdf
+      REVIEWED_SHA: c20bbbab132f9f10e9e8878ded1ca9b7b5f06320
       CARGO_BUILD_JOBS: "2"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -31,7 +31,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 8be2446123c794c142b6565d7c86d04a07b94cdf
+          ref: c20bbbab132f9f10e9e8878ded1ca9b7b5f06320
           persist-credentials: false
 
       - name: Verify reviewed commit
@@ -47,8 +47,8 @@ jobs:
           free-disk-space: "true"
           rust-cache-key: reconciliation-application-ci-pr
 
-      # Verify kernel startup and its live, backtest, and storage consumers.
-      - name: Kernel startup and affected consumer tests
+      # Verify snapshot coverage, startup retries, and affected consumers.
+      - name: Snapshot coverage and affected consumer tests
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
         run: |
@@ -56,14 +56,14 @@ jobs:
           cargo nextest run --locked --cargo-profile ci-pr --profile ci \
             -p nautilus-system -p nautilus-live -p nautilus-backtest -p nautilus-event-store \
             --lib --tests --no-fail-fast \
-            2>&1 | tee "$RUNNER_TEMP/kernel-startup-tests.log"
+            2>&1 | tee "$RUNNER_TEMP/snapshot-coverage-tests.log"
 
       - name: Preserve affected suite output
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: kernel-startup-${{ env.REVIEWED_SHA }}
-          path: ${{ runner.temp }}/kernel-startup-tests.log
+          name: snapshot-coverage-${{ env.REVIEWED_SHA }}
+          path: ${{ runner.temp }}/snapshot-coverage-tests.log
           if-no-files-found: error
 
       - name: Affected library and test Clippy
