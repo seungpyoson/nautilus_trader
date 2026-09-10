@@ -4478,12 +4478,21 @@ mod tests {
                 .account_id(account_id)
                 .build(),
         );
-        order.apply(event.clone()).unwrap();
         portfolio
             .cache
             .borrow_mut()
             .add_order(order, None, None, false)
             .unwrap();
+        // Apply acceptance through Cache so its open-order index matches the order state
+        portfolio.cache.borrow_mut().update_order(&event).unwrap();
+        assert_eq!(
+            portfolio
+                .cache
+                .borrow()
+                .orders_open(None, Some(&instrument.id()), None, Some(&account_id), None)
+                .len(),
+            1,
+        );
         let endpoint = MessagingSwitchboard::portfolio_update_order();
         let original = portfolio.cache.borrow().account_owned(&account_id).unwrap();
 
