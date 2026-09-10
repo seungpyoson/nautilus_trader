@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: 0dd98b9adf9d931296f94faeca2d2a3b9ff50659
+      REVIEWED_SHA: d598eb37f3f2f2d246fb66675fdc5cf5a2e7b6df
       CARGO_BUILD_JOBS: "2"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -31,7 +31,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 0dd98b9adf9d931296f94faeca2d2a3b9ff50659
+          ref: d598eb37f3f2f2d246fb66675fdc5cf5a2e7b6df
           persist-credentials: false
 
       - name: Verify reviewed commit
@@ -47,34 +47,30 @@ jobs:
           free-disk-space: "true"
           rust-cache-key: reconciliation-application-ci-pr
 
-      # Verify stable snapshot references, corrected cycle fixtures, and affected consumers.
-      - name: Snapshot reference identity and affected consumer tests
+      # Diagnose fee revisions and flip-cycle preservation; failures are evidence, not readiness.
+      - name: Fee revision and native flip correction diagnostics
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
         run: |
           set -o pipefail
           cargo nextest run --locked --cargo-profile ci-pr --profile ci \
-            -p nautilus-system -p nautilus-live -p nautilus-backtest -p nautilus-event-store -p nautilus-execution -p nautilus-common -p nautilus-portfolio \
+            -p nautilus-event-store -p nautilus-execution \
             --lib --tests --no-fail-fast \
-            2>&1 | tee "$RUNNER_TEMP/snapshot-blob-identity-tests.log"
+            -E 'test(replay_fill_corrections_match_live_accounting) | test(test_entry_fill_void_preserves_native_flip_cycle_accounting)' \
+            2>&1 | tee "$RUNNER_TEMP/fee-revision-cycle-diagnostics.log"
 
       - name: Preserve affected suite output
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: snapshot-blob-identity-${{ env.REVIEWED_SHA }}
-          path: ${{ runner.temp }}/snapshot-blob-identity-tests.log
+          name: fee-revision-cycle-diagnostics-${{ env.REVIEWED_SHA }}
+          path: ${{ runner.temp }}/fee-revision-cycle-diagnostics.log
           if-no-files-found: error
 
       - name: Affected library and test Clippy
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
-        run: cargo clippy --locked --profile ci-pr -p nautilus-system -p nautilus-live -p nautilus-backtest -p nautilus-event-store -p nautilus-execution -p nautilus-common -p nautilus-portfolio --lib --tests -- -D warnings
-
-      - name: Standalone live library Clippy
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        shell: bash
-        run: cargo clippy --locked --profile ci-pr -p nautilus-live --no-default-features --lib -- -D warnings
+        run: cargo clippy --locked --profile ci-pr -p nautilus-event-store -p nautilus-execution --lib --tests -- -D warnings
 
       - name: Verify source remained unchanged
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
