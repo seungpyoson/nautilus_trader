@@ -1951,7 +1951,6 @@ impl ExecutionManager {
             quantity += match order.order_side() {
                 OrderSide::Sell => order.filled_qty().as_decimal(),
                 OrderSide::Buy => -order.filled_qty().as_decimal(),
-                _ => return None,
             };
         }
         Some(quantity)

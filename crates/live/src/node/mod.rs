@@ -77,10 +77,7 @@
 //! maintenance below 100ms (defaults are seconds to minutes). Cadence drifts
 //! by at most one body duration per fire.
 
-use std::{
-    any::Any, collections::HashSet, fmt::Debug, future::Future, ops::ControlFlow, pin::Pin,
-    time::Duration,
-};
+use std::{any::Any, fmt::Debug, future::Future, ops::ControlFlow, pin::Pin, time::Duration};
 
 use anyhow::Context;
 use indexmap::{IndexMap, IndexSet};
@@ -106,14 +103,14 @@ use nautilus_core::{
     datetime::{mins_to_secs, secs_to_nanos_unchecked},
 };
 #[cfg(test)]
-use nautilus_model::reports::OrderStatusReport;
+use nautilus_model::reports::{OrderStatusReport, PositionStatusReport};
 use nautilus_model::{
     data::InstrumentClose,
     enums::OrderStatus,
     events::{OrderEventAny, PositionEvent},
     identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     orders::Order,
-    reports::{ExecutionMassStatus, FillReport, PositionStatusReport},
+    reports::{ExecutionMassStatus, FillReport},
 };
 use nautilus_network::mode::ReconnectRequestOutcome;
 #[cfg(feature = "python")]
@@ -3937,16 +3934,6 @@ struct PositionFillReportResult {
 struct PositionFillReportQueryResult {
     reports: IndexMap<InstrumentAccountKey, Vec<FillReport>>,
     successful_keys: IndexSet<InstrumentAccountKey>,
-}
-
-struct RunnerReceivers<'a> {
-    time_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-    system_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-    system_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
-    exec_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    exec_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
-    data_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    data_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
 }
 
 /// Flushes data events and commands from both `pending` and the channel receivers

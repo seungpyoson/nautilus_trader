@@ -310,7 +310,7 @@ impl Fixture {
         )
     }
 
-    fn position_report_result(&self) -> PositionReportResult {
+    fn position_report_result(&self) -> PositionReportCollection {
         let mut check = self
             .node
             .exec_manager
@@ -319,7 +319,7 @@ impl Fixture {
             (self.instrument.id(), self.account_id),
             ReportClientCoverage::Resolved(IndexSet::from([self.client_id])),
         );
-        PositionReportResult {
+        PositionReportCollection {
             check,
             reports: vec![PositionStatusReport::new(
                 self.account_id,
