@@ -70,8 +70,8 @@ use nautilus_live::{
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     enums::{
-        AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
-        PositionSideSpecified, TimeInForce,
+        AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
+        TimeInForce,
     },
     events::{AccountState, OrderAcceptedBatch, OrderEventAny},
     identifiers::{
@@ -3663,7 +3663,7 @@ pub(crate) mod serial_tests {
         mass_status.add_position_reports(vec![PositionStatusReport::new(
             account_id,
             instrument.id(),
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from("1.0"),
             UnixNanos::from(1),
             UnixNanos::from(1),

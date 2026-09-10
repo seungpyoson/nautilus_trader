@@ -14351,12 +14351,12 @@ enum PositionRequestMutation {
 }
 
 #[rstest]
-#[case::already_matched(PositionSideSpecified::Long, "5.0", Some(dec!(3000)), dec!(5), true)]
-#[case::applied_adjustment(PositionSideSpecified::Long, "3.0", Some(dec!(3000)), dec!(3), true)]
-#[case::partial_cross_zero(PositionSideSpecified::Short, "3.0", None, dec!(0), false)]
+#[case::already_matched(PositionSide::Long, "5.0", Some(dec!(3000)), dec!(5), true)]
+#[case::applied_adjustment(PositionSide::Long, "3.0", Some(dec!(3000)), dec!(3), true)]
+#[case::partial_cross_zero(PositionSide::Short, "3.0", None, dec!(0), false)]
 #[tokio::test]
 async fn test_reconcile_positions_reports_final_native_quantities(
-    #[case] side: PositionSideSpecified,
+    #[case] side: PositionSide,
     #[case] quantity: &str,
     #[case] avg_px: Option<Decimal>,
     #[case] expected_net: Decimal,
@@ -14701,7 +14701,7 @@ async fn test_reconcile_positions_rechecks_initial_match_after_application_callb
             PositionStatusReport::new(
                 test_account_id(),
                 instrument.id(),
-                PositionSideSpecified::Long,
+                PositionSide::Long,
                 Quantity::from(quantity),
                 UnixNanos::from(1_000_000),
                 UnixNanos::from(1_000_000),
@@ -14947,7 +14947,7 @@ async fn test_position_query_rejects_entire_malformed_source_batch(
         PositionStatusReport::new(
             account,
             instrument,
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(quantity),
             UnixNanos::from(1_000_000),
             UnixNanos::from(1_000_000),

@@ -14523,7 +14523,7 @@ fn test_reconcile_fill_report_applies_fill_event(
     let replay = execution_engine.reconcile_fill_report_with_outcome(&report);
     let position_report = create_position_report(
         instrument.id(),
-        PositionSideSpecified::Long,
+        PositionSide::Long,
         Quantity::from(50_000),
         None,
     );
@@ -14895,8 +14895,14 @@ fn test_reconcile_position_report_hedging_uncached_zero_quantity(
     let (handler, saver) = get_any_saving_handler::<PositionStatusReport>(None);
     msgbus::subscribe_any(pattern, handler.clone(), None);
 
-    execution_engine.reconcile_position_report(&report);
-    execution_engine.reconcile_position_report(&report);
+    assert_eq!(
+        execution_engine.reconcile_position_report_with_outcome(&report),
+        EventApplicationOutcome::Applied,
+    );
+    assert_eq!(
+        execution_engine.reconcile_position_report_with_outcome(&report),
+        EventApplicationOutcome::Applied,
+    );
 
     msgbus::unsubscribe_any(pattern, &handler);
 

@@ -1728,7 +1728,7 @@ impl ExecutionEngine {
 
         let Some(position) = cache.position(venue_position_id) else {
             if report.signed_decimal_qty == Decimal::ZERO {
-                return;
+                return true;
             }
 
             log::error!("Cannot reconcile position: {venue_position_id} not found in cache");

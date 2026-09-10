@@ -459,7 +459,9 @@ fn is_terminal_report_after_full_fill(order: &OrderAny, report: &OrderStatusRepo
 pub fn order_report_is_reconciled(order: &OrderAny, report: &OrderStatusReport) -> bool {
     if order.instrument_id() != report.instrument_id
         || order.account_id() != Some(report.account_id)
-        || order.order_side() != report.order_side
+        || report
+            .order_side
+            .is_some_and(|side| side != order.order_side())
         || order.order_type() != report.order_type
         || report
             .client_order_id

@@ -6019,6 +6019,13 @@ fn test_order_report_postcondition_preserves_native_fill_tolerance(
     }
     assert_eq!(order_report_is_reconciled(&order, &report), reconciled);
 
+    let report_side = report.order_side;
+    report.order_side = None;
+    assert_eq!(order_report_is_reconciled(&order, &report), reconciled);
+    report.order_side = Some(OrderSide::Sell);
+    assert!(!order_report_is_reconciled(&order, &report));
+    report.order_side = report_side;
+
     if reconciled {
         report.quantity = Quantity::from("30.00");
         assert!(!order_report_is_reconciled(&order, &report));
