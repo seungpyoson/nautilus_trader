@@ -1,4 +1,4 @@
-name: Settlement startup focused compile
+name: Settlement startup focused verification
 
 # Fork infrastructure only; excluded from the NT contribution branch.
 on:
@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      SOURCE_SHA: 684a430f9b3f39fec0193fb5d52d53f660b64d01
+      SOURCE_SHA: 2dddadf9f87256900255316755c63f17a69ffb11
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "1"
@@ -30,7 +30,7 @@ jobs:
       - name: Check out candidate source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 684a430f9b3f39fec0193fb5d52d53f660b64d01
+          ref: 2dddadf9f87256900255316755c63f17a69ffb11
           fetch-depth: 0
           persist-credentials: false
 
@@ -46,13 +46,41 @@ jobs:
           free-disk-space: "true"
           rust-cache-key: settlement-startup-integration-advisory
 
-      - name: LiveNode library and test compilation with Clippy
+      - name: Changed native components Clippy
         shell: bash
         run: |
           cargo clippy --locked --keep-going --profile ci-pr \
-            -p nautilus-live --features node,nautilus-model/high-precision \
+            -p nautilus-live -p nautilus-common -p nautilus-model \
+            --features nautilus-live/node,nautilus-model/high-precision \
             --lib --tests -- -D warnings \
             2>&1 | tee "$RUNNER_TEMP/settlement-startup-clippy.log"
+
+      - name: Focused settlement and startup regressions
+        shell: bash
+        run: |
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci \
+            -p nautilus-live -p nautilus-model \
+            --features nautilus-live/node,nautilus-model/high-precision \
+            --lib --tests --no-fail-fast \
+            -E 'test(contract_settlement) | test(test_startup_settled_inventory_uses_native_closes)' \
+            2>&1 | tee "$RUNNER_TEMP/settlement-startup-tests.log"
+
+      - name: Prove cleanup regressions reject the old reconciliation code
+        shell: bash
+        run: |
+          git show 684a430f9b3f39fec0193fb5d52d53f660b64d01:crates/live/src/execution/manager.rs \
+            > crates/live/src/execution/manager.rs
+          set +e
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci \
+            -p nautilus-live --features node,nautilus-model/high-precision \
+            --lib --no-fail-fast \
+            -E 'test(contract_settlement_inventory_survives_history_cleanup)' \
+            2>&1 | tee "$RUNNER_TEMP/settlement-startup-old-history-control.log"
+          control_status=${PIPESTATUS[0]}
+          set -e
+          git restore --source="$SOURCE_SHA" -- crates/live/src/execution/manager.rs
+          echo "Old-history control exit code: $control_status"
+          test "$control_status" -eq 100
 
       - name: Verify final source identity
         if: always()
