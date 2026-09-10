@@ -2036,9 +2036,11 @@ impl Portfolio {
 
     /// Updates portfolio calculations based on a position event.
     ///
-    /// Recalculates net positions, unrealized PnL, and margin requirements.
-    pub fn update_position(&mut self, event: &PositionEvent) {
-        update_position(&self.cache, &self.clock, &self.inner, self.config, event);
+    /// Recalculates net positions, realized/unrealized PnL, and margin requirements.
+    /// An incomplete result can include partial application. This does not acknowledge
+    /// subscribers, durable storage, or a complete financial observation.
+    pub fn update_position(&mut self, event: &PositionEvent) -> EventApplicationOutcome {
+        update_position(&self.cache, &self.clock, &self.inner, self.config, event)
     }
 
     fn update_net_position(&self, instrument_id: &InstrumentId, positions: &[&Position]) {
@@ -3727,9 +3729,10 @@ fn update_position(
     inner: &Rc<RefCell<PortfolioState>>,
     config: PortfolioConfig,
     event: &PositionEvent,
-) {
+) -> EventApplicationOutcome {
     let instrument_id = event.instrument_id();
     let account_id = event.account_id();
+    let mut outcome = EventApplicationOutcome::Applied;
 
     update_snapshot_timer_state(cache, clock, inner, config, account_id);
 
@@ -3758,6 +3761,11 @@ fn update_position(
             .unrealized_pnls
             .insert(event.instrument_id(), calculated_unrealized_pnl);
     } else {
+        inner
+            .borrow_mut()
+            .unrealized_pnls
+            .shift_remove(&instrument_id);
+
         log::debug!(
             "Failed to calculate unrealized PnL for {}, marking as pending",
             event.instrument_id()
@@ -3766,6 +3774,7 @@ fn update_position(
             .borrow_mut()
             .pending_calcs
             .insert(event.instrument_id());
+        outcome = EventApplicationOutcome::Incomplete;
     }
 
     if let Some(calculated_realized_pnl) =
@@ -3788,6 +3797,7 @@ fn update_position(
             .borrow_mut()
             .pending_calcs
             .insert(event.instrument_id());
+        outcome = EventApplicationOutcome::Incomplete;
     }
 
     // Peek under a borrow: the account event log grows per fill, so a clone here was O(n)
@@ -3805,7 +3815,13 @@ fn update_position(
     };
     let account_state_to_publish = match peek {
         AccountPeek::MarginRecompute => {
-            recompute_margin_account(cache, clock, inner, account_id, &instrument_id)
+            match recompute_margin_account(cache, clock, inner, account_id, &instrument_id) {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    log::error!("Cannot recalculate position account: {e}");
+                    None
+                }
+            }
         }
         AccountPeek::LastEvent(last_event) => *last_event,
         AccountPeek::Missing => {
@@ -3822,35 +3838,41 @@ fn update_position(
             format!("events.account.{account_id}").into(),
             &account_state,
         );
+    } else {
+        let mut inner = inner.borrow_mut();
+        inner.unrealized_pnls.shift_remove(&instrument_id);
+        inner.realized_pnls.shift_remove(&instrument_id);
+        inner.pending_calcs.insert(instrument_id);
+        outcome = EventApplicationOutcome::Incomplete;
     }
+
+    outcome
 }
 
 /// Recalculates the margin account for `instrument_id` from the currently open positions.
 ///
 /// Moves the account out of the cache for the recompute instead of cloning it, then moves it
-/// back without a database write when the recompute produces no new state.
+/// back without a database write when calculation fails. A previous account event cannot
+/// acknowledge a failed recomputation.
 fn recompute_margin_account(
     cache: &Rc<RefCell<Cache>>,
     clock: &Rc<RefCell<dyn Clock>>,
     inner: &Rc<RefCell<PortfolioState>>,
     account_id: AccountId,
     instrument_id: &InstrumentId,
-) -> Option<AccountState> {
+) -> anyhow::Result<AccountState> {
     let instrument = { cache.borrow().instrument(instrument_id).cloned() };
     let Some(instrument) = instrument else {
-        log::error!("Cannot update position: no instrument found for {instrument_id}");
-        let cache_ref = cache.borrow();
-        return cache_ref
-            .account(&account_id)
-            .and_then(|account| account.last_event());
+        anyhow::bail!("no instrument found for {instrument_id}");
     };
 
     // Bind the taken account so the mutable cache borrow drops before the recompute
     let taken_account = cache.borrow_mut().take_account(&account_id);
-    let mut account = taken_account?;
+    let mut account = taken_account
+        .ok_or_else(|| anyhow::anyhow!("cannot take account {account_id} for position update"))?;
     let AccountAny::Margin(margin_account) = &mut account else {
-        // The caller peeked a margin account, so this only restores an unexpected account type
-        return restore_cached_account(cache, account);
+        cache.borrow_mut().cache_account_owned(account);
+        anyhow::bail!("account {account_id} is not a margin account");
     };
 
     let recomputed = {
@@ -3868,19 +3890,19 @@ fn recompute_margin_account(
 
     match recomputed {
         Some(account_state) => {
-            cache.borrow_mut().update_account_owned(account).unwrap();
-            Some(account_state)
+            if let Err(e) = account.apply(account_state.clone()) {
+                cache.borrow_mut().cache_account_owned(account);
+                return Err(e);
+            }
+
+            cache.borrow_mut().update_account_owned(account)?;
+            Ok(account_state)
         }
-        None => restore_cached_account(cache, account),
+        None => {
+            cache.borrow_mut().cache_account_owned(account);
+            anyhow::bail!("margin calculation unavailable for {account_id} / {instrument_id}")
+        }
     }
-}
-
-/// Returns the `account` to the cache without a database write and reports its last state event.
-fn restore_cached_account(cache: &Rc<RefCell<Cache>>, account: AccountAny) -> Option<AccountState> {
-    let last_event = account.last_event();
-    cache.borrow_mut().cache_account_owned(account);
-
-    last_event
 }
 
 fn record_closed_position_pnl(
@@ -4255,7 +4277,10 @@ mod tests {
     use nautilus_model::{
         data::QuoteTick,
         enums::{AccountType, OrderSide},
-        events::order::spec::{OrderAcceptedSpec, OrderFilledSpec, OrderSubmittedSpec},
+        events::{
+            PositionOpened,
+            order::spec::{OrderAcceptedSpec, OrderFilledSpec, OrderSubmittedSpec},
+        },
         identifiers::{AccountId, PositionId, Symbol},
         instruments::stubs::{audusd_sim, default_fx_ccy},
         orders::OrderTestBuilder,
@@ -4297,6 +4322,279 @@ mod tests {
             .unwrap()
             .set_calculate_account_state(true);
         (portfolio, instrument)
+    }
+
+    #[rstest]
+    #[case(true, EventApplicationOutcome::Applied)]
+    #[case(false, EventApplicationOutcome::Incomplete)]
+    fn position_update_reports_margin_failure_and_applies_success_before_notification(
+        #[case] with_price: bool,
+        #[case] final_outcome: EventApplicationOutcome,
+        #[values(false, true)] via_topic: bool,
+    ) {
+        let (mut portfolio, _) = fill_endpoint_portfolio(AccountType::Margin);
+        let account_id = AccountId::from("SIM-001");
+        let instrument = InstrumentAny::CurrencyPair(default_fx_ccy(
+            Symbol::from("GBP/EUR"),
+            Some(Venue::from("SIM")),
+        ));
+        portfolio
+            .cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .account_id(account_id)
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("10"))
+            .last_px(Price::from("2.00000"))
+            .currency(Currency::EUR())
+            .position_id(PositionId::from("P-MARGIN-FX"))
+            .commission(Money::zero(Currency::EUR()))
+            .build();
+        let position = Position::new(&instrument, fill.clone());
+        portfolio
+            .cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Netting)
+            .unwrap();
+        let event = PositionEvent::PositionOpened(PositionOpened::create(
+            &position,
+            &fill,
+            UUID4::new(),
+            0.into(),
+        ));
+
+        if with_price {
+            portfolio
+                .cache
+                .borrow_mut()
+                .add_quote(QuoteTick::new(
+                    instrument.id(),
+                    Price::from("2.00000"),
+                    Price::from("2.00000"),
+                    Quantity::from("1"),
+                    Quantity::from("1"),
+                    0.into(),
+                    0.into(),
+                ))
+                .unwrap();
+        }
+
+        let original = portfolio.cache.borrow().account_owned(&account_id).unwrap();
+        let captured = Rc::new(RefCell::new(Vec::<AccountState>::new()));
+        msgbus::subscribe_account_state(
+            "events.account.*".into(),
+            TypedHandler::from({
+                let captured = Rc::clone(&captured);
+                let cache = Rc::clone(&portfolio.cache);
+                move |state: &AccountState| {
+                    let cache = cache.borrow();
+                    let account = cache.account(&state.account_id).unwrap();
+                    assert_eq!(account.last_event().unwrap().event_id, state.event_id);
+                    assert_eq!(
+                        account.balances().into_values().collect::<Vec<_>>(),
+                        state.balances
+                    );
+                    captured.borrow_mut().push(state.clone());
+                }
+            }),
+            Some(20),
+        );
+        portfolio
+            .inner
+            .borrow_mut()
+            .unrealized_pnls
+            .insert(instrument.id(), Money::from("9.00 USD"));
+        portfolio
+            .inner
+            .borrow_mut()
+            .realized_pnls
+            .insert(instrument.id(), Money::from("7.00 USD"));
+
+        // There is no EUR/USD conversion for the required margin calculation
+        if via_topic {
+            msgbus::publish_position_event(
+                msgbus::switchboard::get_event_position_topic(fill.strategy_id),
+                &event,
+            );
+        } else {
+            assert_eq!(
+                portfolio.update_position(&event),
+                EventApplicationOutcome::Incomplete
+            );
+        }
+        assert!(captured.borrow().is_empty());
+        let retained = portfolio.cache.borrow().account_owned(&account_id).unwrap();
+        assert_eq!(retained.balances(), original.balances());
+        assert_eq!(
+            retained.last_event().unwrap().event_id,
+            original.last_event().unwrap().event_id
+        );
+        assert_eq!(retained.event_count(), original.event_count());
+        assert!(
+            !portfolio
+                .inner
+                .borrow()
+                .unrealized_pnls
+                .contains_key(&instrument.id())
+        );
+        assert!(
+            !portfolio
+                .inner
+                .borrow()
+                .realized_pnls
+                .contains_key(&instrument.id())
+        );
+        assert!(
+            portfolio
+                .inner
+                .borrow()
+                .pending_calcs
+                .contains(&instrument.id())
+        );
+
+        let conversion = InstrumentAny::CurrencyPair(default_fx_ccy(
+            Symbol::from("EUR/USD"),
+            Some(Venue::from("SIM")),
+        ));
+        let quote = QuoteTick::new(
+            conversion.id(),
+            Price::from("2.00000"),
+            Price::from("2.00000"),
+            Quantity::from("1"),
+            Quantity::from("1"),
+            0.into(),
+            0.into(),
+        );
+        portfolio
+            .cache
+            .borrow_mut()
+            .add_instrument(conversion)
+            .unwrap();
+        portfolio.cache.borrow_mut().add_quote(quote).unwrap();
+
+        // 10 GBP at 2 EUR, maintenance rate 3%, then 2 USD/EUR: 1.20 USD margin
+        if via_topic {
+            msgbus::publish_position_event(
+                msgbus::switchboard::get_event_position_topic(fill.strategy_id),
+                &event,
+            );
+        } else {
+            assert_eq!(portfolio.update_position(&event), final_outcome);
+        }
+        let cached = portfolio.cache.borrow().account_owned(&account_id).unwrap();
+        assert_eq!(cached.event_count(), original.event_count() + 1);
+        let AccountAny::Margin(account) = cached else {
+            unreachable!()
+        };
+        assert_eq!(
+            account.margin(&instrument.id()).unwrap().maintenance,
+            Money::from("1.20 USD")
+        );
+        assert_eq!(
+            account.balance_total(Some(Currency::USD())),
+            Some(Money::from("1000.00 USD"))
+        );
+        assert_eq!(
+            account.balance_locked(Some(Currency::USD())),
+            Some(Money::from("1.20 USD"))
+        );
+        assert_eq!(
+            account.balance_free(Some(Currency::USD())),
+            Some(Money::from("998.80 USD"))
+        );
+        assert_eq!(captured.borrow().len(), 1);
+        assert!(!captured.borrow()[0].is_reported);
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn position_update_reports_missing_account_or_instrument(
+        #[case] missing_account: bool,
+        #[values(false, true)] via_topic: bool,
+    ) {
+        let (mut portfolio, cached_instrument) = fill_endpoint_portfolio(AccountType::Margin);
+        let account_id = AccountId::from("SIM-001");
+        let original = portfolio.cache.borrow().account_owned(&account_id).unwrap();
+        let instrument = if missing_account {
+            portfolio
+                .cache
+                .borrow_mut()
+                .take_account(&account_id)
+                .unwrap();
+            cached_instrument
+        } else {
+            InstrumentAny::CurrencyPair(default_fx_ccy(
+                Symbol::from("GBP/EUR"),
+                Some(Venue::from("SIM")),
+            ))
+        };
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .account_id(account_id)
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("10"))
+            .last_px(Price::from("2.00000"))
+            .currency(instrument.quote_currency())
+            .position_id(PositionId::from("P-MISSING-INPUT"))
+            .commission(Money::zero(instrument.quote_currency()))
+            .build();
+        let position = Position::new(&instrument, fill.clone());
+        portfolio
+            .cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Netting)
+            .unwrap();
+        let event = PositionEvent::PositionOpened(PositionOpened::create(
+            &position,
+            &fill,
+            UUID4::new(),
+            0.into(),
+        ));
+        let captured = Rc::new(RefCell::new(Vec::<AccountState>::new()));
+        msgbus::subscribe_account_state(
+            "events.account.*".into(),
+            TypedHandler::from({
+                let captured = Rc::clone(&captured);
+                move |state: &AccountState| captured.borrow_mut().push(state.clone())
+            }),
+            Some(20),
+        );
+
+        if via_topic {
+            msgbus::publish_position_event(
+                msgbus::switchboard::get_event_position_topic(fill.strategy_id),
+                &event,
+            );
+        } else {
+            assert_eq!(
+                portfolio.update_position(&event),
+                EventApplicationOutcome::Incomplete
+            );
+        }
+        assert!(captured.borrow().is_empty());
+        assert!(
+            portfolio
+                .inner
+                .borrow()
+                .pending_calcs
+                .contains(&instrument.id())
+        );
+        let cache = portfolio.cache.borrow();
+        if missing_account {
+            assert!(cache.account(&account_id).is_none());
+        } else {
+            let retained = cache.account(&account_id).unwrap();
+            assert_eq!(retained.balances(), original.balances());
+            assert_eq!(
+                retained.last_event().unwrap().event_id,
+                original.last_event().unwrap().event_id
+            );
+            assert_eq!(retained.event_count(), original.event_count());
+        }
     }
 
     fn add_commission_quote(portfolio: &Portfolio) {
