@@ -972,7 +972,9 @@ fn contract_settlement_does_not_relax_unexpired_reduce_only() {
 
 #[rstest]
 #[tokio::test]
-async fn contract_settlement_startup_drain_precedes_reconciliation() {
+async fn contract_settlement_startup_drain_precedes_reconciliation(
+    #[values(false, true)] close_callback: bool,
+) {
     let mut f = Fixture::new();
     f.fill("OWNER-001", "OPEN", OrderSide::Buy, "10.00", "0.400");
     let close = InstrumentClose::new(
@@ -982,8 +984,18 @@ async fn contract_settlement_startup_drain_precedes_reconciliation() {
         f.instrument.expiration_ns().unwrap(),
         f.instrument.expiration_ns().unwrap(),
     );
-    // Startup data is flushed before trader activation. Its bus callback only queues work.
-    AsyncRunner::handle_data_event(DataEvent::Data(Data::InstrumentClose(close)));
+    if close_callback {
+        // Startup data is flushed before trader activation. Its bus callback only queues work.
+        AsyncRunner::handle_data_event(DataEvent::Data(Data::InstrumentClose(close)));
+    } else {
+        // Restored native state has no pending callback to trigger the settlement queue.
+        f.node
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_instrument_close(close)
+            .unwrap();
+    }
     assert!(
         f.node
             .kernel
@@ -991,6 +1003,8 @@ async fn contract_settlement_startup_drain_precedes_reconciliation() {
             .borrow()
             .is_position_open(&f.position_id("OWNER-001"))
     );
+    f.node.perform_startup_reconciliation().await.unwrap();
+    f.assert_settled("5.90 USDC", 1);
     f.node.perform_startup_reconciliation().await.unwrap();
     f.assert_settled("5.90 USDC", 1);
 }

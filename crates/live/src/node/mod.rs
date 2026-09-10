@@ -1065,6 +1065,21 @@ impl LiveNode {
     ) -> anyhow::Result<()> {
         self.process_pending_settlements();
 
+        // Cache restoration does not publish close or position callbacks.
+        let open_instruments = {
+            let cache = self.kernel.cache.borrow();
+            cache
+                .positions_open_refs(None, None, None, None, None)
+                .into_iter()
+                .map(|position| position.instrument_id)
+                .collect::<IndexSet<_>>()
+        };
+        for instrument_id in open_instruments {
+            self.process_settlement(SettlementInput::Position(instrument_id));
+        }
+        self.process_pending_settlements();
+        self.check_execution_health()?;
+
         if !self.config.exec_engine.reconciliation {
             log::info!("Startup reconciliation disabled");
             self.kernel

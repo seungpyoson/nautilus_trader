@@ -14363,7 +14363,7 @@ async fn test_reconcile_positions_reports_final_native_quantities(
     #[case] expected_match: bool,
 ) {
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
-        position_check_threshold_ns: 0,
+        position_check_threshold_ns: DurationNanos::ZERO,
         ..Default::default()
     });
     let instrument = test_instrument();
@@ -14430,7 +14430,7 @@ async fn test_reconcile_positions_reports_final_native_quantities(
 #[tokio::test]
 async fn test_reconcile_positions_query_failure_preserves_exposure(#[case] unsupported: bool) {
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
-        position_check_threshold_ns: 0,
+        position_check_threshold_ns: DurationNanos::ZERO,
         ..Default::default()
     });
     let instrument = test_instrument();
@@ -14483,7 +14483,7 @@ async fn test_reconcile_positions_query_failure_preserves_exposure(#[case] unsup
 async fn test_reconcile_positions_missing_instrument_and_exhaustion_are_not_matches() {
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
         position_check_retries: 1,
-        position_check_threshold_ns: 0,
+        position_check_threshold_ns: DurationNanos::ZERO,
         ..Default::default()
     });
     let instrument = test_instrument();
@@ -14535,7 +14535,7 @@ async fn test_reconcile_positions_preserves_incomplete_native_application(
     #[case] close_in_callback: bool,
 ) {
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
-        position_check_threshold_ns: 0,
+        position_check_threshold_ns: DurationNanos::ZERO,
         ..Default::default()
     });
     // Retain the registered execution client, but omit its native account so that
@@ -14623,7 +14623,7 @@ async fn test_reconcile_positions_preserves_incomplete_native_application(
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
 async fn test_reconcile_positions_defers_unreported_position_opened_during_query() {
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
-        position_check_threshold_ns: 0,
+        position_check_threshold_ns: DurationNanos::ZERO,
         ..Default::default()
     });
     let instrument = test_instrument();
@@ -14672,7 +14672,7 @@ async fn test_reconcile_positions_defers_unreported_position_opened_during_query
 #[tokio::test]
 async fn test_reconcile_positions_rechecks_initial_match_after_application_callback() {
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
-        position_check_threshold_ns: 0,
+        position_check_threshold_ns: DurationNanos::ZERO,
         ..Default::default()
     });
     let matched_instrument = test_instrument();
@@ -14827,7 +14827,7 @@ async fn test_position_query_empty_requires_account_and_venue_ownership(
     #[case] handles_venue: bool,
 ) {
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
-        position_check_threshold_ns: 0,
+        position_check_threshold_ns: DurationNanos::ZERO,
         ..Default::default()
     });
     let instrument = test_instrument();
@@ -14912,7 +14912,7 @@ async fn test_position_query_rejects_entire_malformed_source_batch(
     #[case] include_valid_prefix: bool,
 ) {
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
-        position_check_threshold_ns: 0,
+        position_check_threshold_ns: DurationNanos::ZERO,
         ..Default::default()
     });
     let instrument = test_instrument();
