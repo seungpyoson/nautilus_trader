@@ -13,8 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_model::identifiers::{
-    AccountId, ClientOrderId, InstrumentId, OrderListId, PositionId, VenueOrderId,
+use nautilus_model::{
+    identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, PositionId, VenueOrderId},
+    orders::OrderAny,
 };
 use thiserror::Error;
 use ustr::Ustr;
@@ -45,6 +46,20 @@ pub const ORDER_LIST_NOT_FOUND: &str = "order list not found in cache";
 
 /// Message used for a missing position lookup.
 pub const POSITION_NOT_FOUND: &str = "position not found in cache";
+
+/// An order was applied in memory, but its required cache refresh failed.
+///
+/// The carried order is the committed state, not a candidate to apply again. Callers must
+/// synchronize retained local facts before reporting failure. This error does not imply rollback
+/// or a durable database write, and must not be treated as a rejected-before-application event.
+#[derive(Debug, Error)]
+#[error("Order was applied but cache refresh failed: {source}")]
+pub struct OrderUpdateError {
+    /// The already-applied order snapshot, moved from the normal return path.
+    pub order: OrderAny,
+    /// The refresh failure after resident application.
+    pub source: anyhow::Error,
+}
 
 /// Error returned when a venue order ID is already owned by another client order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

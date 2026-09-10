@@ -32,7 +32,7 @@ use std::{
 use indexmap::{IndexMap, IndexSet};
 use jiff::SignedDuration;
 use nautilus_common::{
-    cache::Cache,
+    cache::{Cache, OrderUpdateError},
     clock::Clock,
     messages::execution::{
         BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
@@ -3244,15 +3244,22 @@ impl OrderMatchingEngine {
             .order(&client_order_id)
             .map(|o| o.clone())?;
 
+        self.sync_core_entry(&order);
+        Some(order)
+    }
+
+    fn sync_core_entry(&mut self, order: &OrderAny) {
+        let client_order_id = order.client_order_id();
+
         // Gate on `is_closed`, not `is_open`: cache may transiently hold the
         // order in `Submitted` (process_limit_order accepts before cache add)
         if order.is_closed() {
             self.delete_core_order(client_order_id);
             self.remove_queue_position(client_order_id);
-            return Some(order);
+            return;
         }
 
-        let new_match_info = Self::matching_core_entry(&order);
+        let new_match_info = Self::matching_core_entry(order);
 
         // Skip the delete+add when unchanged to preserve FIFO at the level
         let unchanged = self
@@ -3261,14 +3268,13 @@ impl OrderMatchingEngine {
             .is_some_and(|existing| *existing == new_match_info);
 
         if unchanged {
-            self.track_post_match_order(&order);
-            return Some(order);
+            self.track_post_match_order(order);
+            return;
         }
 
         self.delete_core_order(client_order_id);
-        self.track_post_match_order(&order);
+        self.track_post_match_order(order);
         self.core.add_order(new_match_info);
-        Some(order)
     }
 
     /// Processes a batch cancel orders command.
@@ -5925,14 +5931,16 @@ impl OrderMatchingEngine {
         }
 
         let event = self.create_order_triggered(&order);
-        let order = match self.cache.borrow_mut().update_order(&event) {
+        let result = self.cache.borrow_mut().update_order(&event);
+        let order = match result {
             Ok(order) => order,
-            Err(e) => {
-                log::debug!(
-                    "Failed to apply triggered event for {} before fill: {e}",
-                    order.client_order_id(),
-                );
-                order
+            Err(error) => {
+                log::error!("Cannot complete stop trigger for {client_order_id}: {error}");
+                if let Ok(failure) = error.downcast::<OrderUpdateError>() {
+                    self.sync_core_entry(&failure.order);
+                    self.dispatch_order_event(event);
+                }
+                return;
             }
         };
         self.dispatch_order_event(event);
@@ -5990,10 +5998,13 @@ impl OrderMatchingEngine {
                 );
 
                 if let Err(e) = self.cache.borrow_mut().update_order(&event) {
-                    log::debug!(
+                    log::error!(
                         "Failed to apply rejected event for {} after post-only trigger: {e}",
                         order.client_order_id(),
                     );
+                    if !e.is::<OrderUpdateError>() {
+                        return;
+                    }
                 }
                 self.dispatch_order_event(event);
                 return;

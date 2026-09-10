@@ -40,6 +40,7 @@ use nautilus_model::{
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_portfolio::Portfolio;
+use nautilus_testkit::cache::TestCacheDatabaseControl;
 use rstest::rstest;
 
 fn funded_execution(
@@ -128,6 +129,7 @@ fn execution_requires_portfolio_fee_conversion_but_preserves_executed_position(
     #[case] account_type: AccountType,
     #[case] healthy_balance: &str,
     #[values(false, true)] conversion_available: bool,
+    #[values(false, true)] order_refresh_fails: bool,
 ) {
     let (_portfolio, engine, order) = funded_execution(account_type);
     let cache = Rc::clone(engine.borrow().cache());
@@ -163,14 +165,19 @@ fn execution_requires_portfolio_fee_conversion_but_preserves_executed_position(
         .commission(Money::from("2.00 GBP"))
         .build();
 
+    let (database, control) = TestCacheDatabaseControl::create();
+    cache.borrow_mut().set_database(Box::new(database));
+    control.set_fail_update_order_on(order_refresh_fails.then_some(1));
+
     assert_eq!(
         msgbus::send_order_event_with_outcome(endpoint, OrderEventAny::Filled(fill)),
-        Some(if conversion_available {
+        Some(if conversion_available && !order_refresh_fails {
             EventApplicationOutcome::Applied
         } else {
             EventApplicationOutcome::Incomplete
         }),
     );
+    assert_eq!(control.update_order_calls(), 1);
     let cache = cache.borrow();
     let account = cache.account(&account_id).unwrap();
     assert_eq!(

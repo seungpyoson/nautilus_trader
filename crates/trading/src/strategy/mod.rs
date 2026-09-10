@@ -25,6 +25,7 @@ pub use api::{OrderApi, PortfolioApi};
 pub use config::{ImportableStrategyConfig, StrategyConfig};
 use nautilus_common::{
     actor::DataActor,
+    cache::OrderUpdateError,
     component::Component,
     enums::ComponentState,
     logging::{CMD, EVT, RECV, SEND},
@@ -631,6 +632,9 @@ pub trait Strategy: DataActor {
     /// # Errors
     ///
     /// Returns an error if the strategy is not registered or order cancellation fails.
+    /// A cache refresh failure is returned after the applied pending-cancel event
+    /// and protective command are sent. An error does not imply rollback or permit
+    /// an automatic retry of the whole operation.
     fn cancel_order(
         &mut self,
         client_order_id: ClientOrderId,
@@ -660,9 +664,12 @@ pub trait Strategy: DataActor {
             .try_order_owned(&client_order_id)
             .map_err(|e| anyhow::anyhow!("Cannot cancel order: {e}"))?;
 
-        if !self.mark_order_pending_cancel(&order)? {
-            return Ok(());
-        }
+        let pending_failure = match self.mark_order_pending_cancel(&order) {
+            Ok(true) => None,
+            Ok(false) => return Ok(()),
+            Err(error) if error.is::<OrderUpdateError>() => Some(error),
+            Err(error) => return Err(error),
+        };
 
         let command = CancelOrder::new(
             trader_id,
@@ -698,7 +705,7 @@ pub trait Strategy: DataActor {
             self.cancel_gtd_expiry(&order.client_order_id());
         }
 
-        Ok(())
+        pending_failure.map_or(Ok(()), Err)
     }
 
     /// Batch cancels multiple orders for the same instrument.
@@ -706,7 +713,9 @@ pub trait Strategy: DataActor {
     /// # Errors
     ///
     /// Returns an error if the strategy is not registered, the orders span multiple instruments,
-    /// or contain emulated/local orders.
+    /// or contain emulated/local orders, or if an order update fails. Already prepared
+    /// cancels, including committed pending-cancel updates, are sent before returning
+    /// a refresh error. Callers must not infer rollback or automatically retry the batch.
     fn cancel_orders(
         &mut self,
         client_order_ids: Vec<ClientOrderId>,
@@ -760,10 +769,22 @@ pub trait Strategy: DataActor {
         }
 
         let mut cancels = Vec::with_capacity(orders.len());
+        let mut pending_failure = None;
 
         for order in orders {
-            if !self.mark_order_pending_cancel(&order)? {
-                continue;
+            match self.mark_order_pending_cancel(&order) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    let applied = error.is::<OrderUpdateError>();
+                    log::error!(
+                        "Batch cancellation encountered an incomplete order update: {error}"
+                    );
+                    pending_failure.get_or_insert(error);
+                    if !applied {
+                        break;
+                    }
+                }
             }
 
             cancels.push(CancelOrder::new(
@@ -782,7 +803,7 @@ pub trait Strategy: DataActor {
 
         if cancels.is_empty() {
             log::warn!("Cannot send `BatchCancelOrders`, no valid cancel commands");
-            return Ok(());
+            return pending_failure.map_or(Ok(()), Err);
         }
 
         let command = BatchCancelOrders::new(
@@ -798,14 +819,15 @@ pub trait Strategy: DataActor {
         );
 
         send_exec_command(TradingCommand::CancelOrders(command));
-        Ok(())
+        pending_failure.map_or(Ok(()), Err)
     }
 
     /// Marks an order as pending update locally before the modify command leaves the strategy.
     ///
     /// # Errors
     ///
-    /// Returns an error if applying the pending update event to the cache fails.
+    /// Returns an error if application or cache refresh fails. A refresh failure
+    /// retains and publishes the pending update; it does not imply rollback.
     fn mark_order_pending_update(&mut self, order: &OrderAny) -> anyhow::Result<bool>
     where
         Self: StrategyNative,
@@ -818,11 +840,12 @@ pub trait Strategy: DataActor {
         required_account_id(order, "pending update")?;
         let event = OrderEventAny::PendingUpdate(self.generate_order_pending_update(order));
 
-        {
+        let pending_failure = {
             let cache_rc = StrategyNative::strategy_core_mut(self).cache_rc();
             let mut cache = cache_rc.borrow_mut();
             match cache.update_order(&event) {
-                Ok(_) => {}
+                Ok(_) => None,
+                Err(error) if error.is::<OrderUpdateError>() => Some(error),
                 Err(e)
                     if matches!(
                         e.downcast_ref::<OrderError>(),
@@ -834,7 +857,7 @@ pub trait Strategy: DataActor {
                 }
                 Err(e) => return Err(e),
             }
-        }
+        };
 
         let topic = format!("events.order.{strategy_id}");
         msgbus::publish_order_event(topic.into(), &event);
@@ -843,14 +866,15 @@ pub trait Strategy: DataActor {
             &event,
         );
 
-        Ok(true)
+        pending_failure.map_or(Ok(true), Err)
     }
 
     /// Marks an order as pending cancel locally before the cancel command leaves the strategy.
     ///
     /// # Errors
     ///
-    /// Returns an error if applying the pending cancel event to the cache fails.
+    /// Returns an error if application or cache refresh fails. A refresh failure
+    /// retains and publishes the pending cancel; it does not imply rollback.
     fn mark_order_pending_cancel(&mut self, order: &OrderAny) -> anyhow::Result<bool>
     where
         Self: StrategyNative,
@@ -871,11 +895,12 @@ pub trait Strategy: DataActor {
         required_account_id(order, "pending cancel")?;
         let event = OrderEventAny::PendingCancel(self.generate_order_pending_cancel(order));
 
-        {
+        let pending_failure = {
             let cache_rc = StrategyNative::strategy_core_mut(self).cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            match cache.update_order(&event) {
-                Ok(_) => {}
+            let failure = match cache.update_order(&event) {
+                Ok(_) => None,
+                Err(error) if error.is::<OrderUpdateError>() => Some(error),
                 Err(e)
                     if matches!(
                         e.downcast_ref::<OrderError>(),
@@ -886,9 +911,10 @@ pub trait Strategy: DataActor {
                     return Ok(false);
                 }
                 Err(e) => return Err(e),
-            }
+            };
             cache.update_order_pending_cancel_local(order);
-        }
+            failure
+        };
 
         let topic = format!("events.order.{strategy_id}");
         msgbus::publish_order_event(topic.into(), &event);
@@ -897,7 +923,7 @@ pub trait Strategy: DataActor {
             &event,
         );
 
-        Ok(true)
+        pending_failure.map_or(Ok(true), Err)
     }
 
     /// Generates an `OrderPendingUpdate` event for an order.
@@ -2091,7 +2117,7 @@ pub trait Strategy: DataActor {
             let mut cache = cache_rc.borrow_mut();
             if let Err(e) = cache.update_order(&event) {
                 log::warn!("Failed to apply OrderDenied event: {e}");
-                false
+                e.is::<OrderUpdateError>()
             } else {
                 true
             }
@@ -2364,6 +2390,7 @@ mod tests {
         types::{Currency, Money, Price},
     };
     use nautilus_portfolio::portfolio::Portfolio;
+    use nautilus_testkit::cache::TestCacheDatabaseControl;
     use rstest::rstest;
     use serde_json::Value;
 
@@ -3999,7 +4026,9 @@ mod tests {
     }
 
     #[rstest]
-    fn test_cancel_order_marks_order_pending_cancel_locally_before_send() {
+    fn test_cancel_order_marks_order_pending_cancel_locally_before_send(
+        #[values(false, true)] refresh_fails: bool,
+    ) {
         let mut strategy = create_test_strategy();
         register_strategy(&mut strategy);
 
@@ -4017,9 +4046,16 @@ mod tests {
         msgbus::subscribe_order_events(topic.clone().into(), event_handler.clone(), None);
         add_order_to_cache(&strategy, &order);
 
+        let (database, control) = TestCacheDatabaseControl::create();
         strategy
-            .cancel_order(order.client_order_id(), None, None)
-            .unwrap();
+            .core
+            .cache_rc()
+            .borrow_mut()
+            .set_database(Box::new(database));
+        control.set_fail_update_order_on(refresh_fails.then_some(1));
+        let result = strategy.cancel_order(order.client_order_id(), None, None);
+        assert_eq!(result.is_err(), refresh_fails);
+        assert_eq!(control.update_order_calls(), 1);
 
         msgbus::unsubscribe_order_events(topic.into(), &event_handler);
 
@@ -4460,7 +4496,9 @@ mod tests {
     }
 
     #[rstest]
-    fn test_cancel_orders_marks_orders_pending_cancel_locally_before_send() {
+    fn test_cancel_orders_marks_orders_pending_cancel_locally_before_send(
+        #[values(None, Some(1), Some(2))] failure_call: Option<usize>,
+    ) {
         let mut strategy = create_test_strategy();
         register_strategy(&mut strategy);
 
@@ -4480,13 +4518,20 @@ mod tests {
         add_order_to_cache(&strategy, &order1);
         add_order_to_cache(&strategy, &order2);
 
+        let (database, control) = TestCacheDatabaseControl::create();
         strategy
-            .cancel_orders(
-                vec![order1.client_order_id(), order2.client_order_id()],
-                None,
-                None,
-            )
-            .unwrap();
+            .core
+            .cache_rc()
+            .borrow_mut()
+            .set_database(Box::new(database));
+        control.set_fail_update_order_on(failure_call);
+        let result = strategy.cancel_orders(
+            vec![order1.client_order_id(), order2.client_order_id()],
+            None,
+            None,
+        );
+        assert_eq!(result.is_err(), failure_call.is_some());
+        assert_eq!(control.update_order_calls(), 2);
 
         msgbus::unsubscribe_order_events(topic.into(), &event_handler);
 
@@ -5485,7 +5530,9 @@ mod tests {
     }
 
     #[rstest]
-    fn test_submit_order_denied_during_market_exit_when_not_reduce_only() {
+    fn test_submit_order_denied_during_market_exit_when_not_reduce_only(
+        #[values(false, true)] refresh_fails: bool,
+    ) {
         let mut strategy = create_test_strategy();
         register_strategy(&mut strategy);
         start_strategy(&mut strategy);
@@ -5517,7 +5564,15 @@ mod tests {
         let topic = format!("events.order.{}", order.strategy_id());
         msgbus::subscribe_order_events(topic.clone().into(), event_handler.clone(), None);
         let client_order_id = order.client_order_id();
+        let (database, control) = TestCacheDatabaseControl::create();
+        strategy
+            .core
+            .cache_rc()
+            .borrow_mut()
+            .set_database(Box::new(database));
+        control.set_fail_update_order_on(refresh_fails.then_some(1));
         let result = strategy.submit_order(order.clone(), None, None, None);
+        assert_eq!(control.update_order_calls(), 1);
 
         msgbus::unsubscribe_order_events(topic.into(), &event_handler);
 

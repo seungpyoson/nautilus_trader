@@ -3518,7 +3518,9 @@ mod tests {
     }
 
     #[rstest]
-    fn order_fill_replay_updates_order_and_creates_position() {
+    fn order_fill_replay_updates_order_and_creates_position(
+        #[values(false, true)] order_refresh_fails: bool,
+    ) {
         let instrument = InstrumentAny::CurrencyPair(audusd_sim());
         let position_id = PositionId::from("P-001");
         let initialized = OrderInitializedSpec::builder()
@@ -3555,17 +3557,28 @@ mod tests {
         let mut cache = Cache::default();
         cache.add_instrument(instrument).expect("add instrument");
 
-        let report = replay_cache_snapshot_tail(&mut cache, &reader).expect("replay");
+        let (database, control) = nautilus_testkit::cache::TestCacheDatabaseControl::create();
+        cache.set_database(Box::new(database));
+        control.set_fail_update_order_on(order_refresh_fails.then_some(3));
+        let result = replay_cache_snapshot_tail(&mut cache, &reader);
         let order = cache.order_owned(&client_order_id).expect("order replayed");
+        assert_eq!(control.update_order_calls(), 3);
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(order.event_count(), 4);
+        assert_eq!(order.last_event(), &filled_event);
+        if order_refresh_fails {
+            let error = result.expect_err("partially applied replay must be refused");
+            assert!(error.to_string().contains("test order update failure"));
+            assert!(cache.position_owned(&position_id).is_none());
+            return;
+        }
+        let report = result.expect("replay");
         let position = cache
             .position_owned(&position_id)
             .expect("position replayed");
 
         assert_eq!(report.applied_entries, 4);
         assert_eq!(report.ignored_entries, 0);
-        assert_eq!(order.status(), OrderStatus::Filled);
-        assert_eq!(order.event_count(), 4);
-        assert_eq!(order.last_event(), &filled_event);
         assert_eq!(position.event_count(), 1);
         assert_eq!(position.last_event(), Some(filled.clone()));
         assert_eq!(position.trade_ids(), vec![filled.trade_id]);

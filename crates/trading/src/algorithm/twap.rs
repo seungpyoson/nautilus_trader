@@ -79,8 +79,8 @@ impl TwapAlgorithm {
         }
     }
 
-    /// Completes the execution sequence for a primary order.
-    fn complete_sequence(&mut self, primary_id: ClientOrderId) {
+    /// Removes the timer, submit parameters and schedule for a primary order.
+    fn clear_sequence(&mut self, primary_id: ClientOrderId) {
         let timer_name = primary_id.as_str();
         let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
         if core.clock_mut().timer_names().contains(&timer_name) {
@@ -88,7 +88,7 @@ impl TwapAlgorithm {
         }
         core.remove_submit_params(&primary_id);
         self.scheduled_orders.remove(&primary_id);
-        log::info!("Completed TWAP execution for {primary_id}");
+        log::info!("Cleared TWAP execution schedule for {primary_id}");
     }
 }
 
@@ -241,7 +241,7 @@ nautilus_execution_algorithm!(TwapAlgorithm, {
                 "Submitting for entire size: qty_per_interval={qty_per_interval}, order_quantity={total_qty}"
             );
             self.submit_order(order, None, None)?;
-            self.complete_sequence(primary_id);
+            self.clear_sequence(primary_id);
             return Ok(());
         }
 
@@ -252,7 +252,7 @@ nautilus_execution_algorithm!(TwapAlgorithm, {
                 "Submitting for entire size: qty_per_interval={qty_per_interval} < min_quantity={min_qty}"
             );
             self.submit_order(order, None, None)?;
-            self.complete_sequence(primary_id);
+            self.clear_sequence(primary_id);
             return Ok(());
         }
 
@@ -358,7 +358,7 @@ nautilus_execution_algorithm!(TwapAlgorithm, {
         // Single slice: submit the primary order directly
         if is_single_slice {
             self.submit_order(order, None, None)?;
-            self.complete_sequence(primary_id);
+            self.clear_sequence(primary_id);
             return Ok(());
         }
 
@@ -367,14 +367,20 @@ nautilus_execution_algorithm!(TwapAlgorithm, {
         let time_in_force = order.time_in_force();
         let reduce_only = order.is_reduce_only();
         let mut order = order;
-        let spawned = self.spawn_market(
+        let spawned = match self.spawn_market(
             &mut order,
             first_qty,
             time_in_force,
             reduce_only,
             tags,
             true,
-        );
+        ) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                self.clear_sequence(primary_id);
+                return Err(error);
+            }
+        };
         self.submit_order(spawned.into(), None, None)?;
 
         ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
@@ -400,12 +406,12 @@ nautilus_execution_algorithm!(TwapAlgorithm, {
 
         let Some(primary) = primary else {
             log::error!("Cannot find primary order for exec_spawn_id={primary_id}");
-            self.complete_sequence(primary_id);
+            self.clear_sequence(primary_id);
             return Ok(());
         };
 
         if primary.is_closed() {
-            self.complete_sequence(primary_id);
+            self.clear_sequence(primary_id);
             return Ok(());
         }
 
@@ -425,7 +431,7 @@ nautilus_execution_algorithm!(TwapAlgorithm, {
         // Final slice: submit the primary order (already reduced to remaining quantity)
         if is_final_slice {
             self.submit_order(primary, None, None)?;
-            self.complete_sequence(primary_id);
+            self.clear_sequence(primary_id);
             return Ok(());
         }
 
@@ -434,14 +440,20 @@ nautilus_execution_algorithm!(TwapAlgorithm, {
         let time_in_force = primary.time_in_force();
         let reduce_only = primary.is_reduce_only();
         let mut primary = primary;
-        let spawned = self.spawn_market(
+        let spawned = match self.spawn_market(
             &mut primary,
             quantity,
             time_in_force,
             reduce_only,
             tags,
             true,
-        );
+        ) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                self.clear_sequence(primary_id);
+                return Err(error);
+            }
+        };
         self.submit_order(spawned.into(), None, None)?;
 
         Ok(())
@@ -471,7 +483,7 @@ nautilus_execution_algorithm!(TwapAlgorithm, {
             });
 
             let Some(interval) = interval.filter(|_| primary_is_open == Some(true)) else {
-                self.complete_sequence(primary_id);
+                self.clear_sequence(primary_id);
                 continue;
             };
 
@@ -526,6 +538,7 @@ mod tests {
         orders::{LimitOrder, MarketOrder},
         types::Price,
     };
+    use nautilus_testkit::cache::TestCacheDatabaseControl;
     use rstest::rstest;
     use ustr::Ustr;
 
@@ -901,6 +914,72 @@ mod tests {
 
         for qty in remaining {
             assert_eq!(*qty, Quantity::from("0.4"));
+        }
+    }
+
+    #[rstest]
+    fn test_twap_reduction_failure_stops_child_and_clears_schedule(
+        #[values(false, true)] timer_slice: bool,
+        #[values(false, true)] refresh_fails: bool,
+    ) {
+        let mut algo = create_twap_algorithm();
+        register_algorithm(&mut algo);
+        add_instrument_to_cache(&algo);
+        let mut params = IndexMap::new();
+        params.insert(Ustr::from("horizon_secs"), Ustr::from("60"));
+        params.insert(Ustr::from("interval_secs"), Ustr::from("20"));
+        let order = create_market_order_with_params_and_qty(params, Quantity::from("1.2"));
+        let primary_id = order.client_order_id();
+        let commands = Rc::new(RefCell::new(Vec::<TradingCommand>::new()));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            msgbus::TypedIntoHandler::from({
+                let commands = Rc::clone(&commands);
+                move |command: TradingCommand| commands.borrow_mut().push(command)
+            }),
+        );
+        if timer_slice {
+            algo.on_order(order.clone()).unwrap();
+            assert_eq!(commands.borrow().len(), 1);
+            commands.borrow_mut().clear();
+        }
+        let (database, control) = TestCacheDatabaseControl::create();
+        algo.core
+            .cache_rc()
+            .borrow_mut()
+            .set_database(Box::new(database));
+        control.set_fail_update_order_on(refresh_fails.then_some(1));
+        let event = TimeEvent::new(primary_id.inner(), UUID4::new(), 0.into(), 0.into());
+        let result = if timer_slice {
+            ExecutionAlgorithm::on_time_event(&mut algo, &event)
+        } else {
+            algo.on_order(order)
+        };
+        assert_eq!(result.is_err(), refresh_fails);
+        assert_eq!(control.update_order_calls(), 1);
+        assert_eq!(commands.borrow().len(), usize::from(!refresh_fails));
+        let child_id = ClientOrderId::from(if timer_slice { "O-001-E2" } else { "O-001-E1" });
+        let cache = algo.cache();
+        assert_eq!(
+            cache.order(&primary_id).unwrap().quantity(),
+            Quantity::from(if timer_slice { "0.4" } else { "0.8" })
+        );
+        assert_eq!(cache.order_exists(&child_id), !refresh_fails);
+        assert_eq!(
+            algo.scheduled_orders.contains_key(&primary_id),
+            !refresh_fails
+        );
+        assert_eq!(
+            algo.clock().timer_names().contains(&primary_id.as_str()),
+            !refresh_fails
+        );
+        if refresh_fails {
+            assert!(algo.core.submit_params(&primary_id).is_none());
+            ExecutionAlgorithm::on_resume(&mut algo).unwrap();
+            ExecutionAlgorithm::on_time_event(&mut algo, &event).unwrap();
+            assert!(commands.borrow().is_empty());
+            assert!(algo.clock().timer_names().is_empty());
+            assert_eq!(control.update_order_calls(), 1);
         }
     }
 

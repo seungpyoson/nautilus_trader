@@ -15,10 +15,6 @@
 
 //! Tests module for `ExecutionEngine`.
 
-#[allow(dead_code)]
-#[path = "matching_engine/cache_database.rs"]
-mod cache_database;
-
 use std::{
     cell::RefCell,
     collections::HashSet,
@@ -30,7 +26,6 @@ use std::{
 };
 
 use ahash::AHashSet;
-use cache_database::FailNthAddOrderDatabase;
 use nautilus_common::{
     cache::{Cache, CacheSnapshotRef},
     clients::ExecutionClient,
@@ -95,6 +90,7 @@ use nautilus_model::{
     stubs::{TestDefault, stub_position_long},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
+use nautilus_testkit::cache::TestCacheDatabaseControl;
 use rstest::*;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -15345,7 +15341,7 @@ fn test_submit_order_does_not_transport_when_origin_persistence_cannot_be_enqueu
     );
     let submitted_order_ids = client.submitted_order_ids();
     execution_engine.register_client(Box::new(client)).unwrap();
-    let (database, _control) = FailNthAddOrderDatabase::create();
+    let (database, _control) = TestCacheDatabaseControl::create();
     execution_engine
         .cache()
         .borrow_mut()
@@ -15594,7 +15590,7 @@ fn test_submit_order_list_adds_missing_orders_then_claims_origin_atomically(
     execution_engine.register_client(Box::new(client)).unwrap();
 
     if reject_batch_enqueue {
-        let (database, _control) = FailNthAddOrderDatabase::create();
+        let (database, _control) = TestCacheDatabaseControl::create();
         execution_engine
             .cache()
             .borrow_mut()
@@ -15949,7 +15945,10 @@ fn test_submit_order_routes_by_account_issuer_before_instrument_venue(
 }
 
 #[rstest]
-fn test_submit_order_with_no_client_denies_order(execution_engine: ExecutionEngine) {
+fn test_submit_order_with_no_client_denies_order(
+    execution_engine: ExecutionEngine,
+    #[values(false, true)] refresh_fails: bool,
+) {
     let trader_id = TraderId::test_default();
     let strategy_id = StrategyId::test_default();
     let instrument = audusd_sim();
@@ -15991,8 +15990,26 @@ fn test_submit_order_with_no_client_denies_order(execution_engine: ExecutionEngi
         causation_id: None,
     };
 
+    let (database, control) = TestCacheDatabaseControl::create();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .set_database(Box::new(database));
+    control.set_fail_update_order_on(refresh_fails.then_some(1));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let handler = nautilus_common::msgbus::TypedHandler::from({
+        let events = Rc::clone(&events);
+        move |event: &OrderEventAny| events.borrow_mut().push(event.clone())
+    });
+    let topic = Ustr::from(&format!("events.order.{strategy_id}"));
+    msgbus::subscribe_order_events(topic.into(), handler.clone(), None);
+
     // No clients registered, no default client: should deny the order
     execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    msgbus::unsubscribe_order_events(topic.into(), &handler);
+    assert_eq!(control.update_order_calls(), 1);
+    assert_eq!(events.borrow().len(), 1);
+    assert!(matches!(events.borrow()[0], OrderEventAny::Denied(_)));
 
     let cache = execution_engine.cache().borrow();
     let cached_order = cache.order(&order.client_order_id()).unwrap();

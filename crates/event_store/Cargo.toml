@@ -52,6 +52,7 @@ thiserror = { workspace = true }
 ustr = { workspace = true }
 
 [dev-dependencies]
+nautilus-testkit = { workspace = true, default-features = false, features = ["cache"] }
 nautilus-model = { workspace = true, features = ["test-support"] }
 nautilus-portfolio = { workspace = true }
 
