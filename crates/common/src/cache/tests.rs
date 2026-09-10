@@ -712,10 +712,10 @@ fn test_cache_positions_skips_malformed_position_oms() {
     let position = snapshot_test_position();
     let position_id = position.id;
     let database = SnapshotBlobTestDatabase {
-        general: AHashMap::from([(
+        general: Mutex::new(AHashMap::from([(
             super::position_oms_key(position_id),
             Bytes::from_static(b"invalid"),
-        )]),
+        )])),
         positions: AHashMap::from([(position_id, position)]),
         ..Default::default()
     };
@@ -7773,7 +7773,7 @@ type OrderClientClaimBatches = Arc<Mutex<Vec<Vec<(ClientOrderId, ClientId)>>>>;
 
 #[derive(Default)]
 struct SnapshotBlobTestDatabase {
-    general: AHashMap<String, Bytes>,
+    general: Mutex<AHashMap<String, Bytes>>,
     orders: AHashMap<ClientOrderId, OrderAny>,
     positions: AHashMap<PositionId, Position>,
     order_positions: AHashMap<ClientOrderId, PositionId>,
@@ -7792,7 +7792,7 @@ impl SnapshotBlobTestDatabase {
         let mut general = AHashMap::new();
         general.insert(key, value);
         Self {
-            general,
+            general: Mutex::new(general),
             ..Default::default()
         }
     }
@@ -7805,7 +7805,7 @@ impl SnapshotBlobTestDatabase {
         )]);
         let positions = AHashMap::from([(position_id, position)]);
         Self {
-            general,
+            general: Mutex::new(general),
             positions,
             ..Default::default()
         }
@@ -7887,7 +7887,7 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
     }
 
     fn load(&self) -> anyhow::Result<AHashMap<String, Bytes>> {
-        Ok(self.general.clone())
+        Ok(self.general.lock().unwrap().clone())
     }
 
     async fn load_currencies(&self) -> anyhow::Result<AHashMap<Ustr, Currency>> {
@@ -8004,10 +8004,11 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
         Ok(Vec::new())
     }
 
-    fn add(&self, _key: String, _value: Bytes) -> anyhow::Result<()> {
+    fn add(&self, key: String, value: Bytes) -> anyhow::Result<()> {
         if self.fail_add {
             anyhow::bail!("add failed");
         }
+        self.general.lock().unwrap().insert(key, value);
         Ok(())
     }
 
