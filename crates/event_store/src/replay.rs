@@ -22,7 +22,6 @@
 
 use std::{fmt::Display, path::PathBuf};
 
-use indexmap::IndexMap;
 use nautilus_common::{
     cache::Cache,
     messages::{
@@ -33,7 +32,7 @@ use nautilus_common::{
         execution::SubmitOrderList,
     },
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::{OmsType, OrderSide, PositionSide},
@@ -43,8 +42,7 @@ use nautilus_model::{
     },
     identifiers::PositionId,
     orders::{Order, OrderAny},
-    position::{Position, PositionReplayEvent},
-    types::{Money, Quantity},
+    position::Position,
 };
 use serde::de::DeserializeOwned;
 
@@ -1623,210 +1621,18 @@ fn apply_fill_void_to_order_and_positions(
     let mut validated_order = order.clone();
     apply_result(entry, validated_order.apply(event.clone()))?;
 
-    let corrected_positions =
-        if let Some(original_fill) = original_fill.filter(|fill| fill.position_id.is_some()) {
-            prepare_fill_void_positions(cache, entry, fill_voided, original_fill.event_id)?
-        } else {
-            Vec::new()
-        };
+    let corrected_positions = if original_fill.is_some_and(|fill| fill.position_id.is_some()) {
+        nautilus_execution::engine::prepare_fill_void_positions(cache, &order, fill_voided)
+            .map_err(|e| apply_error(entry, e))?
+    } else {
+        Vec::new()
+    };
 
     apply_result(entry, cache.update_order(&event))?;
-    for position in corrected_positions {
-        apply_result(entry, cache.update_position(&position))?;
+    for correction in corrected_positions {
+        apply_result(entry, correction.apply_to_cache(cache))?;
     }
     Ok(())
-}
-
-fn prepare_fill_void_positions(
-    cache: &Cache,
-    entry: &EventStoreEntry,
-    fill_voided: &OrderFillVoided,
-    source_event_id: UUID4,
-) -> Result<Vec<Position>, CacheReplayError> {
-    let fragments = collect_fill_void_fragments(cache, entry, fill_voided, source_event_id)?;
-    let allocations = allocate_fill_void_fragments(entry, fill_voided, &fragments)?;
-    let mut corrected_positions = Vec::new();
-
-    for (position_id, (voided_qty, commission_voided)) in allocations {
-        if voided_qty.is_zero() {
-            return Err(apply_error(
-                entry,
-                format!(
-                    "commission-only position correction requires authoritative reconciliation for fill {}",
-                    fill_voided.trade_id
-                ),
-            ));
-        }
-        let mut position = cache
-            .position_owned(&position_id)
-            .ok_or_else(|| apply_error(entry, format!("position {position_id} not found")))?;
-        let previous = position
-            .fill_voids
-            .iter()
-            .rev()
-            .find(|record| {
-                record.event.client_order_id == fill_voided.client_order_id
-                    && record.event.trade_id == fill_voided.trade_id
-            })
-            .map(|record| (record.voided_qty, record.commission_voided));
-        if previous == Some((voided_qty, commission_voided)) {
-            continue;
-        }
-        apply_result(
-            entry,
-            position.apply_fill_void(fill_voided.clone(), voided_qty, commission_voided),
-        )?;
-        corrected_positions.push(position);
-    }
-    Ok(corrected_positions)
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FillVoidFragment {
-    position_id: PositionId,
-    split_rank: u8,
-    quantity: Quantity,
-    commission: Option<Money>,
-}
-
-fn collect_fill_void_fragments(
-    cache: &Cache,
-    entry: &EventStoreEntry,
-    fill_voided: &OrderFillVoided,
-    source_event_id: UUID4,
-) -> Result<Vec<FillVoidFragment>, CacheReplayError> {
-    let positions: Vec<Position> = cache
-        .positions(
-            None,
-            Some(&fill_voided.instrument_id),
-            Some(&fill_voided.strategy_id),
-            Some(&fill_voided.account_id),
-            None,
-        )
-        .into_iter()
-        .map(|position| position.cloned())
-        .collect();
-    let mut fragments = Vec::new();
-
-    for position in &positions {
-        for replay_event in &position.replay_events {
-            let PositionReplayEvent::Filled(fill) = replay_event else {
-                continue;
-            };
-
-            if fill.client_order_id != fill_voided.client_order_id
-                || fill.trade_id != fill_voided.trade_id
-            {
-                continue;
-            }
-            let split_rank = if fill.event_id == source_event_id {
-                0
-            } else if fill.causation_id == Some(source_event_id) {
-                1
-            } else {
-                continue;
-            };
-            fragments.push(FillVoidFragment {
-                position_id: position.id,
-                split_rank,
-                quantity: fill.last_qty,
-                commission: fill.commission,
-            });
-        }
-    }
-
-    if fragments.is_empty() {
-        return Err(apply_error(
-            entry,
-            format!(
-                "no position fragments found for fill {}",
-                fill_voided.trade_id
-            ),
-        ));
-    }
-    fragments.sort_by_key(|fragment| fragment.split_rank);
-    Ok(fragments)
-}
-
-fn allocate_fill_void_fragments(
-    entry: &EventStoreEntry,
-    fill_voided: &OrderFillVoided,
-    fragments: &[FillVoidFragment],
-) -> Result<IndexMap<PositionId, (Quantity, Option<Money>)>, CacheReplayError> {
-    let mut allocations = IndexMap::<PositionId, (Quantity, Option<Money>)>::new();
-    let mut remaining_qty = fill_voided.voided_qty;
-    for fragment in fragments.iter().rev() {
-        if remaining_qty.is_zero() {
-            break;
-        }
-        let removed = remaining_qty.min(fragment.quantity);
-        allocations
-            .entry(fragment.position_id)
-            .and_modify(|allocation| allocation.0 = allocation.0 + removed)
-            .or_insert((removed, None));
-        remaining_qty = remaining_qty - removed;
-    }
-
-    if !remaining_qty.is_zero() {
-        return Err(apply_error(
-            entry,
-            format!(
-                "position fragments do not cover voided quantity for fill {}",
-                fill_voided.trade_id
-            ),
-        ));
-    }
-
-    if let Some(mut remaining_commission) = fill_voided.commission_voided {
-        for fragment in fragments.iter().rev() {
-            if remaining_commission.is_zero() {
-                break;
-            }
-            let Some(commission) = fragment.commission else {
-                continue;
-            };
-
-            if commission.currency != remaining_commission.currency {
-                return Err(apply_error(
-                    entry,
-                    format!(
-                        "position commission currency differs for fill {}",
-                        fill_voided.trade_id
-                    ),
-                ));
-            }
-            let removed_raw = remaining_commission.raw.abs().min(commission.raw.abs());
-            let removed = Money::from_raw(
-                removed_raw * remaining_commission.raw.signum(),
-                remaining_commission.currency,
-            );
-            allocations
-                .entry(fragment.position_id)
-                .and_modify(|allocation| {
-                    allocation.1 = Some(
-                        allocation
-                            .1
-                            .map_or(removed, |commission| commission + removed),
-                    );
-                })
-                .or_insert((
-                    Quantity::zero(fill_voided.voided_qty.precision),
-                    Some(removed),
-                ));
-            remaining_commission = remaining_commission - removed;
-        }
-
-        if !remaining_commission.is_zero() {
-            return Err(apply_error(
-                entry,
-                format!(
-                    "position fragments do not cover voided commission for fill {}",
-                    fill_voided.trade_id
-                ),
-            ));
-        }
-    }
-    Ok(allocations)
 }
 
 fn apply_position_opened(
