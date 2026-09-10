@@ -5772,7 +5772,7 @@ fn closed_netting_cycle(
             .account_id(account_id)
             .client_order_id(ClientOrderId::new(format!("O-{event_id}")))
             .venue_order_id(VenueOrderId::new(format!("V-{event_id}")))
-            .trade_id(TradeId::new(format!("T-{event_id}")))
+            .trade_id(TradeId::new(event_id.to_string()))
             .event_id(event_id)
             .position_id(position_id)
             .order_side(side)
