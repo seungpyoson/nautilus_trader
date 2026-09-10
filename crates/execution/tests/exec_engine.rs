@@ -18259,7 +18259,15 @@ fn test_prior_cycle_fill_void_rejected_without_carried_replay(
 }
 
 #[rstest]
-fn test_entry_fill_void_preserves_native_flip_cycle_accounting() {
+#[case::exact_split(100_000, 50_000, 200_000, "-2.50 USD", "-1.50 USD")]
+#[case::rounded_split(2_000, 1_000, 3_000, "-2.67 USD", "-1.33 USD")]
+fn test_entry_fill_void_preserves_native_flip_cycle_accounting(
+    #[case] original_entry_qty: u64,
+    #[case] corrected_entry_qty: u64,
+    #[case] exit_qty: u64,
+    #[case] archived_pnl: &str,
+    #[case] current_pnl: &str,
+) {
     let instrument = audusd_sim();
     let trader_id = TraderId::test_default();
     let strategy_id = StrategyId::test_default();
@@ -18288,7 +18296,7 @@ fn test_entry_fill_void_preserves_native_flip_cycle_accounting() {
                 "V-CYCLE-FLIP",
                 "T-CYCLE-FLIP",
                 OrderSide::Sell,
-                200_000,
+                exit_qty,
             ),
         ] {
             process_filled_order(
@@ -18308,27 +18316,31 @@ fn test_entry_fill_void_preserves_native_flip_cycle_accounting() {
     };
 
     // Native execution supplies the independent control. Each fill costs 2 USD at price 1.
-    // Buying 50k then selling 200k closes the long and opens a 150k short; fees split 0.5/1.5.
+    // The 2k -> 1k entry correction also distinguishes splitting the original 2 USD exit fee
+    // once (closing 0.67) from re-splitting its rounded 1.33 USD closing fragment (0.66).
     let (expected_current, expected_archive) = {
-        let engine = run(50_000);
+        let engine = run(corrected_entry_qty);
         let cache = engine.cache().borrow();
         let current = cache.position_owned(&position_id).unwrap();
         let archives = cache.position_snapshots(Some(&position_id), None);
         assert_eq!(archives.len(), 1);
-        assert_eq!(archives[0].realized_pnl, Some(Money::from("-2.50 USD")));
-        assert_eq!(current.realized_pnl, Some(Money::from("-1.50 USD")));
+        assert_eq!(archives[0].realized_pnl, Some(Money::from(archived_pnl)));
+        assert_eq!(current.realized_pnl, Some(Money::from(current_pnl)));
         assert_eq!(current.side, PositionSide::Short);
-        assert_eq!(current.quantity, Quantity::from(150_000));
+        assert_eq!(
+            current.quantity,
+            Quantity::from(exit_qty - corrected_entry_qty)
+        );
         (current, archives.into_iter().next().unwrap())
     };
 
     // Reach the same effective fills through a correction. The paid entry fee is not refunded.
-    let mut engine = run(100_000);
+    let mut engine = run(original_entry_qty);
     let event = build_fill_void_from_cached_fill(
         &engine,
         "O-CYCLE-ENTRY",
         "T-CYCLE-ENTRY",
-        Quantity::from(50_000),
+        Quantity::from(original_entry_qty - corrected_entry_qty),
     );
     assert_eq!(
         engine.process_with_outcome(&event),
@@ -18350,6 +18362,7 @@ fn test_entry_fill_void_preserves_native_flip_cycle_accounting() {
     assert_eq!(current.sell_qty, expected_current.sell_qty);
     assert_eq!(current.opening_order_id, expected_current.opening_order_id);
     assert_eq!(current.commissions(), expected_current.commissions());
+    assert_eq!(current.events.len(), expected_current.events.len());
 }
 
 #[rstest]
