@@ -42,11 +42,13 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_event_store::{
     AppendEntry, EventStore, EventStoreConfig, EventStoreEntry, EventStoreLifecycle, Headers,
     PAYLOAD_TYPE_ACCOUNT_STATE, RedbBackend, RegisteredComponents, RetentionMode, RunIdentity,
-    RunManifest, RunStatus, SnapshotAnchor, Topic, compute_entry_hash,
-    compute_snapshot_content_hash, encode_account_state, recover_predecessors,
+    RunManifest, RunStatus, SnapshotAnchor, Topic, apply_cache_replay_entry,
+    capture::builtins::{PAYLOAD_TYPE_ORDER_FILL_VOIDED, encode_order_event_any},
+    compute_entry_hash, compute_snapshot_content_hash, encode_account_state, recover_predecessors,
 };
 use nautilus_execution::engine::{
-    ExecutionEngine, config::ExecutionEngineConfig, stubs::StubExecutionClient,
+    EventApplicationOutcome, ExecutionEngine, config::ExecutionEngineConfig,
+    stubs::StubExecutionClient,
 };
 use nautilus_model::{
     accounts::{AccountAny, CashAccount},
@@ -57,7 +59,7 @@ use nautilus_model::{
     enums::{OmsType, OrderSide, OrderType},
     events::{
         AccountState, OrderEventAny, OrderSnapshot, account::stubs::cash_account_state_million_usd,
-        position::snapshot::PositionSnapshot,
+        order::spec::OrderFillVoidedSpec, position::snapshot::PositionSnapshot,
     },
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
@@ -141,7 +143,16 @@ fn running_manifest(config: &EventStoreConfig, instance_id: UUID4, run_id: &str)
 
 fn append_account_state(seq: u64, state: &AccountState) -> AppendEntry {
     let encoded = encode_account_state(state).expect("encode account state");
-    let topic = Topic::from("events.account.SIM");
+    AppendEntry::without_indices(captured_entry(
+        seq,
+        "events.account.SIM",
+        PAYLOAD_TYPE_ACCOUNT_STATE,
+        encoded.payload,
+    ))
+}
+
+fn captured_entry(seq: u64, topic: &str, payload_type: &str, payload: Bytes) -> EventStoreEntry {
+    let topic = Topic::from(topic);
     let ts = UnixNanos::from(seq);
     let headers = Headers::empty();
     let hash = compute_entry_hash(
@@ -149,22 +160,20 @@ fn append_account_state(seq: u64, state: &AccountState) -> AppendEntry {
         ts,
         ts,
         topic.as_ref(),
-        PAYLOAD_TYPE_ACCOUNT_STATE,
-        &encoded.payload,
+        payload_type,
+        &payload,
         &headers,
     );
-    let entry = EventStoreEntry::new(
+    EventStoreEntry::new(
         hash,
         seq,
         headers,
         topic,
-        Ustr::from(PAYLOAD_TYPE_ACCOUNT_STATE),
-        encoded.payload,
+        Ustr::from(payload_type),
+        payload,
         ts,
         ts,
-    );
-
-    AppendEntry::without_indices(entry)
+    )
 }
 
 fn setup_netting_snapshot_engine(
@@ -248,6 +257,233 @@ fn process_filled_order(
         None,
         Some(AccountId::test_default()),
     ));
+}
+
+#[rstest]
+#[case::archived_correction(true, 0)]
+#[case::current_cycle_with_history(true, 4)]
+#[case::missing_prior_history(false, 0)]
+#[case::current_cycle_without_history(false, 4)]
+fn replay_fill_corrections_match_live_accounting(
+    #[case] carry_history: bool,
+    #[case] corrected_order: usize,
+) {
+    let _guard = lock_kernel_test();
+    let mut engine = ExecutionEngine::new(
+        Rc::new(RefCell::new(TestClock::new())),
+        Rc::new(RefCell::new(Cache::default())),
+        Some(ExecutionEngineConfig {
+            carry_replay_events_on_reopen: carry_history,
+            ..Default::default()
+        }),
+    );
+    let instrument = audusd_sim();
+    let trader_id = TraderId::test_default();
+    let strategy_id = StrategyId::test_default();
+    let position_id = PositionId::new(format!("{}-{strategy_id}", instrument.id));
+    setup_netting_snapshot_engine(&mut engine, &instrument);
+
+    // Two closed cycles and an open position. All fills are at 1 USD with a 2 USD fee.
+    // Voiding 40k from the first buy leaves +60,-40,0,-40,+60k: one rebuilt closed cycle.
+    for (index, (side, quantity)) in [
+        (OrderSide::Buy, 100_000),
+        (OrderSide::Sell, 100_000),
+        (OrderSide::Buy, 40_000),
+        (OrderSide::Sell, 40_000),
+        (OrderSide::Buy, 100_000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        process_filled_order(
+            &mut engine,
+            trader_id,
+            strategy_id,
+            &instrument,
+            &format!("O-CORRECTION-{index}"),
+            &format!("V-CORRECTION-{index}"),
+            &format!("T-CORRECTION-{index}"),
+            side,
+            quantity,
+            position_id,
+        );
+    }
+
+    // Seed replay from actual native state to isolate correction equivalence. This does not
+    // claim that replaying the preceding fills can reconstruct the original OMS policy.
+    let mut replay = Cache::default();
+    let order_id = ClientOrderId::new(format!("O-CORRECTION-{corrected_order}"));
+    let (original_fill, original_archives) = {
+        let cache = engine.cache().borrow();
+        replay
+            .add_instrument(instrument.into())
+            .expect("instrument");
+
+        for order in cache.orders(None, None, None, None, None) {
+            replay
+                .add_order(order.cloned(), None, None, true)
+                .expect("seed native order");
+        }
+        let position = cache.position_owned(&position_id).expect("native position");
+        replay
+            .add_position(&position, OmsType::Netting)
+            .expect("seed native position");
+        let archives = cache
+            .position_snapshot_bytes(&position_id)
+            .expect("archives");
+        assert_eq!(archives.len(), 2);
+        for (index, bytes) in archives.iter().enumerate() {
+            replay
+                .restore_snapshot_blob(
+                    &format!("cache://position-snapshots/{position_id}/{index}"),
+                    Bytes::copy_from_slice(bytes),
+                )
+                .expect("seed native archive");
+        }
+        let order = cache.order(&order_id).expect("source order");
+        let fill = order
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                OrderEventAny::Filled(fill) => Some(fill.clone()),
+                _ => None,
+            })
+            .expect("source fill");
+        (fill, archives)
+    };
+
+    for (index, (quantity, refund, valid)) in [
+        (40_000, "0.80 USD", true),
+        (50_000, "1.00 USD", true),
+        (50_000, "1.00 USD", false), // Duplicate cumulative correction.
+        (20_000, "0.40 USD", false), // Stale cumulative quantity.
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fill = &original_fill;
+        let event = OrderEventAny::FillVoided(
+            OrderFillVoidedSpec::builder()
+                .trader_id(fill.trader_id)
+                .strategy_id(fill.strategy_id)
+                .instrument_id(fill.instrument_id)
+                .client_order_id(fill.client_order_id)
+                .venue_order_id(fill.venue_order_id)
+                .account_id(fill.account_id)
+                .trade_id(fill.trade_id)
+                .voided_qty(Quantity::from(quantity))
+                .commission_voided(Money::from(refund))
+                .order_side(fill.order_side)
+                .order_type(fill.order_type)
+                .last_px(fill.last_px)
+                .currency(fill.currency)
+                .liquidity_side(fill.liquidity_side)
+                .maybe_position_id(fill.position_id)
+                .build(),
+        );
+        let before_order = rmp_serde::to_vec_named(&replay.order_owned(&order_id)).unwrap();
+        let before_position =
+            rmp_serde::to_vec_named(&replay.position_owned(&position_id)).unwrap();
+        let before_archives = replay.position_snapshot_bytes(&position_id);
+        let applicable = carry_history || corrected_order == 4;
+        let accepted = applicable && valid;
+        assert_eq!(
+            engine.process_with_outcome(&event),
+            if accepted {
+                EventApplicationOutcome::Applied
+            } else {
+                EventApplicationOutcome::Incomplete
+            },
+        );
+        let encoded = encode_order_event_any(&event).expect("capture correction");
+        let entry = captured_entry(
+            index as u64 + 1,
+            "events.order.correction",
+            PAYLOAD_TYPE_ORDER_FILL_VOIDED,
+            encoded.payload,
+        );
+        let result = apply_cache_replay_entry(&mut replay, &entry);
+        if accepted {
+            assert!(result.expect("replay correction"));
+        } else {
+            assert!(result.is_err());
+            assert_eq!(
+                rmp_serde::to_vec_named(&replay.order_owned(&order_id)).unwrap(),
+                before_order
+            );
+            assert_eq!(
+                rmp_serde::to_vec_named(&replay.position_owned(&position_id)).unwrap(),
+                before_position
+            );
+            assert_eq!(
+                replay.position_snapshot_bytes(&position_id),
+                before_archives
+            );
+        }
+
+        let live = engine.cache().borrow();
+        assert_eq!(
+            rmp_serde::to_vec_named(&live.order_owned(&order_id)).unwrap(),
+            rmp_serde::to_vec_named(&replay.order_owned(&order_id)).unwrap(),
+        );
+        assert_eq!(
+            rmp_serde::to_vec_named(&live.position_owned(&position_id)).unwrap(),
+            rmp_serde::to_vec_named(&replay.position_owned(&position_id)).unwrap(),
+        );
+        let live_frames = live.position_snapshots(Some(&position_id), None);
+        let mut replay_frames = replay.position_snapshots(Some(&position_id), None);
+        assert_eq!(live_frames.len(), replay_frames.len());
+        for (live_frame, replay_frame) in live_frames.iter().zip(&mut replay_frames) {
+            // Archive IDs are newly generated by each cache; all other state must match.
+            replay_frame.id = live_frame.id;
+            assert_eq!(
+                rmp_serde::to_vec_named(&live_frame).unwrap(),
+                rmp_serde::to_vec_named(&replay_frame).unwrap()
+            );
+        }
+        let archived_pnl = live_frames
+            .iter()
+            .fold(Money::zero(Currency::USD()), |total, frame| {
+                total + frame.realized_pnl.expect("archived PnL")
+            });
+        let position = live.position(&position_id).expect("corrected position");
+        let expected_total = if !applicable {
+            "-10.00 USD"
+        } else if index == 0 {
+            "-9.20 USD"
+        } else {
+            "-9.00 USD"
+        };
+        assert_eq!(
+            archived_pnl + position.realized_pnl.expect("current PnL"),
+            Money::from(expected_total)
+        );
+        assert_eq!(
+            position.quantity,
+            Quantity::from(if !applicable {
+                100_000
+            } else if index == 0 {
+                60_000
+            } else {
+                50_000
+            })
+        );
+
+        if applicable && corrected_order == 0 {
+            // At 50k the corrected history no longer goes flat; the current position
+            // must absorb all PnL and the archive must disappear.
+            assert_eq!(live_frames.len(), usize::from(index == 0));
+            assert_eq!(
+                archived_pnl,
+                Money::from(if index == 0 { "-5.20 USD" } else { "0 USD" })
+            );
+        } else {
+            assert_eq!(
+                live.position_snapshot_bytes(&position_id),
+                Some(original_archives.clone())
+            );
+        }
+    }
 }
 
 #[rstest]
