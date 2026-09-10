@@ -40,6 +40,7 @@
 //!
 //! - `datasets` (enabled by default): Enables test dataset discovery, download, validation, parsing,
 //!   and loading.
+//! - `cache`: Enables the in-memory cache database adapter and failure controls.
 //! - `testers` (enabled by default): Enables test actors, strategies, and in-memory cache backing.
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 //! - `high-precision`: Enables [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) to use 128-bit value types.
@@ -71,7 +72,7 @@
     )
 )]
 
-#[cfg(feature = "testers")]
+#[cfg(feature = "cache")]
 pub mod cache;
 #[cfg(feature = "datasets")]
 pub mod common;

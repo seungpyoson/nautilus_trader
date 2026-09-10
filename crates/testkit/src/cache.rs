@@ -58,6 +58,10 @@ struct TestCacheDatabaseState {
     fail_update_actor: bool,
     fail_update_strategy: bool,
     fail_update_position: bool,
+    fail_add_order_on: Option<usize>,
+    add_order_calls: usize,
+    fail_update_order_on: Option<usize>,
+    update_order_calls: usize,
 }
 
 /// Shared control and observation handle for [`TestCacheDatabase`].
@@ -134,6 +138,26 @@ impl TestCacheDatabaseControl {
             .get(strategy_id)
             .cloned()
             .map(decode_state)
+    }
+
+    /// Fails the selected add-order call, counting from this reset.
+    pub fn set_fail_add_order_on(&self, call: Option<usize>) {
+        let mut state = self.state.lock().unwrap();
+        state.fail_add_order_on = call;
+        state.add_order_calls = 0;
+    }
+
+    /// Fails the selected order-update call, counting from this reset.
+    pub fn set_fail_update_order_on(&self, call: Option<usize>) {
+        let mut state = self.state.lock().unwrap();
+        state.fail_update_order_on = call;
+        state.update_order_calls = 0;
+    }
+
+    /// Returns order-update calls since the last reset.
+    #[must_use]
+    pub fn update_order_calls(&self) -> usize {
+        self.state.lock().unwrap().update_order_calls
     }
 
     /// Configures actor loads to fail.
@@ -336,6 +360,11 @@ impl CacheDatabaseAdapter for TestCacheDatabase {
     }
 
     fn add_order(&self, _order: &OrderAny, _client_id: Option<ClientId>) -> anyhow::Result<()> {
+        let mut state = self.control.state.lock().unwrap();
+        state.add_order_calls += 1;
+        if state.fail_add_order_on == Some(state.add_order_calls) {
+            anyhow::bail!("test add order failure");
+        }
         Ok(())
     }
 
@@ -459,6 +488,11 @@ impl CacheDatabaseAdapter for TestCacheDatabase {
     }
 
     fn update_order(&self, _order_event: &OrderEventAny) -> anyhow::Result<()> {
+        let mut state = self.control.state.lock().unwrap();
+        state.update_order_calls += 1;
+        if state.fail_update_order_on == Some(state.update_order_calls) {
+            anyhow::bail!("test order update failure");
+        }
         Ok(())
     }
 

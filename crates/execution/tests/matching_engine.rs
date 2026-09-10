@@ -15,9 +15,6 @@
 
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
-#[path = "matching_engine/cache_database.rs"]
-mod cache_database;
-
 use jiff::{Timestamp, civil::Date, tz::Offset};
 use nautilus_common::{
     cache::Cache,
@@ -68,12 +65,11 @@ use nautilus_model::{
     stubs::TestDefault,
     types::{Currency, Money, Price, Quantity},
 };
+use nautilus_testkit::cache::TestCacheDatabaseControl;
 use rstest::{fixture, rstest};
 use rust_decimal_macros::dec;
 use ustr::Ustr;
 use uuid::Uuid;
-
-use self::cache_database::FailNthAddOrderDatabase;
 
 fn utc_timestamp(year: i16, month: i8, day: i8, hour: i8, minute: i8, second: i8) -> Timestamp {
     Offset::UTC
@@ -2323,13 +2319,20 @@ fn test_passive_stop_limit_trigger_emits_triggered_before_fill(
     instrument_eth_usdt: InstrumentAny,
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
     account_id: AccountId,
+    #[values(false, true)] refresh_fails: bool,
 ) {
     let config = OrderMatchingEngineConfig {
         reject_stop_orders: false,
         ..Default::default()
     };
-    let mut engine_l2 =
-        get_order_matching_engine_l2(instrument_eth_usdt.clone(), None, None, None, Some(config));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine_l2 = get_order_matching_engine_l2(
+        instrument_eth_usdt.clone(),
+        None,
+        Some(cache.clone()),
+        None,
+        Some(config),
+    );
 
     let ask = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
         .book_action(BookAction::Add)
@@ -2364,10 +2367,33 @@ fn test_passive_stop_limit_trigger_emits_triggered_before_fill(
         UnixNanos::from(2u64),
         UnixNanos::from(2u64),
     );
+    let (database, control) = TestCacheDatabaseControl::create();
+    cache.borrow_mut().set_database(Box::new(database));
+    control.set_fail_update_order_on(refresh_fails.then_some(1));
     engine_l2.process_trade_tick(&trade);
+    assert_eq!(control.update_order_calls(), 1);
 
     let saved_messages = get_order_event_handler_messages(&order_event_handler);
-    assert_eq!(saved_messages.len(), 2);
+    assert_eq!(saved_messages.len(), if refresh_fails { 1 } else { 2 });
+    if refresh_fails {
+        assert!(matches!(saved_messages[0], OrderEventAny::Triggered(_)));
+        assert_eq!(
+            cache
+                .borrow()
+                .order(&client_order_id)
+                .unwrap()
+                .is_triggered(),
+            Some(true)
+        );
+        let entries = engine_l2.get_open_orders();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.client_order_id == client_order_id)
+            .unwrap();
+        assert_eq!(entry.trigger_price, None);
+        assert_eq!(entry.limit_price, Some(Price::from("1506.00")));
+        return;
+    }
 
     let triggered = match saved_messages.first().unwrap() {
         OrderEventAny::Triggered(triggered) => triggered,
@@ -2388,13 +2414,20 @@ fn test_passive_post_only_stop_limit_rejected_when_triggered_as_taker(
     instrument_eth_usdt: InstrumentAny,
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
     account_id: AccountId,
+    #[values(false, true)] refresh_fails: bool,
 ) {
     let config = OrderMatchingEngineConfig {
         reject_stop_orders: false,
         ..Default::default()
     };
-    let mut engine_l2 =
-        get_order_matching_engine_l2(instrument_eth_usdt.clone(), None, None, None, Some(config));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine_l2 = get_order_matching_engine_l2(
+        instrument_eth_usdt.clone(),
+        None,
+        Some(cache.clone()),
+        None,
+        Some(config),
+    );
 
     let ask = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
         .book_action(BookAction::Add)
@@ -2430,7 +2463,11 @@ fn test_passive_post_only_stop_limit_rejected_when_triggered_as_taker(
         UnixNanos::from(2u64),
         UnixNanos::from(2u64),
     );
+    let (database, control) = TestCacheDatabaseControl::create();
+    cache.borrow_mut().set_database(Box::new(database));
+    control.set_fail_update_order_on(refresh_fails.then_some(2));
     engine_l2.process_trade_tick(&trade);
+    assert_eq!(control.update_order_calls(), 2);
 
     let saved_messages = get_order_event_handler_messages(&order_event_handler);
     assert_eq!(saved_messages.len(), 2);
@@ -2448,6 +2485,10 @@ fn test_passive_post_only_stop_limit_rejected_when_triggered_as_taker(
     assert_eq!(rejected.client_order_id, client_order_id);
     assert!(rejected.due_post_only);
     assert!(!engine_l2.order_exists(client_order_id));
+    assert_eq!(
+        cache.borrow().order(&client_order_id).unwrap().status(),
+        OrderStatus::Rejected
+    );
 }
 
 #[rstest]
@@ -13418,7 +13459,7 @@ fn test_option_physical_settlement_second_registration_failure_dispatches_nothin
     );
 
     let option_id = option.id();
-    let (database, database_control) = FailNthAddOrderDatabase::create();
+    let (database, database_control) = TestCacheDatabaseControl::create();
     cache.borrow_mut().set_database(Box::new(database));
 
     let clock = Rc::new(RefCell::new(TestClock::new()));

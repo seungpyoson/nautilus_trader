@@ -17,7 +17,7 @@ use std::{cell::RefCell, collections::VecDeque, fmt::Debug, rc::Rc};
 
 use ahash::{AHashMap, AHashSet};
 use nautilus_common::{
-    cache::Cache,
+    cache::{Cache, OrderUpdateError},
     clock::Clock,
     logging::{CMD, EVT, RECV, SEND},
     messages::{
@@ -26,8 +26,8 @@ use nautilus_common::{
             UnsubscribeQuotes, UnsubscribeTrades,
         },
         execution::{
-            BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder, SubmitOrder,
-            SubmitOrderList, TradingCommand,
+            BatchModifyOrders, CancelAllOrders, CancelOrder, EventApplicationOutcome, ModifyOrder,
+            SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
     msgbus::{
@@ -260,6 +260,7 @@ impl OrderEmulator {
     pub fn start(&mut self) {
         if let Err(e) = self.on_start() {
             log::error!("{e}");
+            return;
         }
 
         log::info!("Started");
@@ -324,7 +325,7 @@ impl OrderEmulator {
                     .is_none_or(|id| self.cache.borrow().is_position_closed(&id));
                 if parent_order.is_closed() && is_position_closed {
                     let actions = self.manager.cancel_order(&order);
-                    self.dispatch_manager_actions(actions);
+                    self.dispatch_manager_actions(actions)?;
                     continue; // Parent already closed
                 }
 
@@ -363,7 +364,7 @@ impl OrderEmulator {
             );
 
             self.manager.cache_submit_order_command(command.clone());
-            self.handle_submit_order(&command);
+            self.handle_submit_order(&command)?;
         }
 
         self.drain_pending_messages();
@@ -375,7 +376,9 @@ impl OrderEmulator {
         log::info!("{RECV}{EVT} {event}");
 
         let actions = self.manager.handle_event(event);
-        self.dispatch_manager_actions(actions);
+        if let Err(error) = self.dispatch_manager_actions(actions) {
+            log::error!("Cannot complete order-manager actions: {error}");
+        }
 
         if let Some(order) = self.cache.borrow().order(&event.client_order_id())
             && order.is_closed()
@@ -487,8 +490,16 @@ impl OrderEmulator {
         log::info!("{RECV}{CMD} {command}");
 
         match command {
-            TradingCommand::SubmitOrder(command) => self.handle_submit_order(&command),
-            TradingCommand::SubmitOrderList(ref command) => self.handle_submit_order_list(command),
+            TradingCommand::SubmitOrder(command) => {
+                if let Err(error) = self.handle_submit_order(&command) {
+                    log::error!("Cannot complete order emulation: {error}");
+                }
+            }
+            TradingCommand::SubmitOrderList(ref command) => {
+                if let Err(error) = self.handle_submit_order_list(command) {
+                    log::error!("Cannot complete order-list emulation: {error}");
+                }
+            }
             TradingCommand::ModifyOrder(ref command) => self.handle_modify_order(command),
             TradingCommand::ModifyOrders(ref command) => self.handle_batch_modify_orders(command),
             TradingCommand::CancelOrder(command) => self.handle_cancel_order(command),
@@ -499,16 +510,32 @@ impl OrderEmulator {
         self.drain_pending_messages();
     }
 
-    fn dispatch_manager_actions(&mut self, actions: Vec<OrderManagerAction>) {
+    fn dispatch_manager_actions(&mut self, actions: Vec<OrderManagerAction>) -> anyhow::Result<()> {
+        let mut failure = None;
         for action in actions {
-            self.dispatch_manager_action(action);
+            if failure.is_some() {
+                match &action {
+                    OrderManagerAction::SubmitToEmulator(command)
+                    | OrderManagerAction::SubmitToRisk(command)
+                    | OrderManagerAction::SubmitToAlgorithm { command, .. } => {
+                        self.manager
+                            .pop_submit_order_command(command.client_order_id);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if let Err(error) = self.dispatch_manager_action(action) {
+                failure.get_or_insert(error);
+            }
         }
+        failure.map_or(Ok(()), Err)
     }
 
-    fn dispatch_manager_action(&mut self, action: OrderManagerAction) {
+    fn dispatch_manager_action(&mut self, action: OrderManagerAction) -> anyhow::Result<()> {
         match action {
             OrderManagerAction::PublishInitialized(event) => publish_order_event(&event),
-            OrderManagerAction::SubmitToEmulator(command) => self.handle_submit_order(&command),
+            OrderManagerAction::SubmitToEmulator(command) => self.handle_submit_order(&command)?,
             OrderManagerAction::SubmitToRisk(command) => {
                 self.send_risk_command(TradingCommand::SubmitOrder(command));
             }
@@ -516,13 +543,28 @@ impl OrderEmulator {
                 command,
                 exec_algorithm_id,
             } => self.send_algo_command(command, exec_algorithm_id),
-            OrderManagerAction::CancelLocal(order) => self.cancel_order(&order),
+            OrderManagerAction::CancelLocal(order) => self.cancel_order(&order)?,
             OrderManagerAction::ModifyLocalQuantity {
                 mut order,
                 quantity,
             } => {
-                self.update_order(&mut order, quantity);
+                self.update_order(&mut order, quantity)?;
             }
+        }
+        Ok(())
+    }
+
+    fn discard_submit_order(&mut self, order: &OrderAny) {
+        let client_order_id = order.client_order_id();
+        self.manager.pop_submit_order_command(client_order_id);
+        let trigger_instrument_id = order
+            .trigger_instrument_id()
+            .unwrap_or(order.instrument_id());
+        if let Some(core) = self.matching_cores.get_mut(&trigger_instrument_id)
+            && core.order_exists(client_order_id)
+            && let Err(error) = core.delete_order(client_order_id)
+        {
+            log::error!("Cannot remove failed emulation from matching core: {error}");
         }
     }
 
@@ -541,7 +583,14 @@ impl OrderEmulator {
     /// # Panics
     ///
     /// Panics if the emulation trigger type is `NoTrigger` or if order not in cache.
-    pub fn handle_submit_order(&mut self, command: &SubmitOrder) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required order update or release fails. Applied facts
+    /// and publications are retained, but dependent submission stops and unsent
+    /// command/core entries are removed. An error does not imply rollback or permit
+    /// an automatic retry of the whole operation.
+    pub fn handle_submit_order(&mut self, command: &SubmitOrder) -> anyhow::Result<()> {
         let client_order_id = command.client_order_id;
 
         let mut order = self
@@ -573,8 +622,8 @@ impl OrderEmulator {
         ) {
             log::error!("Cannot emulate order: `TriggerType` {emulation_trigger:?} not supported");
             let actions = self.manager.cancel_order(&order);
-            self.dispatch_manager_actions(actions);
-            return;
+            self.dispatch_manager_actions(actions)?;
+            return Ok(());
         }
         let strategy_id = command.strategy_id;
         let position_id = command.position_id;
@@ -602,8 +651,8 @@ impl OrderEmulator {
                     Err(e) => {
                         log::error!("Cannot emulate order: {e}");
                         let actions = self.manager.cancel_order(&order);
-                        self.dispatch_manager_actions(actions);
-                        return;
+                        self.dispatch_manager_actions(actions)?;
+                        return Ok(());
                     }
                 }
             } else {
@@ -620,8 +669,8 @@ impl OrderEmulator {
                         "Cannot emulate order: no instrument {trigger_instrument_id} for trigger"
                     );
                     let actions = self.manager.cancel_order(&order);
-                    self.dispatch_manager_actions(actions);
-                    return;
+                    self.dispatch_manager_actions(actions)?;
+                    return Ok(());
                 }
             };
 
@@ -633,15 +682,18 @@ impl OrderEmulator {
             order.order_type(),
             OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
         ) {
-            self.update_trailing_stop_order(&mut order);
+            if let Err(error) = self.update_trailing_stop_order(&mut order) {
+                self.discard_submit_order(&order);
+                return Err(error);
+            }
             if order.trigger_price().is_none() && is_order_activated(&order) {
                 log::error!(
                     "Cannot handle trailing stop order with no trigger_price and no market updates"
                 );
 
                 let actions = self.manager.cancel_order(&order);
-                self.dispatch_manager_actions(actions);
-                return;
+                self.dispatch_manager_actions(actions)?;
+                return Ok(());
             }
             // Not yet activated: held inert until the activation price is touched
         }
@@ -664,7 +716,10 @@ impl OrderEmulator {
         );
 
         if let Some(action) = matching_core.match_order(&match_info) {
-            self.dispatch_match_action(action);
+            if let Err(error) = self.dispatch_match_action(action) {
+                self.discard_submit_order(&order);
+                return Err(error);
+            }
         }
 
         // Handle data subscriptions
@@ -685,7 +740,7 @@ impl OrderEmulator {
             }
             _ => {
                 log::error!("Invalid TriggerType: {emulation_trigger:?}");
-                return;
+                return Ok(());
             }
         }
 
@@ -695,7 +750,7 @@ impl OrderEmulator {
             .get_submit_order_commands()
             .contains_key(&order.client_order_id())
         {
-            return; // Already released
+            return Ok(()); // Already released
         }
 
         // Hold in matching core
@@ -715,12 +770,22 @@ impl OrderEmulator {
 
             let event = OrderEventAny::Emulated(event);
 
-            order = match self.cache.borrow_mut().update_order(&event) {
-                Ok(order) => order,
-                Err(e) => {
-                    log::error!("Cannot apply order event: {e:?}");
-                    return;
+            let result = self.cache.borrow_mut().update_order(&event);
+            let failure = match result {
+                Ok(applied) => {
+                    order = applied;
+                    None
                 }
+                Err(error) => match error.downcast::<OrderUpdateError>() {
+                    Ok(failure) => {
+                        order = failure.order;
+                        Some(failure.source)
+                    }
+                    Err(error) => {
+                        self.discard_submit_order(&order);
+                        return Err(error);
+                    }
+                },
             };
 
             self.send_risk_event(event.clone());
@@ -729,6 +794,10 @@ impl OrderEmulator {
                 format!("events.order.{}", order.strategy_id()).into(),
                 &event,
             );
+            if let Some(error) = failure {
+                self.discard_submit_order(&order);
+                return Err(error.context("Order emulated but cache refresh failed"));
+            }
         }
 
         // Since we are cloning the matching core, we need to insert it back into the original hashmap
@@ -736,9 +805,10 @@ impl OrderEmulator {
             .insert(trigger_instrument_id, matching_core);
 
         log::info!("Emulating {order}");
+        Ok(())
     }
 
-    fn handle_submit_order_list(&mut self, command: &SubmitOrderList) {
+    fn handle_submit_order_list(&mut self, command: &SubmitOrderList) -> anyhow::Result<()> {
         self.check_monitoring(command.strategy_id, command.position_id);
 
         let orders: Vec<OrderAny> = self
@@ -761,16 +831,15 @@ impl OrderEmulator {
                 }
             }
 
-            match self.manager.create_new_submit_order(
+            let actions = self.manager.create_new_submit_order(
                 order,
                 command.position_id,
                 command.client_id,
                 command.correlation_id,
-            ) {
-                Ok(actions) => self.dispatch_manager_actions(actions),
-                Err(e) => log::error!("Error creating new submit order: {e}"),
-            }
+            )?;
+            self.dispatch_manager_actions(actions)?;
         }
+        Ok(())
     }
 
     fn handle_modify_order(&mut self, command: &ModifyOrder) {
@@ -811,7 +880,10 @@ impl OrderEmulator {
             );
 
             let event = OrderEventAny::Updated(event);
-            self.send_exec_event(event.clone());
+            let outcome = self.send_exec_event(event.clone());
+            if outcome != Some(EventApplicationOutcome::Applied) {
+                log::error!("Order modification did not complete: {outcome:?}");
+            }
 
             // A synchronous event handler may supersede this update before dispatch returns
             let order = self
@@ -857,7 +929,11 @@ impl OrderEmulator {
                     if is_activated { order.price() } else { None },
                     is_activated,
                 );
-                let action = matching_core.match_order(&match_info);
+                let action = if outcome == Some(EventApplicationOutcome::Applied) {
+                    matching_core.match_order(&match_info)
+                } else {
+                    None
+                };
                 if action.is_none() {
                     matching_core.add_order(match_info);
                 }
@@ -870,7 +946,9 @@ impl OrderEmulator {
             };
 
             if let Some(action) = action {
-                self.dispatch_match_action(action);
+                if let Err(error) = self.dispatch_match_action(action) {
+                    log::error!("Cannot complete emulated order release: {error}");
+                }
             }
         } else {
             log::error!("Cannot modify order: {} not found", command.client_order_id);
@@ -899,7 +977,9 @@ impl OrderEmulator {
             core
         } else {
             let actions = self.manager.cancel_order(&order);
-            self.dispatch_manager_actions(actions);
+            if let Err(error) = self.dispatch_manager_actions(actions) {
+                log::error!("Cannot complete order-manager actions: {error}");
+            }
             return;
         };
 
@@ -911,7 +991,9 @@ impl OrderEmulator {
             self.send_exec_command(TradingCommand::CancelOrder(command));
         } else {
             let actions = self.manager.cancel_order(&order);
-            self.dispatch_manager_actions(actions);
+            if let Err(error) = self.dispatch_manager_actions(actions) {
+                log::error!("Cannot complete order-manager actions: {error}");
+            }
         }
     }
 
@@ -948,11 +1030,24 @@ impl OrderEmulator {
                 continue;
             };
             let actions = self.manager.cancel_order(&order);
-            self.dispatch_manager_actions(actions);
+            if let Err(error) = self.dispatch_manager_actions(actions) {
+                log::error!("Cannot complete order-manager actions: {error}");
+            }
         }
     }
 
-    pub fn update_order(&mut self, order: &mut OrderAny, new_quantity: Quantity) {
+    /// Updates a local order's quantity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if application or cache refresh fails. A refresh failure
+    /// retains the applied order and publishes its event; it does not imply rollback
+    /// and must not cause an automatic retry of the whole operation.
+    pub fn update_order(
+        &mut self,
+        order: &mut OrderAny,
+        new_quantity: Quantity,
+    ) -> anyhow::Result<()> {
         log::info!(
             "Updating order {} quantity to {new_quantity}",
             order.client_order_id(),
@@ -979,15 +1074,26 @@ impl OrderEmulator {
 
         let event = OrderEventAny::Updated(event);
 
-        *order = match self.cache.borrow_mut().update_order(&event) {
-            Ok(order) => order,
-            Err(e) => {
-                log::error!("Cannot apply order event: {e:?}");
-                return;
+        let failure = match self.cache.borrow_mut().update_order(&event) {
+            Ok(applied) => {
+                *order = applied;
+                None
             }
+            Err(error) => match error.downcast::<OrderUpdateError>() {
+                Ok(failure) => {
+                    *order = failure.order;
+                    Some(
+                        failure
+                            .source
+                            .context("Local quantity changed but cache refresh failed"),
+                    )
+                }
+                Err(error) => return Err(error),
+            },
         };
 
         self.send_risk_event(event);
+        failure.map_or(Ok(()), Err)
     }
 
     pub fn on_order_book_deltas(&mut self, deltas: &OrderBookDeltas) {
@@ -1071,7 +1177,9 @@ impl OrderEmulator {
         };
 
         for action in bid_actions {
-            self.dispatch_match_action(action);
+            if let Err(error) = self.dispatch_match_action(action) {
+                log::error!("Cannot complete emulated order release: {error}");
+            }
         }
 
         let ask_actions = if let Some(matching_core) = self.matching_cores.get_mut(instrument_id) {
@@ -1081,7 +1189,9 @@ impl OrderEmulator {
         };
 
         for action in ask_actions {
-            self.dispatch_match_action(action);
+            if let Err(error) = self.dispatch_match_action(action) {
+                log::error!("Cannot complete emulated order release: {error}");
+            }
         }
 
         // Re-snapshot orders after actions to avoid stale trailing stop updates
@@ -1113,20 +1223,29 @@ impl OrderEmulator {
                 continue;
             }
 
-            self.update_trailing_stop_order(&mut order);
+            if let Err(error) = self.update_trailing_stop_order(&mut order) {
+                log::error!("Cannot complete trailing-stop update: {error}");
+            }
         }
 
         self.drain_pending_messages();
     }
 
-    fn dispatch_match_action(&mut self, action: MatchAction) {
+    fn dispatch_match_action(&mut self, action: MatchAction) -> anyhow::Result<()> {
         match action {
             MatchAction::FillLimit(id) => self.fill_limit_order(id),
             MatchAction::TriggerStop(id) => self.trigger_stop_order(id),
         }
     }
 
-    pub fn cancel_order(&mut self, order: &OrderAny) {
+    /// Cancels a local order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if order application or refresh fails. A refresh error is
+    /// returned after retaining and publishing the cancellation, without rollback
+    /// or permission to automatically retry the operation.
+    pub fn cancel_order(&mut self, order: &OrderAny) -> anyhow::Result<()> {
         log::info!("Canceling order {}", order.client_order_id());
 
         let mut order = order.clone();
@@ -1164,13 +1283,15 @@ impl OrderEmulator {
         );
 
         let event = OrderEventAny::Canceled(event);
-        if let Err(e) = self.cache.borrow_mut().update_order(&event) {
-            log::error!("Failed to apply order event: {e}");
-            return;
-        }
+        let failure = match self.cache.borrow_mut().update_order(&event) {
+            Ok(_) => None,
+            Err(error) if error.is::<OrderUpdateError>() => Some(error),
+            Err(error) => return Err(error),
+        };
 
         self.send_portfolio_order_event(event.clone());
         publish_order_event(&event);
+        failure.map_or(Ok(()), Err)
     }
 
     fn check_monitoring(&mut self, strategy_id: StrategyId, position_id: Option<PositionId>) {
@@ -1226,7 +1347,12 @@ impl OrderEmulator {
     /// # Panics
     ///
     /// Panics if the order type is invalid for a stop order.
-    pub fn trigger_stop_order(&mut self, client_order_id: ClientOrderId) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if transformation or release fails. Applied order facts
+    /// are retained, but no dependent submit is sent after failure.
+    pub fn trigger_stop_order(&mut self, client_order_id: ClientOrderId) -> anyhow::Result<()> {
         let order = match self
             .cache
             .borrow()
@@ -1238,13 +1364,13 @@ impl OrderEmulator {
                 log::error!(
                     "Cannot trigger stop order: order {client_order_id} not found in cache"
                 );
-                return;
+                return Ok(());
             }
         };
 
         match order.order_type() {
             OrderType::StopLimit | OrderType::LimitIfTouched | OrderType::TrailingStopLimit => {
-                self.fill_limit_order(client_order_id);
+                self.fill_limit_order(client_order_id)
             }
             OrderType::Market
             | OrderType::MarketIfTouched
@@ -1257,7 +1383,13 @@ impl OrderEmulator {
     /// # Panics
     ///
     /// Panics if a limit order has no price.
-    pub fn fill_limit_order(&mut self, client_order_id: ClientOrderId) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if transformation or release fails. Applied facts and
+    /// publications are retained; an error does not imply rollback or permit an
+    /// automatic retry. No dependent submit is sent after failure.
+    pub fn fill_limit_order(&mut self, client_order_id: ClientOrderId) -> anyhow::Result<()> {
         let order = match self
             .cache
             .borrow()
@@ -1267,13 +1399,12 @@ impl OrderEmulator {
             Some(order) => order,
             None => {
                 log::error!("Cannot fill limit order: order {client_order_id} not found in cache");
-                return;
+                return Ok(());
             }
         };
 
         if matches!(order.order_type(), OrderType::Limit) {
-            self.fill_market_order(client_order_id);
-            return;
+            return self.fill_market_order(client_order_id);
         }
 
         let trigger_instrument_id = order
@@ -1286,14 +1417,14 @@ impl OrderEmulator {
                 log::error!(
                     "Cannot fill limit order: no matching core for instrument {trigger_instrument_id}"
                 );
-                return; // Order stays queued for retry
+                return Ok(()); // Order stays queued for retry
             }
         };
 
         let released_price =
             match self.validate_release(&order, matching_core, trigger_instrument_id) {
                 Some(price) => price,
-                None => return, // Order stays queued for retry
+                None => return Ok(()), // Order stays queued for retry
             };
 
         let command = match self
@@ -1301,7 +1432,7 @@ impl OrderEmulator {
             .pop_submit_order_command(order.client_order_id())
         {
             Some(command) => command,
-            None => return, // Order already released
+            None => return Ok(()), // Order already released
         };
 
         if let Some(matching_core) = self.matching_cores.get_mut(&trigger_instrument_id) {
@@ -1312,7 +1443,7 @@ impl OrderEmulator {
             let emulation_trigger = TriggerType::NoTrigger;
 
             // Transform order
-            let mut transformed = if let Ok(transformed) = LimitOrder::new_checked(
+            let mut transformed = LimitOrder::new_checked(
                 order.trader_id(),
                 order.strategy_id(),
                 order.instrument_id(),
@@ -1338,12 +1469,7 @@ impl OrderEmulator {
                 order.tags().map(Vec::from),
                 UUID4::new(),
                 self.clock.borrow().timestamp_ns(),
-            ) {
-                transformed
-            } else {
-                log::error!("Cannot create limit order");
-                return;
-            };
+            )?;
             transformed.liquidity_side = order.liquidity_side();
 
             // TODO: fix
@@ -1370,14 +1496,11 @@ impl OrderEmulator {
                 )
             };
 
-            if let Err(e) = add_result {
-                log::error!("Failed to add order: {e}");
-            } else {
-                msgbus::publish_order_event(
-                    format!("events.order.{}", order.strategy_id()).into(),
-                    transformed.last_event(),
-                );
-            }
+            add_result?;
+            msgbus::publish_order_event(
+                format!("events.order.{}", order.strategy_id()).into(),
+                transformed.last_event(),
+            );
 
             let event = OrderReleased::new(
                 order.trader_id(),
@@ -1392,17 +1515,17 @@ impl OrderEmulator {
 
             let event = OrderEventAny::Released(event);
 
-            let transformed = match self.cache.borrow_mut().update_order(&event) {
-                Ok(order) => order,
-                Err(e) => {
-                    log::error!("Failed to apply order event: {e}");
-                    return;
-                }
+            let (transformed, failure) = match self.cache.borrow_mut().update_order(&event) {
+                Ok(order) => (order, None),
+                Err(error) => match error.downcast::<OrderUpdateError>() {
+                    Ok(failure) => (failure.order, Some(failure.source)),
+                    Err(error) => {
+                        return Err(error);
+                    }
+                },
             };
 
             self.send_risk_event(event.clone());
-
-            log::info!("Releasing order {}", order.client_order_id());
 
             // Publish event
             msgbus::publish_order_event(
@@ -1410,18 +1533,30 @@ impl OrderEmulator {
                 &event,
             );
 
+            if let Some(error) = failure {
+                return Err(error.context("Order release applied but cache refresh failed"));
+            }
+            log::info!("Releasing order {}", order.client_order_id());
+
             if let Some(exec_algorithm_id) = order.exec_algorithm_id() {
                 self.send_algo_command(command, exec_algorithm_id);
             } else {
                 self.send_exec_command(TradingCommand::SubmitOrder(command));
             }
         }
+        Ok(())
     }
 
     /// # Panics
     ///
     /// Panics if a market order command is missing.
-    pub fn fill_market_order(&mut self, client_order_id: ClientOrderId) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if transformation or release fails. Applied facts and
+    /// publications are retained; an error does not imply rollback or permit an
+    /// automatic retry. No dependent submit is sent after failure.
+    pub fn fill_market_order(&mut self, client_order_id: ClientOrderId) -> anyhow::Result<()> {
         let mut order = match self
             .cache
             .borrow()
@@ -1431,7 +1566,7 @@ impl OrderEmulator {
             Some(order) => order,
             None => {
                 log::error!("Cannot fill market order: order {client_order_id} not found in cache");
-                return;
+                return Ok(());
             }
         };
 
@@ -1445,14 +1580,14 @@ impl OrderEmulator {
                 log::error!(
                     "Cannot fill market order: no matching core for instrument {trigger_instrument_id}"
                 );
-                return; // Order stays queued for retry
+                return Ok(()); // Order stays queued for retry
             }
         };
 
         let released_price =
             match self.validate_release(&order, matching_core, trigger_instrument_id) {
                 Some(price) => price,
-                None => return, // Order stays queued for retry
+                None => return Ok(()), // Order stays queued for retry
             };
 
         let command = self
@@ -1508,14 +1643,11 @@ impl OrderEmulator {
                 )
             };
 
-            if let Err(e) = add_result {
-                log::error!("Failed to add order: {e}");
-            } else {
-                msgbus::publish_order_event(
-                    format!("events.order.{}", order.strategy_id()).into(),
-                    transformed.last_event(),
-                );
-            }
+            add_result?;
+            msgbus::publish_order_event(
+                format!("events.order.{}", order.strategy_id()).into(),
+                transformed.last_event(),
+            );
 
             let ts_now = self.clock.borrow().timestamp_ns();
             let event = OrderReleased::new(
@@ -1531,13 +1663,14 @@ impl OrderEmulator {
 
             let event = OrderEventAny::Released(event);
 
-            if let Err(e) = self.cache.borrow_mut().update_order(&event) {
-                log::error!("Failed to apply order event: {e}");
-                return;
-            }
+            let failure = match self.cache.borrow_mut().update_order(&event) {
+                Ok(_) => None,
+                Err(error) if error.is::<OrderUpdateError>() => Some(error),
+                Err(error) => {
+                    return Err(error);
+                }
+            };
             self.send_risk_event(event.clone());
-
-            log::info!("Releasing order {}", order.client_order_id());
 
             // Publish event
             msgbus::publish_order_event(
@@ -1545,23 +1678,28 @@ impl OrderEmulator {
                 &event,
             );
 
+            if let Some(error) = failure {
+                return Err(error.context("Order release applied but cache refresh failed"));
+            }
+            log::info!("Releasing order {}", order.client_order_id());
+
             if let Some(exec_algorithm_id) = order.exec_algorithm_id() {
                 self.send_algo_command(command, exec_algorithm_id);
             } else {
                 self.send_exec_command(TradingCommand::SubmitOrder(command));
             }
         }
+        Ok(())
     }
 
-    fn update_trailing_stop_order(&mut self, order: &mut OrderAny) {
+    fn update_trailing_stop_order(&mut self, order: &mut OrderAny) -> anyhow::Result<()> {
         let trigger_instrument_id = order
             .trigger_instrument_id()
             .unwrap_or_else(|| order.instrument_id());
         let Some(matching_core) = self.matching_cores.get(&trigger_instrument_id) else {
-            log::error!(
+            anyhow::bail!(
                 "Cannot update trailing-stop order: no matching core for instrument {trigger_instrument_id}"
             );
-            return;
         };
 
         let mut bid = matching_core.bid;
@@ -1583,8 +1721,21 @@ impl OrderEmulator {
 
         let was_activated = is_order_activated(order);
 
-        if !self.maybe_activate_trailing_stop(order, bid, ask, last) {
-            return; // Not yet activated
+        let activated = match self.maybe_activate_trailing_stop(order, bid, ask, last) {
+            Ok(activated) => activated,
+            Err(error) => {
+                // replace_order can reject before mutation or fail after committing.
+                // Read the actual retained state only on this exceptional path.
+                let retained = self.cache.borrow().order_owned(&order.client_order_id());
+                if let Some(retained) = retained {
+                    *order = retained;
+                    self.refresh_matching_core_entry(order, trigger_instrument_id);
+                }
+                return Err(error);
+            }
+        };
+        if !activated {
+            return Ok(()); // Not yet activated
         }
 
         if !was_activated {
@@ -1604,12 +1755,12 @@ impl OrderEmulator {
             Ok(pair) => pair,
             Err(e) => {
                 log::warn!("Cannot calculate trailing-stop update: {e}");
-                return;
+                return Ok(());
             }
         };
 
         if new_trigger_px.is_none() && new_limit_px.is_none() {
-            return;
+            return Ok(());
         }
 
         let ts_now = self.clock.borrow().timestamp_ns();
@@ -1632,17 +1783,28 @@ impl OrderEmulator {
         );
         let wrapped = OrderEventAny::Updated(update);
 
-        *order = match self.cache.borrow_mut().update_order(&wrapped) {
-            Ok(order) => order,
-            Err(e) => {
-                log::error!("Failed to apply order event: {e}");
-                return;
+        let failure = match self.cache.borrow_mut().update_order(&wrapped) {
+            Ok(applied) => {
+                *order = applied;
+                None
             }
+            Err(error) => match error.downcast::<OrderUpdateError>() {
+                Ok(failure) => {
+                    *order = failure.order;
+                    Some(
+                        failure
+                            .source
+                            .context("Trailing stop changed but cache refresh failed"),
+                    )
+                }
+                Err(error) => return Err(error),
+            },
         };
 
         self.refresh_matching_core_entry(order, trigger_instrument_id);
 
         self.send_risk_event(wrapped);
+        failure.map_or(Ok(()), Err)
     }
 
     fn refresh_matching_core_entry(
@@ -1685,7 +1847,7 @@ impl OrderEmulator {
         bid: Option<Price>,
         ask: Option<Price>,
         last: Option<Price>,
-    ) -> bool {
+    ) -> anyhow::Result<bool> {
         let (is_activated, activation_price, trigger_type, order_side) = match order {
             OrderAny::TrailingStopMarket(inner) => (
                 inner.is_activated,
@@ -1699,11 +1861,11 @@ impl OrderEmulator {
                 inner.trigger_type,
                 inner.order_side(),
             ),
-            _ => return true,
+            _ => return Ok(true),
         };
 
         if is_activated {
-            return true;
+            return Ok(true);
         }
 
         if let Some(activation_price) = activation_price {
@@ -1715,9 +1877,9 @@ impl OrderEmulator {
 
             if hit {
                 Self::set_trailing_stop_activated(order, None);
-                self.persist_trailing_stop_activation(order);
+                self.persist_trailing_stop_activation(order)?;
             }
-            return hit;
+            return Ok(hit);
         }
 
         let market_price = match trigger_type {
@@ -1734,12 +1896,12 @@ impl OrderEmulator {
                 "Cannot activate trailing stop {}: no market price available",
                 order.client_order_id()
             );
-            return false;
+            return Ok(false);
         };
 
         Self::set_trailing_stop_activated(order, Some(market_price));
-        self.persist_trailing_stop_activation(order);
-        true
+        self.persist_trailing_stop_activation(order)?;
+        Ok(true)
     }
 
     fn set_trailing_stop_activated(order: &mut OrderAny, activation_price: Option<Price>) {
@@ -1760,10 +1922,8 @@ impl OrderEmulator {
         }
     }
 
-    fn persist_trailing_stop_activation(&self, order: &OrderAny) {
-        if let Err(e) = self.cache.borrow_mut().replace_order(order) {
-            log::error!("Failed to update order: {e}");
-        }
+    fn persist_trailing_stop_activation(&self, order: &OrderAny) -> anyhow::Result<()> {
+        self.cache.borrow_mut().replace_order(order)
     }
 
     fn send_algo_command(&self, command: SubmitOrder, exec_algorithm_id: ExecAlgorithmId) {
@@ -1792,10 +1952,10 @@ impl OrderEmulator {
         msgbus::send_order_event(endpoint, event);
     }
 
-    fn send_exec_event(&self, event: OrderEventAny) {
+    fn send_exec_event(&self, event: OrderEventAny) -> Option<EventApplicationOutcome> {
         log_evt_send(&event);
         let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, event);
+        msgbus::send_order_event_with_outcome(endpoint, event)
     }
 
     fn send_portfolio_order_event(&self, event: OrderEventAny) {
@@ -1870,6 +2030,7 @@ mod tests {
         orders::{OrderList, OrderTestBuilder},
         types::{Price, Quantity},
     };
+    use nautilus_testkit::cache::TestCacheDatabaseControl;
     use rstest::{fixture, rstest};
     use rust_decimal_macros::dec;
     use ustr::Ustr;
@@ -2010,7 +2171,7 @@ mod tests {
             });
             TypedIntoHandler::from_with_id(receiver.id(), move |event| {
                 receiver.handle(event);
-                None
+                Some(EventApplicationOutcome::Applied)
             })
         });
         TypedIntoMessageSavingHandler::new_with_messages(Some(Ustr::from(id)), messages)
@@ -2088,7 +2249,8 @@ mod tests {
 
         emulator
             .borrow_mut()
-            .dispatch_manager_action(OrderManagerAction::PublishInitialized(event));
+            .dispatch_manager_action(OrderManagerAction::PublishInitialized(event))
+            .unwrap();
         msgbus::unsubscribe_order_events(
             format!("events.order.{strategy_id}").into(),
             &order_handler,
@@ -2122,7 +2284,8 @@ mod tests {
 
         emulator
             .borrow_mut()
-            .dispatch_manager_action(OrderManagerAction::SubmitToEmulator(command));
+            .dispatch_manager_action(OrderManagerAction::SubmitToEmulator(command))
+            .unwrap();
         let cache = cache.borrow();
         let cached_order = cache.order(&client_order_id).unwrap();
         let risk_events = risk_events.get_messages();
@@ -2241,12 +2404,22 @@ mod tests {
                 )
                 .unwrap();
         }
-        emulator.borrow_mut().handle_submit_order(&selected_submit);
-        emulator.borrow_mut().handle_submit_order(&other_submit);
-        emulator.borrow_mut().handle_submit_order(&unclaimed_submit);
         emulator
             .borrow_mut()
-            .handle_submit_order(&cross_trigger_submit);
+            .handle_submit_order(&selected_submit)
+            .unwrap();
+        emulator
+            .borrow_mut()
+            .handle_submit_order(&other_submit)
+            .unwrap();
+        emulator
+            .borrow_mut()
+            .handle_submit_order(&unclaimed_submit)
+            .unwrap();
+        emulator
+            .borrow_mut()
+            .handle_submit_order(&cross_trigger_submit)
+            .unwrap();
 
         emulator
             .borrow_mut()
@@ -2347,7 +2520,8 @@ mod tests {
 
         emulator
             .borrow_mut()
-            .dispatch_manager_action(OrderManagerAction::SubmitToRisk(command));
+            .dispatch_manager_action(OrderManagerAction::SubmitToRisk(command))
+            .unwrap();
 
         let messages = messages.get_messages();
         assert_eq!(messages.len(), 1);
@@ -2377,7 +2551,8 @@ mod tests {
             .dispatch_manager_action(OrderManagerAction::SubmitToAlgorithm {
                 command,
                 exec_algorithm_id,
-            });
+            })
+            .unwrap();
 
         let messages = messages.get_messages();
         assert_eq!(messages.len(), 1);
@@ -2408,7 +2583,8 @@ mod tests {
 
         emulator
             .borrow_mut()
-            .dispatch_manager_action(OrderManagerAction::CancelLocal(order));
+            .dispatch_manager_action(OrderManagerAction::CancelLocal(order))
+            .unwrap();
         msgbus::unsubscribe_order_events(get_event_order_topic(strategy_id).into(), &order_handler);
         msgbus::unsubscribe_order_events(
             get_order_canceled_topic(instrument_id).into(),
@@ -2451,7 +2627,8 @@ mod tests {
 
         emulator
             .borrow_mut()
-            .dispatch_manager_action(OrderManagerAction::ModifyLocalQuantity { order, quantity });
+            .dispatch_manager_action(OrderManagerAction::ModifyLocalQuantity { order, quantity })
+            .unwrap();
         let cache = cache.borrow();
         let cached_order = cache.order(&client_order_id).unwrap();
         let risk_events = risk_events.get_messages();
@@ -2543,7 +2720,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         assert!(
             emulator
@@ -2568,7 +2745,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         assert_eq!(emulator.borrow().subscribed_quotes(), vec![instrument.id()]);
         assert!(emulator.borrow().subscribed_trades().is_empty());
@@ -2606,7 +2783,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         assert!(emulator.borrow().subscribed_quotes().is_empty());
         assert_eq!(emulator.borrow().subscribed_trades(), vec![instrument.id()]);
@@ -2655,11 +2832,17 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(quote_command.clone());
-        emulator.borrow_mut().handle_submit_order(&quote_command);
+        emulator
+            .borrow_mut()
+            .handle_submit_order(&quote_command)
+            .unwrap();
         emulator
             .borrow_mut()
             .cache_submit_order_command(trade_command.clone());
-        emulator.borrow_mut().handle_submit_order(&trade_command);
+        emulator
+            .borrow_mut()
+            .handle_submit_order(&trade_command)
+            .unwrap();
         data_commands.clear();
 
         emulator.borrow_mut().reset();
@@ -2738,7 +2921,7 @@ mod tests {
             emulator
                 .borrow_mut()
                 .cache_submit_order_command(command.clone());
-            emulator.borrow_mut().handle_submit_order(&command);
+            emulator.borrow_mut().handle_submit_order(&command).unwrap();
         }
         data_commands.clear();
 
@@ -2841,7 +3024,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         let commands = emulator.borrow().get_submit_order_commands();
         assert!(commands.contains_key(&client_order_id));
@@ -2865,7 +3048,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
         msgbus::unsubscribe_order_events(
             format!("events.order.{strategy_id}").into(),
             &order_handler,
@@ -2906,7 +3089,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         let cache = cache.borrow();
         let cached_order = cache.order(&client_order_id).unwrap();
@@ -2941,7 +3124,7 @@ mod tests {
             .add_order(order, None, None, false)
             .unwrap();
 
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         let cache = cache.borrow();
         let cached_order = cache.order(&client_order_id).unwrap();
@@ -2991,7 +3174,7 @@ mod tests {
             .add_order(order, None, None, false)
             .unwrap();
 
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         let cache = cache.borrow();
         let cached_order = cache.order(&client_order_id).unwrap();
@@ -3024,7 +3207,7 @@ mod tests {
             .borrow_mut()
             .add_order(order.clone(), None, None, false)
             .unwrap();
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
         let exec_events =
             register_exec_event_handler(cache.clone(), "ExecEngine.process.modify_reindex");
         let new_trigger = Price::from("5200.00");
@@ -3088,7 +3271,7 @@ mod tests {
             .borrow_mut()
             .add_order(order.clone(), None, None, false)
             .unwrap();
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
         risk_events.clear();
         let exec_events = register_exec_event_handler(
             cache.clone(),
@@ -3139,7 +3322,584 @@ mod tests {
     }
 
     #[rstest]
-    fn test_update_order_applies_updated_event_to_cache(instrument: CryptoPerpetual) {
+    #[case::healthy(None, None)]
+    #[case::transformation_failure(Some(1), None)]
+    #[case::release_failure(None, Some(1))]
+    fn test_immediate_release_failure_stops_later_batch_submit(
+        instrument: CryptoPerpetual,
+        #[values(false, true)] limit: bool,
+        #[case] add_failure: Option<usize>,
+        #[case] update_failure: Option<usize>,
+    ) {
+        let (_clock, cache, emulator) = create_emulator();
+        add_instrument_to_cache(&cache, &instrument);
+        let mut core = OrderMatchingCore::new(instrument.id(), instrument.price_increment());
+        core.set_bid_raw(Price::from("5099.00"));
+        core.set_ask_raw(Price::from("5101.00"));
+        emulator
+            .borrow_mut()
+            .matching_cores
+            .insert(instrument.id(), core);
+        let first = if limit {
+            create_stop_limit_order(&instrument, TriggerType::BidAsk)
+        } else {
+            create_stop_market_order(&instrument, TriggerType::BidAsk)
+        };
+        let second = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-AFTER-RELEASE"))
+            .quantity(Quantity::from(1))
+            .emulation_trigger(TriggerType::NoTrigger)
+            .build();
+        let mut actions = emulator
+            .borrow_mut()
+            .manager
+            .create_new_submit_order(&first, None, None, None)
+            .unwrap();
+        actions.extend(
+            emulator
+                .borrow_mut()
+                .manager
+                .create_new_submit_order(&second, None, None, None)
+                .unwrap(),
+        );
+        let (exec_handler, exec_commands): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+        let (risk_handler, risk_commands): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+        let (database, control) = TestCacheDatabaseControl::create();
+        cache.borrow_mut().set_database(Box::new(database));
+        control.set_fail_add_order_on(add_failure);
+        control.set_fail_update_order_on(update_failure);
+        let result = emulator.borrow_mut().dispatch_manager_actions(actions);
+        let fails = add_failure.is_some() || update_failure.is_some();
+        assert_eq!(result.is_err(), fails);
+        assert_eq!(exec_commands.get_messages().len(), usize::from(!fails));
+        assert_eq!(risk_commands.get_messages().len(), usize::from(!fails));
+        assert_eq!(
+            control.update_order_calls(),
+            usize::from(add_failure.is_none())
+        );
+        let emulator = emulator.borrow();
+        assert!(
+            !emulator
+                .get_submit_order_commands()
+                .contains_key(&first.client_order_id())
+        );
+        assert_eq!(
+            emulator
+                .get_submit_order_commands()
+                .contains_key(&second.client_order_id()),
+            !fails
+        );
+        assert!(
+            !emulator
+                .get_matching_core(&instrument.id())
+                .unwrap()
+                .order_exists(first.client_order_id())
+        );
+    }
+
+    #[rstest]
+    fn test_checked_limit_transformation_failure_is_reported(
+        instrument: CryptoPerpetual,
+        #[values(false, true)] display_exceeds_reduced_quantity: bool,
+    ) {
+        let (_clock, cache, emulator) = create_emulator();
+        add_instrument_to_cache(&cache, &instrument);
+        let mut order = OrderTestBuilder::new(OrderType::StopLimit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(10))
+            .price(Price::from("5100.00"))
+            .trigger_price(Price::from("5100.00"))
+            .display_qty(Quantity::from(if display_exceeds_reduced_quantity {
+                5
+            } else {
+                1
+            }))
+            .emulation_trigger(TriggerType::BidAsk)
+            .build();
+        let client_order_id = order.client_order_id();
+        let command = create_submit_order(&instrument, &order);
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
+        emulator
+            .borrow_mut()
+            .update_order(&mut order, Quantity::from(2))
+            .unwrap();
+        let (handler, commands): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            handler,
+        );
+        let result = {
+            let mut emulator = emulator.borrow_mut();
+            emulator
+                .matching_cores
+                .get_mut(&instrument.id())
+                .unwrap()
+                .set_ask_raw(Price::from("5101.00"));
+            emulator.fill_limit_order(client_order_id)
+        };
+        assert_eq!(result.is_err(), display_exceeds_reduced_quantity);
+        assert_eq!(
+            commands.get_messages().len(),
+            usize::from(!display_exceeds_reduced_quantity)
+        );
+        assert_eq!(
+            cache.borrow().order(&client_order_id).unwrap().quantity(),
+            Quantity::from(2)
+        );
+        assert!(
+            !emulator
+                .borrow()
+                .get_submit_order_commands()
+                .contains_key(&client_order_id)
+        );
+        assert!(
+            !emulator
+                .borrow()
+                .get_matching_core(&instrument.id())
+                .unwrap()
+                .order_exists(client_order_id)
+        );
+    }
+
+    #[rstest]
+    fn test_oto_resize_failure_stops_submit_but_keeps_sibling_update_and_cancel(
+        instrument: CryptoPerpetual,
+        #[values(false, true)] refresh_fails: bool,
+    ) {
+        use nautilus_model::orders::stubs::{TestOrderEventStubs, TestOrderStubs};
+
+        let (_clock, cache, emulator) = create_emulator();
+        add_instrument_to_cache(&cache, &instrument);
+        let child_id = ClientOrderId::from("O-OTO-CHILD");
+        let held_id = ClientOrderId::from("O-OTO-HELD");
+        let parent = TestOrderStubs::make_accepted_order(
+            &OrderTestBuilder::new(OrderType::Market)
+                .instrument_id(instrument.id())
+                .client_order_id(ClientOrderId::from("O-OTO-PARENT"))
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from(2))
+                .contingency_type(ContingencyType::Oto)
+                .linked_order_ids(vec![child_id, held_id])
+                .build(),
+        );
+        let child = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .client_order_id(child_id)
+            .quantity(Quantity::from(2))
+            .emulation_trigger(TriggerType::NoTrigger)
+            .build();
+        let held = OrderTestBuilder::new(OrderType::StopMarket)
+            .instrument_id(instrument.id())
+            .client_order_id(held_id)
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(2))
+            .trigger_price(Price::from("4900.00"))
+            .emulation_trigger(TriggerType::BidAsk)
+            .build();
+        let cancel = OrderTestBuilder::new(OrderType::StopMarket)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-OTO-CANCEL"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(2))
+            .trigger_price(Price::from("4900.00"))
+            .emulation_trigger(TriggerType::BidAsk)
+            .build();
+        for order in [&parent, &child, &held, &cancel] {
+            cache
+                .borrow_mut()
+                .add_order(order.clone(), None, None, false)
+                .unwrap();
+        }
+        for order in [&held, &cancel] {
+            emulator
+                .borrow_mut()
+                .handle_submit_order(&create_submit_order(&instrument, order))
+                .unwrap();
+        }
+        let fill = TestOrderEventStubs::filled(
+            &parent,
+            &InstrumentAny::CryptoPerpetual(instrument.clone()),
+            None,
+            None,
+            Some(Price::from("5000.00")),
+            Some(Quantity::from(1)),
+            None,
+            None,
+            None,
+            parent.account_id(),
+        );
+        cache.borrow_mut().update_order(&fill).unwrap();
+        let mut actions = emulator.borrow_mut().manager.handle_event(&fill);
+        actions.extend(emulator.borrow_mut().manager.cancel_order(&cancel));
+        let (handler, commands): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            handler,
+        );
+        let (database, control) = TestCacheDatabaseControl::create();
+        cache.borrow_mut().set_database(Box::new(database));
+        control.set_fail_update_order_on(refresh_fails.then_some(1));
+        let result = emulator.borrow_mut().dispatch_manager_actions(actions);
+        assert_eq!(result.is_err(), refresh_fails);
+        assert_eq!(control.update_order_calls(), 3);
+        assert_eq!(commands.get_messages().len(), usize::from(!refresh_fails));
+        let cache = cache.borrow();
+        assert_eq!(
+            cache.order(&child_id).unwrap().quantity(),
+            Quantity::from(1)
+        );
+        assert_eq!(cache.order(&held_id).unwrap().quantity(), Quantity::from(1));
+        assert_eq!(
+            cache.order(&cancel.client_order_id()).unwrap().status(),
+            OrderStatus::Canceled
+        );
+        let emulator = emulator.borrow();
+        assert!(emulator.get_submit_order_commands().contains_key(&held_id));
+        assert_eq!(
+            emulator.get_submit_order_commands().contains_key(&child_id),
+            !refresh_fails
+        );
+        assert!(
+            !emulator
+                .get_submit_order_commands()
+                .contains_key(&cancel.client_order_id())
+        );
+    }
+
+    #[rstest]
+    fn test_failed_emulation_retains_fact_without_executable_orphan(
+        instrument: CryptoPerpetual,
+        #[values(false, true)] refresh_fails: bool,
+    ) {
+        let (_clock, cache, emulator) = create_emulator();
+        add_instrument_to_cache(&cache, &instrument);
+        let order = create_stop_market_order(&instrument, TriggerType::BidAsk);
+        let client_order_id = order.client_order_id();
+        let command = create_submit_order(&instrument, &order);
+        cache
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+        let risk_events = register_risk_event_handler("RiskEngine.process.emulation_failure");
+        let (database, control) = TestCacheDatabaseControl::create();
+        cache.borrow_mut().set_database(Box::new(database));
+        control.set_fail_update_order_on(refresh_fails.then_some(1));
+        let result = emulator.borrow_mut().handle_submit_order(&command);
+        assert_eq!(result.is_err(), refresh_fails);
+        assert_eq!(control.update_order_calls(), 1);
+        assert_eq!(
+            cache.borrow().order(&client_order_id).unwrap().status(),
+            OrderStatus::Emulated
+        );
+        let events = risk_events.get_messages();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], OrderEventAny::Emulated(_)));
+        assert_eq!(
+            emulator
+                .borrow()
+                .get_submit_order_commands()
+                .contains_key(&client_order_id),
+            !refresh_fails
+        );
+        assert_eq!(
+            emulator
+                .borrow()
+                .get_matching_core(&instrument.id())
+                .unwrap()
+                .order_exists(client_order_id),
+            !refresh_fails
+        );
+        if refresh_fails {
+            emulator.borrow_mut().on_quote_tick(create_quote_tick(
+                &instrument,
+                "5099.00",
+                "5101.00",
+            ));
+            assert_eq!(control.update_order_calls(), 1);
+        }
+    }
+
+    #[rstest]
+    fn test_initial_trailing_activation_failure_stops_immediate_release(
+        instrument: CryptoPerpetual,
+        #[values(false, true)] refresh_fails: bool,
+    ) {
+        let (_clock, cache, emulator) = create_emulator();
+        add_instrument_to_cache(&cache, &instrument);
+        let mut core = OrderMatchingCore::new(instrument.id(), instrument.price_increment());
+        core.set_bid_raw(Price::from("5055.00"));
+        core.set_ask_raw(Price::from("5056.00"));
+        emulator
+            .borrow_mut()
+            .matching_cores
+            .insert(instrument.id(), core);
+        let order = OrderTestBuilder::new(OrderType::TrailingStopMarket)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(1))
+            .activation_price(Price::from("5050.00"))
+            .trigger_price(Price::from("5056.00"))
+            .trailing_offset(dec!(10))
+            .trailing_offset_type(TrailingOffsetType::Price)
+            .emulation_trigger(TriggerType::BidAsk)
+            .build();
+        let client_order_id = order.client_order_id();
+        let command = create_submit_order(&instrument, &order);
+        cache
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+        let (handler, commands): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            handler,
+        );
+        let (database, control) = TestCacheDatabaseControl::create();
+        cache.borrow_mut().set_database(Box::new(database));
+        control.set_fail_update_order_on(refresh_fails.then_some(1));
+        let result = emulator.borrow_mut().handle_submit_order(&command);
+        assert_eq!(result.is_err(), refresh_fails);
+        assert_eq!(commands.get_messages().len(), usize::from(!refresh_fails));
+        assert_eq!(
+            control.update_order_calls(),
+            if refresh_fails { 1 } else { 2 }
+        );
+        assert!(
+            !emulator
+                .borrow()
+                .get_submit_order_commands()
+                .contains_key(&client_order_id)
+        );
+        assert!(
+            !emulator
+                .borrow()
+                .get_matching_core(&instrument.id())
+                .unwrap()
+                .order_exists(client_order_id)
+        );
+        let cache = cache.borrow();
+        let retained = cache.order(&client_order_id).unwrap();
+        if refresh_fails {
+            assert!(
+                matches!(&*retained, OrderAny::TrailingStopMarket(order) if order.is_activated)
+            );
+            assert_eq!(retained.status(), OrderStatus::Initialized);
+        } else {
+            assert_eq!(retained.status(), OrderStatus::Released);
+        }
+    }
+
+    #[rstest]
+    #[case::healthy(None, None)]
+    #[case::transformation_write(Some(1), None)]
+    #[case::release_write(None, Some(1))]
+    fn test_release_requires_transformation_and_release_updates(
+        instrument: CryptoPerpetual,
+        #[values(false, true)] limit: bool,
+        #[case] add_failure: Option<usize>,
+        #[case] update_failure: Option<usize>,
+    ) {
+        let (_clock, cache, emulator) = create_emulator();
+        add_instrument_to_cache(&cache, &instrument);
+        let order = if limit {
+            create_stop_limit_order(&instrument, TriggerType::BidAsk)
+        } else {
+            create_stop_market_order(&instrument, TriggerType::BidAsk)
+        };
+        let client_order_id = order.client_order_id();
+        let command = create_submit_order(&instrument, &order);
+        cache
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
+        let risk_events = register_risk_event_handler("RiskEngine.process.release_failure");
+        let (handler, commands): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            handler,
+        );
+        let (database, control) = TestCacheDatabaseControl::create();
+        cache.borrow_mut().set_database(Box::new(database));
+        control.set_fail_add_order_on(add_failure);
+        control.set_fail_update_order_on(update_failure);
+        let result = {
+            let mut emulator = emulator.borrow_mut();
+            emulator
+                .matching_cores
+                .get_mut(&instrument.id())
+                .unwrap()
+                .set_ask_raw(Price::from("5100.00"));
+            if limit {
+                emulator.fill_limit_order(client_order_id)
+            } else {
+                emulator.fill_market_order(client_order_id)
+            }
+        };
+        let fails = add_failure.is_some() || update_failure.is_some();
+        assert_eq!(result.is_err(), fails);
+        assert_eq!(commands.get_messages().len(), usize::from(!fails));
+        assert_eq!(
+            control.update_order_calls(),
+            usize::from(add_failure.is_none())
+        );
+        assert_eq!(
+            cache.borrow().order(&client_order_id).unwrap().status(),
+            if add_failure.is_some() {
+                OrderStatus::Initialized
+            } else {
+                OrderStatus::Released
+            }
+        );
+        assert_eq!(
+            risk_events.get_messages().len(),
+            usize::from(add_failure.is_none())
+        );
+        assert!(
+            !emulator
+                .borrow()
+                .get_submit_order_commands()
+                .contains_key(&client_order_id)
+        );
+        assert!(
+            !emulator
+                .borrow()
+                .get_matching_core(&instrument.id())
+                .unwrap()
+                .order_exists(client_order_id)
+        );
+    }
+
+    #[rstest]
+    #[case::healthy(true, false)]
+    #[case::committed_refresh_failure(true, true)]
+    #[case::missing_execution_endpoint(false, false)]
+    fn test_modify_requires_native_execution_application_before_release(
+        instrument: CryptoPerpetual,
+        #[case] endpoint_available: bool,
+        #[case] refresh_fails: bool,
+    ) {
+        *msgbus::get_message_bus().borrow_mut() = msgbus::MessageBus::default();
+        let (clock, cache, emulator) = create_emulator();
+        add_instrument_to_cache(&cache, &instrument);
+        let order = OrderTestBuilder::new(OrderType::StopMarket)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .trigger_price(Price::from("5200.00"))
+            .quantity(Quantity::from(1))
+            .emulation_trigger(TriggerType::BidAsk)
+            .build();
+        let client_order_id = order.client_order_id();
+        let command = create_submit_order(&instrument, &order);
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
+        emulator
+            .borrow_mut()
+            .matching_cores
+            .get_mut(&instrument.id())
+            .unwrap()
+            .set_ask_raw(Price::from("5101.00"));
+        let engine = Rc::new(RefCell::new(crate::engine::ExecutionEngine::new(
+            clock,
+            Rc::clone(&cache),
+            None,
+        )));
+        if endpoint_available {
+            crate::engine::ExecutionEngine::register_msgbus_handlers(&engine);
+        }
+        let (handler, commands): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            handler,
+        );
+        let (database, control) = TestCacheDatabaseControl::create();
+        cache.borrow_mut().set_database(Box::new(database));
+        control.set_fail_update_order_on(refresh_fails.then_some(1));
+        let modify = ModifyOrder::new(
+            order.trader_id(),
+            None,
+            order.strategy_id(),
+            instrument.id(),
+            client_order_id,
+            None,
+            None,
+            None,
+            Some(Price::from("5100.00")),
+            UUID4::new(),
+            0.into(),
+            None,
+            None,
+        );
+        emulator.borrow_mut().handle_modify_order(&modify);
+        let released = endpoint_available && !refresh_fails;
+        assert_eq!(commands.get_messages().len(), usize::from(released));
+        assert_eq!(
+            control.update_order_calls(),
+            if released {
+                2
+            } else {
+                usize::from(endpoint_available)
+            }
+        );
+        let cache = cache.borrow();
+        let retained = cache.order(&client_order_id).unwrap();
+        assert_eq!(
+            retained.status(),
+            if released {
+                OrderStatus::Released
+            } else {
+                OrderStatus::Emulated
+            }
+        );
+        if !released {
+            let core = emulator
+                .borrow()
+                .get_matching_core(&instrument.id())
+                .unwrap();
+            assert_eq!(
+                core.get_order(client_order_id).unwrap().trigger_price,
+                retained.trigger_price()
+            );
+            assert_eq!(
+                retained.trigger_price(),
+                Some(Price::from(if endpoint_available {
+                    "5100.00"
+                } else {
+                    "5200.00"
+                }))
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_update_order_applies_updated_event_to_cache(
+        instrument: CryptoPerpetual,
+        #[values(false, true)] refresh_fails: bool,
+    ) {
         let (_clock, cache, emulator) = create_emulator();
         let risk_events = register_risk_event_handler("RiskEngine.process.updated");
         let mut order = create_stop_market_order(&instrument, TriggerType::BidAsk);
@@ -3149,9 +3909,14 @@ mod tests {
             .add_order(order.clone(), None, None, false)
             .unwrap();
 
-        emulator
+        let (database, control) = TestCacheDatabaseControl::create();
+        cache.borrow_mut().set_database(Box::new(database));
+        control.set_fail_update_order_on(refresh_fails.then_some(1));
+        let result = emulator
             .borrow_mut()
             .update_order(&mut order, Quantity::from(2));
+        assert_eq!(result.is_err(), refresh_fails);
+        assert_eq!(control.update_order_calls(), 1);
         let cache = cache.borrow();
         let cached_order = cache.order(&client_order_id).unwrap();
         let risk_events = risk_events.get_messages();
@@ -3180,7 +3945,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
         risk_events.clear();
         let (order_handler, order_events) = subscribe_order_topic(strategy_id);
         {
@@ -3190,7 +3955,7 @@ mod tests {
                 .get_mut(&instrument.id())
                 .unwrap()
                 .set_ask_raw(Price::from("5100.00"));
-            emulator.fill_market_order(client_order_id);
+            emulator.fill_market_order(client_order_id).unwrap();
         }
         msgbus::unsubscribe_order_events(
             format!("events.order.{strategy_id}").into(),
@@ -3228,7 +3993,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
         risk_events.clear();
         let (order_handler, order_events) = subscribe_order_topic(strategy_id);
         {
@@ -3238,7 +4003,7 @@ mod tests {
                 .get_mut(&instrument.id())
                 .unwrap()
                 .set_ask_raw(Price::from("5100.00"));
-            emulator.fill_limit_order(client_order_id);
+            emulator.fill_limit_order(client_order_id).unwrap();
         }
         msgbus::unsubscribe_order_events(
             format!("events.order.{strategy_id}").into(),
@@ -3270,7 +4035,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         let quote = create_quote_tick(&instrument, "5060.00", "5070.00");
         emulator.borrow_mut().on_quote_tick(quote);
@@ -3296,7 +4061,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         let trade = create_trade_tick(&instrument, "5065.00");
         emulator.borrow_mut().on_trade_tick(trade);
@@ -3321,9 +4086,9 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
-        emulator.borrow_mut().cancel_order(&order);
+        emulator.borrow_mut().cancel_order(&order).unwrap();
 
         let core = emulator
             .borrow()
@@ -3346,16 +4111,19 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
-        emulator.borrow_mut().cancel_order(&order);
+        emulator.borrow_mut().cancel_order(&order).unwrap();
 
         let commands = emulator.borrow().get_submit_order_commands();
         assert!(!commands.contains_key(&client_order_id));
     }
 
     #[rstest]
-    fn test_trailing_stop_waits_for_activation_price(instrument: CryptoPerpetual) {
+    fn test_trailing_stop_waits_for_activation_price(
+        instrument: CryptoPerpetual,
+        #[values(false, true)] refresh_fails: bool,
+    ) {
         let (_clock, cache, emulator) = create_emulator();
         let risk_events = register_risk_event_handler("RiskEngine.process.trailing_activation");
         let (handler, exec_commands): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
@@ -3394,7 +4162,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         {
             let cache = cache.borrow();
@@ -3417,6 +4185,10 @@ mod tests {
             "no trailing update before activation"
         );
 
+        let (database, control) = TestCacheDatabaseControl::create();
+        cache.borrow_mut().set_database(Box::new(database));
+        // Activation commits first; the second write refreshes the changed trigger.
+        control.set_fail_update_order_on(refresh_fails.then_some(2));
         // Market rallies through the 5050 activation price: activates and starts trailing
         emulator
             .borrow_mut()
@@ -3433,6 +4205,21 @@ mod tests {
             assert_eq!(cached.trigger_price(), Some(Price::from("5045.00")));
         }
         assert!(exec_commands.get_messages().is_empty());
+        assert_eq!(control.update_order_calls(), 2);
+        let retained_core = emulator
+            .borrow()
+            .get_matching_core(&instrument.id())
+            .unwrap();
+        assert_eq!(
+            retained_core
+                .get_order(client_order_id)
+                .unwrap()
+                .trigger_price,
+            Some(Price::from("5045.00"))
+        );
+        if refresh_fails {
+            return; // This failed input must not release; future input policy belongs to the kernel.
+        }
 
         // Market falls through the trailed trigger: order releases
         emulator
@@ -3491,7 +4278,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         // The market falls below where the trailed trigger would sit (4990)
         // while staying below the 5050 activation price: must not release.
@@ -3550,7 +4337,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         assert!(
             exec_commands.get_messages().is_empty(),
@@ -3620,7 +4407,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         // Activation touches while the trailing calculation errors: the preset
         // trigger must still be honored once the market crosses it.
@@ -3681,7 +4468,7 @@ mod tests {
             emulator
                 .borrow_mut()
                 .cache_submit_order_command(command.clone());
-            emulator.borrow_mut().handle_submit_order(&command);
+            emulator.borrow_mut().handle_submit_order(&command).unwrap();
         }
         assert_eq!(
             cache.borrow().order(&client_order_id_a).unwrap().status(),
@@ -3797,7 +4584,7 @@ mod tests {
         emulator
             .borrow_mut()
             .cache_submit_order_command(command.clone());
-        emulator.borrow_mut().handle_submit_order(&command);
+        emulator.borrow_mut().handle_submit_order(&command).unwrap();
 
         let cache = cache.borrow();
         let transformed = cache.order(&client_order_id).unwrap();

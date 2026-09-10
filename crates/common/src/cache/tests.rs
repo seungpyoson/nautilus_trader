@@ -7784,6 +7784,7 @@ struct SnapshotBlobTestDatabase {
     fail_index_order_clients: bool,
     fail_index_order_position: bool,
     fail_update_order: bool,
+    update_order_calls: Arc<Mutex<usize>>,
     fail_update_position: bool,
 }
 
@@ -8150,6 +8151,7 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
     }
 
     fn update_order(&self, _order_event: &OrderEventAny) -> anyhow::Result<()> {
+        *self.update_order_calls.lock().unwrap() += 1;
         if self.fail_update_order {
             anyhow::bail!("update order failed");
         }
@@ -8605,8 +8607,14 @@ fn test_replace_order_commits_canonical_state_when_database_update_fails(audusd_
 }
 
 #[rstest]
-fn test_update_order_commits_canonical_state_when_database_update_fails() {
-    let database = SnapshotBlobTestDatabase::fail_update_order();
+fn test_update_order_reports_refresh_failure_with_committed_state(
+    #[values(false, true)] write_fails: bool,
+) {
+    let database = SnapshotBlobTestDatabase {
+        fail_update_order: write_fails,
+        ..Default::default()
+    };
+    let update_calls = Arc::clone(&database.update_order_calls);
     let mut cache = Cache::new(None, Some(Box::new(database)));
     let order = OrderTestBuilder::new(OrderType::Market)
         .instrument_id(audusd_sim().id())
@@ -8614,12 +8622,46 @@ fn test_update_order_commits_canonical_state_when_database_update_fails() {
         .quantity(Quantity::from(100_000))
         .build();
     let client_order_id = order.client_order_id();
-    cache.add_order(order.clone(), None, None, false).unwrap();
     let submitted = TestOrderEventStubs::submitted(&order, AccountId::from("SIM-001"));
+
+    let missing = cache.update_order(&submitted).unwrap_err();
+    assert!(matches!(
+        missing.downcast_ref::<OrderError>(),
+        Some(OrderError::NotFound(_))
+    ));
+    assert_eq!(*update_calls.lock().unwrap(), 0);
+    cache.add_order(order, None, None, false).unwrap();
 
     let updated = cache.update_order(&submitted);
 
-    assert!(updated.is_ok());
+    let applied = if write_fails {
+        let failure = updated
+            .unwrap_err()
+            .downcast::<super::OrderUpdateError>()
+            .unwrap();
+        assert_eq!(failure.source.to_string(), "update order failed");
+        failure.order
+    } else {
+        updated.unwrap()
+    };
+    assert_eq!(applied.client_order_id(), client_order_id);
+    assert_eq!(applied.status(), OrderStatus::Submitted);
+    assert_eq!(applied.last_event(), &submitted);
+    assert_eq!(*update_calls.lock().unwrap(), 1);
+    assert!(cache.is_order_inflight(&client_order_id));
+    assert_eq!(cache.orders_inflight(None, None, None, None, None).len(), 1);
+    assert!(
+        cache
+            .orders_active_local(None, None, None, None, None)
+            .is_empty()
+    );
+
+    let repeated = cache.update_order(&submitted).unwrap_err();
+    assert!(matches!(
+        repeated.downcast_ref::<OrderError>(),
+        Some(OrderError::InvalidStateTransition)
+    ));
+    assert_eq!(*update_calls.lock().unwrap(), 1);
     let canonical = cache.order(&client_order_id).unwrap();
     assert_eq!(canonical.status(), OrderStatus::Submitted);
     assert_eq!(canonical.last_event(), &submitted);

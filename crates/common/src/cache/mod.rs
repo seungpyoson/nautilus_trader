@@ -49,8 +49,9 @@ pub use error::{
     ACCOUNT_NOT_FOUND, AccountLookupError, CURRENCY_NOT_FOUND, CurrencyLookupError,
     INSTRUMENT_NOT_FOUND, InstrumentLookupError, ORDER_BOOK_NOT_FOUND, ORDER_LIST_NOT_FOUND,
     ORDER_NOT_FOUND, OWN_ORDER_BOOK_NOT_FOUND, OrderBookLookupError, OrderListLookupError,
-    OrderLookupError, OwnOrderBookLookupError, POSITION_NOT_FOUND, PositionLookupError,
-    SYNTHETIC_INSTRUMENT_NOT_FOUND, SyntheticInstrumentLookupError, VenueOrderIdOwnershipError,
+    OrderLookupError, OrderUpdateError, OwnOrderBookLookupError, POSITION_NOT_FOUND,
+    PositionLookupError, SYNTHETIC_INSTRUMENT_NOT_FOUND, SyntheticInstrumentLookupError,
+    VenueOrderIdOwnershipError,
 };
 use index::CacheIndex;
 use indexmap::IndexMap;
@@ -5140,7 +5141,9 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the order is not found or rejects the event.
+    /// Returns an error if the order is not found or rejects the event, without changing the
+    /// resident order. A refresh failure after application returns [`OrderUpdateError`] carrying
+    /// the committed order. That failure is not rollback and does not permit retrying the event.
     pub fn update_order(&mut self, event: &OrderEventAny) -> anyhow::Result<OrderAny> {
         let event_client_order_id = event.client_order_id();
         let client_order_id = if self.order_exists(&event_client_order_id) {
@@ -5167,17 +5170,20 @@ impl Cache {
         let mut snapshot = order_cell.borrow().clone();
         snapshot.apply(event.clone())?;
 
-        // Preflight only reverse ownership. A same-client forward mismatch remains a logged
-        // refresh inconsistency, while other refresh failures, such as a backing database error,
-        // remain logged after the canonical state is committed.
+        // Preflight only reverse ownership. A same-client forward mismatch retains its existing
+        // logged refresh policy. Returned refresh errors carry the committed order below.
         if let Some(venue_order_id) = snapshot.venue_order_id() {
             self.validate_venue_order_id_ownership(&client_order_id, &venue_order_id)?;
         }
 
         *order_cell.borrow_mut() = snapshot.clone();
 
-        if let Err(e) = self.refresh_order(&snapshot) {
-            log::error!("Error updating order in cache: {e}");
+        if let Err(source) = self.refresh_order(&snapshot) {
+            return Err(OrderUpdateError {
+                order: snapshot,
+                source,
+            }
+            .into());
         }
 
         Ok(snapshot)

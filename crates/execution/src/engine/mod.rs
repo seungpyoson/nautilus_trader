@@ -38,7 +38,7 @@ use futures::future::join_all;
 use indexmap::{IndexMap, IndexSet};
 pub use nautilus_common::messages::execution::EventApplicationOutcome;
 use nautilus_common::{
-    cache::{Cache, PositionRef},
+    cache::{Cache, OrderUpdateError, PositionRef},
     clients::ExecutionClient,
     clock::Clock,
     enums::LogColor,
@@ -2986,7 +2986,9 @@ impl ExecutionEngine {
 
                 if validation.is_ok() {
                     let event = OrderEventAny::Filled(fill.clone());
-                    let Some(order) = self.update_cached_order(client_order_id, &event) else {
+                    let Some((order, cache_outcome)) =
+                        self.update_cached_order(client_order_id, &event)
+                    else {
                         return EventApplicationOutcome::Incomplete;
                     };
 
@@ -3000,7 +3002,9 @@ impl ExecutionEngine {
                     } else {
                         (Vec::new(), EventApplicationOutcome::Applied)
                     };
-                    if portfolio_outcome == EventApplicationOutcome::Incomplete {
+                    if cache_outcome == EventApplicationOutcome::Incomplete
+                        || portfolio_outcome == EventApplicationOutcome::Incomplete
+                    {
                         outcome = EventApplicationOutcome::Incomplete;
                     }
                     self.publish_order_event(&event);
@@ -3107,18 +3111,26 @@ impl ExecutionEngine {
                     ));
                 }
 
-                if self.update_cached_order(client_order_id, &event).is_none() {
+                let Some((_, mut outcome)) = self.update_cached_order(client_order_id, &event)
+                else {
                     return EventApplicationOutcome::Incomplete;
+                };
+                if self.send_order_update_to_portfolio(&event, original_fill.as_ref())
+                    == EventApplicationOutcome::Incomplete
+                {
+                    outcome = EventApplicationOutcome::Incomplete;
                 }
-
-                let outcome = self.send_order_update_to_portfolio(&event, original_fill.as_ref());
                 self.publish_order_event(&event);
                 self.publish_position_events(position_events);
                 outcome
             }
             _ => {
-                if self.update_cached_order(client_order_id, &event).is_some() {
-                    let outcome = self.send_order_update_to_portfolio(&event, None);
+                if let Some((_, mut outcome)) = self.update_cached_order(client_order_id, &event) {
+                    if self.send_order_update_to_portfolio(&event, None)
+                        == EventApplicationOutcome::Incomplete
+                    {
+                        outcome = EventApplicationOutcome::Incomplete;
+                    }
                     self.publish_order_event(&event);
                     outcome
                 } else {
@@ -3581,87 +3593,23 @@ impl ExecutionEngine {
         &self,
         client_order_id: ClientOrderId,
         event: &OrderEventAny,
-    ) -> Option<OrderAny> {
+    ) -> Option<(OrderAny, EventApplicationOutcome)> {
         let result = { self.cache.borrow_mut().update_order(event) };
-
-        let order = match result {
-            Ok(order) => order,
-            Err(e) => {
-                if matches!(
-                    e.downcast_ref::<OrderError>(),
-                    Some(OrderError::InvalidStateTransition)
-                ) {
-                    // A non-fill event that fails to apply to an already-closed order is an
-                    // expected venue race (e.g. a place reject then a stream cancel for the same
-                    // order), not an anomaly. A dropped fill stays at warn even on a closed order,
-                    // since it represents real, possibly lost, execution.
-                    let already_closed = self
-                        .cache
-                        .borrow()
-                        .order(&client_order_id)
-                        .is_some_and(|o| o.is_closed());
-
-                    if already_closed && !matches!(event, OrderEventAny::Filled(_)) {
-                        log::debug!("InvalidStateTrigger: {e}, did not apply {event}");
-                    } else {
-                        log::warn!("InvalidStateTrigger: {e}, did not apply {event}");
-                    }
+        let (order, outcome) = match result {
+            Ok(order) => (order, EventApplicationOutcome::Applied),
+            Err(error) => match error.downcast::<OrderUpdateError>() {
+                Ok(failure) => {
+                    log::error!(
+                        "Order applied with incomplete cache refresh: {}",
+                        failure.source
+                    );
+                    (failure.order, EventApplicationOutcome::Incomplete)
+                }
+                Err(error) => {
+                    self.handle_order_update_rejection(client_order_id, event, &error);
                     return None;
                 }
-
-                if let Some(OrderError::DuplicateFill(trade_id)) = e.downcast_ref::<OrderError>() {
-                    log::warn!(
-                        "Duplicate fill rejected at order level: trade_id={trade_id}, did not apply {event}"
-                    );
-                    return None;
-                }
-
-                if let Some(OrderError::DuplicateFillVoid(trade_id)) =
-                    e.downcast_ref::<OrderError>()
-                {
-                    log::warn!(
-                        "Duplicate fill void rejected at order level: trade_id={trade_id}, did not apply {event}"
-                    );
-                    return None;
-                }
-
-                log::error!("Error applying event: {e}, did not apply {event}");
-
-                if matches!(
-                    event,
-                    OrderEventAny::Denied(_)
-                        | OrderEventAny::Rejected(_)
-                        | OrderEventAny::Canceled(_)
-                        | OrderEventAny::Expired(_)
-                ) {
-                    log::warn!(
-                        "Terminal event {event} failed to apply to {client_order_id}, forcing cleanup from own book"
-                    );
-                    self.cache
-                        .borrow_mut()
-                        .force_remove_from_own_order_book(&client_order_id);
-                } else {
-                    let order = self
-                        .cache
-                        .borrow()
-                        .order(&client_order_id)
-                        .map(|o| o.clone());
-
-                    if let Some(order) = order {
-                        let should_update_own_book = {
-                            let cache = self.cache.borrow();
-                            let own_book = cache.own_order_book(&order.instrument_id());
-                            (own_book.is_some() && order.is_closed())
-                                || should_handle_own_book_order(&order)
-                        };
-
-                        if should_update_own_book {
-                            self.cache.borrow_mut().update_own_order_book(&order);
-                        }
-                    }
-                }
-                return None;
-            }
+            },
         };
 
         if self.config.manage_own_order_books && should_handle_own_book_order(&order) {
@@ -3685,7 +3633,86 @@ impl ExecutionEngine {
             self.create_order_state_snapshot(&order);
         }
 
-        Some(order)
+        Some((order, outcome))
+    }
+
+    fn handle_order_update_rejection(
+        &self,
+        client_order_id: ClientOrderId,
+        event: &OrderEventAny,
+        e: &anyhow::Error,
+    ) {
+        if matches!(
+            e.downcast_ref::<OrderError>(),
+            Some(OrderError::InvalidStateTransition)
+        ) {
+            // A non-fill event that fails to apply to an already-closed order is an
+            // expected venue race (e.g. a place reject then a stream cancel for the same
+            // order), not an anomaly. A dropped fill stays at warn even on a closed order,
+            // since it represents real, possibly lost, execution.
+            let already_closed = self
+                .cache
+                .borrow()
+                .order(&client_order_id)
+                .is_some_and(|o| o.is_closed());
+
+            if already_closed && !matches!(event, OrderEventAny::Filled(_)) {
+                log::debug!("InvalidStateTrigger: {e}, did not apply {event}");
+            } else {
+                log::warn!("InvalidStateTrigger: {e}, did not apply {event}");
+            }
+            return;
+        }
+
+        if let Some(OrderError::DuplicateFill(trade_id)) = e.downcast_ref::<OrderError>() {
+            log::warn!(
+                "Duplicate fill rejected at order level: trade_id={trade_id}, did not apply {event}"
+            );
+            return;
+        }
+
+        if let Some(OrderError::DuplicateFillVoid(trade_id)) = e.downcast_ref::<OrderError>() {
+            log::warn!(
+                "Duplicate fill void rejected at order level: trade_id={trade_id}, did not apply {event}"
+            );
+            return;
+        }
+
+        log::error!("Error applying event: {e}, did not apply {event}");
+
+        if matches!(
+            event,
+            OrderEventAny::Denied(_)
+                | OrderEventAny::Rejected(_)
+                | OrderEventAny::Canceled(_)
+                | OrderEventAny::Expired(_)
+        ) {
+            log::warn!(
+                "Terminal event {event} failed to apply to {client_order_id}, forcing cleanup from own book"
+            );
+            self.cache
+                .borrow_mut()
+                .force_remove_from_own_order_book(&client_order_id);
+        } else {
+            let order = self
+                .cache
+                .borrow()
+                .order(&client_order_id)
+                .map(|o| o.clone());
+
+            if let Some(order) = order {
+                let should_update_own_book = {
+                    let cache = self.cache.borrow();
+                    let own_book = cache.own_order_book(&order.instrument_id());
+                    (own_book.is_some() && order.is_closed())
+                        || should_handle_own_book_order(&order)
+                };
+
+                if should_update_own_book {
+                    self.cache.borrow_mut().update_own_order_book(&order);
+                }
+            }
+        }
     }
 
     fn send_order_update_to_portfolio(
@@ -4354,10 +4381,19 @@ impl ExecutionEngine {
         let event = OrderEventAny::Denied(denied);
         let order = match self.cache.borrow_mut().update_order(&event) {
             Ok(order) => order,
-            Err(e) => {
-                log::error!("Failed to apply denied event to order: {e}");
-                return;
-            }
+            Err(error) => match error.downcast::<OrderUpdateError>() {
+                Ok(failure) => {
+                    log::error!(
+                        "Denied order applied with incomplete cache refresh: {}",
+                        failure.source
+                    );
+                    failure.order
+                }
+                Err(error) => {
+                    log::error!("Failed to apply denied event to order: {error}");
+                    return;
+                }
+            },
         };
 
         let topic = switchboard::get_event_order_topic(order.strategy_id());
