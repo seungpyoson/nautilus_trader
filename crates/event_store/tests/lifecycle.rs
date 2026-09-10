@@ -284,7 +284,7 @@ fn replay_fill_corrections_match_live_accounting(
     setup_netting_snapshot_engine(&mut engine, &instrument);
 
     // Two closed cycles and an open position. All fills are at 1 USD with a 2 USD fee.
-    // Voiding 40k from the first buy leaves +60,-40,0,-40,+60k: one rebuilt closed cycle.
+    // Voiding the first buy crosses the original closed-cycle boundaries.
     for (index, (side, quantity)) in [
         (OrderSide::Buy, 100_000),
         (OrderSide::Sell, 100_000),
@@ -355,11 +355,14 @@ fn replay_fill_corrections_match_live_accounting(
         (fill, archives)
     };
 
-    for (index, (quantity, refund, valid)) in [
-        (40_000, "0.80 USD", true),
-        (50_000, "1.00 USD", true),
-        (50_000, "1.00 USD", false), // Duplicate cumulative correction.
-        (20_000, "0.40 USD", false), // Stale cumulative quantity.
+    for (index, (quantity, refund, valid, remaining_qty, total_pnl)) in [
+        (40_000, "0.80 USD", true, 60_000, "-9.20 USD"),
+        // Same cancelled quantity, larger fee refund: closed-cycle PnL must change too.
+        (40_000, "1.00 USD", true, 60_000, "-9.00 USD"),
+        (50_000, "1.00 USD", true, 50_000, "-9.00 USD"),
+        // Duplicate and stale corrections preserve the last accepted financial state.
+        (50_000, "1.00 USD", false, 50_000, "-9.00 USD"),
+        (20_000, "0.40 USD", false, 50_000, "-9.00 USD"),
     ]
     .into_iter()
     .enumerate()
@@ -450,37 +453,17 @@ fn replay_fill_corrections_match_live_accounting(
                 total + frame.realized_pnl.expect("archived PnL")
             });
         let position = live.position(&position_id).expect("corrected position");
-        let expected_total = if !applicable {
-            "-10.00 USD"
-        } else if index == 0 {
-            "-9.20 USD"
-        } else {
-            "-9.00 USD"
-        };
         assert_eq!(
             archived_pnl + position.realized_pnl.expect("current PnL"),
-            Money::from(expected_total)
+            Money::from(if applicable { total_pnl } else { "-10.00 USD" }),
+            "cumulative void quantity={quantity}, refund={refund}, carry_history={carry_history}, corrected_order={corrected_order}",
         );
         assert_eq!(
             position.quantity,
-            Quantity::from(if !applicable {
-                100_000
-            } else if index == 0 {
-                60_000
-            } else {
-                50_000
-            })
+            Quantity::from(if applicable { remaining_qty } else { 100_000 })
         );
 
-        if applicable && corrected_order == 0 {
-            // At 50k the corrected history no longer goes flat; the current position
-            // must absorb all PnL and the archive must disappear.
-            assert_eq!(live_frames.len(), usize::from(index == 0));
-            assert_eq!(
-                archived_pnl,
-                Money::from(if index == 0 { "-5.20 USD" } else { "0 USD" })
-            );
-        } else {
+        if !applicable || corrected_order != 0 {
             assert_eq!(
                 live.position_snapshot_bytes(&position_id),
                 Some(original_archives.clone())
