@@ -347,8 +347,8 @@ impl EventStoreSession {
     /// Returns a snapshot anchorer bound to the open writer.
     ///
     /// The execution engine installs this callback while the run is open. The callback
-    /// records the cache-owned snapshot reference against the writer's durable
-    /// high-watermark after flushing earlier captured entries.
+    /// records the position archive with partial coverage against the writer's durable
+    /// high-watermark after flushing earlier captured entries. It is not a full cache checkpoint.
     #[must_use]
     pub fn snapshot_anchorer(&self) -> Option<SnapshotAnchorer> {
         let writer = Arc::clone(self.writer.as_ref()?);
@@ -603,8 +603,9 @@ impl EventStoreLifecycle {
     /// Restores cache state from the configured replay run or recovered parent run.
     ///
     /// This is a bootstrap-only reconstruction path. It opens the sealed replay source
-    /// for read-only replay, restores the cache-owned snapshot blob, then replays only
-    /// the entries after the snapshot anchor directly into [`Cache`].
+    /// for read-only replay and applies supported events directly into [`Cache`].
+    /// Anchored checkpoints are refused because the native cache only restores individual
+    /// position archives, which cannot replace a full replay prefix.
     ///
     /// # Errors
     ///
@@ -779,13 +780,15 @@ impl Drop for EventStoreLifecycle {
 /// error rather than failing the sweep: recovery must never leave the trader unbootable
 /// because one run file is damaged. Skipped runs keep their on-disk status, so the next
 /// boot retries them.
+/// Anchored sources are refused before sealing: sealing an unrestorable source would
+/// remove it from the next boot's recovery sweep and allow a retry to skip it.
 ///
 /// # Errors
 ///
 /// Returns [`EventStoreError`] when the directory enumeration fails, or when a
 /// predecessor unexpectedly reopens without the
 /// [`EventStoreError::CrashedPredecessor`] handshake the backend uses to surface
-/// unsealed runs.
+/// unsealed runs, or when an anchored source cannot be restored by the native cache.
 pub fn recover_predecessors(
     base_dir: &Path,
     instance_id: &str,
@@ -813,6 +816,12 @@ pub fn recover_predecessors(
                 log::error!("Skipping recovery of run {run_id}, reopen failed: {other}");
                 continue;
             }
+        }
+
+        if backend.latest_snapshot_anchor()?.is_some() {
+            return Err(EventStoreError::Backend(format!(
+                "cannot recover anchored cache checkpoint from run {run_id}; native full cache restore is unsupported",
+            )));
         }
 
         let high_watermark = backend.high_watermark()?;
@@ -1622,6 +1631,7 @@ mod tests {
                         1,
                         "cache://snapshot/run-crash/1",
                         "blake3:abc",
+                        crate::SnapshotCoverage::Partial,
                     ))
                     .expect("record snapshot anchor");
             }
@@ -1655,8 +1665,12 @@ mod tests {
     fn restore_cache_snapshot_blob_rejects_hash_mismatch() {
         let mut cache = Cache::default();
         let blob = Bytes::from_static(b"snapshot");
-        let anchor =
-            crate::SnapshotAnchor::new(0, "cache://position-snapshots/P-1/0", "blake3:bad");
+        let anchor = crate::SnapshotAnchor::new(
+            0,
+            "cache://position-snapshots/P-1/0",
+            "blake3:bad",
+            crate::SnapshotCoverage::Partial,
+        );
 
         cache
             .add(&anchor.blob_ref, blob)
@@ -2398,6 +2412,19 @@ mod tests {
         let config = make_config(tmp.path().to_path_buf());
         let predecessor_run_id = format!("3000-{crash_point:?}");
         seed_crashed_predecessor(&config, &predecessor_run_id, crash_point);
+
+        if expect_snapshot_anchor {
+            for _ in 0..2 {
+                let error = recover_predecessors(&config.base_dir, INSTANCE_ID)
+                    .expect_err("anchored source must remain a recovery obligation");
+                assert!(error.to_string().contains("anchored cache checkpoint"));
+                let manifests =
+                    RedbBackend::list_runs(&config.base_dir, INSTANCE_ID).expect("list sources");
+                assert_eq!(manifests.len(), 1);
+                assert_eq!(manifests[0].status, RunStatus::Running);
+            }
+            return;
+        }
 
         let outcome = recover_predecessors(&config.base_dir, INSTANCE_ID).expect("recover sweep");
         assert_eq!(outcome.recovered.len(), 1);

@@ -406,7 +406,12 @@ mod tests {
             "scan_seq" => backend.scan_seq(1).unwrap_err(),
             "lookup" => backend.lookup(IndexKind::ClientOrderId, "k").unwrap_err(),
             "record_snapshot_anchor" => backend
-                .record_snapshot_anchor(SnapshotAnchor::new(0, "blob", "hash"))
+                .record_snapshot_anchor(SnapshotAnchor::new(
+                    0,
+                    "blob",
+                    "hash",
+                    crate::SnapshotCoverage::Partial,
+                ))
                 .unwrap_err(),
             "latest_snapshot_anchor" => backend.latest_snapshot_anchor().unwrap_err(),
             "seal" => backend.seal(RunStatus::Ended).unwrap_err(),
@@ -519,7 +524,12 @@ mod tests {
         open_backend
             .append_batch(&[append_with(1, 10, Vec::new())])
             .expect("append");
-        let anchor = SnapshotAnchor::new(1, "cache://snapshots/run-1/1", "blake3:abc");
+        let anchor = SnapshotAnchor::new(
+            1,
+            "cache://snapshots/run-1/1",
+            "blake3:abc",
+            crate::SnapshotCoverage::Partial,
+        );
 
         open_backend
             .record_snapshot_anchor(anchor.clone())
@@ -535,7 +545,12 @@ mod tests {
 
     #[rstest]
     fn snapshot_anchor_rejects_watermark_past_durable_hwm(mut open_backend: MemoryBackend) {
-        let anchor = SnapshotAnchor::new(1, "cache://snapshots/run-1/1", "blake3:abc");
+        let anchor = SnapshotAnchor::new(
+            1,
+            "cache://snapshots/run-1/1",
+            "blake3:abc",
+            crate::SnapshotCoverage::Partial,
+        );
         let err = open_backend
             .record_snapshot_anchor(anchor)
             .expect_err("must reject");
@@ -560,11 +575,21 @@ mod tests {
             ])
             .expect("append");
         open_backend
-            .record_snapshot_anchor(SnapshotAnchor::new(2, "latest", "hash-latest"))
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                2,
+                "latest",
+                "hash-latest",
+                crate::SnapshotCoverage::Partial,
+            ))
             .expect("record latest");
 
         let err = open_backend
-            .record_snapshot_anchor(SnapshotAnchor::new(1, "older", "hash-older"))
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                1,
+                "older",
+                "hash-older",
+                crate::SnapshotCoverage::Partial,
+            ))
             .expect_err("must reject older anchor");
 
         match err {
@@ -583,7 +608,12 @@ mod tests {
         open_backend.seal(RunStatus::Ended).expect("seal");
 
         let err = open_backend
-            .record_snapshot_anchor(SnapshotAnchor::new(1, "blob", "hash"))
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                1,
+                "blob",
+                "hash",
+                crate::SnapshotCoverage::Partial,
+            ))
             .expect_err("must reject");
 
         assert!(matches!(err, EventStoreError::Closed));

@@ -264,7 +264,12 @@ fn methods_error_when_no_run_open(#[case] op: &str) {
         "scan_seq" => backend.scan_seq(1).unwrap_err(),
         "lookup" => backend.lookup(IndexKind::ClientOrderId, "k").unwrap_err(),
         "record_snapshot_anchor" => backend
-            .record_snapshot_anchor(SnapshotAnchor::new(0, "blob", "hash"))
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                0,
+                "blob",
+                "hash",
+                nautilus_event_store::SnapshotCoverage::Partial,
+            ))
             .unwrap_err(),
         "latest_snapshot_anchor" => backend.latest_snapshot_anchor().unwrap_err(),
         "seal" => backend.seal(RunStatus::Ended).unwrap_err(),
@@ -409,7 +414,12 @@ fn snapshot_anchor_round_trips_and_persists_for_sealed_reader() {
             append_with(2, 11, Vec::new()),
         ])
         .expect("append");
-    let anchor = SnapshotAnchor::new(2, "cache://snapshots/run-1/2", "blake3:abc");
+    let anchor = SnapshotAnchor::new(
+        2,
+        "cache://snapshots/run-1/2",
+        "blake3:abc",
+        nautilus_event_store::SnapshotCoverage::Partial,
+    );
 
     backend
         .record_snapshot_anchor(anchor.clone())
@@ -435,7 +445,12 @@ fn snapshot_anchor_rejects_watermark_past_durable_hwm() {
     let (_tmp, mut backend) = open_backend();
 
     let err = backend
-        .record_snapshot_anchor(SnapshotAnchor::new(1, "blob", "hash"))
+        .record_snapshot_anchor(SnapshotAnchor::new(
+            1,
+            "blob",
+            "hash",
+            nautilus_event_store::SnapshotCoverage::Partial,
+        ))
         .expect_err("must reject");
 
     match err {
@@ -459,11 +474,21 @@ fn snapshot_anchor_rejects_backward_move() {
         ])
         .expect("append");
     backend
-        .record_snapshot_anchor(SnapshotAnchor::new(2, "latest", "hash-latest"))
+        .record_snapshot_anchor(SnapshotAnchor::new(
+            2,
+            "latest",
+            "hash-latest",
+            nautilus_event_store::SnapshotCoverage::Partial,
+        ))
         .expect("record latest");
 
     let err = backend
-        .record_snapshot_anchor(SnapshotAnchor::new(1, "older", "hash-older"))
+        .record_snapshot_anchor(SnapshotAnchor::new(
+            1,
+            "older",
+            "hash-older",
+            nautilus_event_store::SnapshotCoverage::Partial,
+        ))
         .expect_err("must reject");
 
     match err {
@@ -483,14 +508,21 @@ fn snapshot_anchor_after_seal_returns_closed() {
     backend.seal(RunStatus::Ended).expect("seal");
 
     let err = backend
-        .record_snapshot_anchor(SnapshotAnchor::new(1, "blob", "hash"))
+        .record_snapshot_anchor(SnapshotAnchor::new(
+            1,
+            "blob",
+            "hash",
+            nautilus_event_store::SnapshotCoverage::Partial,
+        ))
         .expect_err("must reject");
 
     assert!(matches!(err, EventStoreError::Closed));
 }
 
 #[rstest]
-fn latest_snapshot_anchor_returns_corrupted_when_anchor_bytes_are_garbled() {
+#[case::garbled(false)]
+#[case::legacy_without_coverage(true)]
+fn latest_snapshot_anchor_rejects_invalid_or_legacy_bytes(#[case] legacy: bool) {
     let run_id = "run-anchor-decode";
     let tmp = TempDir::new().expect("tempdir");
     let path = {
@@ -500,10 +532,27 @@ fn latest_snapshot_anchor_returns_corrupted_when_anchor_bytes_are_garbled() {
             .append_batch(&[append_with(1, 10, Vec::new())])
             .expect("append");
         backend
-            .record_snapshot_anchor(SnapshotAnchor::new(1, "blob", "hash"))
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                1,
+                "blob",
+                "hash",
+                nautilus_event_store::SnapshotCoverage::Partial,
+            ))
             .expect("record anchor");
         backend.seal(RunStatus::Ended).expect("seal");
         backend.current_path().expect("path").to_path_buf()
+    };
+
+    // The old positional struct had exactly these three fields and no coverage.
+    let invalid_bytes = if legacy {
+        nautilus_event_store::codec::encode_to_vec(&(
+            1_u64,
+            "cache://position-snapshots/P-1/0",
+            "blake3:old",
+        ))
+        .expect("encode legacy anchor")
+    } else {
+        vec![0xff; 8]
     };
 
     {
@@ -514,7 +563,7 @@ fn latest_snapshot_anchor_returns_corrupted_when_anchor_bytes_are_garbled() {
         {
             let mut table = txn.open_table(snapshot_anchor).expect("open table");
             table
-                .insert("latest", b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF".as_slice())
+                .insert("latest", invalid_bytes.as_slice())
                 .expect("overwrite latest snapshot anchor");
         }
         txn.commit().expect("commit overwrite");

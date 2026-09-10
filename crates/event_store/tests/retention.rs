@@ -221,11 +221,52 @@ fn planning_run(
     )
 }
 
+#[rstest]
+#[case::bounded(RetentionMode::Bounded { keep_last: 1 })]
+#[case::snapshot_anchored(RetentionMode::SnapshotAnchored)]
+fn only_full_checkpoints_authorize_reclaiming_predecessors(
+    #[case] mode: RetentionMode,
+    #[values(false, true)] full_cache: bool,
+) {
+    let mut anchor = SnapshotAnchor::new(
+        1,
+        "opaque-blob",
+        "hash",
+        nautilus_event_store::SnapshotCoverage::Partial,
+    );
+
+    if full_cache {
+        anchor.coverage = nautilus_event_store::SnapshotCoverage::FullCache;
+    }
+    let runs = vec![
+        planning_run(
+            "predecessor",
+            RunStatus::Ended,
+            1,
+            SnapshotAnchorStatus::Missing,
+        ),
+        planning_run(
+            "latest",
+            RunStatus::Ended,
+            2,
+            SnapshotAnchorStatus::Valid(anchor),
+        ),
+    ];
+    let plan = plan_retention(runs, mode);
+
+    if full_cache {
+        assert_eq!(run_ids(&plan.reclaim_candidates), vec!["predecessor"]);
+    } else {
+        assert!(plan.reclaim_candidates.is_empty());
+    }
+}
+
 fn valid_anchor(high_watermark: u64) -> SnapshotAnchorStatus {
     SnapshotAnchorStatus::Valid(SnapshotAnchor::new(
         high_watermark,
         format!("cache://snapshots/{high_watermark}"),
         "blake3:abc",
+        nautilus_event_store::SnapshotCoverage::FullCache,
     ))
 }
 
@@ -246,7 +287,12 @@ fn write_redb_run(
 
     if record_anchor {
         backend
-            .record_snapshot_anchor(SnapshotAnchor::new(1, "cache://snapshots/1", "blake3:abc"))
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                1,
+                "cache://snapshots/1",
+                "blake3:abc",
+                nautilus_event_store::SnapshotCoverage::FullCache,
+            ))
             .expect("record anchor");
     }
 

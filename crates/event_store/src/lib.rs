@@ -120,7 +120,7 @@ pub use retention::{
     RetentionPlan, RetentionRun, SnapshotAnchorStatus, list_redb_sealed_runs, plan_redb_retention,
     plan_retention,
 };
-pub use snapshot::{SnapshotAnchor, compute_snapshot_content_hash};
+pub use snapshot::{SnapshotAnchor, SnapshotCoverage, compute_snapshot_content_hash};
 pub use verifier::{
     GapRange, IndexDrift, ManifestField, Verifier, VerifyError, VerifyFinding, VerifyReport,
 };

@@ -292,12 +292,13 @@ mod imp {
             self.high_watermark.load(Ordering::Acquire)
         }
 
-        /// Flushes pending entries and records a snapshot anchor at the durable
+        /// Flushes pending entries and records a partial snapshot anchor at the durable
         /// high-watermark.
         ///
         /// The cache owns `blob_ref` and `content_hash`; the writer derives the
         /// high-watermark only after earlier submitted entries have committed, so the
-        /// anchor never points past durable event-store state.
+        /// anchor never points past durable event-store state. This path records position
+        /// archives, which do not replace a full cache replay prefix.
         ///
         /// # Errors
         ///
@@ -572,7 +573,7 @@ mod imp {
             self.high_watermark.load(Ordering::Acquire)
         }
 
-        /// Records a snapshot anchor at the current durable high-watermark.
+        /// Records a partial snapshot anchor at the current durable high-watermark.
         ///
         /// # Errors
         ///
@@ -597,6 +598,7 @@ mod imp {
                 self.high_watermark.load(Ordering::Acquire),
                 blob_ref,
                 content_hash,
+                crate::SnapshotCoverage::Partial,
             );
 
             match inner.backend.record_snapshot_anchor(anchor.clone()) {
@@ -1063,7 +1065,7 @@ mod tests {
     }
 
     #[rstest]
-    fn record_snapshot_anchor_flushes_pending_entries_and_replay_tail_starts_after_anchor(
+    fn record_snapshot_anchor_flushes_pending_entries_with_partial_coverage(
         captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
     ) {
         let (halt, captured) = captured_halt;
@@ -1089,6 +1091,7 @@ mod tests {
             .expect("record anchor");
 
         assert_eq!(anchor.high_watermark, 2);
+        assert_eq!(anchor.coverage, crate::SnapshotCoverage::Partial);
 
         writer.submit(entry_draft(12)).expect("submit third");
         writer.submit(entry_draft(13)).expect("submit fourth");
@@ -1971,6 +1974,7 @@ mod madsim_tests {
 
         let backend = shared.lock().expect("shared");
         assert_eq!(anchor.high_watermark, 2);
+        assert_eq!(anchor.coverage, crate::SnapshotCoverage::Partial);
         assert_eq!(
             backend.latest_snapshot_anchor().expect("latest anchor"),
             Some(anchor),

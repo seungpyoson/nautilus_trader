@@ -63,7 +63,9 @@ use nautilus_model::{
         AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
         TraderId, Venue, VenueOrderId,
     },
-    instruments::{CurrencyPair, InstrumentAny, SyntheticInstrument, stubs::audusd_sim},
+    instruments::{
+        CurrencyPair, Instrument, InstrumentAny, SyntheticInstrument, stubs::audusd_sim,
+    },
     orderbook::OrderBook,
     orders::{Order, OrderAny, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
@@ -414,6 +416,10 @@ fn kernel_start_installs_snapshot_anchorer_for_execution_snapshots() {
         anchor.content_hash,
         compute_snapshot_content_hash(&snapshot),
     );
+    assert_eq!(
+        anchor.coverage,
+        nautilus_event_store::SnapshotCoverage::Partial
+    );
     assert!(anchor.high_watermark >= 1);
     assert!(
         anchor.high_watermark <= durable_high_watermark,
@@ -431,23 +437,36 @@ fn kernel_start_installs_snapshot_anchorer_for_execution_snapshots() {
 }
 
 #[rstest]
-fn kernel_start_restores_parent_cache_snapshot_and_replays_tail() {
+#[case::crashed_full_log(false, false, false)]
+#[case::configured_full_log(true, false, false)]
+#[case::crashed_partial(false, true, false)]
+#[case::configured_partial(true, true, false)]
+#[case::crashed_legacy(false, true, true)]
+#[case::configured_legacy(true, true, true)]
+fn kernel_start_requires_complete_cache_replay(
+    #[case] configured_replay: bool,
+    #[case] partial_snapshot: bool,
+    #[case] legacy: bool,
+    #[values(false, true)] from_database: bool,
+) {
     let _guard = lock_kernel_test();
     let tmp = TempDir::new().expect("tempdir");
     let instance_id = UUID4::new();
-    let config = config_with(tmp.path().to_path_buf());
+    let mut config = config_with(tmp.path().to_path_buf());
     let parent_run_id = "parent-run";
-    let instrument = audusd_sim();
-    let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
+    if configured_replay {
+        config.replay_from_run_id = Some(parent_run_id.to_string());
+    }
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim());
     let position_id = PositionId::new("P-KERNEL-RESTORE-1");
     let order = OrderTestBuilder::new(OrderType::Market)
-        .instrument_id(instrument.id)
+        .instrument_id(instrument.id())
         .side(OrderSide::Buy)
         .quantity(Quantity::from(100_000))
         .build();
     let fill = TestOrderEventStubs::filled(
         &order,
-        &instrument_any,
+        &instrument,
         Some(TradeId::new("T-KERNEL-RESTORE-1")),
         Some(position_id),
         None,
@@ -457,171 +476,143 @@ fn kernel_start_restores_parent_cache_snapshot_and_replays_tail() {
         None,
         Some(AccountId::test_default()),
     );
-    let position = Position::new(&instrument_any, fill.into());
+    let position = Position::new(&instrument, fill.into());
     let mut snapshot_cache = Cache::default();
     let snapshot_ref = snapshot_cache
         .snapshot_position_encoded(&position)
-        .expect("snapshot position");
+        .expect("snapshot");
     let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
     let replayed_state = cash_account_state_million_usd("200 USD", "0 USD", "200 USD");
+    let mut unrelated_state = cash_account_state_million_usd("700 USD", "0 USD", "700 USD");
+    unrelated_state.account_id = AccountId::new("SIM-UNRELATED");
 
-    {
+    let source_path = {
         let mut backend = RedbBackend::new(config.base_dir.clone());
         backend
             .open_run(running_manifest(&config, instance_id, parent_run_id))
-            .expect("open parent run");
+            .expect("open");
         backend
-            .append_batch(&[append_account_state(1, &anchored_state)])
-            .expect("append anchored state");
+            .append_batch(&[
+                append_account_state(1, &anchored_state),
+                append_account_state(2, &unrelated_state),
+            ])
+            .expect("append prefix");
+
+        if partial_snapshot {
+            backend
+                .record_snapshot_anchor(SnapshotAnchor::new(
+                    2,
+                    snapshot_ref.blob_ref.clone(),
+                    compute_snapshot_content_hash(snapshot_ref.blob.as_ref()),
+                    nautilus_event_store::SnapshotCoverage::Partial,
+                ))
+                .expect("anchor position archive");
+        }
         backend
-            .record_snapshot_anchor(SnapshotAnchor::new(
-                1,
+            .append_batch(&[append_account_state(3, &replayed_state)])
+            .expect("append tail");
+        if configured_replay {
+            backend.seal(RunStatus::Ended).expect("seal source");
+        }
+        backend.current_path().expect("source path").to_path_buf()
+    };
+
+    if legacy {
+        let bytes = nautilus_event_store::codec::encode_to_vec(&(
+            2_u64,
+            snapshot_ref.blob_ref.as_str(),
+            compute_snapshot_content_hash(snapshot_ref.blob.as_ref()),
+        ))
+        .expect("legacy snapshot metadata");
+        let table: redb::TableDefinition<&str, &[u8]> =
+            redb::TableDefinition::new("snapshot_anchor");
+        let db = redb::Database::create(&source_path).expect("open source");
+        let txn = db.begin_write().expect("begin legacy metadata write");
+        {
+            txn.open_table(table)
+                .expect("anchor table")
+                .insert("latest", bytes.as_slice())
+                .expect("legacy metadata");
+        }
+        txn.commit().expect("commit legacy metadata");
+    }
+
+    let attempts = if partial_snapshot { 2 } else { 1 };
+    for _ in 0..attempts {
+        let mut builder = NautilusKernelBuilder::default()
+            .with_instance_id(instance_id)
+            .with_event_store(event_store_factory(config.clone()));
+
+        if from_database {
+            builder = builder.with_cache_database(Box::new(StubCacheDatabase::with_blob(
                 snapshot_ref.blob_ref.clone(),
-                compute_snapshot_content_hash(snapshot_ref.blob.as_ref()),
-            ))
-            .expect("record snapshot anchor");
-        backend
-            .append_batch(&[append_account_state(2, &replayed_state)])
-            .expect("append replay tail");
-    }
+                snapshot_ref.blob.clone(),
+            )));
+        }
+        let built = builder.build();
 
-    let mut kernel = NautilusKernelBuilder::default()
-        .with_instance_id(instance_id)
-        .with_event_store(event_store_factory(config))
-        .build()
-        .expect("kernel");
-    kernel
-        .cache
-        .borrow_mut()
-        .add(&snapshot_ref.blob_ref, snapshot_ref.blob.clone())
-        .expect("seed cache-owned snapshot blob");
+        if partial_snapshot && !configured_replay {
+            let error = built
+                .err()
+                .expect("unrestorable source must block construction");
+            let expected = if legacy {
+                "decode snapshot anchor"
+            } else {
+                "anchored cache checkpoint"
+            };
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            let manifests = RedbBackend::list_runs(&config.base_dir, &instance_id.to_string())
+                .expect("list sources");
+            assert_eq!(manifests.len(), 1);
+            assert_eq!(manifests[0].run_id, parent_run_id);
+            assert_eq!(manifests[0].status, RunStatus::Running);
+            continue;
+        }
+        let mut kernel = built.expect("kernel");
+        if !from_database {
+            kernel
+                .cache
+                .borrow_mut()
+                .add(&snapshot_ref.blob_ref, snapshot_ref.blob.clone())
+                .expect("seed archive blob");
+        }
 
-    kernel.start().expect("start kernel");
-
-    {
+        let result = kernel.start();
         let cache = kernel.cache.borrow();
-        let frames = cache
-            .position_snapshot_bytes(&position.id)
-            .expect("restored position snapshot");
-        let account = cache
-            .account_owned(&replayed_state.account_id)
-            .expect("replayed account");
+        let event_store = kernel.event_store().expect("event store");
+        assert_eq!(event_store.parent_run_id(), Some(parent_run_id));
+        assert!(cache.position_snapshot_bytes(&position_id).is_none());
 
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].as_slice(), snapshot_ref.blob.as_ref());
-        assert_eq!(account.events(), vec![replayed_state]);
+        if partial_snapshot {
+            let error = result.expect_err("partial snapshot must block startup");
+            let expected = if legacy {
+                "decode snapshot anchor"
+            } else {
+                "partial"
+            };
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(cache.account_owned(&anchored_state.account_id).is_none());
+            assert!(cache.account_owned(&unrelated_state.account_id).is_none());
+            assert!(event_store.run_id().is_none());
+        } else {
+            result.expect("anchor-free startup");
+            assert_eq!(
+                cache
+                    .account_owned(&anchored_state.account_id)
+                    .expect("account")
+                    .events(),
+                vec![anchored_state.clone(), replayed_state.clone()],
+            );
+            assert_eq!(
+                cache
+                    .account_owned(&unrelated_state.account_id)
+                    .expect("unrelated account")
+                    .events(),
+                vec![unrelated_state.clone()],
+            );
+            assert!(event_store.run_id().is_some());
+        }
     }
-
-    assert_eq!(
-        kernel.event_store().expect("event store").parent_run_id(),
-        Some(parent_run_id)
-    );
-}
-
-#[rstest]
-fn kernel_start_replays_configured_run_without_recovered_parent() {
-    let _guard = lock_kernel_test();
-    let tmp = TempDir::new().expect("tempdir");
-    let instance_id = UUID4::new();
-    let replay_run_id = "seed-run";
-    let mut config = config_with(tmp.path().to_path_buf());
-    config.replay_from_run_id = Some(replay_run_id.to_string());
-    let instrument = audusd_sim();
-    let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
-    let position_id = PositionId::new("P-KERNEL-CONFIG-REPLAY-1");
-    let order = OrderTestBuilder::new(OrderType::Market)
-        .instrument_id(instrument.id)
-        .side(OrderSide::Buy)
-        .quantity(Quantity::from(100_000))
-        .build();
-    let fill = TestOrderEventStubs::filled(
-        &order,
-        &instrument_any,
-        Some(TradeId::new("T-KERNEL-CONFIG-REPLAY-1")),
-        Some(position_id),
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(AccountId::test_default()),
-    );
-    let position = Position::new(&instrument_any, fill.into());
-    let mut snapshot_cache = Cache::default();
-    let snapshot_ref = snapshot_cache
-        .snapshot_position_encoded(&position)
-        .expect("snapshot position");
-    let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
-    let replayed_state = cash_account_state_million_usd("200 USD", "0 USD", "200 USD");
-
-    {
-        let mut backend = RedbBackend::new(config.base_dir.clone());
-        backend
-            .open_run(running_manifest(&config, instance_id, replay_run_id))
-            .expect("open replay source");
-        backend
-            .append_batch(&[append_account_state(1, &anchored_state)])
-            .expect("append anchored state");
-        backend
-            .record_snapshot_anchor(SnapshotAnchor::new(
-                1,
-                snapshot_ref.blob_ref.clone(),
-                compute_snapshot_content_hash(snapshot_ref.blob.as_ref()),
-            ))
-            .expect("record snapshot anchor");
-        backend
-            .append_batch(&[append_account_state(2, &replayed_state)])
-            .expect("append replay tail");
-        backend.seal(RunStatus::Ended).expect("seal replay source");
-    }
-
-    let mut kernel = NautilusKernelBuilder::default()
-        .with_instance_id(instance_id)
-        .with_event_store(event_store_factory(config.clone()))
-        .build()
-        .expect("kernel");
-    kernel
-        .cache
-        .borrow_mut()
-        .add(&snapshot_ref.blob_ref, snapshot_ref.blob.clone())
-        .expect("seed cache-owned snapshot blob");
-
-    kernel.start().expect("start kernel");
-
-    {
-        let cache = kernel.cache.borrow();
-        let frames = cache
-            .position_snapshot_bytes(&position.id)
-            .expect("restored position snapshot");
-        let account = cache
-            .account_owned(&replayed_state.account_id)
-            .expect("replayed account");
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].as_slice(), snapshot_ref.blob.as_ref());
-        assert_eq!(account.events(), vec![replayed_state]);
-    }
-
-    let event_store = kernel.event_store().expect("event store");
-    assert_eq!(event_store.parent_run_id(), Some(replay_run_id));
-    let opened_run_id = event_store
-        .run_id()
-        .expect("configured replay must still open a fresh run after restore")
-        .to_string();
-
-    kernel.dispose();
-
-    let manifests =
-        RedbBackend::list_runs(&config.base_dir, &instance_id.to_string()).expect("list runs");
-    let opened_manifest = manifests
-        .iter()
-        .find(|manifest| manifest.run_id == opened_run_id)
-        .expect("opened run manifest");
-
-    assert_eq!(
-        opened_manifest.parent_run_id.as_deref(),
-        Some(replay_run_id)
-    );
 }
 
 #[rstest]
@@ -932,15 +923,16 @@ fn kernel_start_quarantined_configured_replay_run_does_not_open_new_run(#[case] 
 #[rstest]
 #[case::missing_blob(false, false)]
 #[case::hash_mismatch(true, true)]
-fn kernel_start_restore_failure_does_not_open_new_run(
+fn kernel_start_rejects_partial_snapshot_with_missing_or_corrupt_blob(
     #[case] seed_blob: bool,
     #[case] bad_hash: bool,
 ) {
     let _guard = lock_kernel_test();
     let tmp = TempDir::new().expect("tempdir");
     let instance_id = UUID4::new();
-    let config = config_with(tmp.path().to_path_buf());
+    let mut config = config_with(tmp.path().to_path_buf());
     let parent_run_id = "parent-run";
+    config.replay_from_run_id = Some(parent_run_id.to_string());
     let instrument = audusd_sim();
     let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -985,8 +977,10 @@ fn kernel_start_restore_failure_does_not_open_new_run(
                 1,
                 snapshot_ref.blob_ref.clone(),
                 content_hash,
+                nautilus_event_store::SnapshotCoverage::Partial,
             ))
             .expect("record snapshot anchor");
+        backend.seal(RunStatus::Ended).expect("seal source");
     }
 
     let mut kernel = NautilusKernelBuilder::default()
@@ -1026,123 +1020,9 @@ fn kernel_start_restore_failure_does_not_open_new_run(
 }
 
 #[rstest]
-fn kernel_start_restores_parent_cache_from_injected_database() {
-    // A real process restart finds an empty in-memory cache; the snapshot blob must
-    // travel back through Cache::load_snapshot_blob -> cache_general() ->
-    // CacheDatabaseAdapter::load(). This test wires a stub adapter through the
-    // kernel builder and asserts the restore succeeds without anyone pre-seeding
-    // the cache.
-    let _guard = lock_kernel_test();
-    let tmp = TempDir::new().expect("tempdir");
-    let instance_id = UUID4::new();
-    let config = config_with(tmp.path().to_path_buf());
-    let parent_run_id = "parent-run";
-    let instrument = audusd_sim();
-    let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
-    let position_id = PositionId::new("P-KERNEL-DB-RESTORE-1");
-    let order = OrderTestBuilder::new(OrderType::Market)
-        .instrument_id(instrument.id)
-        .side(OrderSide::Buy)
-        .quantity(Quantity::from(100_000))
-        .build();
-    let fill = TestOrderEventStubs::filled(
-        &order,
-        &instrument_any,
-        Some(TradeId::new("T-KERNEL-DB-RESTORE-1")),
-        Some(position_id),
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(AccountId::test_default()),
-    );
-    let position = Position::new(&instrument_any, fill.into());
-    let mut snapshot_cache = Cache::default();
-    let snapshot_ref = snapshot_cache
-        .snapshot_position_encoded(&position)
-        .expect("snapshot position");
-    let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
-    let replayed_state = cash_account_state_million_usd("200 USD", "0 USD", "200 USD");
-
-    {
-        let mut backend = RedbBackend::new(config.base_dir.clone());
-        backend
-            .open_run(running_manifest(&config, instance_id, parent_run_id))
-            .expect("open parent run");
-        backend
-            .append_batch(&[append_account_state(1, &anchored_state)])
-            .expect("append anchored state");
-        backend
-            .record_snapshot_anchor(SnapshotAnchor::new(
-                1,
-                snapshot_ref.blob_ref.clone(),
-                compute_snapshot_content_hash(snapshot_ref.blob.as_ref()),
-            ))
-            .expect("record snapshot anchor");
-        backend
-            .append_batch(&[append_account_state(2, &replayed_state)])
-            .expect("append replay tail");
-    }
-
-    let cache_database =
-        StubCacheDatabase::with_blob(snapshot_ref.blob_ref.clone(), snapshot_ref.blob.clone());
-
-    let mut kernel = NautilusKernelBuilder::default()
-        .with_instance_id(instance_id)
-        .with_event_store(event_store_factory(config))
-        .with_cache_database(Box::new(cache_database))
-        .build()
-        .expect("kernel");
-
-    assert!(
-        kernel
-            .cache
-            .borrow()
-            .position_snapshot_bytes(&position.id)
-            .is_none(),
-        "cache must not be pre-seeded with the snapshot blob",
-    );
-
-    kernel.start().expect("start kernel");
-
-    {
-        let cache = kernel.cache.borrow();
-        let frames = cache
-            .position_snapshot_bytes(&position.id)
-            .expect("restored position snapshot");
-        let account = cache
-            .account_owned(&replayed_state.account_id)
-            .expect("replayed account");
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].as_slice(), snapshot_ref.blob.as_ref());
-        assert_eq!(account.events(), vec![replayed_state]);
-    }
-
-    assert_eq!(
-        kernel.event_store().expect("event store").parent_run_id(),
-        Some(parent_run_id)
-    );
-    assert!(
-        kernel
-            .event_store()
-            .expect("event store")
-            .run_id()
-            .is_some()
-    );
-}
-
-#[rstest]
-fn kernel_start_db_load_error_leaves_run_unopened() {
-    // CacheDatabaseAdapter::load() can fail at boot (DB down, decode error). The
-    // kernel must surface that as a refusal to open a fresh run, mirroring the
-    // missing-blob and hash-mismatch cases.
-    let _guard = lock_kernel_test();
-    let tmp = TempDir::new().expect("tempdir");
-    let instance_id = UUID4::new();
-    let config = config_with(tmp.path().to_path_buf());
-    let parent_run_id = "parent-run";
+#[case::healthy(false)]
+#[case::load_error(true)]
+fn snapshot_blob_restore_from_database(#[case] load_error: bool) {
     let instrument = audusd_sim();
     let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -1167,52 +1047,36 @@ fn kernel_start_db_load_error_leaves_run_unopened() {
     let snapshot_ref = snapshot_cache
         .snapshot_position_encoded(&position)
         .expect("snapshot position");
-    let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
 
-    {
-        let mut backend = RedbBackend::new(config.base_dir.clone());
-        backend
-            .open_run(running_manifest(&config, instance_id, parent_run_id))
-            .expect("open parent run");
-        backend
-            .append_batch(&[append_account_state(1, &anchored_state)])
-            .expect("append anchored state");
-        backend
-            .record_snapshot_anchor(SnapshotAnchor::new(
-                1,
-                snapshot_ref.blob_ref.clone(),
-                compute_snapshot_content_hash(snapshot_ref.blob.as_ref()),
-            ))
-            .expect("record snapshot anchor");
+    let database = if load_error {
+        StubCacheDatabase::failing_load("db unavailable")
+    } else {
+        StubCacheDatabase::with_blob(snapshot_ref.blob_ref.clone(), snapshot_ref.blob.clone())
+    };
+    let mut cache = Cache::new(None, Some(Box::new(database)));
+    let anchor = SnapshotAnchor::new(
+        0,
+        snapshot_ref.blob_ref,
+        compute_snapshot_content_hash(snapshot_ref.blob.as_ref()),
+        nautilus_event_store::SnapshotCoverage::Partial,
+    );
+    let result = nautilus_event_store::restore_cache_snapshot_blob(&mut cache, Some(&anchor));
+
+    if load_error {
+        assert!(
+            result
+                .expect_err("database failure")
+                .to_string()
+                .contains("db unavailable")
+        );
+        assert!(cache.position_snapshot_bytes(&position.id).is_none());
+    } else {
+        result.expect("load archive blob");
+        assert_eq!(
+            cache.position_snapshot_bytes(&position.id).expect("frame"),
+            vec![snapshot_ref.blob.to_vec()]
+        );
     }
-
-    let mut kernel = NautilusKernelBuilder::default()
-        .with_instance_id(instance_id)
-        .with_event_store(event_store_factory(config.clone()))
-        .with_cache_database(Box::new(StubCacheDatabase::failing_load("db unavailable")))
-        .build()
-        .expect("kernel");
-
-    kernel
-        .start()
-        .expect_err("startup must reject invalid persisted state");
-
-    let manifests =
-        RedbBackend::list_runs(&config.base_dir, &instance_id.to_string()).expect("list runs");
-
-    assert_eq!(
-        kernel.event_store().expect("event store").parent_run_id(),
-        Some(parent_run_id)
-    );
-    assert!(
-        kernel
-            .event_store()
-            .expect("event store")
-            .run_id()
-            .is_none()
-    );
-    assert_eq!(manifests.len(), 1);
-    assert_eq!(manifests[0].run_id, parent_run_id);
 }
 
 struct StubCacheDatabase {

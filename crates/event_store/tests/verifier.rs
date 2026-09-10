@@ -790,7 +790,12 @@ fn snapshot_anchor_past_durable_watermark_is_a_finding() {
             ])
             .expect("append");
         backend
-            .record_snapshot_anchor(SnapshotAnchor::new(2, "cache://snapshots/2", "blake3:abc"))
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                2,
+                "cache://snapshots/2",
+                "blake3:abc",
+                nautilus_event_store::SnapshotCoverage::Partial,
+            ))
             .expect("record anchor");
         backend.seal(RunStatus::Ended).expect("seal");
     }

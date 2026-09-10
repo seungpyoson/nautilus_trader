@@ -16,27 +16,42 @@
 //! Snapshot anchors recorded by the event store.
 //!
 //! Cache snapshots remain owned by the cache backing store. The event store records only
-//! the durable log high-watermark the snapshot covers plus enough metadata for restore to
-//! fetch the blob and validate its content hash before tail replay resumes at
-//! `seq > high_watermark`.
+//! the durable log high-watermark and declared coverage, plus enough metadata to fetch
+//! and validate the blob. Only a full-cache checkpoint permits prefix skipping.
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::EventStoreError;
+
+/// Cache state represented by an anchored snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotCoverage {
+    /// A subset of cache state, such as one archived position cycle.
+    Partial,
+    /// All cache state represented by the prefix through the anchor watermark,
+    /// including archived position cycles and correction history.
+    FullCache,
+}
 
 /// A pointer from a cache snapshot blob to a durable event-store high-watermark.
 ///
 /// `blob_ref` and `content_hash` are intentionally opaque strings. The cache owns the
 /// storage backend and hash algorithm; the event store only persists the metadata needed
 /// to find the blob and prove the fetched bytes match the snapshot that was anchored.
+/// The producer must declare coverage independently of byte integrity.
+///
+/// Stored anchors without coverage are rejected by the positional codec. They cannot
+/// safely authorize prefix skipping or retention because their coverage is unknown.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotAnchor {
-    /// Largest event-store `seq` covered by the snapshot.
+    /// Durable event-store `seq` when the snapshot was anchored.
     pub high_watermark: u64,
     /// Cache-owned reference to the snapshot blob.
     pub blob_ref: String,
     /// Cache-owned content hash for the snapshot blob.
     pub content_hash: String,
+    /// State covered by the snapshot. A matching hash alone does not establish coverage.
+    pub coverage: SnapshotCoverage,
 }
 
 impl SnapshotAnchor {
@@ -46,12 +61,20 @@ impl SnapshotAnchor {
         high_watermark: u64,
         blob_ref: impl Into<String>,
         content_hash: impl Into<String>,
+        coverage: SnapshotCoverage,
     ) -> Self {
         Self {
             high_watermark,
             blob_ref: blob_ref.into(),
             content_hash: content_hash.into(),
+            coverage,
         }
+    }
+
+    /// Returns whether the producer declares a complete cache checkpoint.
+    #[must_use]
+    pub const fn covers_full_cache(&self) -> bool {
+        matches!(self.coverage, SnapshotCoverage::FullCache)
     }
 }
 
@@ -93,7 +116,12 @@ mod tests {
 
     #[rstest]
     fn anchor_new_sets_all_fields() {
-        let anchor = SnapshotAnchor::new(7, "cache://snapshots/run-1/7", "blake3:abc");
+        let anchor = SnapshotAnchor::new(
+            7,
+            "cache://snapshots/run-1/7",
+            "blake3:abc",
+            SnapshotCoverage::Partial,
+        );
 
         assert_eq!(anchor.high_watermark, 7);
         assert_eq!(anchor.blob_ref, "cache://snapshots/run-1/7");
@@ -110,7 +138,7 @@ mod tests {
 
     #[rstest]
     fn validate_rejects_anchor_past_durable_watermark() {
-        let anchor = SnapshotAnchor::new(8, "blob", "hash");
+        let anchor = SnapshotAnchor::new(8, "blob", "hash", SnapshotCoverage::Partial);
         let err = validate_new_anchor(&anchor, 7, None).expect_err("must reject");
 
         match err {
@@ -126,8 +154,8 @@ mod tests {
 
     #[rstest]
     fn validate_rejects_anchor_older_than_latest() {
-        let latest = SnapshotAnchor::new(9, "latest", "hash-latest");
-        let anchor = SnapshotAnchor::new(8, "older", "hash-older");
+        let latest = SnapshotAnchor::new(9, "latest", "hash-latest", SnapshotCoverage::Partial);
+        let anchor = SnapshotAnchor::new(8, "older", "hash-older", SnapshotCoverage::Partial);
         let err = validate_new_anchor(&anchor, 10, Some(&latest)).expect_err("must reject");
 
         match err {
@@ -140,9 +168,9 @@ mod tests {
 
     #[rstest]
     fn validate_accepts_equal_or_newer_anchor() {
-        let latest = SnapshotAnchor::new(9, "latest", "hash-latest");
-        let same = SnapshotAnchor::new(9, "same", "hash-same");
-        let newer = SnapshotAnchor::new(10, "newer", "hash-newer");
+        let latest = SnapshotAnchor::new(9, "latest", "hash-latest", SnapshotCoverage::Partial);
+        let same = SnapshotAnchor::new(9, "same", "hash-same", SnapshotCoverage::Partial);
+        let newer = SnapshotAnchor::new(10, "newer", "hash-newer", SnapshotCoverage::Partial);
 
         validate_new_anchor(&same, 10, Some(&latest)).expect("same hwm accepted");
         validate_new_anchor(&newer, 10, Some(&latest)).expect("newer hwm accepted");
