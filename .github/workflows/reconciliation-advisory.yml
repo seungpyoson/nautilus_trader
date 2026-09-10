@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      REVIEWED_SHA: 7be16b0367680e6c5eeb70f23f26df971a1d832e
+      REVIEWED_SHA: 725e5aa6b2ee4198c298814eeba432fa86d11cc0
       CARGO_BUILD_JOBS: "2"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -31,7 +31,7 @@ jobs:
       - name: Check out reviewed source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 7be16b0367680e6c5eeb70f23f26df971a1d832e
+          ref: 725e5aa6b2ee4198c298814eeba432fa86d11cc0
           persist-credentials: false
 
       - name: Verify reviewed commit
@@ -47,30 +47,35 @@ jobs:
           free-disk-space: "true"
           rust-cache-key: reconciliation-application-ci-pr
 
-      # Diagnose fee revisions and flip-cycle preservation; failures are evidence, not readiness.
-      - name: Fee revision and native flip correction diagnostics
+      # Check native construction and snapshots, retaining the unresolved correction diagnostics.
+      - name: Native position construction and affected consumer tests
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
         run: |
           set -o pipefail
           cargo nextest run --locked --cargo-profile ci-pr --profile ci \
-            -p nautilus-event-store -p nautilus-execution \
+            -p nautilus-model -p nautilus-common -p nautilus-execution -p nautilus-event-store \
+            -p nautilus-portfolio -p nautilus-system -p nautilus-live -p nautilus-backtest \
             --lib --tests --no-fail-fast \
-            -E 'test(replay_fill_corrections_match_live_accounting) | test(test_entry_fill_void_preserves_native_flip_cycle_accounting)' \
-            2>&1 | tee "$RUNNER_TEMP/fee-revision-cycle-diagnostics.log"
+            2>&1 | tee "$RUNNER_TEMP/native-position-construction.log"
 
       - name: Preserve affected suite output
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fee-revision-cycle-diagnostics-${{ env.REVIEWED_SHA }}
-          path: ${{ runner.temp }}/fee-revision-cycle-diagnostics.log
+          name: native-position-construction-${{ env.REVIEWED_SHA }}
+          path: ${{ runner.temp }}/native-position-construction.log
           if-no-files-found: error
 
       - name: Affected library and test Clippy
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash
-        run: cargo clippy --locked --profile ci-pr -p nautilus-event-store -p nautilus-execution --lib --tests -- -D warnings
+        run: cargo clippy --locked --profile ci-pr -p nautilus-model -p nautilus-common -p nautilus-execution -p nautilus-event-store -p nautilus-portfolio -p nautilus-system -p nautilus-live -p nautilus-backtest --lib --tests -- -D warnings
+
+      - name: Standalone live library Clippy
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        shell: bash
+        run: cargo clippy --locked --profile ci-pr -p nautilus-live --no-default-features --lib -- -D warnings
 
       - name: Verify source remained unchanged
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
