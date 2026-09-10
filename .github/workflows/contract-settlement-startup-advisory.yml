@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      SOURCE_SHA: 6d4a4c0949470d72ca24afb45a8d32468f17cc97
+      SOURCE_SHA: a047513d08229acc5236a0a07a81d12db9ff2b6e
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "1"
@@ -30,7 +30,7 @@ jobs:
       - name: Check out candidate source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 6d4a4c0949470d72ca24afb45a8d32468f17cc97
+          ref: a047513d08229acc5236a0a07a81d12db9ff2b6e
           fetch-depth: 0
           persist-credentials: false
 
