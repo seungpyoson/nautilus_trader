@@ -2680,7 +2680,6 @@ pub(crate) mod serial_tests {
             Some(LiquiditySide::Taker),
             Some(Money::from("0.10 USDC")),
             Some(UnixNanos::from(1)),
-            None,
             Some(account_id),
         ) else {
             unreachable!()
@@ -2718,7 +2717,7 @@ pub(crate) mod serial_tests {
             cache
                 .add_order(order, Some(position_id), Some(client_id), false)
                 .unwrap();
-            cache.add_position(&position, OmsType::Netting).unwrap();
+            cache.add_position(&position, OmsType::Hedging).unwrap();
         }
         let mut report = ExecutionMassStatus::new(
             client_id,

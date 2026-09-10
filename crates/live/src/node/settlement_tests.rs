@@ -1285,3 +1285,62 @@ async fn contract_settlement_inventory_requires_matching_account_and_instrument(
     );
     f.assert_settled("5.90 USDC", 1);
 }
+
+#[rstest]
+#[case::matching_history(true)]
+#[case::conflicting_history(false)]
+fn contract_settlement_mass_status_replays_prior_cycles_once(#[case] matching: bool) {
+    let mut f = Fixture::new();
+    let opening = f.fill("OWNER-001", "OPEN", OrderSide::Buy, "10.00", "0.400");
+    f.close("1.000", InstrumentCloseType::ContractExpired);
+    let late_1 = f.fill("OWNER-001", "LATE-1", OrderSide::Buy, "2.50", "0.400");
+    let late_2 = f.fill("OWNER-001", "LATE-2", OrderSide::Buy, "2.50", "0.400");
+    assert_eq!(opening.ts_event, late_1.ts_event);
+    assert_eq!(opening.ts_event, late_2.ts_event);
+    f.assert_settled("8.70 USDC", 3);
+
+    let mut mass = ExecutionMassStatus::new(
+        f.client_id,
+        f.account_id,
+        f.instrument.id().venue,
+        opening.ts_event,
+        None,
+    );
+    mass.set_report_window(None, true);
+    mass.add_fill_reports(
+        [opening, late_1, late_2]
+            .into_iter()
+            .map(|fill| {
+                FillReport::new(
+                    fill.account_id,
+                    fill.instrument_id,
+                    fill.venue_order_id,
+                    fill.trade_id,
+                    fill.order_side,
+                    fill.last_qty,
+                    fill.last_px,
+                    if matching {
+                        fill.commission.unwrap()
+                    } else {
+                        Money::from("0.20 USDC")
+                    },
+                    fill.liquidity_side,
+                    Some(fill.client_order_id),
+                    None,
+                    fill.ts_event,
+                    fill.ts_init,
+                    None,
+                )
+            })
+            .collect(),
+    );
+    for _ in 0..2 {
+        let result = f
+            .node
+            .exec_manager
+            .reconcile_execution_mass_status_ref(&mass, &f.node.kernel.exec_engine);
+        f.node.process_pending_settlements();
+        assert_eq!(result.summary.all_received_reports_reconciled(), matching);
+        f.assert_settled("8.70 USDC", 3);
+    }
+}
