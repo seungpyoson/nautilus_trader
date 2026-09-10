@@ -35,6 +35,7 @@ use nautilus_model::{
     position::Position,
     types::Money,
 };
+use serde::{Deserialize, Serialize};
 
 use super::Cache;
 
@@ -61,22 +62,32 @@ impl CacheSnapshotRef {
     }
 }
 
+/// Distinguishes a snapshot of one cycle from a correction's aggregate of earlier cycles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum PositionSnapshotKind {
+    Cycle,
+    RebuiltPriorCycles,
+}
+
 /// One frame in a position's NETTING snapshot history.
 ///
-/// A frame keeps the archived position and encodes it only when a consumer asks for the bytes,
-/// so a run with no durable snapshot sink never pays the encode on the order path. A frame
-/// restored from durable bytes keeps those exact bytes, since anchors record their content hash.
-#[derive(Debug)]
+/// Encoding is deferred until its bytes are needed. Restored frames preserve their exact bytes,
+/// including their kind, because event-store anchors record the content hash.
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) struct PositionSnapshotFrame {
+    kind: PositionSnapshotKind,
+    #[serde(flatten)]
     position: Position,
+    #[serde(skip)]
     encoded: OnceCell<Bytes>,
 }
 
 impl PositionSnapshotFrame {
-    fn new(position: Position, encoded: Option<Bytes>) -> Self {
+    fn new(position: Position, kind: PositionSnapshotKind) -> Self {
         Self {
+            kind,
             position,
-            encoded: encoded.map_or_else(OnceCell::new, OnceCell::from),
+            encoded: OnceCell::new(),
         }
     }
 
@@ -85,7 +96,7 @@ impl PositionSnapshotFrame {
             return Ok(encoded.clone());
         }
 
-        let encoded = Bytes::from(serde_json::to_vec(&self.position)?);
+        let encoded = Bytes::from(serde_json::to_vec(self)?);
         let _ = self.encoded.set(encoded.clone());
 
         Ok(encoded)
@@ -105,14 +116,13 @@ impl Cache {
     ///
     /// Returns an error if serializing or storing the position snapshot fails.
     pub fn snapshot_position(&mut self, position: &Position) -> anyhow::Result<()> {
-        let (blob_ref, snapshot) = self.build_position_snapshot(position);
+        let (blob_ref, snapshot) =
+            self.build_position_snapshot(position, PositionSnapshotKind::Cycle);
 
-        let encoded = if self.database.is_some() {
-            Some(self.persist_position_snapshot(&blob_ref, &snapshot)?)
-        } else {
-            None
-        };
-        self.store_position_snapshot(position.id, snapshot, encoded);
+        if self.database.is_some() {
+            self.persist_position_snapshot(&blob_ref, &snapshot)?;
+        }
+        self.store_position_snapshot(position.id, snapshot);
 
         Ok(())
     }
@@ -129,10 +139,11 @@ impl Cache {
         &mut self,
         position: &Position,
     ) -> anyhow::Result<CacheSnapshotRef> {
-        let (blob_ref, snapshot) = self.build_position_snapshot(position);
+        let (blob_ref, snapshot) =
+            self.build_position_snapshot(position, PositionSnapshotKind::Cycle);
         let encoded = self.persist_position_snapshot(&blob_ref, &snapshot)?;
 
-        self.store_position_snapshot(position.id, snapshot, Some(encoded.clone()));
+        self.store_position_snapshot(position.id, snapshot);
 
         Ok(CacheSnapshotRef::new(blob_ref, encoded))
     }
@@ -166,9 +177,10 @@ impl Cache {
         self.bump_position_snapshot_revision(position.id);
 
         if let Some(closed_cycles_pnl) = closed_cycles_pnl {
-            let (_, mut settled) = self.build_position_snapshot(position);
-            settled.realized_pnl = Some(closed_cycles_pnl);
-            self.store_position_snapshot(position.id, settled, None);
+            let (_, mut settled) =
+                self.build_position_snapshot(position, PositionSnapshotKind::RebuiltPriorCycles);
+            settled.position.realized_pnl = Some(closed_cycles_pnl);
+            self.store_position_snapshot(position.id, settled);
         }
     }
 
@@ -183,7 +195,11 @@ impl Cache {
             .or_default() += 1;
     }
 
-    fn build_position_snapshot(&self, position: &Position) -> (String, Position) {
+    fn build_position_snapshot(
+        &self,
+        position: &Position,
+        kind: PositionSnapshotKind,
+    ) -> (String, PositionSnapshotFrame) {
         let position_id = position.id;
 
         let mut copied_position = position.clone();
@@ -198,15 +214,15 @@ impl Cache {
             self.position_snapshot_count(&position_id),
         );
 
-        (blob_ref, copied_position)
+        (blob_ref, PositionSnapshotFrame::new(copied_position, kind))
     }
 
     fn persist_position_snapshot(
         &mut self,
         blob_ref: &str,
-        snapshot: &Position,
+        snapshot: &PositionSnapshotFrame,
     ) -> anyhow::Result<Bytes> {
-        let encoded = Bytes::from(serde_json::to_vec(snapshot)?);
+        let encoded = snapshot.encoded()?;
         self.add(blob_ref, encoded.clone())?;
 
         Ok(encoded)
@@ -216,15 +232,71 @@ impl Cache {
     fn store_position_snapshot(
         &mut self,
         position_id: PositionId,
-        snapshot: Position,
-        encoded: Option<Bytes>,
+        snapshot: PositionSnapshotFrame,
     ) {
-        log::debug!("Snapshot {snapshot}");
+        log::debug!("Snapshot {}", snapshot.position);
 
         self.position_snapshots
             .entry(position_id)
             .or_default()
-            .push(PositionSnapshotFrame::new(snapshot, encoded));
+            .push(snapshot);
+    }
+
+    /// Returns the last archived amount when that frame represents the supplied closed cycle.
+    ///
+    /// Opening-fill identity survives later fee or funding changes within the same cycle.
+    /// The saved frame may have been taken while that cycle was still open.
+    /// Rebuilt prior-cycle totals never represent the current cycle, even when their copied
+    /// position fields or monetary amounts coincide. Reads the cached frame without cloning it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a potentially matching cycle lacks its opening fill identity,
+    /// or when a matching cycle lacks the current or archived PnL required for deduplication.
+    pub fn position_snapshot_pnl_for_current_cycle(
+        &self,
+        position: &Position,
+    ) -> anyhow::Result<Option<Money>> {
+        let Some(frame) = self
+            .position_snapshots
+            .get(&position.id)
+            .and_then(|frames| frames.last())
+        else {
+            return Ok(None);
+        };
+
+        if position.is_open() || frame.kind == PositionSnapshotKind::RebuiltPriorCycles {
+            return Ok(None);
+        }
+        let opening_fill = position.events.first().ok_or_else(|| {
+            anyhow::anyhow!(
+                "closed position {} has no opening fill identity",
+                position.id
+            )
+        })?;
+        let archived_opening_fill = frame.position.events.first().ok_or_else(|| {
+            anyhow::anyhow!(
+                "position archive {} has no opening fill identity",
+                position.id
+            )
+        })?;
+        let same_cycle = opening_fill.event_id == archived_opening_fill.event_id
+            && position.account_id == frame.position.account_id
+            && position.instrument_id == frame.position.instrument_id
+            && position.strategy_id == frame.position.strategy_id;
+
+        if !same_cycle {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            position.realized_pnl.is_some(),
+            "closed position {} has no realized PnL for its archived cycle",
+            position.id,
+        );
+        let archived_pnl = frame.position.realized_pnl.ok_or_else(|| {
+            anyhow::anyhow!("position archive {} has no realized PnL", position.id)
+        })?;
+        Ok(Some(archived_pnl))
     }
 
     fn position_snapshot_frame(&self, blob_ref: &str) -> Option<&PositionSnapshotFrame> {
@@ -264,7 +336,8 @@ impl Cache {
     ///
     /// Returns an error if the blob reference is unsupported, malformed, skips earlier
     /// snapshot frames, conflicts with an existing frame, or does not decode to the expected
-    /// position snapshot.
+    /// position snapshot. Legacy blobs without a frame kind are rejected because a cycle and a
+    /// rebuilt prior-cycle total cannot be distinguished from position fields alone.
     pub fn restore_snapshot_blob(&mut self, blob_ref: &str, blob: Bytes) -> anyhow::Result<()> {
         let (position_id, snapshot_index) = parse_position_snapshot_blob_ref(blob_ref)?;
         let restored = decode_position_snapshot_blob(&position_id, blob.as_ref())?;
@@ -278,7 +351,8 @@ impl Cache {
                 );
             }
             None if frames.len() == snapshot_index => {
-                frames.push(PositionSnapshotFrame::new(restored, Some(blob.clone())));
+                let _ = restored.encoded.set(blob.clone());
+                frames.push(restored);
             }
             None => {
                 anyhow::bail!(
@@ -343,7 +417,8 @@ impl Cache {
 
     /// Gets the serialized position snapshot frames for the `position_id`.
     ///
-    /// Each element in the returned vector is one JSON-encoded [`Position`] snapshot,
+    /// Each element in the returned vector is one JSON-encoded frame with an explicit kind
+    /// and flattened [`Position`] fields,
     /// in the order they were taken. Frames that fail to serialize are skipped with a warning.
     #[must_use]
     pub fn position_snapshot_bytes(&self, position_id: &PositionId) -> Option<Vec<Vec<u8>>> {
@@ -467,8 +542,9 @@ fn parse_position_snapshot_blob_ref(blob_ref: &str) -> anyhow::Result<(PositionI
 fn decode_position_snapshot_blob(
     position_id: &PositionId,
     blob: &[u8],
-) -> anyhow::Result<Position> {
-    let snapshot = serde_json::from_slice::<Position>(blob)?;
+) -> anyhow::Result<PositionSnapshotFrame> {
+    let frame = serde_json::from_slice::<PositionSnapshotFrame>(blob)?;
+    let snapshot = &frame.position;
     let expected_prefix = format!("{}-", position_id.as_str());
 
     let Some(snapshot_uuid) = snapshot.id.as_str().strip_prefix(&expected_prefix) else {
@@ -485,5 +561,5 @@ fn decode_position_snapshot_blob(
         );
     }
 
-    Ok(snapshot)
+    Ok(frame)
 }

@@ -8716,6 +8716,68 @@ fn test_restore_position_snapshot_blob(mut cache: Cache) {
 }
 
 #[rstest]
+#[case::cycle(false)]
+#[case::rebuilt_prior_cycles(true)]
+fn test_position_snapshot_cycle_identity_survives_restore(#[case] rebuilt: bool) {
+    let mut position = snapshot_test_position();
+    let mut closing_fill = position.events[0].clone();
+    closing_fill.event_id = UUID4::new();
+    closing_fill.trade_id = TradeId::new("T-CLOSE");
+    closing_fill.order_side = OrderSide::Sell;
+    position.apply(&closing_fill);
+    assert!(position.is_closed());
+    assert_eq!(position.realized_pnl, Some(Money::from("-4 USD")));
+    let mut source = Cache::default();
+
+    if rebuilt {
+        source.settle_position_snapshots(&position, position.realized_pnl);
+    } else {
+        source.snapshot_position(&position).unwrap();
+    }
+    let expected = if rebuilt { None } else { position.realized_pnl };
+    assert_eq!(
+        source
+            .position_snapshot_pnl_for_current_cycle(&position)
+            .unwrap(),
+        expected
+    );
+    let blob_ref = position_snapshot_blob_ref(&position.id, 0);
+    let blob = source.load_snapshot_blob(&blob_ref).unwrap().unwrap();
+    let mut restored = Cache::default();
+    restored.restore_snapshot_blob(&blob_ref, blob).unwrap();
+    assert_eq!(
+        restored
+            .position_snapshot_pnl_for_current_cycle(&position)
+            .unwrap(),
+        expected
+    );
+}
+
+#[rstest]
+fn test_restore_position_snapshot_blob_requires_explicit_kind() {
+    let mut source = Cache::default();
+    let position = snapshot_test_position();
+    let snapshot_ref = source.snapshot_position_encoded(&position).unwrap();
+    let mut encoded: serde_json::Value = serde_json::from_slice(&snapshot_ref.blob).unwrap();
+    encoded.as_object_mut().unwrap().remove("kind").unwrap();
+    let legacy = Bytes::from(serde_json::to_vec(&encoded).unwrap());
+    let mut rejected = Cache::default();
+
+    let error = rejected
+        .restore_snapshot_blob(&snapshot_ref.blob_ref, legacy)
+        .unwrap_err();
+    assert!(error.to_string().contains("kind"), "{error}");
+    assert_eq!(rejected.position_snapshot_count(&position.id), 0);
+    assert_eq!(rejected.get(&snapshot_ref.blob_ref).unwrap(), None);
+
+    let mut healthy = Cache::default();
+    healthy
+        .restore_snapshot_blob(&snapshot_ref.blob_ref, snapshot_ref.blob)
+        .unwrap();
+    assert_eq!(healthy.position_snapshot_count(&position.id), 1);
+}
+
+#[rstest]
 fn test_restore_position_snapshot_blob_keeps_the_restored_bytes_verbatim() {
     let mut source_cache = Cache::default();
     let position = snapshot_test_position();
@@ -8725,7 +8787,8 @@ fn test_restore_position_snapshot_blob_keeps_the_restored_bytes_verbatim() {
         .position_snapshots(Some(&position_id), None)
         .remove(0);
     // Same value, different bytes: anchors hash the frame, so re-encoding it would break them
-    let pretty = Bytes::from(serde_json::to_vec_pretty(&snapshot).unwrap());
+    let encoded: serde_json::Value = serde_json::from_slice(&snapshot_ref.blob).unwrap();
+    let pretty = Bytes::from(serde_json::to_vec_pretty(&encoded).unwrap());
     let mut cache = Cache::default();
 
     cache
@@ -8747,7 +8810,7 @@ fn test_restore_position_snapshot_blob_keeps_the_restored_bytes_verbatim() {
 fn test_restore_position_snapshot_blob_rejects_wrong_position(mut cache: Cache) {
     let mut position = snapshot_test_position();
     position.id = PositionId::new("OTHER-POSITION-1");
-    let blob = Bytes::from(serde_json::to_vec(&position).unwrap());
+    let blob = cache.snapshot_position_encoded(&position).unwrap().blob;
 
     let err = cache
         .restore_snapshot_blob("cache://position-snapshots/P-1/0", blob)
