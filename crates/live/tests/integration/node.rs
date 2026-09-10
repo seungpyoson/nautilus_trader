@@ -2611,6 +2611,7 @@ pub(crate) mod serial_tests {
         #[case] reported_quantity: &str,
         #[case] expected_reconciled: bool,
         #[values(false, true)] run: bool,
+        #[values(false, true)] close_callback: bool,
     ) {
         use nautilus_common::messages::DataEvent;
         use nautilus_live::runner::AsyncRunner;
@@ -2758,16 +2759,30 @@ pub(crate) mod serial_tests {
             Some(Decimal::from_str_exact("0.4").unwrap()),
         )]);
         *state.mass_status.lock() = Some(report);
-        // Drive the native data path; settlement remains queued until the node's startup drain.
-        AsyncRunner::handle_data_event(DataEvent::Data(Data::InstrumentClose(
-            InstrumentClose::new(
-                instrument_id,
-                Price::from("1.000"),
-                InstrumentCloseType::ContractExpired,
-                instrument.expiration_ns().unwrap(),
-                instrument.expiration_ns().unwrap(),
-            ),
-        )));
+        let close = InstrumentClose::new(
+            instrument_id,
+            Price::from("1.000"),
+            InstrumentCloseType::ContractExpired,
+            instrument.expiration_ns().unwrap(),
+            instrument.expiration_ns().unwrap(),
+        );
+        if close_callback {
+            // The native data callback queues settlement until the startup drain.
+            AsyncRunner::handle_data_event(DataEvent::Data(Data::InstrumentClose(close)));
+        } else {
+            // Restored native state does not publish a fresh close callback.
+            node.kernel()
+                .cache()
+                .borrow_mut()
+                .add_instrument_close(close)
+                .unwrap();
+        }
+        assert!(
+            node.kernel()
+                .cache()
+                .borrow()
+                .is_position_open(&position_id)
+        );
         let observed = Arc::new(Mutex::new(None));
         node.add_actor(ReconciliationSummaryActor {
             core: DataActorCore::new(DataActorConfig::default()),

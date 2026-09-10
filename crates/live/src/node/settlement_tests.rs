@@ -674,7 +674,7 @@ async fn contract_settlement_failure_blocks_queued_trading_and_returns_error(
     msgbus::unsubscribe_order_events("events.order.*".into(), &handler);
     let error = f.node.finalize_stop().await.unwrap_err().to_string();
     let expected = if application_failure {
-        "Settlement did not close position"
+        "Settlement event application was incomplete"
     } else {
         "Conflicting contract close"
     };
@@ -972,7 +972,7 @@ fn contract_settlement_does_not_relax_unexpired_reduce_only() {
 
 #[rstest]
 #[tokio::test]
-async fn contract_settlement_startup_drain_precedes_reconciliation(
+async fn contract_settlement_startup_drains_before_report_failure(
     #[values(false, true)] close_callback: bool,
 ) {
     let mut f = Fixture::new();
@@ -1003,10 +1003,17 @@ async fn contract_settlement_startup_drain_precedes_reconciliation(
             .borrow()
             .is_position_open(&f.position_id("OWNER-001"))
     );
-    f.node.perform_startup_reconciliation().await.unwrap();
-    f.assert_settled("5.90 USDC", 1);
-    f.node.perform_startup_reconciliation().await.unwrap();
-    f.assert_settled("5.90 USDC", 1);
+    for _ in 0..2 {
+        // The order-only stub cannot provide startup reports. Settlement must finish first.
+        let Err(error) = f.node.perform_startup_reconciliation().await else {
+            panic!("unsupported report collection must fail startup");
+        };
+        assert!(
+            format!("{error:#}").contains("order status reports are unsupported by SETTLEMENT"),
+            "unexpected startup failure: {error:#}",
+        );
+        f.assert_settled("5.90 USDC", 1);
+    }
 }
 
 #[rstest]
