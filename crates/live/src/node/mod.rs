@@ -1031,8 +1031,8 @@ impl LiveNode {
         };
         Ok(StartupReconciliationAttempt {
             summary,
-            reports,
             deadline,
+            reports,
         })
     }
 

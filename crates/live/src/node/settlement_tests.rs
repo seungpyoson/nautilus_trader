@@ -748,7 +748,7 @@ async fn contract_settlement_final_drain_gates_queued_trading(
     msgbus::subscribe_order_events("events.order.*".into(), order_handler.clone(), None);
     match delivery {
         "settlement" => {
-            AsyncRunner::handle_data_event(DataEvent::Data(Data::InstrumentClose(close)))
+            AsyncRunner::handle_data_event(DataEvent::Data(Data::InstrumentClose(close)));
         }
         "queued" => data_sender
             .send(DataEvent::Data(Data::InstrumentClose(close)))
