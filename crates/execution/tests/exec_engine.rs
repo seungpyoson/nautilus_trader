@@ -72,8 +72,8 @@ use nautilus_model::{
         OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderUpdated,
         PositionEvent,
         order::spec::{
-            OrderCancelRejectedSpec, OrderCanceledSpec, OrderExpiredSpec, OrderFillVoidedSpec,
-            OrderFilledSpec, OrderModifyRejectedSpec, OrderPendingCancelSpec,
+            OrderCancelRejectedSpec, OrderCanceledSpec, OrderDeniedSpec, OrderExpiredSpec,
+            OrderFillVoidedSpec, OrderFilledSpec, OrderModifyRejectedSpec, OrderPendingCancelSpec,
             OrderPendingUpdateSpec, OrderRejectedSpec, OrderUpdatedSpec,
         },
     },
@@ -117,6 +117,174 @@ fn execution_engine() -> ExecutionEngine {
     let cache = Rc::new(RefCell::new(Cache::default()));
 
     ExecutionEngine::new(clock, cache, None)
+}
+
+fn register_applied_portfolio_stub() {
+    msgbus::register_order_event_endpoint(
+        MessagingSwitchboard::portfolio_update_order(),
+        TypedIntoHandler::from(|_: OrderEventAny| Some(EventApplicationOutcome::Applied)),
+    );
+}
+
+#[rstest]
+#[case::unassigned(false, false, EventApplicationOutcome::Applied, OrderStatus::Denied)]
+#[case::known_cash(true, true, EventApplicationOutcome::Applied, OrderStatus::Submitted)]
+#[case::unknown_account(
+    true,
+    false,
+    EventApplicationOutcome::Incomplete,
+    OrderStatus::Submitted
+)]
+fn test_order_application_distinguishes_no_account_from_unknown_account(
+    mut execution_engine: ExecutionEngine,
+    #[case] assigned: bool,
+    #[case] account_available: bool,
+    #[case] expected: EventApplicationOutcome,
+    #[case] expected_status: OrderStatus,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let instrument = audusd_sim();
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .build();
+    let account_id = AccountId::test_default();
+    {
+        let mut cache = execution_engine.cache().borrow_mut();
+        cache.add_instrument(instrument.clone().into()).unwrap();
+        cache.add_order(order.clone(), None, None, false).unwrap();
+        if account_available {
+            cache.add_account(CashAccount::default().into()).unwrap();
+        }
+    }
+    let received = Rc::new(RefCell::new(Vec::new()));
+    msgbus::register_order_event_endpoint(
+        MessagingSwitchboard::portfolio_update_order(),
+        TypedIntoHandler::from({
+            let received = Rc::clone(&received);
+            move |event: OrderEventAny| {
+                received.borrow_mut().push(event);
+                Some(EventApplicationOutcome::Applied)
+            }
+        }),
+    );
+    let event = if assigned {
+        TestOrderEventStubs::submitted(&order, account_id)
+    } else {
+        OrderEventAny::Denied(
+            OrderDeniedSpec::builder()
+                .instrument_id(instrument.id())
+                .client_order_id(order.client_order_id())
+                .build(),
+        )
+    };
+    assert_eq!(execution_engine.process_with_outcome(&event), expected);
+    assert_eq!(
+        execution_engine
+            .cache()
+            .borrow()
+            .order(&order.client_order_id())
+            .unwrap()
+            .status(),
+        expected_status,
+    );
+    assert_eq!(
+        received.borrow().len(),
+        usize::from(assigned && !account_available)
+    );
+}
+
+#[rstest]
+#[case(AccountType::Cash)]
+#[case(AccountType::Wallet)]
+fn test_fill_void_calls_portfolio_once_after_position_correction(
+    mut execution_engine: ExecutionEngine,
+    #[case] account_type: AccountType,
+    #[values(
+        Some(EventApplicationOutcome::Applied),
+        Some(EventApplicationOutcome::Incomplete),
+        None
+    )]
+    portfolio_outcome: Option<EventApplicationOutcome>,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    register_applied_portfolio_stub();
+    let account_id = AccountId::test_default();
+    let total = Money::from("1000000 USD");
+    let account_state = AccountState::new(
+        account_id,
+        account_type,
+        vec![AccountBalance::new(
+            total,
+            Money::zero(Currency::USD()),
+            total,
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        0.into(),
+        0.into(),
+        (account_type != AccountType::Wallet).then_some(Currency::USD()),
+    );
+    let (instrument, order) =
+        prepare_accepted_order_with_account(&mut execution_engine, account_state.into());
+    let fill = build_order_filled(
+        order.trader_id(),
+        order.strategy_id(),
+        instrument.id(),
+        order.client_order_id(),
+        VenueOrderId::from("V-001"),
+        account_id,
+        TradeId::from("T-VOID-ONCE"),
+        order.order_side(),
+        order.order_type(),
+        order.quantity(),
+        Price::from("1.00000"),
+        instrument.quote_currency(),
+        LiquiditySide::Maker,
+        None,
+        Some(Money::from("2 USD")),
+    );
+    assert_eq!(
+        execution_engine.process_with_outcome(&OrderEventAny::Filled(fill)),
+        EventApplicationOutcome::Applied
+    );
+    let event = build_fill_void_from_cached_fill(
+        &execution_engine,
+        order.client_order_id().as_str(),
+        "T-VOID-ONCE",
+        Quantity::from(50_000),
+    );
+    let received = Rc::new(RefCell::new(Vec::new()));
+    msgbus::register_order_event_endpoint(
+        MessagingSwitchboard::portfolio_update_order(),
+        TypedIntoHandler::from({
+            let cache = Rc::clone(execution_engine.cache());
+            let received = Rc::clone(&received);
+            move |event: OrderEventAny| {
+                let cache = cache.borrow();
+                let positions = cache.positions_open(
+                    None,
+                    Some(&event.instrument_id()),
+                    None,
+                    Some(&account_id),
+                    None,
+                );
+                assert_eq!(positions.len(), 1);
+                assert_eq!(positions[0].quantity, Quantity::from(50_000));
+                assert_eq!(
+                    cache.order(&event.client_order_id()).unwrap().filled_qty(),
+                    Quantity::from(50_000)
+                );
+                received.borrow_mut().push(event);
+                portfolio_outcome
+            }
+        }),
+    );
+    assert_eq!(
+        execution_engine.process_with_outcome(&event),
+        portfolio_outcome.unwrap_or(EventApplicationOutcome::Incomplete),
+    );
+    assert_eq!(received.borrow().len(), 1);
 }
 
 #[fixture]
@@ -2769,6 +2937,12 @@ fn test_process_closing_fill_updates_cache_before_publishing_position_closed(
 #[rstest]
 fn test_process_leg_fill_without_order_updates_position_and_publishes_order_before_position(
     mut execution_engine: ExecutionEngine,
+    #[values(
+        Some(EventApplicationOutcome::Applied),
+        Some(EventApplicationOutcome::Incomplete),
+        None
+    )]
+    portfolio_outcome: Option<EventApplicationOutcome>,
 ) {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
 
@@ -2830,7 +3004,7 @@ fn test_process_leg_fill_without_order_updates_position_and_publishes_order_befo
         let receiver = portfolio_handler;
         TypedIntoHandler::from_with_id(receiver.id(), move |event| {
             receiver.handle(event);
-            None
+            portfolio_outcome
         })
     });
 
@@ -2849,7 +3023,10 @@ fn test_process_leg_fill_without_order_updates_position_and_publishes_order_befo
         .position(&expected_position_id)
         .expect("leg fill should open a position");
 
-    assert_eq!(outcome, EventApplicationOutcome::Applied);
+    assert_eq!(
+        outcome,
+        portfolio_outcome.unwrap_or(EventApplicationOutcome::Incomplete)
+    );
     assert!(received_fills.borrow().is_empty());
     assert_eq!(received_portfolio.len(), 1);
     let OrderEventAny::Filled(portfolio_fill) = &received_portfolio[0].0 else {
@@ -3212,14 +3389,20 @@ fn test_reconciliation_projection_rejects_orderless_leg(
 }
 
 #[rstest]
-#[case(false, EventApplicationOutcome::Incomplete)]
-#[case(true, EventApplicationOutcome::Applied)]
+#[case(false, false, EventApplicationOutcome::Incomplete)]
+#[case(false, true, EventApplicationOutcome::Incomplete)]
+#[case(true, false, EventApplicationOutcome::Incomplete)]
+#[case(true, true, EventApplicationOutcome::Applied)]
 fn test_fill_application_outcome_requires_position_account(
     mut execution_engine: ExecutionEngine,
     #[case] account_available: bool,
+    #[case] portfolio_available: bool,
     #[case] expected: EventApplicationOutcome,
 ) {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    if portfolio_available {
+        register_applied_portfolio_stub();
+    }
     let instrument = InstrumentAny::from(audusd_sim());
     let account_id = AccountId::test_default();
     let mut order = OrderTestBuilder::new(OrderType::Market)
@@ -3327,6 +3510,12 @@ enum PortfolioNonFillEventKind {
 #[rstest]
 fn test_process_cash_account_fill_sends_portfolio_update_order_endpoint(
     mut execution_engine: ExecutionEngine,
+    #[values(
+        Some(EventApplicationOutcome::Applied),
+        Some(EventApplicationOutcome::Incomplete),
+        None
+    )]
+    portfolio_outcome: Option<EventApplicationOutcome>,
 ) {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
 
@@ -3353,7 +3542,7 @@ fn test_process_cash_account_fill_sends_portfolio_update_order_endpoint(
         let receiver = handler;
         TypedIntoHandler::from_with_id(receiver.id(), move |event| {
             receiver.handle(event);
-            None
+            portfolio_outcome
         })
     });
 
@@ -3375,7 +3564,10 @@ fn test_process_cash_account_fill_sends_portfolio_update_order_endpoint(
         Some(Money::from("2 USD")),
     ));
 
-    execution_engine.process(&event);
+    assert_eq!(
+        execution_engine.process_with_outcome(&event),
+        portfolio_outcome.unwrap_or(EventApplicationOutcome::Incomplete),
+    );
 
     let received = received.borrow();
     assert_eq!(received.len(), 1);
@@ -3383,6 +3575,13 @@ fn test_process_cash_account_fill_sends_portfolio_update_order_endpoint(
     assert_eq!(received[0].0.client_order_id(), order.client_order_id());
     assert_eq!(received[0].1, OrderStatus::Filled);
     assert_eq!(received[0].2, 0);
+    assert_eq!(
+        execution_engine
+            .cache()
+            .borrow()
+            .positions_open_count(None, None, None, None, None),
+        1,
+    );
 }
 
 #[rstest]
@@ -3395,6 +3594,12 @@ fn test_process_non_fill_order_event_sends_portfolio_update_order_endpoint(
     mut execution_engine: ExecutionEngine,
     #[case] event_kind: PortfolioNonFillEventKind,
     #[case] expected_status: OrderStatus,
+    #[values(
+        Some(EventApplicationOutcome::Applied),
+        Some(EventApplicationOutcome::Incomplete),
+        None
+    )]
+    portfolio_outcome: Option<EventApplicationOutcome>,
 ) {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
 
@@ -3444,14 +3649,17 @@ fn test_process_non_fill_order_event_sends_portfolio_update_order_endpoint(
         let receiver = handler;
         TypedIntoHandler::from_with_id(receiver.id(), move |event| {
             receiver.handle(event);
-            None
+            portfolio_outcome
         })
     });
 
     let event = build_portfolio_non_fill_event(event_kind, &instrument, &order, account_id);
     let expected_event_type = event.event_type();
 
-    execution_engine.process(&event);
+    assert_eq!(
+        execution_engine.process_with_outcome(&event),
+        portfolio_outcome.unwrap_or(EventApplicationOutcome::Incomplete),
+    );
 
     let received = received.borrow();
     assert_eq!(received.len(), 1);
@@ -3463,6 +3671,13 @@ fn test_process_non_fill_order_event_sends_portfolio_update_order_endpoint(
 #[rstest]
 fn test_process_margin_account_fill_sends_single_portfolio_update_before_position(
     mut execution_engine: ExecutionEngine,
+    #[values(false, true)] instrument_available: bool,
+    #[values(
+        Some(EventApplicationOutcome::Applied),
+        Some(EventApplicationOutcome::Incomplete),
+        None
+    )]
+    portfolio_outcome: Option<EventApplicationOutcome>,
 ) {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
 
@@ -3484,6 +3699,19 @@ fn test_process_margin_account_fill_sends_single_portfolio_update_before_positio
     );
     let (instrument, order) =
         prepare_accepted_order_with_account(&mut execution_engine, account_state.into());
+    if !instrument_available {
+        execution_engine
+            .cache()
+            .borrow_mut()
+            .purge_instrument_skip_order_guard(instrument.id());
+        assert!(
+            execution_engine
+                .cache()
+                .borrow()
+                .instrument(&instrument.id())
+                .is_none()
+        );
+    }
     let received = Rc::new(RefCell::new(
         Vec::<(OrderEventAny, OrderStatus, usize)>::new(),
     ));
@@ -3506,7 +3734,7 @@ fn test_process_margin_account_fill_sends_single_portfolio_update_before_positio
         let receiver = handler;
         TypedIntoHandler::from_with_id(receiver.id(), move |event| {
             receiver.handle(event);
-            None
+            portfolio_outcome
         })
     });
 
@@ -3528,7 +3756,14 @@ fn test_process_margin_account_fill_sends_single_portfolio_update_before_positio
         Some(Money::from("2 USD")),
     ));
 
-    execution_engine.process(&event);
+    assert_eq!(
+        execution_engine.process_with_outcome(&event),
+        if instrument_available {
+            portfolio_outcome.unwrap_or(EventApplicationOutcome::Incomplete)
+        } else {
+            EventApplicationOutcome::Incomplete
+        },
+    );
 
     let received = received.borrow();
     assert_eq!(received.len(), 1);
@@ -3540,8 +3775,15 @@ fn test_process_margin_account_fill_sends_single_portfolio_update_before_positio
         execution_engine
             .cache()
             .borrow()
+            .positions_open_count(None, None, None, None, None),
+        usize::from(instrument_available),
+    );
+    assert_eq!(
+        execution_engine
+            .cache()
+            .borrow()
             .positions_total_count(None, None, None, None, None),
-        1,
+        usize::from(instrument_available),
     );
 }
 
@@ -13793,6 +14035,7 @@ fn test_reconcile_fill_report_applies_fill_event(
     #[case] account_present: bool,
     #[case] expected: EventApplicationOutcome,
 ) {
+    register_applied_portfolio_stub();
     if account_present {
         execution_engine
             .cache()
@@ -13916,6 +14159,7 @@ fn test_reconcile_fill_report_finds_order_by_venue_order_id(mut execution_engine
 fn test_reconcile_fill_report_uses_report_account_for_position(
     mut execution_engine: ExecutionEngine,
 ) {
+    register_applied_portfolio_stub();
     let instrument = audusd_sim();
     let client_order_id = ClientOrderId::from("O-ACCOUNT-001");
     let venue_order_id = VenueOrderId::from("V-ACCOUNT-001");
@@ -17090,7 +17334,7 @@ fn test_reconcile_order_with_fills_suppresses_canceled_for_superseded_leg(
 }
 
 #[rstest]
-fn test_reconcile_order_with_fills_applies_terminal_without_cached_instrument(
+fn test_reconcile_order_with_fills_applies_terminal_but_incomplete_without_account_or_instrument(
     mut execution_engine: ExecutionEngine,
 ) {
     let instrument = audusd_sim();
@@ -17125,7 +17369,7 @@ fn test_reconcile_order_with_fills_applies_terminal_without_cached_instrument(
     );
     assert_eq!(
         execution_engine.reconcile_order_with_fills_with_outcome(&report, &[]),
-        EventApplicationOutcome::Applied
+        EventApplicationOutcome::Incomplete
     );
 
     let cache = execution_engine.cache().borrow();
@@ -18268,6 +18512,7 @@ fn test_entry_fill_void_preserves_native_flip_cycle_accounting(
     #[case] archived_pnl: &str,
     #[case] current_pnl: &str,
 ) {
+    register_applied_portfolio_stub();
     let instrument = audusd_sim();
     let trader_id = TraderId::test_default();
     let strategy_id = StrategyId::test_default();
@@ -18415,6 +18660,7 @@ fn test_runtime_bundle_keeps_companion_failure_after_matching_snapshot(
     #[case] fault: &str,
     #[case] expected: EventApplicationOutcome,
 ) {
+    register_applied_portfolio_stub();
     let instrument = audusd_sim();
     let account_id = AccountId::test_default();
     let client_order_id = ClientOrderId::from("O-BUNDLE-OUTCOME");
