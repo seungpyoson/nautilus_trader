@@ -18,3 +18,4 @@ mod cache_database;
 mod exec_engine;
 mod matching_engine;
 mod order_emulator;
+mod submit_handoff_denial;
