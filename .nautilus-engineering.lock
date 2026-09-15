@@ -1,6 +1,6 @@
 version = 1
 repository = "https://github.com/nautechsystems/nautilus_engineering"
-revision = "f47207a7c6a1906c01bbd0844b3092b133e15ae1"
+revision = "4134801627cb431a38a752a2388518a481558c5d"
 manifest_sha256 = "591f89f0394dfd8a02a4c3bda884dbdc02298d2da3a1cb4861ed8d4c6d67e97e"
 marker_file = ".nautilus-engineering.syncing"
 profiles = ["sync"]
@@ -98,7 +98,7 @@ executable = true
 [[file]]
 artifact = "no-build-package-check"
 path = "scripts/check-no-build-packages.sh"
-sha256 = "4f34c20dc50135b158d7b646e01a6f7de16709760a5789c6aa8267d2e2d08d5a"
+sha256 = "d064dbd0ae5ee4d318187b87afb4259993129dd4e531f49d194daf0233e2ab41"
 executable = true
 
 [[file]]

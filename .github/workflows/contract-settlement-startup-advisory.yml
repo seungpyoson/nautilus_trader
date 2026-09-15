@@ -3,7 +3,7 @@ name: Settlement startup integration verification
 # Fork infrastructure only; excluded from the NT contribution branch.
 on:
   push:
-    branches: [ci/contract-settlement-startup-20260910]
+    branches: [ci/contract-settlement-startup-phases-20260915]
 
 permissions:
   contents: read
@@ -39,7 +39,7 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: seungpyoson/nautilus_trader/.github/actions/common-setup@a047513d08229acc5236a0a07a81d12db9ff2b6e
         with:
           python-version: "3.13"
           build-type: test
@@ -57,7 +57,32 @@ jobs:
             --lib --tests -- -D warnings \
             2>&1 | tee "$RUNNER_TEMP/settlement-startup-clippy.log"
 
-      - name: Affected native components and Polymarket tests
+      - name: Retain completed Clippy evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: settlement-startup-clippy
+          path: ${{ runner.temp }}/settlement-startup-clippy.log
+          if-no-files-found: error
+
+      - name: Compile affected native components and Polymarket tests
+        shell: bash
+        run: |
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci \
+            -p nautilus-live -p nautilus-execution -p nautilus-common \
+            -p nautilus-portfolio -p nautilus-polymarket -p nautilus-model \
+            -p nautilus-risk -p nautilus-backtest -p nautilus-sandbox \
+            --features nautilus-live/node,nautilus-model/high-precision \
+            --lib --tests --no-fail-fast --no-run \
+            2>&1 | tee "$RUNNER_TEMP/settlement-startup-compile.log"
+
+      - name: Retain completed compilation evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: settlement-startup-compile
+          path: ${{ runner.temp }}/settlement-startup-compile.log
+          if-no-files-found: error
+
+      - name: Execute affected native components and Polymarket tests
         shell: bash
         run: |
           cargo nextest run --locked --cargo-profile ci-pr --profile ci \
@@ -67,6 +92,13 @@ jobs:
             --features nautilus-live/node,nautilus-model/high-precision \
             --lib --tests --no-fail-fast \
             2>&1 | tee "$RUNNER_TEMP/settlement-startup-tests.log"
+
+      - name: Retain completed test evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: settlement-startup-tests
+          path: ${{ runner.temp }}/settlement-startup-tests.log
+          if-no-files-found: error
 
       - name: Prove cleanup regressions reject the old reconciliation code
         shell: bash

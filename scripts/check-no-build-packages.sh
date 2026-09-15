@@ -31,7 +31,7 @@ while (($# > 0)); do
   esac
 done
 
-for tool in awk comm diff git grep sed sort tr uniq; do
+for tool in awk comm git grep sed sort tr uniq; do
   command -v "$tool" > /dev/null || {
     echo "Required tool not on PATH: $tool" >&2
     exit 2
@@ -131,13 +131,14 @@ for pair in "${pairs[@]}"; do
 
   locked=$(locked_third_party "$lock")
   declared_raw=$(declared_packages "$manifest")
+  declared_ordered=$(printf '%s\n' "$declared_raw" | LC_ALL=C sort)
   declared_sorted=$(printf '%s\n' "$declared_raw" | LC_ALL=C sort -u)
 
   missing=$(LC_ALL=C comm -23 <(printf '%s\n' "$locked") <(printf '%s\n' "$declared_sorted"))
   stale=$(LC_ALL=C comm -13 <(printf '%s\n' "$locked") <(printf '%s\n' "$declared_sorted"))
   duplicates=$(printf '%s\n' "$declared_raw" | LC_ALL=C sort | uniq -d)
   out_of_order=""
-  if ! diff -q <(printf '%s\n' "$declared_raw") <(printf '%s\n' "$declared_raw" | LC_ALL=C sort) > /dev/null 2>&1; then
+  if [[ "$declared_raw" != "$declared_ordered" ]]; then
     out_of_order="yes"
   fi
 
