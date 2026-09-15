@@ -72,7 +72,7 @@ jobs:
             -p nautilus-portfolio -p nautilus-polymarket -p nautilus-model \
             -p nautilus-risk -p nautilus-backtest -p nautilus-sandbox \
             --features nautilus-live/node,nautilus-model/high-precision \
-            --lib --tests --no-fail-fast --no-run \
+            --lib --tests --no-run \
             2>&1 | tee "$RUNNER_TEMP/settlement-startup-compile.log"
 
       - name: Retain completed compilation evidence
