@@ -666,6 +666,10 @@ pub struct DataApiPosition {
     pub size: Decimal,
     #[serde(default, deserialize_with = "deserialize_optional_decimal_from_json")]
     pub avg_price: Option<Decimal>,
+    /// Whether the venue reports the position as redeemable: its market resolved and the
+    /// tokens are still held (losing sides included). Absent when the row does not carry it.
+    #[serde(default)]
+    pub redeemable: Option<bool>,
 }
 
 /// A trade row from the Polymarket Data API v2 `GET /v2/trades` endpoint.

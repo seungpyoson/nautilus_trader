@@ -1030,6 +1030,13 @@ pub(crate) struct FillBuildDiscards {
     pub untimestamped_trades: usize,
 }
 
+/// Counts of Data API position rows dropped while building position reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PositionBuildDiscards {
+    /// Resolved, unredeemed rows skipped because their instrument is not loaded.
+    pub resolved_unredeemed: usize,
+}
+
 fn admit_selected_trade<'a>(
     selected_trades: &mut AHashMap<&'a str, &'a PolymarketTradeReport>,
     trade: &'a PolymarketTradeReport,
@@ -1449,9 +1456,10 @@ pub(crate) fn build_reconciliation_position_reports(
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     instrument_filter: Option<InstrumentId>,
     load_ids: Option<&[InstrumentId]>,
-) -> anyhow::Result<Vec<PositionStatusReport>> {
+) -> anyhow::Result<(Vec<PositionStatusReport>, PositionBuildDiscards)> {
     let collection_load_ids = instrument_filter.is_none().then_some(load_ids).flatten();
     let mut reports = Vec::with_capacity(positions.len());
+    let mut discards = PositionBuildDiscards::default();
 
     for position in positions {
         if let Some(report) = build_reconciliation_position_report(
@@ -1461,12 +1469,13 @@ pub(crate) fn build_reconciliation_position_reports(
             instruments,
             instrument_filter,
             collection_load_ids,
+            &mut discards,
         )? {
             reports.push(report);
         }
     }
 
-    Ok(reports)
+    Ok((reports, discards))
 }
 
 fn build_reconciliation_position_report(
@@ -1476,6 +1485,7 @@ fn build_reconciliation_position_report(
     instruments: &AtomicMap<Ustr, InstrumentAny>,
     instrument_filter: Option<InstrumentId>,
     collection_load_ids: Option<&[InstrumentId]>,
+    discards: &mut PositionBuildDiscards,
 ) -> anyhow::Result<Option<PositionStatusReport>> {
     let instrument_id = instrument_id_from_market_token(&position.condition_id, &position.asset);
 
@@ -1494,13 +1504,27 @@ fn build_reconciliation_position_report(
         return Ok(None);
     }
 
-    if !position_instrument_loaded(&position.asset, instrument_id, instruments) {
-        anyhow::bail!(unmapped_in_scope_message(
-            "position",
-            instrument_id,
-            None,
-            collection_load_ids,
-        ));
+    match position_instrument_binding(&position.asset, instrument_id, instruments) {
+        PositionInstrumentBinding::Loaded => {}
+        PositionInstrumentBinding::NotLoaded if position.redeemable == Some(true) => {
+            discards.resolved_unredeemed += 1;
+
+            log::warn!(
+                "Skipping resolved unredeemed position {instrument_id} size={}: the venue reports \
+                 it redeemable and the instrument is not loaded; the settled contract is not \
+                 projected as an open position",
+                position.size,
+            );
+            return Ok(None);
+        }
+        PositionInstrumentBinding::NotLoaded | PositionInstrumentBinding::Contradictory => {
+            anyhow::bail!(unmapped_in_scope_message(
+                "position",
+                instrument_id,
+                None,
+                collection_load_ids,
+            ));
+        }
     }
 
     Ok(build_position_report_from_reportable_position(
@@ -1563,8 +1587,9 @@ pub(crate) async fn generate_mass_status(
 
     fill_tracker.snap_fill_reports(&mut fill_reports);
 
-    let position_reports = if ctx.signer_type == PolymarketSignerType::Session {
-        Vec::new()
+    let (position_reports, position_discards) = if ctx.signer_type == PolymarketSignerType::Session
+    {
+        (Vec::new(), PositionBuildDiscards::default())
     } else {
         let positions = data_api_client
             .get_positions(ctx.user_address)
@@ -1584,7 +1609,7 @@ pub(crate) async fn generate_mass_status(
     log::debug!(
         "Generated mass status: {} orders ({} filtered), {} fills ({} instrument-filtered, \
          {} in-scope historical misses, {} unowned maker trades, {} untimestamped trades), {} \
-         positions",
+         positions ({} resolved unredeemed positions skipped)",
         order_reports.len(),
         orders_filtered,
         fill_reports.len(),
@@ -1593,6 +1618,7 @@ pub(crate) async fn generate_mass_status(
         fill_discards.unowned_maker_trades,
         fill_discards.untimestamped_trades,
         position_reports.len(),
+        position_discards.resolved_unredeemed,
     );
 
     if lookback_start.is_none() {
@@ -1698,16 +1724,29 @@ fn unmapped_in_scope_message(
     }
 }
 
-fn position_instrument_loaded(
+enum PositionInstrumentBinding {
+    /// The token is loaded and its instrument id agrees with the row's condition.
+    Loaded,
+    /// The token is not in the loaded instrument set.
+    NotLoaded,
+    /// The token is loaded under a different condition than the row reports.
+    Contradictory,
+}
+
+fn position_instrument_binding(
     token_id: &str,
     instrument_id: InstrumentId,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
-) -> bool {
-    instruments
-        .get_cloned(&Ustr::from(token_id))
-        .is_some_and(|instrument| {
-            polymarket_instrument_ids_equivalent(instrument.id(), instrument_id)
-        })
+) -> PositionInstrumentBinding {
+    match instruments.get_cloned(&Ustr::from(token_id)) {
+        Some(instrument)
+            if polymarket_instrument_ids_equivalent(instrument.id(), instrument_id) =>
+        {
+            PositionInstrumentBinding::Loaded
+        }
+        Some(_) => PositionInstrumentBinding::Contradictory,
+        None => PositionInstrumentBinding::NotLoaded,
+    }
 }
 
 fn position_is_dust(position: &DataApiPosition) -> bool {
@@ -1914,6 +1953,72 @@ mod tests {
         )
         .expect("valid Data API position fixture");
         page.data
+    }
+
+    #[rstest]
+    fn test_data_api_position_parses_redeemable_flag() {
+        let positions = data_api_positions();
+        assert_eq!(
+            positions[0].redeemable,
+            Some(false),
+            "the OPEN fixture row must preserve redeemable=false so it cannot authorize a resolved skip"
+        );
+        assert_eq!(
+            positions[2].redeemable,
+            Some(true),
+            "the REDEEMABLE fixture row must preserve redeemable=true as venue resolution evidence"
+        );
+        let position: DataApiPosition = serde_json::from_str(include_str!(
+            "../../test_data/decimal_precision_position.json"
+        ))
+        .expect(
+            "a legacy row without redeemable must still deserialize because the field is optional",
+        );
+        assert_eq!(
+            position.redeemable, None,
+            "an absent redeemable flag must remain unknown so it cannot authorize a resolved skip"
+        );
+    }
+
+    #[rstest]
+    fn test_build_reconciliation_position_reports_counts_resolved_unredeemed_skip() {
+        let positions = data_api_positions();
+        let instruments = AtomicMap::new();
+        let account_id = AccountId::from("POLYMARKET-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+        let (reports, discards) = build_reconciliation_position_reports(
+            &positions[2..3],
+            account_id,
+            ts_init,
+            &instruments,
+            None,
+            None,
+        )
+        .expect("a resolved unredeemed row must be skipped when its instrument is not loaded");
+        assert!(
+            reports.is_empty(),
+            "an unloaded resolved contract must not be projected as an open position"
+        );
+        assert_eq!(
+            discards.resolved_unredeemed, 1,
+            "the single skipped resolved row must be counted for reconciliation diagnostics"
+        );
+
+        let error = build_reconciliation_position_reports(
+            &positions[0..1],
+            account_id,
+            ts_init,
+            &instruments,
+            None,
+            None,
+        )
+        .expect_err(
+            "an OPEN row with redeemable=false must still fail without a loaded instrument",
+        );
+        assert!(
+            error.to_string().contains("unmapped in-scope position"),
+            "expected an unmapped in-scope position error because unresolved rows remain fail-closed: {error:#}"
+        );
     }
 
     #[rstest]

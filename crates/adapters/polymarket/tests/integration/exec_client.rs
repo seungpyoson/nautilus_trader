@@ -1943,6 +1943,287 @@ async fn test_generate_mass_status_rejects_malformed_position_with_wrong_loaded_
 
 #[rstest]
 #[tokio::test]
+async fn test_generate_mass_status_skips_resolved_unredeemed_position_without_loaded_instrument() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.positions_response_override.lock().await = Some(json!([{
+        "token_id": TEST_TOKEN_ID,
+        "condition_id": TEST_CONDITION_ID,
+        "current_size": "5.9523",
+        "avg_price": "0.42",
+        "redeemable": true,
+        "status": "REDEEMABLE",
+    }]));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect("a resolved unredeemed position without a loaded instrument must not block startup")
+        .expect("mass status must remain available after the resolved position is skipped");
+
+    assert!(
+        mass_status.position_reports().is_empty(),
+        "a resolved position without a loaded instrument must not be projected as open"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_skips_resolved_unredeemed_position_named_in_load_ids() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.positions_response_override.lock().await = Some(json!([{
+        "token_id": TEST_TOKEN_ID,
+        "condition_id": TEST_CONDITION_ID,
+        "current_size": "5.9523",
+        "avg_price": "0.42",
+        "redeemable": true,
+        "status": "REDEEMABLE",
+    }]));
+    let addr = start_mock_server(state).await;
+    let position_instrument_id =
+        InstrumentId::from(format!("{TEST_CONDITION_ID}-{TEST_TOKEN_ID}.POLYMARKET").as_str());
+    let mut config = create_test_exec_config(addr);
+    config.instrument_config = Some(PolymarketInstrumentProviderConfig {
+        load_ids: Some(vec![position_instrument_id]),
+        ..Default::default()
+    });
+    let (client, _rx, _cache) = create_test_execution_client_from_config(config);
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect(
+            "naming a resolved position in load_ids must not require its instrument to be loaded",
+        )
+        .expect(
+            "mass status must remain available after the in-scope resolved position is skipped",
+        );
+
+    assert!(
+        mass_status.position_reports().is_empty(),
+        "an in-scope resolved position without a loaded instrument must not be projected as open"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_rejects_unresolved_position_without_loaded_instrument() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.positions_response_override.lock().await = Some(json!([{
+        "token_id": TEST_TOKEN_ID,
+        "condition_id": TEST_CONDITION_ID,
+        "current_size": "5.9523",
+        "avg_price": "0.42",
+        "redeemable": false,
+        "status": "OPEN",
+    }]));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let error = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect_err("an unresolved in-scope position must fail when its instrument is not loaded");
+
+    assert!(
+        error.to_string().contains("unmapped in-scope position"),
+        "expected an unmapped in-scope position error because redeemable=false cannot authorize a skip: {error:#}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_rejects_resolved_position_with_contradictory_loaded_condition() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let loaded_condition = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let reported_condition = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let token_id = "99999999999999999999999999999999999999999999999999999999999999999";
+    *state.positions_response_override.lock().await = Some(json!([{
+        "token_id": token_id,
+        "condition_id": reported_condition,
+        "current_size": "5.9523",
+        "avg_price": "0.42",
+        "redeemable": true,
+        "status": "REDEEMABLE",
+    }]));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let loaded_instrument_id =
+        InstrumentId::from(format!("{loaded_condition}-{token_id}.POLYMARKET").as_str());
+    add_instrument_to_cache_with_binding(
+        &cache,
+        loaded_instrument_id,
+        (token_id, loaded_condition, "Yes"),
+        "0.0001",
+        4,
+        Decimal::ZERO,
+    );
+    let instrument = cache
+        .borrow()
+        .instrument(&loaded_instrument_id)
+        .expect("the contradictory instrument must be cached to exercise the loaded token binding")
+        .clone();
+    client.on_instrument(instrument);
+
+    let error = client.generate_mass_status(Some(60)).await.expect_err(
+        "redeemable=true must not authorize a token bound to a contradictory condition",
+    );
+
+    assert!(
+        error.to_string().contains("unmapped in-scope position"),
+        "expected an unmapped in-scope position error because resolution cannot excuse contradictory binding: {error:#}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_reports_resolved_unredeemed_position_when_instrument_is_loaded()
+{
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.positions_response_override.lock().await = Some(json!([{
+        "token_id": TEST_TOKEN_ID,
+        "condition_id": TEST_CONDITION_ID,
+        "current_size": "5.9523",
+        "avg_price": "0.42",
+        "redeemable": true,
+        "status": "REDEEMABLE",
+    }]));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let position_instrument_id =
+        InstrumentId::from(format!("{TEST_CONDITION_ID}-{TEST_TOKEN_ID}.POLYMARKET").as_str());
+    add_instrument_to_cache_with_binding(
+        &cache,
+        position_instrument_id,
+        (TEST_TOKEN_ID, TEST_CONDITION_ID, "Yes"),
+        "0.0001",
+        4,
+        Decimal::ZERO,
+    );
+    let instrument = cache
+        .borrow()
+        .instrument(&position_instrument_id)
+        .expect("the matching instrument must be cached to preserve loaded-position reporting")
+        .clone();
+    client.on_instrument(instrument);
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect("a resolved position with a matching loaded instrument must retain today's report")
+        .expect("mass status must remain available for a loaded resolved position");
+    let position_reports = mass_status.position_reports();
+    assert_eq!(
+        position_reports.len(),
+        1,
+        "only the loaded instrument must be reported because the venue returned one position"
+    );
+    let reports = position_reports
+        .get(&position_instrument_id)
+        .expect("the report must use the exact loaded instrument whose token and condition agree");
+    assert_eq!(
+        reports.len(),
+        1,
+        "the single venue row must retain exactly one report for the loaded instrument"
+    );
+    let report = &reports[0];
+    assert_eq!(
+        report.instrument_id, position_instrument_id,
+        "the report must preserve the loaded instrument's matching token and condition"
+    );
+    assert!(
+        report.is_long(),
+        "a loaded resolved position must remain LONG because core settlement projection is unchanged"
+    );
+    assert_eq!(
+        report.quantity.as_decimal(),
+        dec!(5.9523),
+        "the loaded position must preserve the exact venue quantity rather than synthesize a flat report"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_position_status_reports_skips_resolved_unredeemed_position_without_loaded_instrument()
+ {
+    let state = TestServerState::default();
+    *state.positions_response_override.lock().await = Some(json!([{
+        "token_id": TEST_TOKEN_ID,
+        "condition_id": TEST_CONDITION_ID,
+        "current_size": "5.9523",
+        "avg_price": "0.42",
+        "redeemable": true,
+        "status": "REDEEMABLE",
+    }]));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+    let position_instrument_id =
+        InstrumentId::from(format!("{TEST_CONDITION_ID}-{TEST_TOKEN_ID}.POLYMARKET").as_str());
+
+    let reports = client
+        .generate_position_status_reports(&GeneratePositionStatusReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(position_instrument_id),
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect("a resolved position without a loaded instrument must also be skipped by direct reports");
+
+    assert!(
+        reports.is_empty(),
+        "direct reports must not project the unloaded resolved contract as an open position"
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_generate_mass_status_lookback_marks_in_scope_historical_incomplete() {
     let state = TestServerState::default();
     *state.orders_response_override.lock().await = Some(json!({

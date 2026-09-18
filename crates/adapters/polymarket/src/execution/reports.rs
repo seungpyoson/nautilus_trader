@@ -997,7 +997,7 @@ impl PolymarketExecutionClient {
             .context("failed to fetch positions from Data API")?;
 
         let ts_now = self.clock.get_time_ns();
-        let reports = build_reconciliation_position_reports(
+        let (reports, discards) = build_reconciliation_position_reports(
             &positions,
             self.core.account_id,
             ts_now,
@@ -1006,7 +1006,11 @@ impl PolymarketExecutionClient {
             self.config.reconciliation_load_ids(),
         )?;
 
-        log::debug!("Generated {} position status reports", reports.len());
+        log::debug!(
+            "Generated {} position status reports ({} resolved unredeemed positions skipped)",
+            reports.len(),
+            discards.resolved_unredeemed,
+        );
         Ok(reports)
     }
 
