@@ -1,0 +1,81 @@
+name: Resolved position reconciliation verification
+
+# Fork infrastructure only; excluded from the NT contribution branch.
+on:
+  push:
+    branches: [ci/resolved-position-reconciliation-20260918]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    if: github.repository == 'seungpyoson/nautilus_trader'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: 31d1a95774c3e428f20bacf7283c1f51a685e815
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
+          allowed-endpoints: >-
+            ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
+            ${{ vars.CI_ALLOWED_ENDPOINTS }}
+
+      - name: Check out candidate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 31d1a95774c3e428f20bacf7283c1f51a685e815
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify candidate commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Common setup
+        uses: seungpyoson/nautilus_trader/.github/actions/common-setup@31d1a95774c3e428f20bacf7283c1f51a685e815
+        with:
+          python-version: "3.13"
+          build-type: test
+          free-disk-space: "true"
+          rust-cache-key: resolved-position-reconciliation-advisory
+
+      - name: Polymarket adapter Clippy
+        shell: bash
+        run: |
+          cargo clippy --locked --keep-going --profile ci-pr \
+            -p nautilus-polymarket \
+            --lib --tests -- -D warnings \
+            2>&1 | tee "$RUNNER_TEMP/resolved-position-clippy.log"
+
+      - name: Retain Clippy evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: resolved-position-clippy
+          path: ${{ runner.temp }}/resolved-position-clippy.log
+          if-no-files-found: error
+
+      - name: Polymarket adapter tests
+        shell: bash
+        run: |
+          cargo nextest run --locked --cargo-profile ci-pr --profile ci \
+            -p nautilus-polymarket \
+            --lib --tests --no-fail-fast \
+            2>&1 | tee "$RUNNER_TEMP/resolved-position-tests.log"
+
+      - name: Retain test evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: resolved-position-tests
+          path: ${{ runner.temp }}/resolved-position-tests.log
+          if-no-files-found: error
+
+      - name: Verify final source identity
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA" && git diff --quiet
