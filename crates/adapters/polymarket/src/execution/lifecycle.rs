@@ -1570,7 +1570,7 @@ mod tests {
         live::runner::set_exec_event_sender,
         messages::{
             ExecutionEvent,
-            execution::{CancelAllOrders, GenerateFillReportsBuilder},
+            execution::{CancelAllOrders, GenerateFillReportsBuilder, SubmitOrder},
         },
         msgbus::{publish_order_event, publish_position_event, switchboard},
     };
@@ -2878,6 +2878,94 @@ mod tests {
             fill_reports.unwrap_err().to_string(),
             "cannot generate fill reports: Polymarket settlement registry holds 1 record(s) \
              with unresolved evidence"
+        );
+    }
+
+    /// Records that a per-trade settlement hard fault fails mass status but does not refuse
+    /// submissions (#4876).
+    ///
+    /// Terminal REST `CONFIRMED` evidence contradicting a hydrated fill hard-faults the trade.
+    /// Only a client fault makes `check_not_faulted` refuse commands; the uncached order lets
+    /// the submission stop at the cache lookup without a venue request. Whether a trade fault
+    /// should gate submissions is open.
+    #[rstest]
+    #[tokio::test]
+    async fn trade_hard_fault_fails_mass_status_and_leaves_submissions_open() {
+        let (client, _cache) = test_client();
+        client.core.set_connected();
+        let leg = AdmittedLeg {
+            venue_order_id: VenueOrderId::from("0xorder"),
+            trade_id: TradeId::from("trade-faulted"),
+            instrument_id: InstrumentId::from("TOKEN-A.POLYMARKET"),
+            order_side: OrderSide::Buy,
+            liquidity_side: LiquiditySide::Taker,
+            last_qty: Quantity::from("10.00"),
+            last_px: Price::from("0.50"),
+            commission: Money::from("0 pUSD"),
+            ts_event: UnixNanos::from(1_000_u64),
+        };
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(leg.instrument_id)
+            .venue_order_id(leg.venue_order_id)
+            .account_id(AccountId::from("POLYMARKET-001"))
+            .trade_id(leg.trade_id)
+            .order_side(leg.order_side)
+            .last_qty(leg.last_qty)
+            .last_px(leg.last_px)
+            .currency(Currency::pUSD())
+            .liquidity_side(leg.liquidity_side)
+            .commission(leg.commission.clone())
+            .ts_event(leg.ts_event)
+            .build();
+        client.settlement.hydrate_fill(&fill);
+        let mut contradicting = leg.clone();
+        contradicting.last_qty = Quantity::from("10.01");
+        let order = open_limit_order(leg.instrument_id);
+        let submit = || {
+            SubmitOrder::from_order(
+                &order,
+                TraderId::from("TESTER-001"),
+                Some(ClientId::from("POLYMARKET")),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+            )
+        };
+
+        client.settlement.admit_rest_result(&AdmittedTrade {
+            venue_trade_id: "trade-faulted".to_string(),
+            status: PolymarketTradeStatus::Confirmed,
+            legs: vec![contradicting],
+        });
+        let mass_status = client.generate_mass_status(None).await;
+        let client_faulted = client.settlement.client_faulted();
+        let trade_fault_submit = client.submit_order(submit());
+        let connected = client.is_connected();
+        force_client_fault(&client.settlement, "capacity exhausted");
+        let client_fault_submit = client.submit_order(submit());
+
+        assert_eq!(
+            trade_hard_fault(&client.settlement, "trade-faulted"),
+            Some(
+                "terminal REST CONFIRMED evidence for trade trade-faulted contradicts the applied \
+                 fill on order 0xorder"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            mass_status.unwrap_err().to_string(),
+            "cannot generate mass status: Polymarket settlement registry holds 1 record(s) \
+             with unresolved evidence"
+        );
+        assert!(!client_faulted);
+        assert_eq!(
+            trade_fault_submit.unwrap_err().to_string(),
+            "order not found in cache: O-RETAIN"
+        );
+        assert!(connected);
+        assert_eq!(
+            client_fault_submit.unwrap_err().to_string(),
+            "Polymarket execution client is faulted closed until restart: capacity exhausted"
         );
     }
 

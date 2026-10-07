@@ -1494,18 +1494,31 @@ fn voided_event_fill(voided: &OrderFillVoided) -> OrderFilled {
 pub(crate) mod tests {
     use futures_util::FutureExt;
     use indexmap::IndexMap;
-    use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_core::{UUID4, UnixNanos, collections::AtomicMap};
     use nautilus_execution::reconciliation::create_inferred_reconciliation_trade_id;
     use nautilus_model::{
         enums::{OrderSide, OrderType},
         identifiers::{PositionId, StrategyId, TraderId},
+        instruments::InstrumentAny,
         orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         types::{Price, Quantity},
     };
     use rstest::rstest;
 
     use super::*;
-    use crate::execution::{get_pusd_currency, parse::make_composite_trade_id};
+    use crate::{
+        common::enums::PolymarketSignerType,
+        execution::{
+            get_pusd_currency,
+            parse::make_composite_trade_id,
+            settlement::{AdmissionContext, TradeEvidence, admit_trade_evidence},
+        },
+        http::{
+            models::{GammaMarket, PolymarketTradeReport},
+            parse::{create_instrument_from_def, parse_gamma_market},
+        },
+        websocket::{dispatch::rest_trade_info, messages::PolymarketUserTrade},
+    };
 
     pub(crate) fn settlement_state(
         registry: &SettlementRegistry,
@@ -2483,6 +2496,367 @@ pub(crate) mod tests {
         assert_eq!(retained.commission, historical.commission);
         assert_eq!(retained.applied_fill.as_deref(), Some(&fill));
         assert_eq!(retained.application, LegApplication::FillObserved);
+    }
+
+    const VENUE_QTY: &str = "714.285714";
+    const TRIMMED_QTY: &str = "714.285710";
+
+    fn fixture_trades() -> (PolymarketUserTrade, PolymarketTradeReport) {
+        let stream: PolymarketUserTrade =
+            serde_json::from_str(include_str!("../../../test_data/ws_user_trade.json"))
+                .expect("stream fixture");
+        let rest: PolymarketTradeReport =
+            serde_json::from_str(include_str!("../../../test_data/http_trade_report.json"))
+                .expect("REST fixture");
+        (stream, rest)
+    }
+
+    /// Admits the stream and REST trade fixtures through production admission, against the
+    /// market fixture bound to the trade with the given taker fee rate.
+    fn admit_fixture_evidence(
+        stream: &PolymarketUserTrade,
+        rest: &PolymarketTradeReport,
+        fee_rate: Decimal,
+    ) -> (AdmittedTrade, AdmittedTrade) {
+        let market: GammaMarket =
+            serde_json::from_str(include_str!("../../../test_data/gamma_market.json"))
+                .expect("market fixture");
+        let definitions = parse_gamma_market(&market).expect("market definitions");
+        let mut instrument =
+            create_instrument_from_def(&definitions[0], UnixNanos::from(1_000_000_000_u64))
+                .expect("fixture instrument");
+        let InstrumentAny::BinaryOption(binary) = &mut instrument else {
+            panic!("expected binary option fixture");
+        };
+        binary.outcome = Some(Ustr::from(stream.outcome.as_str()));
+        binary.info.get_or_insert_with(Default::default).insert(
+            "condition_id".to_string(),
+            serde_json::Value::String(stream.market.to_string()),
+        );
+        binary.info.as_mut().expect("fixture metadata").insert(
+            "fee_schedule".to_string(),
+            serde_json::json!({"rate": fee_rate.to_string(), "exponent": "1"}),
+        );
+        let instruments = AtomicMap::new();
+        instruments.insert(stream.asset_id, instrument);
+        let context = AdmissionContext {
+            signer_type: PolymarketSignerType::Owner,
+            user_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            api_key: "00000000-0000-0000-0000-000000000001",
+            pusd: get_pusd_currency(),
+            instruments: &instruments,
+        };
+
+        (
+            admit_trade_evidence(TradeEvidence::Stream(stream), &context)
+                .expect("stream fixture passes production admission"),
+            admit_trade_evidence(TradeEvidence::Rest(rest), &context)
+                .expect("REST fixture passes production admission"),
+        )
+    }
+
+    struct HydratedTrade {
+        registry: SettlementRegistry,
+        stream: AdmittedTrade,
+        rest: AdmittedTrade,
+    }
+
+    /// Restarts with one retained fill of the fixture trade while the venue reports `VENUE_QTY`
+    /// (#4876).
+    ///
+    /// `TRIMMED_QTY` is the quantity an adapter before `1f123359b2` retained after trimming a
+    /// dust overfill to the submitted quantity; `extra_commission` adds a commission rounding
+    /// difference. The venue evidence passes production admission, and the registry hydrates
+    /// the fill in the order `connect` uses.
+    fn hydrated_trade(
+        cached_qty: &str,
+        extra_commission: Option<&str>,
+        fee_rate: &str,
+    ) -> HydratedTrade {
+        let (mut stream, mut rest) = fixture_trades();
+        stream.size = VENUE_QTY.to_string();
+        stream.status = PolymarketTradeStatus::Confirmed;
+        rest.size = Decimal::from_str_exact(VENUE_QTY).unwrap();
+        rest.status = PolymarketTradeStatus::Confirmed;
+        let (stream_admitted, rest_admitted) =
+            admit_fixture_evidence(&stream, &rest, Decimal::from_str_exact(fee_rate).unwrap());
+        let mut cached_leg = AdmittedLeg {
+            last_qty: Quantity::from(cached_qty),
+            ..rest_admitted.legs[0]
+        };
+
+        if let Some(extra) = extra_commission {
+            cached_leg.commission = Money::from_decimal(
+                cached_leg.commission.as_decimal() + Decimal::from_str_exact(extra).unwrap(),
+                cached_leg.commission.currency,
+            )
+            .unwrap();
+        }
+        let mut cached = applied_fill(&cached_leg, Some(&rest_admitted.venue_trade_id));
+        cached.info = rest_trade_info(&rest);
+        let registry = live_registry();
+        registry.mark_hydrating();
+        registry.hydrate_fill(&cached);
+        registry.begin_session();
+        registry.mark_live();
+
+        HydratedTrade {
+            registry,
+            stream: stream_admitted,
+            rest: rest_admitted,
+        }
+    }
+
+    #[rstest]
+    #[case::exact_quantity(VENUE_QTY)]
+    #[case::trimmed_quantity(TRIMMED_QTY)]
+    fn test_hydrated_fill_report_returns_cached_quantity(#[case] cached_qty: &str) {
+        let hydrated = hydrated_trade(cached_qty, None, "0");
+        let key = hydrated.rest.venue_trade_id.clone();
+
+        let report = hydrated.registry.build_fill_report(
+            &key,
+            &hydrated.rest.legs[0],
+            UnixNanos::from(2_000_u64),
+        );
+
+        assert_eq!(report.unwrap().last_qty, Quantity::from(cached_qty));
+        assert!(hydrated.registry.pending_resolutions().is_empty());
+        assert!(trade_hard_fault(&hydrated.registry, &key).is_none());
+        assert!(
+            hydrated
+                .registry
+                .ensure_resolved(None, "mass status")
+                .is_ok()
+        );
+    }
+
+    #[rstest]
+    #[case::exact_quantity(VENUE_QTY)]
+    #[case::trimmed_quantity(TRIMMED_QTY)]
+    fn test_hydrated_fill_stream_confirmation_accepts_cached_quantity(#[case] cached_qty: &str) {
+        let hydrated = hydrated_trade(cached_qty, None, "0");
+        let key = hydrated.stream.venue_trade_id.clone();
+
+        let actions = hydrated.registry.admit_stream_trade(&hydrated.stream);
+
+        assert!(actions.is_empty());
+        assert!(hydrated.registry.pending_resolutions().is_empty());
+        assert_eq!(
+            settlement_state(&hydrated.registry, &key),
+            Some(SettlementState::StreamConfirmed)
+        );
+        assert!(trade_hard_fault(&hydrated.registry, &key).is_none());
+        assert!(
+            hydrated
+                .registry
+                .ensure_resolved(None, "mass status")
+                .is_ok()
+        );
+    }
+
+    #[rstest]
+    #[case::exact_quantity(VENUE_QTY, None, "7.142850", false)]
+    #[case::trimmed_quantity(TRIMMED_QTY, None, "7.142850", true)]
+    #[case::rounded_commission(VENUE_QTY, Some("0.00001"), "7.142860", true)]
+    fn test_hydrated_fill_terminal_rest_confirmation_requires_agreement(
+        #[case] cached_qty: &str,
+        #[case] extra_commission: Option<&str>,
+        #[case] cached_commission: &str,
+        #[case] faults: bool,
+    ) {
+        let hydrated = hydrated_trade(cached_qty, extra_commission, "0.04");
+        let key = hydrated.rest.venue_trade_id.clone();
+
+        let actions = hydrated.registry.admit_rest_result(&hydrated.rest);
+
+        let expected_fault = faults.then(|| {
+            format!(
+                "terminal REST CONFIRMED evidence for trade {key} contradicts the applied fill \
+                 on order {}",
+                hydrated.rest.legs[0].venue_order_id
+            )
+        });
+        assert!(actions.is_empty());
+        assert_eq!(trade_hard_fault(&hydrated.registry, &key), expected_fault);
+        assert_eq!(
+            hydrated
+                .registry
+                .ensure_resolved(None, "mass status")
+                .map_err(|e| e.to_string()),
+            if faults {
+                Err(
+                    "cannot generate mass status: Polymarket settlement registry holds 1 \
+                     record(s) with unresolved evidence"
+                        .to_string(),
+                )
+            } else {
+                Ok(())
+            }
+        );
+        assert_eq!(
+            hydrated.rest.legs[0].commission.as_decimal(),
+            Decimal::from_str_exact("7.142850").unwrap()
+        );
+        let inner = hydrated.registry.inner.lock();
+        let retained = &inner.records[&key].legs[0];
+        assert_eq!(
+            retained.commission.as_decimal(),
+            Decimal::from_str_exact(cached_commission).unwrap()
+        );
+    }
+
+    /// Records what a per-trade hard fault leaves observable (#4876).
+    ///
+    /// After terminal REST `CONFIRMED` evidence contradicts a hydrated fill, the trade still
+    /// counts as confirmed (`is_trade_confirmed`). Report gating fails for the whole account,
+    /// for the trade's instrument and for its venue order, but passes for another instrument. No
+    /// targeted read remains scheduled, and the client fault read by `check_not_faulted` stays
+    /// clear. There is no dedicated settlement-fault signal today; what a live node should
+    /// observe is open.
+    #[rstest]
+    fn test_trade_hard_fault_visibility() {
+        let hydrated = hydrated_trade(TRIMMED_QTY, None, "0.04");
+        let key = hydrated.rest.venue_trade_id.clone();
+        let leg = &hydrated.rest.legs[0];
+        let other_instrument_id = InstrumentId::from("TOKEN-OTHER.POLYMARKET");
+        let unresolved = |report: &str| {
+            Err(format!(
+                "cannot generate {report}: Polymarket settlement registry holds 1 record(s) with \
+                 unresolved evidence"
+            ))
+        };
+
+        let actions = hydrated.registry.admit_rest_result(&hydrated.rest);
+
+        assert!(actions.is_empty());
+        assert_eq!(
+            trade_hard_fault(&hydrated.registry, &key),
+            Some(format!(
+                "terminal REST CONFIRMED evidence for trade {key} contradicts the applied fill on \
+                 order {}",
+                leg.venue_order_id
+            ))
+        );
+        assert_eq!(
+            settlement_state(&hydrated.registry, &key),
+            Some(SettlementState::RestConfirmed)
+        );
+        assert!(hydrated.registry.is_trade_confirmed(&key));
+        assert_eq!(
+            hydrated
+                .registry
+                .ensure_resolved(None, "mass status")
+                .map_err(|e| e.to_string()),
+            unresolved("mass status")
+        );
+        assert_eq!(
+            hydrated
+                .registry
+                .ensure_resolved(Some(leg.instrument_id), "fill reports")
+                .map_err(|e| e.to_string()),
+            unresolved("fill reports")
+        );
+        assert_eq!(
+            hydrated
+                .registry
+                .ensure_order_resolved(&leg.venue_order_id, "fill reports")
+                .map_err(|e| e.to_string()),
+            unresolved(&format!(
+                "fill reports for venue order {}",
+                leg.venue_order_id
+            ))
+        );
+        assert!(
+            hydrated
+                .registry
+                .ensure_resolved(Some(other_instrument_id), "fill reports")
+                .is_ok()
+        );
+        assert_eq!(
+            hydrated.registry.pending_resolutions(),
+            Vec::<String>::new()
+        );
+        assert!(!hydrated.registry.client_faulted());
+    }
+
+    /// Records the fill report check after a fee-schedule refresh (#4876).
+    ///
+    /// A taker fill is applied under the original schedule (zero rate) and settles without
+    /// conflict, through terminal REST or stream `CONFIRMED`. A later report admits the same REST
+    /// row under `report_fee_rate`; admission recomputes the commission from the current
+    /// schedule. Reports compare economics only for REST-terminal trades, so the outcome depends
+    /// on how the trade settled. Which fee basis later comparisons should use is open.
+    #[rstest]
+    #[case::rest_confirmed_unchanged_schedule(true, "0", "0.000000", None)]
+    #[case::rest_confirmed_refreshed_schedule(
+        true,
+        "0.04",
+        "0.250000",
+        Some("report trade trade-0xabcdef1234 contradicts retained leg trade-0xabcdef1234")
+    )]
+    #[case::stream_confirmed_refreshed_schedule(false, "0.04", "0.250000", None)]
+    fn test_settled_fill_report_after_fee_schedule_refresh(
+        #[case] rest_confirmed: bool,
+        #[case] report_fee_rate: &str,
+        #[case] reported_commission: &str,
+        #[case] report_error: Option<&str>,
+    ) {
+        let (stream, rest) = fixture_trades();
+        let (stream_settled, rest_settled) = admit_fixture_evidence(&stream, &rest, Decimal::ZERO);
+        let (_, rest_reported) = admit_fixture_evidence(
+            &stream,
+            &rest,
+            Decimal::from_str_exact(report_fee_rate).unwrap(),
+        );
+        let key = rest_settled.venue_trade_id.clone();
+        let applied = rest_settled.legs[0].clone();
+        let registry = live_registry();
+        registry.note_order_submitted(applied.venue_order_id);
+
+        let actions = if rest_confirmed {
+            registry.admit_rest_result(&rest_settled)
+        } else {
+            registry.admit_stream_trade(&stream_settled)
+        };
+        registry.note_leg_enqueued(&applied.trade_id);
+        registry.observe_fill_applied(&applied_fill(&applied, Some(&key)));
+
+        let report = registry
+            .build_fill_report(&key, &rest_reported.legs[0], UnixNanos::from(2_000_u64))
+            .map(|report| (report.last_qty, report.commission))
+            .map_err(|e| e.to_string());
+
+        assert_eq!(apply_count(&actions), 1);
+        assert_eq!(
+            settlement_state(&registry, &key),
+            Some(if rest_confirmed {
+                SettlementState::RestConfirmed
+            } else {
+                SettlementState::StreamConfirmed
+            })
+        );
+        assert_eq!(trade_hard_fault(&registry, &key), None);
+        assert_eq!(
+            leg_application(&registry, &applied.trade_id),
+            Some(LegApplication::FillObserved)
+        );
+        assert!(registry.ensure_resolved(None, "mass status").is_ok());
+        assert_eq!(applied.commission, Money::zero(get_pusd_currency()));
+        assert_eq!(
+            rest_reported.legs[0].commission.as_decimal(),
+            Decimal::from_str_exact(reported_commission).unwrap()
+        );
+        assert_eq!(
+            report,
+            match report_error {
+                Some(error) => Err(error.to_string()),
+                None => Ok((
+                    Quantity::from("25.000000"),
+                    Money::zero(get_pusd_currency())
+                )),
+            }
+        );
     }
 
     #[rstest]
