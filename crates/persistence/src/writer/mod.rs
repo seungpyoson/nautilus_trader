@@ -25,4 +25,5 @@ pub mod traits;
 pub(crate) mod materializer;
 pub(crate) mod promotion;
 pub(crate) mod staged;
+pub use materializer::restore_staged_record_batches;
 pub use promotion::PromotionResult;

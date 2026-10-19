@@ -119,9 +119,7 @@ pub(crate) async fn read_feather_record_batches_with_identity(
 /// # Errors
 ///
 /// Returns an error if the staging metadata columns are incomplete, malformed, or inconsistent.
-pub(crate) fn restore_staged_record_batches(
-    batch: RecordBatch,
-) -> anyhow::Result<Vec<RecordBatch>> {
+pub fn restore_staged_record_batches(batch: RecordBatch) -> anyhow::Result<Vec<RecordBatch>> {
     let schema = batch.schema();
 
     let Ok(id_index) = schema.index_of(NAUTILUS_ARROW_METADATA_ID_COLUMN) else {
