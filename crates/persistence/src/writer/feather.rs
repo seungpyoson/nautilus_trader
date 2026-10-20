@@ -2119,7 +2119,7 @@ mod tests {
             e.to_string(),
             format!("Feather write admission refused: {original}")
         );
-        assert!(std::ptr::eq(
+        assert!(std::ptr::addr_eq(
             e.source().unwrap(),
             original.as_ref() as &dyn std::error::Error,
         ));
@@ -2140,7 +2140,9 @@ mod tests {
             let partials = feather_files(&self.directory, FEATHER_PARTIAL_EXTENSION);
             assert_eq!(partials.len(), 1);
             let path = &partials[0];
-            let before = fs::read(path).unwrap();
+            // Reading through a second handle is denied under Windows byte-range locks, so the
+            // scan's effect is observed through the file's length and name only.
+            let before = fs::metadata(path).unwrap().len();
             let scanner = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -2148,7 +2150,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(scanner.try_lock(), Err(TryLockError::WouldBlock)));
             recover_partial_feather_files(&self.directory);
-            assert_eq!(fs::read(path).unwrap(), before);
+            assert_eq!(fs::metadata(path).unwrap().len(), before);
             assert!(feather_files(&self.directory, FEATHER_EXTENSION).is_empty());
             self.failures.fetch_add(1, Ordering::AcqRel);
         }
@@ -2244,7 +2246,7 @@ mod tests {
         assert_eq!(admission.calls.load(Ordering::Acquire), 1);
         assert!(first.inner.is_empty());
         assert!(sibling.inner.is_empty());
-        assert!(std::ptr::eq(
+        assert!(std::ptr::addr_eq(
             std::error::Error::source(&first_error).unwrap(),
             std::error::Error::source(&sibling_error).unwrap(),
         ));
@@ -2259,7 +2261,7 @@ mod tests {
         let first_source = std::error::Error::source(&first_error).unwrap();
         let later_source = std::error::Error::source(&later_error).unwrap();
 
-        assert!(std::ptr::eq(first_source, later_source));
+        assert!(std::ptr::addr_eq(first_source, later_source));
         assert_eq!(
             later_source
                 .downcast_ref::<io::Error>()
@@ -2322,7 +2324,7 @@ mod tests {
 
         for source in &sources {
             assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
-            assert!(std::ptr::eq(sources[0], *source));
+            assert!(std::ptr::addr_eq(sources[0], *source));
         }
         assert_eq!(admission.calls.load(Ordering::Acquire), 1);
     }
@@ -3517,6 +3519,8 @@ mod tests {
         .unwrap();
         file.write_record_batch(&batch).unwrap();
         file.seal().unwrap();
+        // The sealed file stays locked until its handles drop; release it before reading
+        drop(file);
 
         assert!(!path.with_extension(FEATHER_PARTIAL_EXTENSION).exists());
         let mut reader = StreamReader::try_new(File::open(&path).unwrap(), None).unwrap();
