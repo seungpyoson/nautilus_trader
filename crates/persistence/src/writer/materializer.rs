@@ -115,11 +115,13 @@ pub(crate) async fn read_feather_record_batches_with_identity(
 ///
 /// A single staging batch can contain rows from several input schemas. The metadata columns
 /// identify contiguous schema runs, so restoring them can produce more than one record batch.
-/// A batch without either staging column passes through unchanged; metadata JSON without the
-/// staged-ID column is rejected. Staged batches must contain both `nautilus_metadata_id` and
-/// `nautilus_metadata_json`, with non-null values castable to UTF-8. Restoration removes these
+/// A batch with no `nautilus_metadata_id` column and no `nautilus_metadata_json` column passes
+/// through unchanged; metadata JSON without the staged-ID column is rejected. Staged batches must
+/// contain both `nautilus_metadata_id` and `nautilus_metadata_json`, with non-null values castable
+/// to UTF-8. Restoration removes these
 /// columns and restores each run's schema and field metadata. IDs must hash the canonical schema
-/// metadata, or, for legacy staged files, the raw metadata JSON string.
+/// metadata, or, for legacy staged files, the raw metadata JSON string. A zero-row staged batch
+/// returns an empty `Vec`.
 ///
 /// # Errors
 ///
