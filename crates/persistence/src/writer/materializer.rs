@@ -115,13 +115,18 @@ pub(crate) async fn read_feather_record_batches_with_identity(
 ///
 /// A single staging batch can contain rows from several input schemas. The metadata columns
 /// identify contiguous schema runs, so restoring them can produce more than one record batch.
+/// A batch with no `nautilus_metadata_id` column and no `nautilus_metadata_json` column passes
+/// through unchanged; metadata JSON without the staged-ID column is rejected. Staged batches must
+/// contain both `nautilus_metadata_id` and `nautilus_metadata_json`, with non-null values castable
+/// to UTF-8. Restoration removes these
+/// columns and restores each run's schema and field metadata. IDs must hash the canonical schema
+/// metadata, or, for legacy staged files, the raw metadata JSON string. A zero-row staged batch
+/// returns an empty `Vec`.
 ///
 /// # Errors
 ///
 /// Returns an error if the staging metadata columns are incomplete, malformed, or inconsistent.
-pub(crate) fn restore_staged_record_batches(
-    batch: RecordBatch,
-) -> anyhow::Result<Vec<RecordBatch>> {
+pub fn restore_staged_record_batches(batch: RecordBatch) -> anyhow::Result<Vec<RecordBatch>> {
     let schema = batch.schema();
 
     let Ok(id_index) = schema.index_of(NAUTILUS_ARROW_METADATA_ID_COLUMN) else {
@@ -606,6 +611,53 @@ mod tests {
                 .metadata()
                 .get("ARROW:extension:name"),
             Some(&"arrow.json".to_string()),
+        );
+    }
+
+    #[rstest]
+    fn public_restore_preserves_plain_batches_and_legacy_metadata() {
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("ts_init", DataType::UInt64, false)
+                    .with_metadata(HashMap::from([("unit".to_string(), "ns".to_string())])),
+            ],
+            HashMap::from([("type_name".to_string(), "Example".to_string())]),
+        ));
+        let plain = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(UInt64Array::from(vec![17, 29])) as ArrayRef],
+        )
+        .unwrap();
+        let restored_plain = crate::writer::restore_staged_record_batches(plain.clone()).unwrap();
+        assert_eq!(restored_plain, vec![plain.clone()]);
+
+        let json = r#"{
+            "format_version": 1,
+            "schema_metadata": {"type_name": "Example"},
+            "field_metadata": {"ts_init": {"unit": "ns"}}
+        }"#;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts_init", DataType::UInt64, false),
+            Field::new(NAUTILUS_ARROW_METADATA_ID_COLUMN, DataType::Utf8, false),
+            Field::new(NAUTILUS_ARROW_METADATA_JSON_COLUMN, DataType::Utf8, false),
+        ]));
+        let staged = RecordBatch::try_new(
+            schema,
+            vec![
+                plain.column(0).clone(),
+                Arc::new(StringArray::from(vec![staged_metadata_id(json); 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec![json; 2])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let restored = crate::writer::restore_staged_record_batches(staged.clone()).unwrap();
+        let json_without_id = staged.project(&[0, 2]).unwrap();
+        let e = crate::writer::restore_staged_record_batches(json_without_id).unwrap_err();
+
+        assert_eq!(restored, vec![plain]);
+        assert_eq!(
+            e.to_string(),
+            "Feather batch has staged metadata JSON without a metadata ID"
         );
     }
 

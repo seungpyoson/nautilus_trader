@@ -14,11 +14,17 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
+    collections::HashMap,
     fs::{self, File},
     sync::{Arc, atomic::AtomicU64},
 };
 
-use datafusion::arrow::ipc::reader::StreamReader;
+use datafusion::arrow::{
+    array::{ArrayRef, StringArray, UInt64Array},
+    datatypes::{DataType, Field, Schema},
+    ipc::reader::StreamReader,
+    record_batch::RecordBatch,
+};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{
@@ -34,6 +40,49 @@ use nautilus_persistence::{
 };
 use rstest::rstest;
 use tempfile::TempDir;
+
+#[rstest]
+fn test_restore_staged_record_batches_public_contract() {
+    let plain = RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("ts_init", DataType::UInt64, false)
+                    .with_metadata(HashMap::from([("unit".to_string(), "ns".to_string())])),
+            ],
+            HashMap::from([("type_name".to_string(), "Example".to_string())]),
+        )),
+        vec![Arc::new(UInt64Array::from(vec![17, 29])) as ArrayRef],
+    )
+    .unwrap();
+    let restored_plain =
+        nautilus_persistence::writer::restore_staged_record_batches(plain.clone()).unwrap();
+    let json = r#"{
+        "format_version": 1,
+        "schema_metadata": {"type_name": "Example"},
+        "field_metadata": {"ts_init": {"unit": "ns"}}
+    }"#;
+    let id = format!("blake3:{}", blake3::hash(json.as_bytes()).to_hex());
+    let staged = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("ts_init", DataType::UInt64, false),
+            Field::new("nautilus_metadata_id", DataType::Utf8, false),
+            Field::new("nautilus_metadata_json", DataType::Utf8, false),
+        ])),
+        vec![
+            plain.column(0).clone(),
+            Arc::new(StringArray::from(vec![id; 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec![json; 2])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let empty =
+        nautilus_persistence::writer::restore_staged_record_batches(staged.slice(0, 0)).unwrap();
+    let restored = nautilus_persistence::writer::restore_staged_record_batches(staged).unwrap();
+
+    assert_eq!(restored_plain, vec![plain.clone()]);
+    assert_eq!(restored, vec![plain]);
+    assert!(empty.is_empty());
+}
 
 #[rstest]
 fn test_write_data_enum_quote() {

@@ -122,7 +122,8 @@ A writer holds an exclusive lock on each `.feather.partial` file until it seals 
 crashed process leaves its open files unlocked. Recovery seals each unlocked regular partial file: it keeps
 the complete record batches, drops any bytes after them with a warning, and renames the file to
 `.feather`. It removes a partial file that has no complete record batch and leaves an empty one in
-place. A read error other than a write cut short leaves the file for a later recovery pass.
+place. A writer removes its own released partial file when no complete batch reached it.
+A read error other than a write cut short leaves the file for a later recovery pass.
 
 Recovery runs when a streaming writer starts on the run folder, and when
 `ParquetDataCatalog.read_backtest()`, `read_live_run()`, or `convert_stream_to_data()` reads the

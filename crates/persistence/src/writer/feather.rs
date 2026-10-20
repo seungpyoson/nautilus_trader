@@ -23,13 +23,13 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
-    fmt::Debug,
+    fmt::{Debug, Display},
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, BufReader, BufWriter, Seek, Write},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc::Sender,
     },
@@ -97,12 +97,21 @@ use crate::{
 pub(crate) type FeatherWriteCommand =
     Box<dyn FnOnce(&mut FeatherWriter) -> Result<(), Box<dyn std::error::Error>> + Send + 'static>;
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "map_err transfers ownership of the boxed writer error"
-)]
 pub(crate) fn feather_error(e: Box<dyn std::error::Error>) -> anyhow::Error {
-    anyhow::anyhow!("{e}")
+    // Latched refusals and I/O failures retain their source through io::Error; other errors keep
+    // the existing text conversion without adding Send + Sync bounds to the public API.
+    match e.downcast::<io::Error>() {
+        Ok(e) => anyhow::Error::new(*e),
+        Err(e) => anyhow::anyhow!("{e}"),
+    }
+}
+
+// Unwrap Arrow's I/O error so the first failure has the same concrete type as later latched errors
+fn feather_write_error(e: ArrowError) -> Box<dyn std::error::Error> {
+    match e {
+        ArrowError::IoError(_, e) => e.into(),
+        e => e.into(),
+    }
 }
 
 macro_rules! define_builtin_data_batch_dispatch {
@@ -315,17 +324,168 @@ pub(crate) const FEATHER_EXTENSION: &str = "feather";
 /// File extension of a Feather stream file that is still being appended to.
 pub(crate) const FEATHER_PARTIAL_EXTENSION: &str = "feather.partial";
 
+/// Application-owned admission authority for physical Feather payload writes.
+///
+/// Admission occurs beneath the file buffer, including drains from flush, seal, rotation and
+/// drop. Successful short-write retries remain inside one admission. A failed write retains its
+/// entire charge and prevents subsequent writes through that handle. Implementations sharing a
+/// budget with other writers must reject subsequent admissions on refusal and on `io_failed`.
+/// An I/O failure latches only its handle and calls `io_failed`; it does not latch the writer.
+/// Every error returned from a failed handle, including the first, is a wrapper with
+/// `io::ErrorKind::Other` and no raw OS code to prevent retries; its source retains the original
+/// kind, OS code and typed error.
+/// Once any admission refuses, the writer is finished: every later write, flush, seal, close and
+/// drop on every handle returns the latched refusal and no further payload byte reaches any file;
+/// the authority is not consulted again. Bytes already admitted stay, and abandoned files are
+/// recovered to their last complete batch.
+/// Drop cannot return an error to its caller, so it logs the refusal instead.
+/// A handle with no admitted bytes leaves no file when abandoned, sealed, closed or dropped.
+/// Callbacks must not synchronously re-enter the same writer. They also run during
+/// [`FeatherWriter`] drop; panicking there while the thread is unwinding aborts the process.
+pub trait FeatherWriteAdmission: Debug + Send + Sync {
+    /// Reserves the complete pending payload before any of its bytes reach the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the application refuses the write, including after admission is halted.
+    fn admit_write(&self, pending_bytes: usize) -> io::Result<()>;
+
+    /// Reports an underlying file creation, lock, write, flush, sync or rename failure.
+    fn io_failed(&self, error: &io::Error);
+}
+
+#[derive(Clone, Debug)]
+enum FeatherWriteFailure {
+    Admission(Arc<io::Error>),
+    Io(Arc<io::Error>),
+}
+
+impl FeatherWriteFailure {
+    fn error(&self) -> io::Error {
+        // A latched Interrupted error must terminate write_all and BufWriter retries
+        io::Error::other(self.clone())
+    }
+}
+
+impl Display for FeatherWriteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(e) => write!(formatter, "Feather write admission refused: {e}"),
+            Self::Io(e) => write!(formatter, "Feather payload I/O failure: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FeatherWriteFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Admission(e) | Self::Io(e) => Some(e.as_ref()),
+        }
+    }
+}
+
+struct AdmittedWriter<W> {
+    inner: W,
+    admission: Option<Arc<dyn FeatherWriteAdmission>>,
+    failure: Option<FeatherWriteFailure>,
+    admission_failure: Arc<OnceLock<FeatherWriteFailure>>,
+}
+
+impl<W> AdmittedWriter<W> {
+    fn new(
+        inner: W,
+        admission: Option<Arc<dyn FeatherWriteAdmission>>,
+        admission_failure: Arc<OnceLock<FeatherWriteFailure>>,
+    ) -> Self {
+        Self {
+            inner,
+            admission,
+            failure: None,
+            admission_failure,
+        }
+    }
+
+    fn report_failure(&mut self, e: io::Error) -> io::Error {
+        if let Some(admission) = &self.admission {
+            admission.io_failed(&e);
+        }
+
+        self.failure
+            .get_or_insert_with(|| FeatherWriteFailure::Io(Arc::new(e)))
+            .error()
+    }
+
+    fn check_failure(&self) -> io::Result<()> {
+        if let Some(failure) = self.admission_failure.get().or(self.failure.as_ref()) {
+            return Err(failure.error());
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for AdmittedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.check_failure()?;
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        if let Some(admission) = &self.admission
+            && let Err(e) = admission.admit_write(buf.len())
+        {
+            return Err(self
+                .admission_failure
+                .get_or_init(|| FeatherWriteFailure::Admission(Arc::new(e)))
+                .error());
+        }
+
+        // Keep short-write retries within one admission. Err may follow a written prefix,
+        // departing from Write::write's no-bytes-on-error contract. BufWriter is the only
+        // production caller; the permanent latch makes this writer unusable afterwards and
+        // prevents retrying that prefix.
+        if let Err(e) = self.inner.write_all(buf) {
+            return Err(self.report_failure(e));
+        }
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.check_failure()?;
+
+        if let Err(e) = self.inner.flush() {
+            return Err(self.report_failure(e));
+        }
+
+        Ok(())
+    }
+}
+
+impl AdmittedWriter<File> {
+    fn sync_all(&mut self) -> io::Result<()> {
+        self.check_failure()?;
+
+        if let Err(e) = self.inner.sync_all() {
+            return Err(self.report_failure(e));
+        }
+
+        Ok(())
+    }
+}
+
 /// An open local Feather file that appends Arrow IPC stream batches.
 ///
 /// Batches go to `{name}.feather.partial`, which is renamed to `{name}.feather` when the file is
 /// sealed, so readers listing `.feather` files only see complete streams. The file stays
-/// exclusively locked until it is sealed, so [`recover_partial_feather_files`] can tell an open
-/// file from one its writer abandoned. Written rows are
+/// exclusively locked until it is sealed or recovered, so [`recover_partial_feather_files`] can
+/// tell an open file from one its writer abandoned. Written rows are
 /// buffered and appended as one record batch on flush, on seal, when the buffer reaches
 /// [`DEFAULT_DATA_BATCH_CHUNK_SIZE`] rows, or when size rotation may be due, because each IPC
 /// batch carries a message header that outweighs a single row.
 struct FeatherFile {
-    writer: StreamWriter<CountingWriter<BufWriter<File>>>,
+    writer: StreamWriter<CountingWriter<BufWriter<AdmittedWriter<File>>>>,
+    recovery_file: File,
     partial_path: PathBuf,
     path: PathBuf,
     schema: SchemaRef,
@@ -340,26 +500,54 @@ impl FeatherFile {
         path: &Path,
         schema: &Schema,
         rotation_config: &RotationConfig,
+        admission: Option<Arc<dyn FeatherWriteAdmission>>,
+        admission_failure: Arc<OnceLock<FeatherWriteFailure>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let partial_path = path.with_extension(FEATHER_PARTIAL_EXTENSION);
+        let report_io_error = |e: &io::Error| {
+            if let Some(admission) = &admission {
+                admission.io_failed(e);
+            }
+        };
+
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).inspect_err(report_io_error)?;
         }
 
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
-            .open(&partial_path)?;
+            .open(&partial_path)
+            .inspect_err(report_io_error)?;
 
         // Recovery can briefly lock a new, empty file before its writer does, so wait it out
-        file.lock().map_err(|e| {
+        file.lock().inspect_err(report_io_error).map_err(|e| {
             format!(
                 "Failed to lock Feather file {}: {e}",
                 partial_path.display()
             )
         })?;
 
-        let writer = StreamWriter::try_new(CountingWriter::new(BufWriter::new(file)), schema)?;
+        // The duplicate retains the exclusive lock when the buffered writer is dropped
+        let recovery_file = match file.try_clone() {
+            Ok(file) => file,
+            Err(e) => {
+                report_io_error(&e);
+                recover_released_feather_file(file, &partial_path);
+                return Err(e.into());
+            }
+        };
+
+        let file = AdmittedWriter::new(file, admission, admission_failure);
+        let writer = match StreamWriter::try_new(CountingWriter::new(BufWriter::new(file)), schema)
+        {
+            Ok(writer) => writer,
+            Err(e) => {
+                recover_released_feather_file(recovery_file, &partial_path);
+                return Err(feather_write_error(e));
+            }
+        };
 
         let max_size = match rotation_config {
             RotationConfig::Size { max_size } => Some(*max_size),
@@ -368,6 +556,7 @@ impl FeatherFile {
 
         Ok(Self {
             writer,
+            recovery_file,
             partial_path,
             path: path.to_path_buf(),
             schema: Arc::new(schema.clone()),
@@ -427,19 +616,14 @@ impl FeatherFile {
         self.writer.flush()
     }
 
-    fn seal(mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.write_buffer()?;
-        self.writer.finish()?;
-        let file = self
-            .writer
-            .into_inner()?
-            .inner
-            .into_inner()
-            .map_err(io::IntoInnerError::into_error)?;
+    fn seal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.write_buffer().map_err(feather_write_error)?;
+        self.writer.finish().map_err(feather_write_error)?;
+        let file = self.writer.get_mut().inner.get_mut();
         file.sync_all()?;
 
         // Renaming before the file closes keeps it locked until it is sealed
-        fs::rename(&self.partial_path, &self.path)?;
+        fs::rename(&self.partial_path, &self.path).map_err(|e| file.report_failure(e))?;
         Ok(())
     }
 }
@@ -535,6 +719,8 @@ pub struct FeatherWriter {
     flush_interval_ms: u64,
     last_flush_ns: UnixNanos,
     pending_write_error: Option<String>,
+    write_admission: Option<Arc<dyn FeatherWriteAdmission>>,
+    admission_failure: Arc<OnceLock<FeatherWriteFailure>>,
 }
 
 impl FeatherWriter {
@@ -563,7 +749,31 @@ impl FeatherWriter {
             flush_interval_ms,
             last_flush_ns,
             pending_write_error: None,
+            write_admission: None,
+            admission_failure: Arc::default(),
         }
+    }
+
+    /// Attaches the application authority used before every physical payload write.
+    ///
+    /// Installing an authority before any file reservation replaces the previous authority.
+    /// See [`FeatherWriteAdmission`] for the refusal rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a file has already been reserved, including after a failed write.
+    pub fn set_write_admission(
+        &mut self,
+        admission: Arc<dyn FeatherWriteAdmission>,
+    ) -> io::Result<()> {
+        if !self.path_sequences.is_empty() {
+            return Err(io::Error::other(
+                "Feather write admission must be installed before any file reservation",
+            ));
+        }
+
+        self.write_admission = Some(admission);
+        Ok(())
     }
 
     /// Sets typed record-family filter for subsequent writes.
@@ -586,6 +796,8 @@ impl FeatherWriter {
     where
         T: EncodeToRecordBatch + CatalogFamily + 'static,
     {
+        self.check_admission_failure()?;
+
         let metadata = T::metadata(&data);
         let identifier = catalog_identifier_from_metadata(&metadata);
         let data_type = Self::staged_data_type::<T>(&metadata)?;
@@ -594,7 +806,7 @@ impl FeatherWriter {
             return Ok(());
         }
 
-        let path = self.get_writer_path(data_type);
+        let path = self.get_writer_path(data_type)?;
 
         // Create a new FileWriter if one does not exist.
         if !self.writers.contains_key(&path) {
@@ -630,6 +842,8 @@ impl FeatherWriter {
     where
         T: EncodeToRecordBatch + CatalogFamily + 'static,
     {
+        self.check_admission_failure()?;
+
         if data.is_empty() || !self.should_write_family(&T::catalog_family()) {
             return Ok(());
         }
@@ -659,7 +873,7 @@ impl FeatherWriter {
         let mut pending = PendingIo::default();
 
         for (data_type, group) in groups.into_values() {
-            let path = self.get_writer_path(data_type);
+            let path = self.get_writer_path(data_type)?;
             let metadata = T::chunk_metadata(&group);
 
             if !self.writers.contains_key(&path) {
@@ -714,7 +928,7 @@ impl FeatherWriter {
             Ok(should_rotate) => should_rotate,
             Err(e) => {
                 self.abandon_file(&path);
-                return Err(e.into());
+                return Err(feather_write_error(e));
             }
         };
 
@@ -853,14 +1067,23 @@ impl FeatherWriter {
     fn seal_file(&mut self, path: &FileWriterPath) -> Result<(), Box<dyn std::error::Error>> {
         self.next_rotation_times.remove(path);
 
-        let Some(file) = self.writers.remove(path) else {
+        let Some(mut file) = self.writers.remove(path) else {
             return Ok(());
         };
 
-        let partial_path = file.partial_path.clone();
-        let result = file
-            .seal()
-            .inspect_err(|_| recover_released_feather_file(&partial_path));
+        let result = file.seal();
+        let FeatherFile {
+            writer,
+            recovery_file,
+            partial_path,
+            ..
+        } = file;
+        drop(writer);
+
+        if result.is_err() {
+            recover_released_feather_file(recovery_file, &partial_path);
+        }
+
         self.notify_sealed(path);
         result
     }
@@ -874,15 +1097,20 @@ impl FeatherWriter {
             return;
         };
 
-        let partial_path = file.partial_path.clone();
-        drop(file);
+        let FeatherFile {
+            writer,
+            recovery_file,
+            partial_path,
+            ..
+        } = file;
+        drop(writer);
 
         log::error!(
             "Abandoned Feather file {} after a failed write",
             path.path.display()
         );
 
-        recover_released_feather_file(&partial_path);
+        recover_released_feather_file(recovery_file, &partial_path);
         self.notify_sealed(path);
     }
 
@@ -922,7 +1150,13 @@ impl FeatherWriter {
             &T::get_schema(Some(metadata)),
         ));
 
-        let file = FeatherFile::create(&path.path, &schema, &self.rotation_config)?;
+        let file = FeatherFile::create(
+            &path.path,
+            &schema,
+            &self.rotation_config,
+            self.write_admission.clone(),
+            Arc::clone(&self.admission_failure),
+        )?;
         self.writers.insert(path, file);
         Ok(())
     }
@@ -946,8 +1180,14 @@ impl FeatherWriter {
         let schema =
             Self::schema_with_delta_staging_columns(&schema_with_identifier_column(&schema));
 
-        let file = FeatherFile::create(&path.path, &schema, &self.rotation_config)
-            .map_err(|e| format!("Failed to create Feather file for custom {type_name}: {e}"))?;
+        let file = FeatherFile::create(
+            &path.path,
+            &schema,
+            &self.rotation_config,
+            self.write_admission.clone(),
+            Arc::clone(&self.admission_failure),
+        )
+        .map_err(|e| format!("Failed to create Feather file for custom {type_name}: {e}"))?;
         self.writers.insert(path, file);
         Ok(())
     }
@@ -1019,7 +1259,9 @@ impl FeatherWriter {
     ///
     /// This is called automatically based on `flush_interval_ms` if configured, but can also
     /// be called manually by the client. Files stay open, so flushing never starts a new file.
+    /// See [`FeatherWriteAdmission`] for the refusal rule.
     pub fn flush(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.check_admission_failure()?;
         let paths = self.writers.keys().cloned().collect::<Vec<_>>();
 
         for path in paths {
@@ -1027,7 +1269,7 @@ impl FeatherWriter {
                 && let Err(e) = file.flush()
             {
                 self.abandon_file(&path);
-                return Err(e.into());
+                return Err(feather_write_error(e));
             }
         }
 
@@ -1043,6 +1285,8 @@ impl FeatherWriter {
     /// Seals every open file so its complete stream is visible as a `.feather` file.
     ///
     /// Writes after sealing open new files, so this is the boundary promotion uses.
+    /// See [`FeatherWriteAdmission`] for the refusal rule.
+    /// Refused handles are abandoned, removing empty files and recovering complete batches.
     pub fn seal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let paths = self.writers.keys().cloned().collect::<Vec<_>>();
         let mut first_error = None;
@@ -1054,6 +1298,8 @@ impl FeatherWriter {
             }
         }
 
+        self.check_admission_failure()?;
+
         match first_error {
             Some(e) => Err(e),
             None => Ok(()),
@@ -1063,6 +1309,7 @@ impl FeatherWriter {
     /// Seals all open files and reports any write error recorded since the last flush.
     ///
     /// Writes after closing open new files.
+    /// See [`FeatherWriteAdmission`] for the refusal rule.
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.seal()?;
 
@@ -1125,7 +1372,15 @@ impl FeatherWriter {
                 .is_none_or(|filter| filter.allows(data_type, identifier))
     }
 
-    fn reserve_writer_path(&mut self, data_type: CatalogDataType) -> FileWriterPath {
+    fn check_admission_failure(&self) -> io::Result<()> {
+        if let Some(failure) = self.admission_failure.get() {
+            return Err(failure.error());
+        }
+        Ok(())
+    }
+
+    fn reserve_writer_path(&mut self, data_type: CatalogDataType) -> io::Result<FileWriterPath> {
+        self.check_admission_failure()?;
         let now = self.clock.timestamp_ns();
         let (timestamp, first_sequence) = self
             .path_sequences
@@ -1144,7 +1399,7 @@ impl FeatherWriter {
 
             self.path_sequences
                 .insert(data_type.clone(), (timestamp, sequence + 1));
-            return FileWriterPath { path, data_type };
+            return Ok(FileWriterPath { path, data_type });
         }
 
         unreachable!("unbounded writer path sequence exhausted")
@@ -1210,13 +1465,13 @@ impl FeatherWriter {
             validate_custom_catalog_schema(type_name, &schema)?;
         }
 
-        Ok(self.reserve_writer_path(data_type))
+        Ok(self.reserve_writer_path(data_type)?)
     }
 
     /// Returns the open file staging `data_type`, or reserves a new one.
-    fn get_writer_path(&mut self, data_type: CatalogDataType) -> FileWriterPath {
+    fn get_writer_path(&mut self, data_type: CatalogDataType) -> io::Result<FileWriterPath> {
         if let Some(existing) = self.writers.keys().find(|path| path.data_type == data_type) {
-            return existing.clone();
+            return Ok(existing.clone());
         }
 
         self.reserve_writer_path(data_type)
@@ -1227,6 +1482,8 @@ impl FeatherWriter {
     /// This is a convenience method that routes the Data enum to the appropriate
     /// typed write method.
     pub fn write_data(&mut self, data: Data) -> Result<(), Box<dyn std::error::Error>> {
+        self.check_admission_failure()?;
+
         match data {
             Data::Instrument(instrument) => self.write(*instrument),
             Data::Quote(quote) => self.write(quote),
@@ -1266,6 +1523,8 @@ impl FeatherWriter {
         reason = "the public writer API accepts ownership of each submitted data batch"
     )]
     pub fn write_data_batch(&mut self, data: Vec<Data>) -> Result<(), Box<dyn std::error::Error>> {
+        self.check_admission_failure()?;
+
         for batch in DataBatch::from_data_vec_grouped(&data)? {
             match &batch {
                 DataBatch::Custom(data) => {
@@ -1289,6 +1548,7 @@ impl FeatherWriter {
         let Some(command) = Self::write_command(message) else {
             return Ok(false);
         };
+        self.check_admission_failure()?;
 
         if let Err(e) = command(self) {
             self.record_write_error(e.to_string());
@@ -1424,6 +1684,8 @@ impl FeatherWriter {
 
     /// Writes a single custom data value (catalog layout: `data/custom/{type_name}[/{identifier}]`).
     fn write_custom_data(&mut self, custom: &CustomData) -> Result<(), Box<dyn std::error::Error>> {
+        self.check_admission_failure()?;
+
         let batch = Self::encode_custom_to_batch(custom)?;
         self.write_custom_batch(custom, batch)
     }
@@ -1433,6 +1695,8 @@ impl FeatherWriter {
         custom: &CustomData,
         mut batch: RecordBatch,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.check_admission_failure()?;
+
         let type_name = custom.data.type_name();
         let identifier = custom.data_type.identifier().map(String::from);
 
@@ -1480,7 +1744,9 @@ impl FeatherWriter {
     /// Subscribes to all messages on the message bus (pattern "*").
     ///
     /// This will automatically write all supported data types that are published
-    /// on the message bus to the feather files.
+    /// on the message bus to the feather files. After a refusal, every writable bus message fails
+    /// with the latched refusal and is logged by the subscription until
+    /// [`Self::unsubscribe_from_message_bus`] is called.
     ///
     /// The writer must be wrapped in `Rc<RefCell<>>` to be shareable with the message bus handler.
     ///
@@ -1508,13 +1774,14 @@ impl Debug for FeatherWriter {
     }
 }
 
-/// Drop contract: seals open files so their streams stay readable and promotable.
+/// Drop contract: seals open files, or abandons them after an admission refusal.
 ///
-/// Errors are logged, never raised. Call [`FeatherWriter::close`] for deterministic sealing.
+/// Errors are logged, never raised. A latched refusal is logged again even if
+/// [`FeatherWriter::close`] already returned it; call that method for an inspectable result.
 impl Drop for FeatherWriter {
     fn drop(&mut self) {
-        if !self.writers.is_empty() {
-            let _ = self.seal();
+        if let Err(e) = self.seal() {
+            log::error!("Failed to close Feather writer during drop: {e}");
         }
     }
 }
@@ -1602,9 +1869,11 @@ pub(crate) fn recover_partial_feather_files(directory: &Path) {
     }
 }
 
-// Recovers a file its writer released after a failure, so its complete batches stay promotable
-fn recover_released_feather_file(partial_path: &Path) {
-    if let Err(e) = recover_partial_feather_file(partial_path) {
+// The writer keeps its own file exclusively locked through recovery. Scans use try_lock,
+// writers use create_new and skip existing partial names, so the name cannot be reused while
+// the buffered writer is dropped and this owned handle recovers its complete batches.
+fn recover_released_feather_file(file: File, partial_path: &Path) {
+    if let Err(e) = recover_locked_feather_file(file, partial_path) {
         log::error!(
             "Failed to recover Feather file {}: {e}",
             partial_path.display()
@@ -1637,14 +1906,28 @@ fn recover_partial_feather_file(partial_path: &Path) -> anyhow::Result<()> {
         Err(TryLockError::Error(e)) => return Err(e.into()),
     }
 
-    let len = file.metadata()?.len();
-
-    // A writer renames its file before unlocking it, and a new file stays empty until its writer
-    // locks it, so recovery leaves a missing or empty file alone
-    if !partial_path.try_exists()? || len == 0 {
+    // A new file stays empty until its writer locks it, so the scan leaves empty files alone
+    if file.metadata()?.len() == 0 {
         return Ok(());
     }
 
+    recover_locked_feather_file(file, partial_path)
+}
+
+fn recover_locked_feather_file(mut file: File, partial_path: &Path) -> anyhow::Result<()> {
+    if !partial_path.try_exists()? {
+        return Ok(());
+    }
+
+    let len = file.metadata()?.len();
+
+    if len == 0 {
+        fs::remove_file(partial_path)?;
+        return Ok(());
+    }
+
+    // A cloned writer handle shares its cursor, so recovery starts at the stream header
+    file.rewind()?;
     let mut batches = 0;
     let mut complete_len = 0;
     let mut tail_error = None;
@@ -1714,7 +1997,10 @@ fn recover_partial_feather_file(partial_path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::Ordering};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use nautilus_common::{clock::VirtualClock, live::LiveClock};
     #[cfg(target_os = "linux")]
@@ -1736,6 +2022,1047 @@ mod tests {
         common::datafusion::identifiers_from_record_batches,
         writer::materializer::restore_staged_record_batches,
     };
+
+    #[derive(Debug)]
+    struct TestAdmission {
+        cap: u64,
+        charged: AtomicU64,
+        halted: AtomicBool,
+        failures: AtomicU64,
+    }
+
+    impl TestAdmission {
+        fn new(cap: u64) -> Arc<Self> {
+            Arc::new(Self {
+                cap,
+                charged: AtomicU64::new(0),
+                halted: AtomicBool::new(false),
+                failures: AtomicU64::new(0),
+            })
+        }
+    }
+
+    impl FeatherWriteAdmission for TestAdmission {
+        fn admit_write(&self, pending_bytes: usize) -> io::Result<()> {
+            if self.halted.load(Ordering::Acquire) {
+                return Err(io::Error::other("write admission halted"));
+            }
+            let bytes = u64::try_from(pending_bytes).unwrap();
+
+            if self
+                .charged
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(bytes).filter(|next| *next <= self.cap)
+                })
+                .is_err()
+            {
+                self.halted.store(true, Ordering::Release);
+                return Err(io::Error::other("write admission cap exceeded"));
+            }
+            Ok(())
+        }
+
+        fn io_failed(&self, _: &io::Error) {
+            self.failures.fetch_add(1, Ordering::AcqRel);
+            self.halted.store(true, Ordering::Release);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct NonLatchingAdmission {
+        charged: AtomicU64,
+        failures: AtomicU64,
+    }
+
+    impl FeatherWriteAdmission for NonLatchingAdmission {
+        fn admit_write(&self, pending_bytes: usize) -> io::Result<()> {
+            self.charged
+                .fetch_add(u64::try_from(pending_bytes).unwrap(), Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn io_failed(&self, _: &io::Error) {
+            self.failures.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[derive(Debug)]
+    struct RefusesOnceAdmission {
+        calls: AtomicU64,
+        kind: io::ErrorKind,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("injected admission refusal")]
+    struct TestAdmissionError;
+
+    impl FeatherWriteAdmission for RefusesOnceAdmission {
+        fn admit_write(&self, _: usize) -> io::Result<()> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                return Err(io::Error::new(self.kind, TestAdmissionError));
+            }
+            Ok(())
+        }
+
+        fn io_failed(&self, _: &io::Error) {}
+    }
+
+    fn assert_latched_refusal(
+        e: &(dyn std::error::Error + 'static),
+        latch: &OnceLock<FeatherWriteFailure>,
+    ) {
+        let FeatherWriteFailure::Admission(original) = latch.get().unwrap() else {
+            panic!("Expected an admission refusal");
+        };
+
+        assert_eq!(
+            e.to_string(),
+            format!("Feather write admission refused: {original}")
+        );
+        assert!(std::ptr::addr_eq(
+            e.source().unwrap(),
+            original.as_ref() as &dyn std::error::Error,
+        ));
+    }
+
+    #[derive(Debug)]
+    struct ScanOnIoFailureAdmission {
+        directory: PathBuf,
+        failures: AtomicU64,
+    }
+
+    impl FeatherWriteAdmission for ScanOnIoFailureAdmission {
+        fn admit_write(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn io_failed(&self, _: &io::Error) {
+            let partials = feather_files(&self.directory, FEATHER_PARTIAL_EXTENSION);
+            assert_eq!(partials.len(), 1);
+            let path = &partials[0];
+            // Reading through a second handle is denied under Windows byte-range locks, so the
+            // scan's effect is observed through the file's length and name only.
+            let before = fs::metadata(path).unwrap().len();
+            let scanner = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            assert!(matches!(scanner.try_lock(), Err(TryLockError::WouldBlock)));
+            recover_partial_feather_files(&self.directory);
+            assert_eq!(fs::metadata(path).unwrap().len(), before);
+            assert!(feather_files(&self.directory, FEATHER_EXTENSION).is_empty());
+            self.failures.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct ShortWriter {
+        bytes: Vec<u8>,
+        fail_after: Option<usize>,
+        halt_during_write: Option<Arc<TestAdmission>>,
+        fail_flush: bool,
+    }
+
+    impl Write for ShortWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail_after == Some(self.bytes.len()) {
+                self.fail_after = None;
+                return Err(io::Error::other("injected partial I/O failure"));
+            }
+            self.bytes.push(buf[0]);
+
+            if let Some(admission) = &self.halt_during_write {
+                admission.halted.store(true, Ordering::Release);
+            }
+            Ok(1)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                return Err(io::Error::other("injected flush failure"));
+            }
+            Ok(())
+        }
+    }
+
+    struct SharedShortWriter(Arc<Mutex<ShortWriter>>);
+
+    impl Write for SharedShortWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    #[rstest]
+    #[case::refuses_once(io::ErrorKind::Other)]
+    #[case::interrupted(io::ErrorKind::Interrupted)]
+    fn admission_refusal_latches_before_a_later_acceptance(#[case] kind: io::ErrorKind) {
+        let admission = Arc::new(RefusesOnceAdmission {
+            calls: AtomicU64::new(0),
+            kind,
+        });
+        let mut writer = AdmittedWriter::new(Vec::new(), Some(admission.clone()), Arc::default());
+        assert_eq!(
+            writer.write(b"first").unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        let error = writer.write(b"second").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Feather write admission refused: injected admission refusal"
+        );
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap();
+        assert_eq!(source.kind(), kind);
+        assert_eq!(source.to_string(), "injected admission refusal");
+        assert!(source.get_ref().unwrap().is::<TestAdmissionError>());
+        assert_eq!(admission.calls.load(Ordering::Acquire), 1);
+        assert!(writer.inner.is_empty());
+    }
+
+    #[rstest]
+    fn physical_refusal_latches_across_handles() {
+        let admission = Arc::new(RefusesOnceAdmission {
+            calls: AtomicU64::new(0),
+            kind: io::ErrorKind::Interrupted,
+        });
+        let latch = Arc::default();
+        let mut first =
+            AdmittedWriter::new(Vec::new(), Some(admission.clone()), Arc::clone(&latch));
+        let mut sibling = AdmittedWriter::new(Vec::new(), Some(admission.clone()), latch);
+        let first_error = first.write_all(b"first").unwrap_err();
+        let sibling_error = sibling.write_all(b"sibling").unwrap_err();
+
+        assert_eq!(first_error.to_string(), sibling_error.to_string());
+        assert!(sibling.write(b"").is_err());
+        assert!(sibling.flush().is_err());
+        assert_eq!(admission.calls.load(Ordering::Acquire), 1);
+        assert!(first.inner.is_empty());
+        assert!(sibling.inner.is_empty());
+        assert!(std::ptr::addr_eq(
+            std::error::Error::source(&first_error).unwrap(),
+            std::error::Error::source(&sibling_error).unwrap(),
+        ));
+    }
+
+    #[rstest]
+    fn latched_io_error_preserves_raw_os_error() {
+        let admission = Arc::new(NonLatchingAdmission::default());
+        let mut writer = AdmittedWriter::new(Vec::new(), Some(admission.clone()), Arc::default());
+        let first_error = writer.report_failure(io::Error::from_raw_os_error(28));
+        let later_error = writer.write_all(b"later").unwrap_err();
+        let first_source = std::error::Error::source(&first_error).unwrap();
+        let later_source = std::error::Error::source(&later_error).unwrap();
+
+        assert!(std::ptr::addr_eq(first_source, later_source));
+        assert_eq!(
+            later_source
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(28)
+        );
+        assert!(
+            later_error
+                .to_string()
+                .starts_with("Feather payload I/O failure:")
+        );
+        assert_eq!(admission.failures.load(Ordering::Acquire), 1);
+        assert!(writer.admission_failure.get().is_none());
+        assert!(writer.inner.is_empty());
+    }
+
+    #[rstest]
+    fn streaming_sink_retains_original_refusal_source() {
+        let directory = TempDir::new().unwrap();
+        let admission = Arc::new(RefusesOnceAdmission {
+            calls: AtomicU64::new(0),
+            kind: io::ErrorKind::PermissionDenied,
+        });
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        );
+        writer.set_write_admission(admission.clone()).unwrap();
+        StreamingSink::write_data(&mut writer, Data::Quote(quote_at(1))).unwrap();
+        let errors = [
+            StreamingSink::flush(&mut writer).unwrap_err(),
+            StreamingSink::write_data(&mut writer, Data::Quote(quote_at(2))).unwrap_err(),
+            StreamingSink::flush(&mut writer).unwrap_err(),
+            StreamingSink::close(&mut writer).unwrap_err(),
+        ];
+
+        for e in &errors {
+            assert!(e.downcast_ref::<io::Error>().is_some());
+        }
+
+        let sources = errors
+            .iter()
+            .map(|e| {
+                e.chain()
+                    .filter_map(|source| source.downcast_ref::<io::Error>())
+                    .find(|source| {
+                        source.get_ref().is_some_and(
+                            <dyn std::error::Error + Send + Sync + 'static>::is::<
+                                TestAdmissionError,
+                            >,
+                        )
+                    })
+                    .expect("original typed admission error")
+            })
+            .collect::<Vec<_>>();
+
+        for source in &sources {
+            assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+            assert!(std::ptr::addr_eq(sources[0], *source));
+        }
+        assert_eq!(admission.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[rstest]
+    fn buffered_drop_does_not_retry_a_partially_failed_drain() {
+        let inner = Arc::new(Mutex::new(ShortWriter {
+            bytes: Vec::new(),
+            fail_after: Some(2),
+            halt_during_write: None,
+            fail_flush: false,
+        }));
+        let admission = Arc::new(NonLatchingAdmission::default());
+        let mut writer = BufWriter::with_capacity(
+            16,
+            AdmittedWriter::new(
+                SharedShortWriter(Arc::clone(&inner)),
+                Some(admission.clone()),
+                Arc::default(),
+            ),
+        );
+        writer.write_all(b"abcd").unwrap();
+        assert!(inner.lock().unwrap().bytes.is_empty());
+        assert!(writer.flush().is_err());
+        assert_eq!(inner.lock().unwrap().bytes, b"ab");
+        assert_eq!(admission.charged.load(Ordering::Acquire), 4);
+        drop(writer);
+        assert_eq!(inner.lock().unwrap().bytes, b"ab");
+        assert_eq!(admission.charged.load(Ordering::Acquire), 4);
+        assert_eq!(admission.failures.load(Ordering::Acquire), 1);
+    }
+
+    #[rstest]
+    #[case(None, 4, 0)]
+    #[case(Some(2), 2, 1)]
+    fn physical_admission_charges_short_writes_once(
+        #[case] fail_after: Option<usize>,
+        #[case] expected_written: usize,
+        #[case] expected_failures: u64,
+    ) {
+        let admission = TestAdmission::new(4);
+        let mut writer = AdmittedWriter::new(
+            ShortWriter {
+                bytes: Vec::new(),
+                fail_after,
+                halt_during_write: None,
+                fail_flush: false,
+            },
+            Some(admission.clone()),
+            Arc::default(),
+        );
+        let result = writer.write_all(b"abcd");
+        assert_eq!(result.is_err(), fail_after.is_some());
+        assert_eq!(writer.inner.bytes, &b"abcd"[..expected_written]);
+        assert_eq!(admission.charged.load(Ordering::Acquire), 4);
+        assert_eq!(
+            admission.failures.load(Ordering::Acquire),
+            expected_failures
+        );
+        assert!(writer.write_all(b"x").is_err());
+        assert_eq!(writer.inner.bytes.len(), expected_written);
+        assert_eq!(admission.charged.load(Ordering::Acquire), 4);
+    }
+
+    #[rstest]
+    #[case::non_latching_admission(true)]
+    #[case::no_admission(false)]
+    fn partial_io_failure_latches_without_authority_refusal(#[case] with_admission: bool) {
+        let admission = Arc::new(NonLatchingAdmission::default());
+        let authority: Option<Arc<dyn FeatherWriteAdmission>> = if with_admission {
+            Some(admission.clone())
+        } else {
+            None
+        };
+        let mut writer = AdmittedWriter::new(
+            ShortWriter {
+                bytes: Vec::new(),
+                fail_after: Some(2),
+                halt_during_write: None,
+                fail_flush: false,
+            },
+            authority,
+            Arc::default(),
+        );
+        assert_eq!(
+            writer.write_all(b"abcd").unwrap_err().to_string(),
+            "Feather payload I/O failure: injected partial I/O failure"
+        );
+        assert_eq!(writer.inner.bytes, b"ab");
+        let charged = admission.charged.load(Ordering::Acquire);
+        assert_eq!(charged, if with_admission { 4 } else { 0 });
+        assert_eq!(
+            admission.failures.load(Ordering::Acquire),
+            u64::from(with_admission)
+        );
+
+        writer.inner.fail_flush = true;
+        assert!(writer.flush().is_err());
+        let error = writer.write_all(b"later").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Feather payload I/O failure: injected partial I/O failure"
+        );
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap();
+        assert_eq!(source.kind(), io::ErrorKind::Other);
+        assert_eq!(source.to_string(), "injected partial I/O failure");
+        assert_eq!(writer.inner.bytes, b"ab");
+        assert_eq!(admission.charged.load(Ordering::Acquire), charged);
+
+        // The underlying writer recovers; the wrapper must still prevent another write
+        writer.inner.write_all(b"ok").unwrap();
+        assert_eq!(writer.inner.bytes, b"abok");
+    }
+
+    #[rstest]
+    fn admitted_short_write_retries_finish_after_admission_halts() {
+        let admission = TestAdmission::new(4);
+        let mut writer = AdmittedWriter::new(
+            ShortWriter {
+                bytes: Vec::new(),
+                fail_after: None,
+                halt_during_write: Some(admission.clone()),
+                fail_flush: false,
+            },
+            Some(admission.clone()),
+            Arc::default(),
+        );
+        writer.write_all(b"abcd").unwrap();
+        assert!(admission.halted.load(Ordering::Acquire));
+        assert_eq!(writer.inner.bytes, b"abcd");
+        assert!(writer.write_all(b"x").is_err());
+        assert_eq!(writer.inner.bytes, b"abcd");
+        assert_eq!(admission.charged.load(Ordering::Acquire), 4);
+    }
+
+    #[derive(Debug)]
+    enum DrainAction {
+        Flush,
+        Seal,
+        Close,
+        Drop,
+    }
+
+    #[rstest]
+    #[case::close(false)]
+    #[case::drop(true)]
+    fn one_shot_refusal_stops_sibling_writes_and_drains(#[case] drop_writer: bool) {
+        let directory = TempDir::new().unwrap();
+        let admission = Arc::new(RefusesOnceAdmission {
+            calls: AtomicU64::new(0),
+            kind: io::ErrorKind::Other,
+        });
+        let clock = Arc::new(AtomicU64::new(0));
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::clone(&clock)),
+            RotationConfig::NoRotation,
+            None,
+            Some(1),
+        );
+        writer.set_write_admission(admission.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        let trade = TradeTick::new(
+            InstrumentId::from("AUD/USD.SIM"),
+            Price::from("1.0"),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::from("1"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        );
+        writer.write(trade).unwrap();
+        let e = writer.flush().unwrap_err();
+        assert_latched_refusal(e.as_ref(), &writer.admission_failure);
+        assert_eq!(writer.writers.len(), 1);
+        let sibling_path = writer.writers.keys().next().unwrap().clone();
+        let buffered_rows = writer.writers[&sibling_path].buffer_rows;
+
+        clock.store(1_000_000, Ordering::Relaxed);
+
+        let e = if sibling_path.data_type == NautilusDataType::QuoteTick.into() {
+            writer.write(quote_at(2)).unwrap_err()
+        } else {
+            writer.write(trade).unwrap_err()
+        };
+
+        assert_latched_refusal(e.as_ref(), &writer.admission_failure);
+        assert_eq!(writer.writers[&sibling_path].buffer_rows, buffered_rows);
+        assert_eq!(admission.calls.load(Ordering::Acquire), 1);
+
+        if !drop_writer {
+            let e = writer.close().unwrap_err();
+            assert_latched_refusal(e.as_ref(), &writer.admission_failure);
+            assert!(writer.is_closed());
+        }
+
+        drop(writer);
+        assert_eq!(admission.calls.load(Ordering::Acquire), 1);
+        assert!(feather_files(directory.path(), FEATHER_EXTENSION).is_empty());
+        assert!(feather_files(directory.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
+    }
+
+    #[rstest]
+    fn single_file_refusal_remains_terminal_after_abandonment() {
+        let directory = TempDir::new().unwrap();
+        let admission = Arc::new(RefusesOnceAdmission {
+            calls: AtomicU64::new(0),
+            kind: io::ErrorKind::Other,
+        });
+        let clock = Arc::new(AtomicU64::new(0));
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::clone(&clock)),
+            RotationConfig::NoRotation,
+            None,
+            Some(1),
+        );
+        writer.set_write_admission(admission.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        clock.store(1_000_000, Ordering::Relaxed);
+        let e = writer.flush().unwrap_err();
+        assert_latched_refusal(e.as_ref(), &writer.admission_failure);
+        assert!(writer.is_closed());
+        let errors = [
+            writer.seal().unwrap_err(),
+            writer.close().unwrap_err(),
+            writer.flush().unwrap_err(),
+            writer.write(quote_at(2)).unwrap_err(),
+            writer.write_batch::<QuoteTick>(Vec::new()).unwrap_err(),
+            writer.write_data_batch(Vec::new()).unwrap_err(),
+            writer.write_any_message(&quote_at(3)).unwrap_err(),
+        ];
+
+        for e in errors {
+            assert_latched_refusal(e.as_ref(), &writer.admission_failure);
+        }
+
+        // Entry checks reject writes before the elapsed auto-flush interval is considered
+        assert_eq!(writer.last_flush_ns, UnixNanos::from(0));
+        assert!(writer.is_closed());
+        assert!(!writer.write_any_message(&42_u64).unwrap());
+        assert_eq!(admission.calls.load(Ordering::Acquire), 1);
+        assert!(feather_files(directory.path(), FEATHER_EXTENSION).is_empty());
+        assert!(feather_files(directory.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
+    }
+
+    #[rstest]
+    #[case::flush(DrainAction::Flush)]
+    #[case::seal(DrainAction::Seal)]
+    #[case::close(DrainAction::Close)]
+    #[case::drop(DrainAction::Drop)]
+    fn halted_admission_rejects_buffered_drains(#[case] action: DrainAction) {
+        let directory = TempDir::new().unwrap();
+        let admission = TestAdmission::new(u64::MAX);
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        );
+        writer.set_write_admission(admission.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        admission.halted.store(true, Ordering::Release);
+
+        match action {
+            DrainAction::Flush => assert!(writer.flush().is_err()),
+            DrainAction::Seal => assert!(writer.seal().is_err()),
+            DrainAction::Close => assert!(writer.close().is_err()),
+            DrainAction::Drop => {}
+        }
+        drop(writer);
+        assert_eq!(admission.charged.load(Ordering::Acquire), 0);
+        assert_eq!(admission.failures.load(Ordering::Acquire), 0);
+        assert!(feather_files(directory.path(), FEATHER_EXTENSION).is_empty());
+        assert!(feather_files(directory.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
+    }
+
+    #[rstest]
+    #[case::flush(false)]
+    #[case::close(true)]
+    fn refusal_prevents_further_file_reservations(#[case] close: bool) {
+        let directory = TempDir::new().unwrap();
+        let admission = TestAdmission::new(u64::MAX);
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        );
+        writer.set_write_admission(admission.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        admission.halted.store(true, Ordering::Release);
+
+        if close {
+            assert!(writer.close().is_err());
+        } else {
+            assert!(writer.flush().is_err());
+        }
+
+        for timestamp in [2, 3] {
+            assert!(writer.write(quote_at(timestamp)).is_err());
+            assert!(writer.flush().is_err());
+
+            assert!(feather_files(directory.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
+        }
+
+        let reservations = writer.path_sequences.clone();
+        assert!(writer.write_batch(vec![quote_at(4)]).is_err());
+        assert!(
+            writer
+                .reserve_writer_path(NautilusDataType::TradeTick.into())
+                .is_err()
+        );
+        assert_eq!(writer.path_sequences, reservations);
+        assert!(writer.flush().is_err());
+        drop(writer);
+        assert!(feather_files(directory.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
+        assert!(feather_files(directory.path(), FEATHER_EXTENSION).is_empty());
+        assert_eq!(admission.charged.load(Ordering::Acquire), 0);
+    }
+
+    #[rstest]
+    #[case::close(true)]
+    #[case::drop(false)]
+    fn one_shot_refusal_during_sealing_stops_sibling_drain(#[case] close: bool) {
+        let directory = TempDir::new().unwrap();
+        let admission = Arc::new(RefusesOnceAdmission {
+            calls: AtomicU64::new(0),
+            kind: io::ErrorKind::Other,
+        });
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        );
+        writer.set_write_admission(admission.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        writer
+            .write(TradeTick::new(
+                InstrumentId::from("AUD/USD.SIM"),
+                Price::from("1.0"),
+                Quantity::from("1000"),
+                AggressorSide::Buy,
+                TradeId::from("1"),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+            ))
+            .unwrap();
+        assert_eq!(writer.writers.len(), 2);
+        let partials = feather_files(directory.path(), FEATHER_PARTIAL_EXTENSION);
+        assert_eq!(partials.len(), 2);
+
+        if close {
+            let e = writer.close().unwrap_err();
+            assert_latched_refusal(e.as_ref(), &writer.admission_failure);
+        }
+
+        drop(writer);
+
+        for partial in partials {
+            assert!(!partial.exists());
+        }
+        assert_eq!(admission.calls.load(Ordering::Acquire), 1);
+        assert!(feather_files(directory.path(), FEATHER_EXTENSION).is_empty());
+    }
+
+    #[rstest]
+    fn exact_cap_and_shared_budget_exhaustion() {
+        let directory = TempDir::new().unwrap();
+        let admission = TestAdmission::new(u64::MAX);
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        );
+        writer.set_write_admission(TestAdmission::new(0)).unwrap();
+        writer.set_write_admission(admission.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        assert!(
+            writer
+                .set_write_admission(TestAdmission::new(u64::MAX))
+                .is_err()
+        );
+        writer.close().unwrap();
+        let path = feather_files(directory.path(), FEATHER_EXTENSION).remove(0);
+        let cap = fs::metadata(&path).unwrap().len();
+        assert_eq!(admission.charged.load(Ordering::Acquire), cap);
+        assert_eq!(read_quotes(&path), vec![Data::from(quote_at(1))]);
+
+        for other_charge in [0, 1, cap] {
+            let next = TempDir::new().unwrap();
+            let authority = TestAdmission::new(cap);
+            authority
+                .admit_write(usize::try_from(other_charge).unwrap())
+                .unwrap();
+            let mut writer = FeatherWriter::new(
+                next.path().to_path_buf(),
+                WriterClock::Test(Arc::new(AtomicU64::new(0))),
+                RotationConfig::NoRotation,
+                None,
+                Some(0),
+            );
+            writer.set_write_admission(authority.clone()).unwrap();
+            let result = writer.write(quote_at(1)).and_then(|()| writer.close());
+            assert_eq!(result.is_ok(), other_charge == 0);
+            drop(writer);
+            let physical: u64 = feather_files(next.path(), FEATHER_EXTENSION)
+                .into_iter()
+                .chain(feather_files(next.path(), FEATHER_PARTIAL_EXTENSION))
+                .map(|path| fs::metadata(path).unwrap().len())
+                .sum();
+            assert!(physical + other_charge <= cap);
+            assert!(authority.charged.load(Ordering::Acquire) <= cap);
+        }
+    }
+
+    #[rstest]
+    fn flush_failure_notifies_shared_admission_and_blocks_later_payload() {
+        let admission = TestAdmission::new(u64::MAX);
+        let mut writer = AdmittedWriter::new(
+            ShortWriter {
+                bytes: Vec::new(),
+                fail_after: None,
+                halt_during_write: None,
+                fail_flush: true,
+            },
+            Some(admission.clone()),
+            Arc::default(),
+        );
+        writer.write_all(b"ok").unwrap();
+        assert!(writer.flush().is_err());
+        assert_eq!(admission.failures.load(Ordering::Acquire), 1);
+        assert!(admission.halted.load(Ordering::Acquire));
+        assert!(writer.write_all(b"later").is_err());
+        assert_eq!(writer.inner.bytes, b"ok");
+        assert_eq!(admission.charged.load(Ordering::Acquire), 2);
+    }
+
+    #[rstest]
+    #[case::directory(true)]
+    #[case::open(false)]
+    fn file_creation_failure_notifies_shared_admission(#[case] directory_failure: bool) {
+        let directory = TempDir::new().unwrap();
+        let admission = TestAdmission::new(u64::MAX);
+        let path = if directory_failure {
+            let blocked = directory.path().join("blocked");
+            fs::write(&blocked, b"existing file").unwrap();
+            blocked.join("quotes.feather")
+        } else {
+            let path = directory.path().join("quotes.feather");
+            fs::write(
+                path.with_extension(FEATHER_PARTIAL_EXTENSION),
+                b"existing partial",
+            )
+            .unwrap();
+            path
+        };
+        let metadata = QuoteTick::metadata(&quote_at(1));
+        let schema = QuoteTick::get_schema(Some(metadata));
+        assert!(
+            FeatherFile::create(
+                &path,
+                &schema,
+                &RotationConfig::NoRotation,
+                Some(admission.clone()),
+                Arc::default(),
+            )
+            .is_err()
+        );
+        assert_eq!(admission.failures.load(Ordering::Acquire), 1);
+        assert!(admission.halted.load(Ordering::Acquire));
+        assert_eq!(admission.charged.load(Ordering::Acquire), 0);
+        if !directory_failure {
+            assert_eq!(
+                fs::read(path.with_extension(FEATHER_PARTIAL_EXTENSION)).unwrap(),
+                b"existing partial"
+            );
+        }
+    }
+
+    #[rstest]
+    #[cfg(target_os = "linux")]
+    fn synchronization_failure_notifies_admission_before_any_later_payload() {
+        let full = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let admission = TestAdmission::new(u64::MAX);
+        let mut writer = AdmittedWriter::new(full, Some(admission.clone()), Arc::default());
+        assert!(writer.sync_all().is_err());
+        assert_eq!(admission.failures.load(Ordering::Acquire), 1);
+        assert!(admission.halted.load(Ordering::Acquire));
+        assert!(writer.write_all(b"later").is_err());
+        assert_eq!(admission.charged.load(Ordering::Acquire), 0);
+        drop(writer);
+    }
+
+    #[rstest]
+    fn rename_failure_notifies_shared_admission() {
+        let directory = TempDir::new().unwrap();
+        let admission = TestAdmission::new(u64::MAX);
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        );
+        writer.set_write_admission(admission.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        let final_path = PathBuf::from(
+            writer
+                .get_current_file_info()
+                .into_values()
+                .next()
+                .unwrap()
+                .1,
+        );
+        fs::create_dir(&final_path).unwrap();
+        assert!(writer.close().is_err());
+        assert_eq!(admission.failures.load(Ordering::Acquire), 1);
+        assert!(admission.halted.load(Ordering::Acquire));
+        assert!(writer.is_closed());
+        assert!(final_path.is_dir());
+    }
+
+    #[rstest]
+    fn refusal_after_admitted_batches_recovers_only_the_complete_prefix() {
+        let reference = TempDir::new().unwrap();
+        let unlimited = TestAdmission::new(u64::MAX);
+        let mut writer = FeatherWriter::new(
+            reference.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        );
+        writer.set_write_admission(unlimited.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        writer.flush().unwrap();
+        let first_charge = unlimited.charged.load(Ordering::Acquire);
+        drop(writer);
+
+        let directory = TempDir::new().unwrap();
+        let admission = TestAdmission::new(first_charge.checked_mul(2).unwrap());
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        );
+        writer.set_write_admission(admission.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(admission.charged.load(Ordering::Acquire), first_charge);
+        let result = writer
+            .write_batch((2..5_003).map(quote_at).collect())
+            .and_then(|()| writer.flush());
+        assert!(result.is_err());
+        drop(writer);
+        assert!(admission.halted.load(Ordering::Acquire));
+        assert_eq!(admission.failures.load(Ordering::Acquire), 0);
+        let charged = admission.charged.load(Ordering::Acquire);
+        assert!(charged > first_charge && charged <= admission.cap);
+        let files = feather_files(directory.path(), FEATHER_EXTENSION);
+        assert_eq!(files.len(), 1);
+        assert_eq!(read_quotes(&files[0]), quotes_at(&[1]));
+        assert!(fs::metadata(&files[0]).unwrap().len() <= charged);
+        assert!(feather_files(directory.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
+    }
+
+    #[rstest]
+    fn released_file_stays_locked_through_recovery() {
+        let directory = TempDir::new().unwrap();
+        let admission = Arc::new(ScanOnIoFailureAdmission {
+            directory: directory.path().to_path_buf(),
+            failures: AtomicU64::new(0),
+        });
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        );
+        writer.set_write_admission(admission.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        writer.flush().unwrap();
+        let path = writer
+            .get_writer_path(NautilusDataType::QuoteTick.into())
+            .unwrap();
+        let file = writer.writers.get_mut(&path).unwrap();
+
+        // Drop the original locked descriptor; the recovery duplicate must still exclude scans
+        file.writer.get_mut().inner.get_mut().inner = File::open(&file.partial_path).unwrap();
+        writer.write(quote_at(2)).unwrap();
+        assert!(writer.flush().is_err());
+
+        assert_eq!(admission.failures.load(Ordering::Acquire), 1);
+        assert!(writer.is_closed());
+        assert!(feather_files(directory.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
+        assert_eq!(read_quotes(&path.path), quotes_at(&[1]));
+    }
+
+    #[rstest]
+    fn failed_flush_keeps_sibling_auto_flush_due() {
+        let directory = TempDir::new().unwrap();
+        let clock = Arc::new(AtomicU64::new(0));
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::clone(&clock)),
+            RotationConfig::NoRotation,
+            None,
+            Some(1),
+        );
+        writer.write(quote_at(1)).unwrap();
+        writer
+            .write(TradeTick::new(
+                InstrumentId::from("AUD/USD.SIM"),
+                Price::from("1.0"),
+                Quantity::from("1000"),
+                AggressorSide::Buy,
+                TradeId::from("1"),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+            ))
+            .unwrap();
+        let first_path = writer.writers.keys().next().unwrap().clone();
+        let file = writer.writers.get_mut(&first_path).unwrap();
+        file.writer.get_mut().inner.get_mut().inner = File::open(&file.partial_path).unwrap();
+        clock.store(1_000_000, Ordering::Relaxed);
+        assert!(writer.flush().is_err());
+        assert_eq!(writer.last_flush_ns, UnixNanos::from(0));
+        assert_eq!(writer.writers.len(), 1);
+        assert_eq!(writer.writers.values().next().unwrap().buffer_rows, 1);
+
+        writer.write(quote_at(2)).unwrap();
+
+        assert_eq!(writer.last_flush_ns, UnixNanos::from(1_000_000));
+        assert!(writer.writers.values().all(|file| file.buffer_rows == 0));
+        writer.close().unwrap();
+    }
+
+    #[rstest]
+    fn admitted_stream_recovers_after_io_failure_and_refusal() {
+        let directory = TempDir::new().unwrap();
+        let admission = TestAdmission::new(u64::MAX);
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        );
+        writer.set_write_admission(admission.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        writer.flush().unwrap();
+        let first_charge = admission.charged.load(Ordering::Acquire);
+        let path = writer
+            .get_writer_path(NautilusDataType::QuoteTick.into())
+            .unwrap();
+        let file = writer.writers.get_mut(&path).unwrap();
+
+        // Keep the live IPC stream, buffer and admission wrapper; only the OS handle fails writes
+        let read_only = File::open(&file.partial_path).unwrap();
+        file.writer.get_mut().inner.get_mut().inner = read_only;
+        writer.write(quote_at(2)).unwrap();
+        let io_failure = StreamingSink::flush(&mut writer).unwrap_err();
+        assert!(io_failure.chain().any(|source| {
+            source
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.raw_os_error().is_some())
+        }));
+        assert_eq!(admission.failures.load(Ordering::Acquire), 1);
+        assert!(writer.admission_failure.get().is_none());
+        assert!(writer.is_closed());
+        let charged_after_io = admission.charged.load(Ordering::Acquire);
+        assert!(charged_after_io > first_charge);
+
+        // I/O failure is handle-local; the authority refuses the next file's first drain
+        writer.write(quote_at(3)).unwrap();
+        assert!(writer.flush().is_err());
+        assert!(writer.admission_failure.get().is_some());
+        assert!(writer.close().is_err());
+        drop(writer);
+        recover_partial_feather_files(directory.path());
+        let files = feather_files(directory.path(), FEATHER_EXTENSION);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(read_quotes(&files[0]), quotes_at(&[1]));
+        assert!(feather_files(directory.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
+        assert_eq!(admission.charged.load(Ordering::Acquire), charged_after_io);
+        assert_eq!(admission.failures.load(Ordering::Acquire), 1);
+    }
+
+    #[rstest]
+    #[case::close(true)]
+    #[case::drop(false)]
+    fn refused_write_leaves_no_payload_through_close_and_drop(#[case] close: bool) {
+        let directory = TempDir::new().unwrap();
+        let admission = TestAdmission::new(0);
+        let mut writer = FeatherWriter::new(
+            directory.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        );
+        writer.set_write_admission(admission.clone()).unwrap();
+        writer.write(quote_at(1)).unwrap();
+        let partials = feather_files(directory.path(), FEATHER_PARTIAL_EXTENSION);
+        assert_eq!(partials.len(), 1);
+        assert_eq!(fs::metadata(&partials[0]).unwrap().len(), 0);
+
+        if close {
+            assert!(writer.close().is_err());
+            assert!(
+                writer
+                    .set_write_admission(TestAdmission::new(u64::MAX))
+                    .is_err()
+            );
+            assert!(!partials[0].exists());
+        }
+
+        drop(writer);
+        assert!(admission.halted.load(Ordering::Acquire));
+        assert!(!partials[0].exists());
+        assert_eq!(admission.charged.load(Ordering::Acquire), 0);
+        assert_eq!(admission.failures.load(Ordering::Acquire), 0);
+        assert!(feather_files(directory.path(), FEATHER_EXTENSION).is_empty());
+    }
 
     fn feather_files(directory: &Path, extension: &str) -> Vec<PathBuf> {
         let mut files = Vec::new();
@@ -2034,7 +3361,9 @@ mod tests {
         manager.write(trade).unwrap();
 
         // Check keys and paths for quotes and trades
-        let path = manager.get_writer_path(QuoteTick::catalog_family());
+        let path = manager
+            .get_writer_path(QuoteTick::catalog_family())
+            .unwrap();
         let expected_path = temp_dir
             .path()
             .join("quotes")
@@ -2044,7 +3373,9 @@ mod tests {
         let writer = manager.writers.get(&path).unwrap();
         assert!(writer.size() > 0);
 
-        let path = manager.get_writer_path(TradeTick::catalog_family());
+        let path = manager
+            .get_writer_path(TradeTick::catalog_family())
+            .unwrap();
         let expected_path = temp_dir
             .path()
             .join("trades")
@@ -2178,9 +3509,18 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("quotes.feather");
-        let mut file = FeatherFile::create(&path, &schema, &RotationConfig::NoRotation).unwrap();
+        let mut file = FeatherFile::create(
+            &path,
+            &schema,
+            &RotationConfig::NoRotation,
+            None,
+            Arc::default(),
+        )
+        .unwrap();
         file.write_record_batch(&batch).unwrap();
         file.seal().unwrap();
+        // The sealed file stays locked until its handles drop; release it before reading
+        drop(file);
 
         assert!(!path.with_extension(FEATHER_PARTIAL_EXTENSION).exists());
         let mut reader = StreamReader::try_new(File::open(&path).unwrap(), None).unwrap();
@@ -2571,7 +3911,9 @@ mod tests {
         fs::write(&sealed, b"sealed").unwrap();
         fs::write(&partial, b"partial").unwrap();
 
-        let path = writer.reserve_writer_path(NautilusDataType::TradeTick.into());
+        let path = writer
+            .reserve_writer_path(NautilusDataType::TradeTick.into())
+            .unwrap();
 
         assert_eq!(
             path.path,
@@ -2757,7 +4099,13 @@ mod tests {
 
         let error = writer.close().unwrap_err();
 
-        assert_eq!(error.to_string(), "No such file or directory (os error 2)");
+        assert_eq!(
+            error.to_string(),
+            "Feather payload I/O failure: No such file or directory (os error 2)"
+        );
+        let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
+        assert_eq!(source.kind(), io::ErrorKind::NotFound);
+        assert_eq!(source.raw_os_error(), Some(2));
         assert!(writer.is_closed());
         assert!(feather_files(temp_dir.path(), FEATHER_EXTENSION).is_empty());
         assert_eq!(
@@ -2789,15 +4137,27 @@ mod tests {
         let (path, file) = writer.writers.iter_mut().next().unwrap();
         let sealed = path.path.clone();
         let full = OpenOptions::new().write(true).open("/dev/full").unwrap();
-        file.writer =
-            StreamWriter::try_new(CountingWriter::new(BufWriter::new(full)), &file.schema).unwrap();
+        file.writer = StreamWriter::try_new(
+            CountingWriter::new(BufWriter::new(AdmittedWriter::new(
+                full,
+                None,
+                Arc::default(),
+            ))),
+            &file.schema,
+        )
+        .unwrap();
 
         let error = writer.close().unwrap_err();
 
         assert_eq!(
             error.to_string(),
-            "Io error: No space left on device (os error 28)"
+            "Feather payload I/O failure: No space left on device (os error 28)"
         );
+        let wrapper = error.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(wrapper.kind(), io::ErrorKind::Other);
+        assert_eq!(wrapper.raw_os_error(), None);
+        let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
+        assert_eq!(source.raw_os_error(), Some(28));
         assert!(writer.is_closed());
         assert!(feather_files(temp_dir.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
         assert_eq!(read_quotes(&sealed), quotes_at(&[1]));
@@ -2836,8 +4196,15 @@ mod tests {
         let (abandoned, file) = writer.writers.iter_mut().next().unwrap();
         let abandoned = abandoned.clone();
         let full = OpenOptions::new().write(true).open("/dev/full").unwrap();
-        file.writer =
-            StreamWriter::try_new(CountingWriter::new(BufWriter::new(full)), &file.schema).unwrap();
+        file.writer = StreamWriter::try_new(
+            CountingWriter::new(BufWriter::new(AdmittedWriter::new(
+                full,
+                None,
+                Arc::default(),
+            ))),
+            &file.schema,
+        )
+        .unwrap();
 
         let error = writer.flush().unwrap_err();
         writer.write(quote_at(3)).unwrap();
@@ -2849,12 +4216,16 @@ mod tests {
             .collect::<Vec<_>>();
         recovered.sort_by_key(HasTsInit::ts_init);
 
-        // Quote 2 was buffered when the flush failed, and the full device also fails the writer's
-        // drop-time flush, so it reaches no file
+        // Quote 2 was buffered when the flush failed, so it reaches no file
         assert_eq!(
             error.to_string(),
-            "Io error: No space left on device (os error 28)"
+            "Feather payload I/O failure: No space left on device (os error 28)"
         );
+        let wrapper = error.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(wrapper.kind(), io::ErrorKind::Other);
+        assert_eq!(wrapper.raw_os_error(), None);
+        let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
+        assert_eq!(source.raw_os_error(), Some(28));
         assert_eq!(abandoned.path.exists(), flushed);
         assert!(feather_files(temp_dir.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
         assert_eq!(recovered, quotes_at(&expected));

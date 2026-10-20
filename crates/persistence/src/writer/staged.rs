@@ -984,7 +984,7 @@ mod tests {
 
         assert_eq!(
             worker.client.seal().unwrap_err().to_string(),
-            "No such file or directory (os error 2)"
+            "Feather payload I/O failure: No such file or directory (os error 2)"
         );
         assert_eq!(
             worker.client.seal().unwrap(),
