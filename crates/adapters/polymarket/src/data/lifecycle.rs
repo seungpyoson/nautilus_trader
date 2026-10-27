@@ -36,6 +36,7 @@ use crate::{
     resolve::{
         ResolveBatchErrorMode, ResolveWatchSelectionMode, collect_resolve_watch_selection,
         fetch_and_apply_resolutions_by_condition_ids, pause_and_reconcile_resolve_watch_entries,
+        release_resolve_watch_position_serialized,
         update_resolve_watchlist_from_position_event_serialized,
     },
     websocket::messages::PolymarketWsMessage,
@@ -50,16 +51,49 @@ impl PolymarketDataClient {
         }
 
         let watchlist = self.resolve_poll_watchlist.clone();
-        let instruments = self.instruments.clone();
+        let cache = self.cache.clone();
+        let instrument_update_state = self.instrument_update_state.clone();
         let owner_lock = self.resolve_watch_apply_mutex.clone();
-        let closed_condition_ids = self.subscriptions.closed_condition_ids.clone();
+        let resolved_instrument_ids = self.subscriptions.resolved_instrument_ids.clone();
 
         let handler = TypedHandler::from(move |event: &PositionEvent| {
+            let instrument_id = event.instrument_id();
+            if instrument_id.venue != *crate::common::consts::POLYMARKET_VENUE {
+                return;
+            }
+
+            // A closed position leaves any watch, whatever settled it or purged its instrument
+            if let PositionEvent::PositionClosed(closed) = event {
+                release_resolve_watch_position_serialized(
+                    &owner_lock,
+                    &watchlist,
+                    instrument_id,
+                    closed.position_id,
+                );
+                return;
+            }
+
+            // Clients share the engine cache, so only the admitting generation owns settlement
+            if !instrument_update_state.lock().is_admitted(&instrument_id) {
+                return;
+            }
+            // Position metadata belongs to the engine cache, not retired live routing
+            let cache = cache.borrow();
+            // Consumed closes survive a client reset and remain engine-owned authority
+            if cache.instrument_close(&instrument_id).is_some() {
+                return;
+            }
+            let Some(instrument) = cache.instrument(&instrument_id) else {
+                log::error!(
+                    "Cannot track Polymarket position resolution: instrument {instrument_id} is absent from the cache"
+                );
+                return;
+            };
             update_resolve_watchlist_from_position_event_serialized(
                 &owner_lock,
-                &closed_condition_ids,
+                &resolved_instrument_ids,
                 &watchlist,
-                &instruments,
+                instrument,
                 event,
             );
         });
@@ -644,7 +678,7 @@ mod tests {
         models::fee::{FeeModelAny, MakerTakerFeeModel},
     };
     use nautilus_model::{
-        data::{DataType, QuoteTick},
+        data::{Data, DataType, QuoteTick},
         enums::BookType,
         identifiers::{ClientId, InstrumentId, PositionId, Symbol, TraderId},
         instruments::{Instrument, InstrumentAny, stubs::binary_option},
@@ -716,6 +750,7 @@ mod tests {
             PolymarketDataClient::new_with_proxy(
                 *POLYMARKET_CLIENT_ID,
                 config,
+                Rc::new(RefCell::new(Cache::default())).into(),
                 gamma,
                 clob,
                 data_api,
@@ -726,6 +761,7 @@ mod tests {
             PolymarketDataClient::new(
                 *POLYMARKET_CLIENT_ID,
                 config,
+                Rc::new(RefCell::new(Cache::default())).into(),
                 gamma,
                 clob,
                 data_api,
@@ -792,6 +828,7 @@ mod tests {
         let mut client = PolymarketDataClient::new(
             *POLYMARKET_CLIENT_ID,
             config,
+            Rc::new(RefCell::new(Cache::default())).into(),
             gamma,
             clob,
             data_api,
@@ -904,6 +941,7 @@ mod tests {
         PolymarketDataClient::new_with_proxy(
             ClientId::from("POLY-TEST"),
             config,
+            Rc::new(RefCell::new(Cache::default())).into(),
             gamma,
             clob,
             data_api,
@@ -942,6 +980,7 @@ mod tests {
         PolymarketDataClient::new(
             ClientId::from("POLY-TEST"),
             config,
+            Rc::new(RefCell::new(Cache::default())).into(),
             gamma,
             clob,
             data_api,
@@ -1000,6 +1039,7 @@ mod tests {
         let client = PolymarketDataClient::new(
             ClientId::from("POLY-TEST"),
             PolymarketDataClientConfig::default(),
+            Rc::new(RefCell::new(Cache::default())).into(),
             gamma,
             clob,
             PolymarketDataApiHttpClient::new(None, 5).unwrap(),
@@ -1950,6 +1990,500 @@ mod tests {
                 .read()
                 .contains_key(&"0xCOND-POLL".to_string())
         );
+    }
+
+    #[rstest]
+    #[case::ordinary(false)]
+    #[case::after_retirement(true)]
+    #[tokio::test]
+    async fn position_resolution_survives_retirement_without_reopening_settled_legs(
+        #[case] retire_before_position: bool,
+    ) {
+        use nautilus_model::{
+            enums::{OrderSide, PositionSide},
+            events::PositionOpened,
+            identifiers::{AccountId, ClientOrderId, StrategyId},
+        };
+
+        let mut client = make_client_for_reset_test();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        client.data_sender = tx.into();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let condition_id = "0xCOND-LATE";
+        client.cache = cache.clone().into();
+        let instruments = ["0xYES", "0xNO"].map(|token| {
+            let mut binary = binary_option();
+            binary.id = InstrumentId::from(format!("{condition_id}-{token}.POLYMARKET").as_str());
+            binary.raw_symbol = Symbol::new(token);
+            binary.currency = Currency::pUSD();
+            binary.expiration_ns = client.clock.get_time_ns();
+            let instrument = InstrumentAny::BinaryOption(binary);
+            cache
+                .borrow_mut()
+                .add_instrument(instrument.clone())
+                .unwrap();
+            admit_instrument(&client, &instrument);
+            instrument
+        });
+        client.start_client();
+
+        if retire_before_position {
+            assert!(
+                client
+                    .subscriptions
+                    .retire_condition(condition_id, std::iter::empty(), None)
+                    .await
+            );
+            assert!(client.instruments.load().is_empty());
+        }
+
+        let mut position_events = Vec::new();
+
+        for (index, instrument) in instruments.iter().enumerate() {
+            assert!(cache.borrow().instrument(&instrument.id()).is_some());
+            let event = PositionEvent::PositionOpened(PositionOpened {
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("STRATEGY-001"),
+                instrument_id: instrument.id(),
+                position_id: PositionId::new(format!("P-{index}").as_str()),
+                account_id: AccountId::from("ACCOUNT-001"),
+                opening_order_id: ClientOrderId::from(format!("ENTRY-{index}").as_str()),
+                entry: OrderSide::Buy,
+                side: PositionSide::Long,
+                signed_qty: 1.into(),
+                quantity: Quantity::from("1"),
+                last_qty: Quantity::from("1"),
+                last_px: Price::from("0.75"),
+                currency: Currency::pUSD(),
+                avg_px_open: "0.75".parse().unwrap(),
+                realized_pnl: None,
+                event_id: UUID4::new(),
+                ts_event: client.clock.get_time_ns(),
+                ts_init: client.clock.get_time_ns(),
+            });
+            msgbus::publish_position_event("events.position.STRATEGY-001".into(), &event);
+            assert!(
+                client
+                    .resolve_poll_watchlist
+                    .read()
+                    .contains_key(condition_id)
+            );
+
+            assert_eq!(
+                crate::resolve::apply_condition_resolution(
+                    &client.resolution_context(),
+                    condition_id,
+                    "0xYES",
+                    "Yes",
+                )
+                .await,
+                crate::resolve::ResolveApplyResult::Applied { emitted_closes: 1 }
+            );
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            let closes = events
+                .iter()
+                .filter_map(|event| match event {
+                    DataEvent::Data(Data::InstrumentClose(close)) => Some(close),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(closes.len(), 1);
+            assert_eq!(closes[0].instrument_id, instrument.id());
+            let expected_price = if index == 0 {
+                rust_decimal::Decimal::ONE
+            } else {
+                rust_decimal::Decimal::ZERO
+            };
+            assert_eq!(closes[0].close_price.as_decimal(), expected_price);
+
+            // A duplicate position event cannot reopen a leg after its close was emitted
+            msgbus::publish_position_event("events.position.STRATEGY-001".into(), &event);
+            assert!(client.resolve_poll_watchlist.read().is_empty());
+            assert_eq!(
+                crate::resolve::apply_condition_resolution(
+                    &client.resolution_context(),
+                    condition_id,
+                    "0xYES",
+                    "Yes",
+                )
+                .await,
+                crate::resolve::ResolveApplyResult::Ignored
+            );
+            assert!(rx.try_recv().is_err());
+            // The engine's consumed receipt is distinct from publication on the data channel
+            cache.borrow_mut().add_instrument_close(*closes[0]).unwrap();
+            position_events.push(event);
+        }
+
+        client.reset_client();
+        assert!(
+            client
+                .subscriptions
+                .resolved_instrument_ids
+                .lock()
+                .is_empty()
+        );
+
+        // The next generation owns the same legs again, so only consumed closes fence them
+        for instrument in &instruments {
+            admit_instrument(&client, instrument);
+        }
+        client.start_client();
+
+        for event in &position_events {
+            msgbus::publish_position_event("events.position.STRATEGY-001".into(), event);
+        }
+        assert!(client.resolve_poll_watchlist.read().is_empty());
+        assert!(rx.try_recv().is_err());
+        client.stop_client();
+    }
+
+    fn admit_instrument(client: &PolymarketDataClient, instrument: &InstrumentAny) {
+        assert!(apply_live_instrument(
+            &client.subscriptions.closed_condition_ids,
+            &client.instrument_update_state,
+            &client.instruments,
+            &client.subscriptions.token_meta,
+            instrument,
+            |_| {},
+        ));
+    }
+
+    fn cached_outcome(
+        cache: &Rc<RefCell<Cache>>,
+        condition_id: &str,
+        token_id: &str,
+        expiration_ns: UnixNanos,
+    ) -> InstrumentAny {
+        let mut binary = binary_option();
+        binary.id = InstrumentId::from(format!("{condition_id}-{token_id}.POLYMARKET").as_str());
+        binary.raw_symbol = Symbol::new(token_id);
+        binary.currency = Currency::pUSD();
+        binary.expiration_ns = expiration_ns;
+        let instrument = InstrumentAny::BinaryOption(binary);
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        instrument
+    }
+
+    fn stub_position_opened(instrument_id: InstrumentId) -> PositionEvent {
+        use nautilus_model::{
+            enums::{OrderSide, PositionSide},
+            events::PositionOpened,
+            identifiers::{AccountId, ClientOrderId, StrategyId},
+        };
+
+        PositionEvent::PositionOpened(PositionOpened {
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id: StrategyId::from("STRATEGY-001"),
+            instrument_id,
+            position_id: PositionId::new("P-1"),
+            account_id: AccountId::from("ACCOUNT-001"),
+            opening_order_id: ClientOrderId::from("ENTRY-1"),
+            entry: OrderSide::Buy,
+            side: PositionSide::Long,
+            signed_qty: 1.into(),
+            quantity: Quantity::from("1"),
+            last_qty: Quantity::from("1"),
+            last_px: Price::from("0.75"),
+            currency: Currency::pUSD(),
+            avg_px_open: "0.75".parse().unwrap(),
+            realized_pnl: None,
+            event_id: UUID4::new(),
+            ts_event: UnixNanos::from(1),
+            ts_init: UnixNanos::from(1),
+        })
+    }
+
+    fn stub_position_closed(instrument_id: InstrumentId) -> PositionEvent {
+        use nautilus_core::DurationNanos;
+        use nautilus_model::{
+            enums::{OrderSide, PositionSide},
+            events::PositionClosed,
+            identifiers::{AccountId, ClientOrderId, StrategyId},
+            types::Money,
+        };
+
+        PositionEvent::PositionClosed(PositionClosed {
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id: StrategyId::from("STRATEGY-001"),
+            instrument_id,
+            position_id: PositionId::new("P-1"),
+            account_id: AccountId::from("ACCOUNT-001"),
+            opening_order_id: ClientOrderId::from("ENTRY-1"),
+            closing_order_id: None,
+            entry: OrderSide::Buy,
+            side: PositionSide::Flat,
+            signed_qty: 0.into(),
+            quantity: Quantity::from("0"),
+            peak_quantity: Quantity::from("1"),
+            last_qty: Quantity::from("1"),
+            last_px: Price::from("1"),
+            currency: Currency::pUSD(),
+            avg_px_open: "0.75".parse().unwrap(),
+            avg_px_close: Some(1.into()),
+            realized_return: 0.25 / 0.75,
+            realized_pnl: Some(Money::new(0.25, Currency::pUSD())),
+            unrealized_pnl: Money::new(0.0, Currency::pUSD()),
+            duration: DurationNanos::new(1),
+            event_id: UUID4::new(),
+            ts_opened: UnixNanos::from(1),
+            ts_closed: Some(UnixNanos::from(2)),
+            ts_event: UnixNanos::from(2),
+            ts_init: UnixNanos::from(2),
+        })
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn shared_cache_position_has_one_resolution_owner() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut clients = ["POLYMARKET-A", "POLYMARKET-B"].map(|name| {
+            let mut client = make_client_for_reset_test();
+            client.client_id = ClientId::from(name);
+            client.cache = cache.clone().into();
+            client
+        });
+        let mut receivers = clients.each_mut().map(|client| {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            client.data_sender = tx.into();
+            rx
+        });
+        let condition_id = "0xCOND-SHARED";
+        let instrument = cached_outcome(
+            &cache,
+            condition_id,
+            "0xYES",
+            clients[0].clock.get_time_ns(),
+        );
+        // Only the first client loads this market; both observe every position event
+        admit_instrument(&clients[0], &instrument);
+        for client in &mut clients {
+            client.start_client();
+        }
+
+        msgbus::publish_position_event(
+            "events.position.STRATEGY-001".into(),
+            &stub_position_opened(instrument.id()),
+        );
+        let watched = clients.each_ref().map(|client| {
+            client
+                .resolve_poll_watchlist
+                .read()
+                .contains_key(condition_id)
+        });
+
+        assert_eq!(
+            crate::resolve::apply_condition_resolution(
+                &clients[0].resolution_context(),
+                condition_id,
+                "0xYES",
+                "Yes",
+            )
+            .await,
+            crate::resolve::ResolveApplyResult::Applied { emitted_closes: 1 }
+        );
+        let close = std::iter::from_fn(|| receivers[0].try_recv().ok())
+            .find_map(|event| match event {
+                DataEvent::Data(Data::InstrumentClose(close)) => Some(close),
+                _ => None,
+            })
+            .expect("owner publishes the instrument close");
+        // The engine records the close before it publishes the settled position
+        cache.borrow_mut().add_instrument_close(close).unwrap();
+        msgbus::publish_position_event(
+            "events.position.STRATEGY-001".into(),
+            &stub_position_closed(instrument.id()),
+        );
+
+        // The other client later observes the same venue resolution
+        crate::resolve::apply_condition_resolution(
+            &clients[1].resolution_context(),
+            condition_id,
+            "0xYES",
+            "Yes",
+        )
+        .await;
+        let duplicate_closes = std::iter::from_fn(|| receivers[1].try_recv().ok())
+            .filter(|event| matches!(event, DataEvent::Data(Data::InstrumentClose(_))))
+            .count();
+
+        assert_eq!(
+            (watched, duplicate_closes),
+            ([true, false], 0),
+            "only the client which admitted the instrument may watch and settle its position",
+        );
+
+        for client in &mut clients {
+            client.stop_client();
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn closed_position_releases_watch_after_instrument_leaves_cache() {
+        let mut client = make_client_for_reset_test();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        client.cache = cache.clone().into();
+        let condition_id = "0xCOND-PURGED";
+        let instrument = cached_outcome(&cache, condition_id, "0xYES", client.clock.get_time_ns());
+        admit_instrument(&client, &instrument);
+        client.start_client();
+
+        msgbus::publish_position_event(
+            "events.position.STRATEGY-001".into(),
+            &stub_position_opened(instrument.id()),
+        );
+        assert!(
+            client
+                .resolve_poll_watchlist
+                .read()
+                .contains_key(condition_id)
+        );
+
+        // Another position subscriber, such as sandbox expiry cleanup, may purge it first
+        cache.borrow_mut().purge_instrument(instrument.id());
+        assert!(cache.borrow().instrument(&instrument.id()).is_none());
+        msgbus::publish_position_event(
+            "events.position.STRATEGY-001".into(),
+            &stub_position_closed(instrument.id()),
+        );
+
+        assert!(client.resolve_poll_watchlist.read().is_empty());
+        client.stop_client();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn restarted_client_settles_first_position_in_closed_expired_scope_once() {
+        use nautilus_common::providers::InstrumentProvider;
+
+        let mut market: Value = serde_json::from_str(include_str!(
+            "../../test_data/gamma_market_fee_zero_rate.json"
+        ))
+        .unwrap();
+        market["closed"] = Value::Bool(true);
+        market["acceptingOrders"] = Value::Bool(false);
+        market["endDate"] = Value::String("2020-01-01T00:00:00Z".to_string());
+        let condition_id = market["conditionId"].as_str().unwrap().to_string();
+        let tokens: Vec<String> =
+            serde_json::from_str(market["clobTokenIds"].as_str().unwrap()).unwrap();
+        let instrument_ids = tokens
+            .iter()
+            .map(|token| InstrumentId::from(format!("{condition_id}-{token}.POLYMARKET").as_str()))
+            .collect::<Vec<_>>();
+        let mut page = serde_json::Map::new();
+        page.insert("markets".to_string(), Value::Array(vec![market]));
+        page.insert("next_cursor".to_string(), Value::Null);
+        let response = Value::Object(page).to_string();
+        let router = axum::Router::new().route(
+            "/markets/keyset",
+            axum::routing::get(move || {
+                let response = response.clone();
+                async move { response }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        replace_data_event_sender(tx);
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let config = PolymarketDataClientConfig {
+            instrument_config: Some(PolymarketInstrumentProviderConfig {
+                load_ids: Some(instrument_ids.clone()),
+                ..Default::default()
+            }),
+            ..PolymarketDataClientConfig::default()
+        };
+        let mut client = PolymarketDataClient::new(
+            ClientId::from("POLY-TEST"),
+            config,
+            cache.clone().into(),
+            PolymarketGammaHttpClient::new(
+                Some(format!("http://{address}")),
+                5,
+                RetryConfig::default(),
+            )
+            .unwrap(),
+            PolymarketClobPublicClient::new(Some(format!("http://{address}")), 5).unwrap(),
+            PolymarketDataApiHttpClient::new(None, 5).unwrap(),
+            PolymarketMarketConnectionPool::new(
+                None,
+                false,
+                TransportBackend::default(),
+                WS_DEFAULT_SUBSCRIPTIONS,
+            ),
+        )
+        .unwrap();
+
+        client.bootstrap_instruments().await.unwrap();
+        server.abort();
+        // The configured market is already closed and expired, so it gets no live routing
+        assert!(client.instruments.load().is_empty());
+        assert!(
+            client
+                .provider()
+                .store()
+                .list_all()
+                .iter()
+                .any(|instrument| instrument.id() == instrument_ids[0])
+        );
+
+        // A restarted engine cache still holds the market and has no close for it
+        for instrument in client.provider().store().list_all() {
+            cache
+                .borrow_mut()
+                .add_instrument(instrument.clone())
+                .unwrap();
+        }
+        client.start_client();
+        msgbus::publish_position_event(
+            "events.position.STRATEGY-001".into(),
+            &stub_position_opened(instrument_ids[0]),
+        );
+        let watched = client
+            .resolve_poll_watchlist
+            .read()
+            .contains_key(&condition_id);
+        let mut results = Vec::new();
+
+        for _ in 0..2 {
+            results.push(
+                crate::resolve::apply_condition_resolution(
+                    &client.resolution_context(),
+                    &condition_id,
+                    &tokens[0],
+                    "Yes",
+                )
+                .await,
+            );
+        }
+        let closes = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    DataEvent::Data(Data::InstrumentClose(close))
+                        if close.instrument_id == instrument_ids[0]
+                )
+            })
+            .count();
+
+        assert_eq!(
+            (watched, results, closes),
+            (
+                true,
+                vec![
+                    crate::resolve::ResolveApplyResult::Applied { emitted_closes: 1 },
+                    crate::resolve::ResolveApplyResult::Ignored,
+                ],
+                1,
+            ),
+            "a first position in a configured closed market must settle exactly once",
+        );
+        client.stop_client();
     }
 
     #[rstest]

@@ -214,7 +214,7 @@ pub(super) fn request_instruments(client: &PolymarketDataClient, request: Reques
             }
         };
 
-        let update_state = instrument_update_state.lock();
+        let mut update_state = instrument_update_state.lock();
         let mut effective_instruments = Vec::with_capacity(instruments.len());
         let now_ns = clock.get_time_ns();
 
@@ -236,6 +236,7 @@ pub(super) fn request_instruments(client: &PolymarketDataClient, request: Reques
         let cached_count = if update_state.retired {
             0
         } else {
+            update_state.record_admissions(&effective_instruments);
             let terminal_conditions = closed_condition_ids.lock();
 
             let live: Vec<_> = effective_instruments
@@ -321,7 +322,7 @@ pub(super) fn request_instrument(
         };
 
         if let Some(inst) = instrument {
-            let update_state = instrument_update_state.lock();
+            let mut update_state = instrument_update_state.lock();
             let inst = match update_state.compose_instrument(&inst) {
                 Ok(instrument) => instrument,
                 Err(e) => {
@@ -334,13 +335,14 @@ pub(super) fn request_instrument(
                 &inst,
                 clock.get_time_ns(),
             ) {
+                update_state.record_admissions(std::slice::from_ref(&inst));
                 log::debug!(
                     "Skipping expired instrument {instrument_id} during request_instrument cache update"
                 );
             } else {
                 apply_live_instrument_locked(
                     &closed_condition_ids,
-                    &update_state,
+                    &mut update_state,
                     &instruments_cache,
                     &token_meta,
                     &inst,

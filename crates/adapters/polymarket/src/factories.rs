@@ -67,7 +67,7 @@ impl DataClientFactory for PolymarketDataClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        _cache: CacheView,
+        cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let polymarket_config = config
@@ -79,7 +79,11 @@ impl DataClientFactory for PolymarketDataClientFactory {
                 )
             })?;
 
-        Ok(Box::new(Self::create_client(name, polymarket_config)?))
+        Ok(Box::new(Self::create_client(
+            name,
+            polymarket_config,
+            cache,
+        )?))
     }
 
     fn name(&self) -> &'static str {
@@ -95,6 +99,7 @@ impl PolymarketDataClientFactory {
     fn create_client(
         name: &str,
         polymarket_config: &PolymarketDataClientConfig,
+        cache: CacheView,
     ) -> anyhow::Result<PolymarketDataClient> {
         polymarket_config.validate()?;
 
@@ -142,6 +147,7 @@ impl PolymarketDataClientFactory {
         let mut client = PolymarketDataClient::new_with_proxy(
             client_id,
             polymarket_config.clone(),
+            cache,
             gamma_client,
             clob_public_client,
             data_api_client,
@@ -432,7 +438,9 @@ mod tests {
             http_timeout_secs: 2,
             ..PolymarketDataClientConfig::default()
         };
-        let client = PolymarketDataClientFactory::create_client(POLYMARKET, &config).unwrap();
+        let cache = Rc::new(RefCell::new(Cache::default())).into();
+        let client =
+            PolymarketDataClientFactory::create_client(POLYMARKET, &config, cache).unwrap();
 
         let errors = [
             client

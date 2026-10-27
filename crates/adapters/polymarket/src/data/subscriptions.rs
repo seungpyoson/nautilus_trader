@@ -65,6 +65,8 @@ pub(crate) struct DataSubscriptions {
     pub(super) ws_sub_mutex: Arc<tokio::sync::Mutex<()>>,
     pub(super) pending_auto_loads: Arc<Mutex<AHashSet<InstrumentId>>>,
     pub(super) closed_condition_ids: Arc<Mutex<AHashSet<String>>>,
+    // Published closes fence callbacks before the engine consumes them into its cache
+    pub(super) resolved_instrument_ids: Arc<Mutex<AHashSet<InstrumentId>>>,
 }
 
 impl DataSubscriptions {
@@ -97,6 +99,7 @@ impl DataSubscriptions {
             ws_sub_mutex: Arc::new(tokio::sync::Mutex::new(())),
             pending_auto_loads: Arc::new(Mutex::new(AHashSet::new())),
             closed_condition_ids: Arc::new(Mutex::new(AHashSet::new())),
+            resolved_instrument_ids: Arc::new(Mutex::new(AHashSet::new())),
         }
     }
 
@@ -228,6 +231,11 @@ impl DataSubscriptions {
                 }
             }
         }
+    }
+
+    // Resolution application holds the owner lock through publication and recording
+    pub(crate) fn record_instrument_close(&self, instrument_id: InstrumentId) {
+        self.resolved_instrument_ids.lock().insert(instrument_id);
     }
 
     // Strict resolution holds the reconciliation and resolution locks before releasing intents

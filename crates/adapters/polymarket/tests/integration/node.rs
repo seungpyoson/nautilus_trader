@@ -17,6 +17,7 @@
 
 use std::{
     net::SocketAddr,
+    panic::AssertUnwindSafe,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24,12 +25,17 @@ use std::{
     time::Duration,
 };
 
+use futures_util::FutureExt;
 use nautilus_common::{
     actor::DataActor,
     enums::Environment,
-    msgbus::{self, MessagingSwitchboard, stubs::get_any_saving_handler},
+    msgbus::{
+        self, MessagingSwitchboard,
+        stubs::{get_any_saving_handler, get_typed_message_saving_handler},
+    },
     testing::wait_until_async,
 };
+use nautilus_core::{UnixNanos, datetime::unix_nanos_to_iso8601, time::get_atomic_clock_realtime};
 use nautilus_live::{
     builder::LiveNodeBuilder,
     config::{LiveExecutionEngineConfig, LiveNodeConfig},
@@ -37,8 +43,11 @@ use nautilus_live::{
     node::{LiveNode, NodeState},
 };
 use nautilus_model::{
+    data::InstrumentClose,
     enums::OrderStatus,
-    events::{OrderAccepted, OrderCanceled, OrderFillVoided, OrderFilled, OrderRejected},
+    events::{
+        OrderAccepted, OrderCanceled, OrderFillVoided, OrderFilled, OrderRejected, PositionEvent,
+    },
     identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     instruments::Instrument,
     orders::Order,
@@ -142,6 +151,29 @@ nautilus_strategy!(SubmitLimitOnStart, {
         self.probe.fill_voided.store(true, Ordering::Relaxed);
     }
 });
+
+#[derive(Debug)]
+struct SubmitOutcomePairOnStart {
+    core: StrategyCore,
+    instrument_ids: [InstrumentId; 2],
+}
+
+impl DataActor for SubmitOutcomePairOnStart {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        for (index, instrument_id) in self.instrument_ids.into_iter().enumerate() {
+            self.submit_order(
+                harness::limit_order(instrument_id, &format!("LATE-{index}")),
+                None,
+                Some(ClientId::from(POLYMARKET)),
+                None,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+nautilus_strategy!(SubmitOutcomePairOnStart, {});
 
 async fn start_accepting_mock() -> (SocketAddr, TestServerState) {
     let state = TestServerState::default();
@@ -681,6 +713,267 @@ async fn fill_routes_through_node_execution_manager() {
     );
     assert_eq!(positions.len(), 1);
     assert_eq!(positions[0].quantity, Quantity::from("100.0000"));
+}
+
+#[rstest]
+#[case::ordinary(false)]
+#[case::first_position_after_terminal(true)]
+#[tokio::test]
+async fn native_resolution_closes_both_outcomes_after_terminal(
+    #[case] terminal_before_first_fill: bool,
+) {
+    let state = TestServerState::default();
+    state.configure_default_order_success().await;
+    state
+        .order_response_uses_request_hash
+        .store(true, Ordering::Release);
+    *state.orders_response_override.lock().await = Some(json!({"data": [], "next_cursor": "LTE="}));
+    *state.trades_response_override.lock().await = Some(json!({"data": [], "next_cursor": "LTE="}));
+    let mut market = load_json("gamma_market.json");
+    let condition_id = market["conditionId"].as_str().unwrap().to_string();
+    let tokens: [String; 2] =
+        serde_json::from_str(market["clobTokenIds"].as_str().unwrap()).unwrap();
+    let outcomes: [String; 2] = serde_json::from_str(market["outcomes"].as_str().unwrap()).unwrap();
+    let instrument_ids = tokens
+        .each_ref()
+        .map(|token| InstrumentId::from(format!("{condition_id}-{token}.POLYMARKET")));
+    let addr = start_mock_server(state.clone()).await;
+    let base_url = format!("http://{addr}");
+    let data_config = PolymarketDataClientConfig {
+        base_url_http: Some(base_url.clone()),
+        base_url_gamma: Some(base_url.clone()),
+        base_url_data_api: Some(base_url),
+        base_url_ws: Some(format!("ws://{addr}/ws")),
+        instrument_config: Some(PolymarketInstrumentProviderConfig {
+            load_ids: Some(instrument_ids.to_vec()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(data_config.resolve_poll_enabled);
+    assert!(!data_config.subscribe_new_markets);
+    let poll_bound = Duration::from_secs(data_config.resolve_poll_interval_secs) + DEADLINE;
+    let grace = Duration::from_secs(data_config.resolve_poll_grace_secs);
+    let expiration = UnixNanos::from(
+        get_atomic_clock_realtime().get_time_ns().as_u64()
+            - u64::try_from(grace.as_nanos()).unwrap(),
+    );
+    market["endDate"] = json!(unix_nanos_to_iso8601(expiration));
+    *state.gamma_response.lock().await = Some(json!([market.clone()]));
+    let mut resolved = market;
+    resolved["closed"] = json!(true);
+    resolved["acceptingOrders"] = json!(false);
+    resolved["outcomePrices"] = json!("[\"1\",\"0\"]");
+
+    let config = LiveNodeConfig {
+        environment: Environment::Live,
+        trader_id: TraderId::from(harness::TRADER_ID),
+        exec_engine: LiveExecutionEngineConfig {
+            reconciliation: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let run_bound = poll_bound * (u32::try_from(instrument_ids.len()).unwrap() + 1)
+        + RUN_TIMEOUT
+        + config.delay_post_stop
+        + config.timeout_disconnection;
+    assert!(Duration::from_secs(data_config.resolve_poll_max_wait_secs) > grace + run_bound);
+    let mut node = LiveNodeBuilder::from_config(config)
+        .unwrap()
+        .with_name("PolymarketLatePositionResolution")
+        .add_data_client(
+            None,
+            Box::new(PolymarketDataClientFactory),
+            Box::new(data_config),
+        )
+        .unwrap()
+        .add_exec_client(
+            None,
+            Box::new(PolymarketExecutionClientFactory),
+            Box::new(execution_config(addr)),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    node.add_strategy(SubmitOutcomePairOnStart {
+        core: StrategyCore::new(StrategyConfig {
+            strategy_id: Some(StrategyId::from(harness::STRATEGY_ID)),
+            ..Default::default()
+        }),
+        instrument_ids,
+    })
+    .unwrap();
+    let (close_handler, closes) = get_any_saving_handler::<InstrumentClose>(None);
+    let close_topic = "data.close.POLYMARKET.*".into();
+    msgbus::subscribe_instrument_close(close_topic, close_handler.clone(), Some(1));
+    let (position_handler, positions) = get_typed_message_saving_handler::<PositionEvent>(None);
+    let position_topic = "events.position.*".into();
+    msgbus::subscribe_position_events(position_topic, position_handler.clone(), Some(1));
+    let cache = node.kernel().cache();
+    let handle = node.handle();
+
+    let proof = async {
+        wait_until_async(
+            || async {
+                instrument_ids.iter().enumerate().all(|(index, _)| {
+                    cache
+                        .borrow()
+                        .order(&ClientOrderId::from(format!("LATE-{index}")))
+                        .is_some_and(|order| order.status() == OrderStatus::Accepted)
+                })
+            },
+            DEADLINE,
+        )
+        .await;
+        assert!(positions.get_messages().is_empty());
+
+        if terminal_before_first_fill {
+            *state.gamma_response.lock().await = Some(json!([resolved.clone()]));
+            wait_until_async(
+                || async {
+                    instrument_ids.iter().all(|id| {
+                        cache
+                            .borrow()
+                            .instrument(id)
+                            .and_then(|instrument| instrument.info())
+                            .is_some_and(|info| {
+                                info.get("closed").and_then(|v| v.as_bool()) == Some(true)
+                            })
+                    })
+                },
+                poll_bound,
+            )
+            .await;
+            // This proves terminal discovery, not private metadata retirement completion.
+            assert!(positions.get_messages().is_empty());
+            assert!(closes.get_messages().is_empty());
+        }
+
+        for (index, instrument_id) in instrument_ids.iter().enumerate() {
+            let order_id = ClientOrderId::from(format!("LATE-{index}"));
+            let venue_order_id = cache
+                .borrow()
+                .order(&order_id)
+                .unwrap()
+                .venue_order_id()
+                .unwrap();
+            let mut fill = load_json("ws_user_trade_full.json");
+            fill["event_type"] = json!("trade");
+            fill["id"] = json!(format!("late-position-{index}"));
+            fill["market"] = json!(condition_id);
+            fill["asset_id"] = json!(tokens[index]);
+            fill["outcome"] = json!(outcomes[index]);
+            fill["taker_order_id"] = json!(venue_order_id.as_str());
+            fill["maker_orders"][0]["asset_id"] = json!(tokens[index]);
+            fill["maker_orders"][0]["outcome"] = json!(outcomes[index]);
+            let clock = get_atomic_clock_realtime();
+            fill["timestamp"] = json!(clock.get_time_ms().to_string());
+            fill["match_time"] = json!(unix_nanos_to_iso8601(clock.get_time_ns()));
+            fill["last_update"] = fill["match_time"].clone();
+            state.send_user(fill.clone()).await;
+            wait_until_async(
+                || async {
+                    positions.get_messages().iter().any(|event| {
+                        matches!(event, PositionEvent::PositionOpened(open) if open.instrument_id == *instrument_id)
+                    })
+                },
+                DEADLINE,
+            )
+            .await;
+
+            if !terminal_before_first_fill && index == 0 {
+                assert!(closes.get_messages().is_empty());
+                assert_eq!(
+                    cache
+                        .borrow()
+                        .positions_open(None, None, None, None, None)
+                        .len(),
+                    1,
+                );
+                *state.gamma_response.lock().await = Some(json!([resolved.clone()]));
+            }
+
+            wait_until_async(
+                || async {
+                    positions.get_messages().iter().any(|event| {
+                        matches!(event, PositionEvent::PositionClosed(closed) if closed.instrument_id == *instrument_id)
+                    })
+                },
+                poll_bound,
+            )
+            .await;
+            let instrument_closes = closes
+                .get_messages()
+                .into_iter()
+                .filter(|close| close.instrument_id == *instrument_id)
+                .collect::<Vec<_>>();
+            assert_eq!(instrument_closes.len(), 1);
+            assert_eq!(
+                instrument_closes[0].close_price.as_decimal(),
+                [Decimal::ONE, Decimal::ZERO][index],
+            );
+            assert!(
+                cache
+                    .borrow()
+                    .positions_open(None, None, None, None, None)
+                    .is_empty(),
+            );
+            assert!(cache.borrow().instrument_close(instrument_id).is_some());
+
+            if index == 0 {
+                // This replay precedes the opposite fill on the same FIFO user socket.
+                // Final event counts must stay exact; admission can defer the replay after close.
+                state.send_user(fill).await;
+            }
+        }
+    };
+    let driver = async {
+        let result = AssertUnwindSafe(proof).catch_unwind().await;
+        handle.stop();
+        result
+    };
+    let run = tokio::time::timeout(run_bound, async { tokio::join!(node.run(), driver) }).await;
+    msgbus::unsubscribe_instrument_close(close_topic, &close_handler);
+    msgbus::unsubscribe_position_events(position_topic, &position_handler);
+    let (node_result, proof_result) =
+        run.expect("native resolution run exceeded configured bounds");
+    node_result.expect("native node shutdown");
+
+    if let Err(panic) = proof_result {
+        std::panic::resume_unwind(panic);
+    }
+
+    assert_eq!(handle.state(), NodeState::Stopped);
+    assert_eq!(closes.get_messages().len(), instrument_ids.len());
+    let events = positions.get_messages();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, PositionEvent::PositionOpened(_)))
+            .count(),
+        instrument_ids.len(),
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, PositionEvent::PositionClosed(_)))
+            .count(),
+        instrument_ids.len(),
+    );
+    assert!(
+        cache
+            .borrow()
+            .positions_open(None, None, None, None, None)
+            .is_empty(),
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .positions_closed(None, None, None, None, None)
+            .len(),
+        instrument_ids.len(),
+    );
 }
 
 #[rstest]

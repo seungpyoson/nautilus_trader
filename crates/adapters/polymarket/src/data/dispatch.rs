@@ -778,7 +778,7 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
 
             if !apply_live_instrument_locked(
                 &ctx.subscriptions.closed_condition_ids,
-                &update_state,
+                &mut update_state,
                 &ctx.instruments,
                 &ctx.subscriptions.token_meta,
                 &rebuilt,
@@ -1491,10 +1491,12 @@ fn is_crossed(book: &OrderBook) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::RefCell,
         collections::{BTreeMap, VecDeque},
         net::SocketAddr,
         num::NonZeroUsize,
         ops::{Deref, DerefMut},
+        rc::Rc,
         sync::atomic::{AtomicUsize, Ordering},
         time::{Duration, Duration as StdDuration},
     };
@@ -1514,6 +1516,7 @@ mod tests {
     use indexmap::IndexMap;
     use jiff::{SignedDuration, Timestamp, tz::Offset};
     use nautilus_common::{
+        cache::Cache,
         clients::DataClient,
         live::{dst::time::Instant, runner::replace_data_event_sender},
         messages::{
@@ -2614,6 +2617,13 @@ mod tests {
                 instrument,
                 client.clock.get_time_ns()
             ));
+            // Skipping live routing leaves this client owning the requested market's settlement
+            assert!(
+                client
+                    .instrument_update_state
+                    .lock()
+                    .is_admitted(&instrument.id())
+            );
 
             if !closed {
                 assert_eq!(
@@ -2781,6 +2791,14 @@ mod tests {
             .expect("instrument response");
 
         assert_eq!(response.len(), if multiple { 2 } else { 1 });
+        // A terminal market stays owned by the live generation; a retired one admits nothing
+        let admitted = {
+            let update_state = client.instrument_update_state.lock();
+            response
+                .iter()
+                .all(|instrument| update_state.is_admitted(&instrument.id()) != retired)
+        };
+        assert!(admitted);
 
         let (mut expected, _) = crate::http::gamma::parse_markets_with_transient(
             &[expected_market],
@@ -3940,6 +3958,7 @@ mod tests {
         let client = PolymarketDataClient::new(
             *POLYMARKET_CLIENT_ID,
             config,
+            Rc::new(RefCell::new(Cache::default())).into(),
             gamma,
             clob_public,
             data_api,
@@ -3974,6 +3993,7 @@ mod tests {
         PolymarketDataClient::new(
             *POLYMARKET_CLIENT_ID,
             PolymarketDataClientConfig::default(),
+            Rc::new(RefCell::new(Cache::default())).into(),
             gamma,
             clob_public,
             data_api,
@@ -4757,9 +4777,9 @@ mod tests {
 
         update_resolve_watchlist_from_position_event_serialized(
             &ctx.resolve_watch_apply_mutex,
-            &ctx.subscriptions.closed_condition_ids,
+            &ctx.subscriptions.resolved_instrument_ids,
             &ctx.resolve_poll_watchlist,
-            &ctx.instruments,
+            &yes,
             &stub_position_opened_event(yes.id()),
         );
 
@@ -4810,16 +4830,16 @@ mod tests {
 
         update_resolve_watchlist_from_position_event_serialized(
             &ctx.resolve_watch_apply_mutex,
-            &ctx.subscriptions.closed_condition_ids,
+            &ctx.subscriptions.resolved_instrument_ids,
             &ctx.resolve_poll_watchlist,
-            &ctx.instruments,
+            &yes,
             &stub_position_opened_event(yes.id()),
         );
         update_resolve_watchlist_from_position_event_serialized(
             &ctx.resolve_watch_apply_mutex,
-            &ctx.subscriptions.closed_condition_ids,
+            &ctx.subscriptions.resolved_instrument_ids,
             &ctx.resolve_poll_watchlist,
-            &ctx.instruments,
+            &no,
             &stub_position_opened_event(no.id()),
         );
 

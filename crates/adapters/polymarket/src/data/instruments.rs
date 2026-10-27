@@ -58,12 +58,27 @@ struct LiveTick {
 #[derive(Debug, Default)]
 pub(super) struct InstrumentUpdateState {
     live_ticks: AHashMap<Ustr, LiveTick>,
+    // Resolving an instrument grants this generation position-resolution ownership; routing
+    // filters and retirement never revoke it
+    admitted_instrument_ids: AHashSet<InstrumentId>,
     pub(super) retired: bool,
 }
 
 impl InstrumentUpdateState {
     pub(super) fn retire_generation(&mut self) {
         self.retired = true;
+    }
+
+    pub(super) fn record_admissions(&mut self, instruments: &[InstrumentAny]) {
+        if self.retired {
+            return;
+        }
+        self.admitted_instrument_ids
+            .extend(instruments.iter().map(Instrument::id));
+    }
+
+    pub(super) fn is_admitted(&self, instrument_id: &InstrumentId) -> bool {
+        self.admitted_instrument_ids.contains(instrument_id)
     }
 
     pub(super) fn is_stale_tick(&self, token_id: &Ustr, ts_event: UnixNanos) -> bool {
@@ -151,12 +166,12 @@ pub(super) fn apply_live_instrument(
     instrument: &InstrumentAny,
     apply: impl FnOnce(&InstrumentAny),
 ) -> bool {
-    let update_state = instrument_update_state.lock();
+    let mut update_state = instrument_update_state.lock();
 
     // Keep the guard through the callback so cache writes and queued publication stay ordered
     apply_live_instrument_locked(
         closed_condition_ids,
-        &update_state,
+        &mut update_state,
         instruments,
         token_meta,
         instrument,
@@ -166,7 +181,7 @@ pub(super) fn apply_live_instrument(
 
 pub(super) fn apply_live_instrument_locked(
     closed_condition_ids: &Arc<Mutex<AHashSet<String>>>,
-    update_state: &MutexGuard<'_, InstrumentUpdateState>,
+    update_state: &mut MutexGuard<'_, InstrumentUpdateState>,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
     instrument: &InstrumentAny,
@@ -186,6 +201,8 @@ pub(super) fn apply_live_instrument_locked(
             return false;
         }
     };
+
+    update_state.record_admissions(std::slice::from_ref(&instrument));
 
     // The terminal guard scopes only the closure check and cache write
     {
@@ -279,10 +296,11 @@ pub(super) fn cache_and_publish_instruments(
     now_ns: UnixNanos,
     instruments: Vec<InstrumentAny>,
 ) -> usize {
-    let update_state = instrument_update_state.lock();
+    let mut update_state = instrument_update_state.lock();
     if update_state.retired {
         return 0;
     }
+    update_state.record_admissions(&instruments);
 
     let mut pending = Vec::with_capacity(instruments.len());
 
@@ -641,7 +659,9 @@ impl PolymarketDataClient {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::RefCell,
         net::SocketAddr,
+        rc::Rc,
         sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -652,7 +672,7 @@ mod tests {
         response::{IntoResponse, Response},
         routing::get,
     };
-    use nautilus_common::live::runner::replace_data_event_sender;
+    use nautilus_common::{cache::Cache, live::runner::replace_data_event_sender};
     use nautilus_core::UnixNanos;
     use nautilus_model::{
         enums::AssetClass,
@@ -700,6 +720,7 @@ mod tests {
         PolymarketDataClient::new(
             ClientId::from("POLY-TEST"),
             config,
+            Rc::new(RefCell::new(Cache::default())).into(),
             gamma,
             clob,
             data_api,

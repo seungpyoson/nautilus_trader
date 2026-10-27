@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
-use nautilus_core::{AtomicMap, DurationNanos, UnixNanos};
+use nautilus_core::{DurationNanos, UnixNanos};
 use nautilus_model::{
     events::PositionEvent,
     identifiers::{InstrumentId, PositionId},
@@ -205,48 +205,32 @@ pub(crate) fn upsert_resolve_watch_entry_from_instrument(
     }
 }
 
-fn remove_resolve_watch_instrument(
+// Identifiers suffice, so release cannot depend on instrument metadata another owner may purge
+fn remove_resolve_watch_position(
     watchlist: &Arc<ResolveWatchlist>,
-    instrument: &InstrumentAny,
+    instrument_id: InstrumentId,
     position_id: PositionId,
 ) {
-    let Some((condition_id, token_id, _expiration_ns, _tracked)) =
-        binary_option_context(instrument)
-    else {
-        return;
-    };
-
     {
         let mut entries = watchlist.write();
-        let remove_entry = match entries.get_mut(&condition_id) {
-            Some(entry) => {
-                let remove_token = match entry.tracked.get_mut(&token_id) {
-                    Some(tracked) => {
-                        tracked.open_position_ids.remove(&position_id);
-                        tracked.open_position_ids.is_empty() && !tracked.has_data_subscription
-                    }
-                    None => false,
-                };
-
-                if remove_token {
-                    entry.tracked.remove(&token_id);
+        entries.retain(|_, entry| {
+            entry.tracked.retain(|_, tracked| {
+                if tracked.instrument_id != instrument_id {
+                    return true;
                 }
-                entry.tracked.is_empty()
-            }
-            None => false,
-        };
-
-        if remove_entry {
-            entries.remove(&condition_id);
-        }
+                tracked.open_position_ids.remove(&position_id);
+                !tracked.open_position_ids.is_empty() || tracked.has_data_subscription
+            });
+            !entry.tracked.is_empty()
+        });
     }
 }
 
 pub(crate) fn update_resolve_watchlist_from_position_event_serialized(
     owner_lock: &Arc<Mutex<()>>,
-    closed_condition_ids: &Arc<Mutex<AHashSet<String>>>,
+    resolved_instrument_ids: &Arc<Mutex<AHashSet<InstrumentId>>>,
     watchlist: &Arc<ResolveWatchlist>,
-    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    instrument: &InstrumentAny,
     event: &PositionEvent,
 ) {
     let _guard = owner_lock.lock();
@@ -255,22 +239,21 @@ pub(crate) fn update_resolve_watchlist_from_position_event_serialized(
         return;
     }
 
-    let loaded = instruments.load();
-    let Some(instrument) = loaded.get(&instrument_id) else {
-        return;
-    };
-    let (_, _, condition_id) = instrument_market_context(instrument);
-    let condition_id = condition_id.or_else(|| extract_condition_id(&instrument.id()).ok());
-    let Some(condition_id) = condition_id else {
-        return;
-    };
-
-    let terminal_conditions = closed_condition_ids.lock();
-    if terminal_conditions.contains(&condition_id) && !watchlist.read().contains_key(&condition_id)
-    {
+    // Trading closure does not settle a position; only an emitted close fences this leg
+    if resolved_instrument_ids.lock().contains(&instrument_id) {
         return;
     }
     apply_position_event_to_watchlist(watchlist, instrument, event);
+}
+
+pub(crate) fn release_resolve_watch_position_serialized(
+    owner_lock: &Arc<Mutex<()>>,
+    watchlist: &Arc<ResolveWatchlist>,
+    instrument_id: InstrumentId,
+    position_id: PositionId,
+) {
+    let _guard = owner_lock.lock();
+    remove_resolve_watch_position(watchlist, instrument_id, position_id);
 }
 
 fn apply_position_event_to_watchlist(
@@ -287,7 +270,7 @@ fn apply_position_event_to_watchlist(
 
     match event {
         PositionEvent::PositionClosed(_) => {
-            remove_resolve_watch_instrument(watchlist, instrument, position_id);
+            remove_resolve_watch_position(watchlist, instrument.id(), position_id);
         }
         PositionEvent::PositionOpened(_)
         | PositionEvent::PositionChanged(_)
@@ -376,7 +359,7 @@ pub(crate) fn pause_resolve_watch_entries(
 mod tests {
     use ahash::AHashSet;
     use indexmap::IndexMap;
-    use nautilus_core::{DurationNanos, Params, UUID4};
+    use nautilus_core::{AtomicMap, DurationNanos, Params, UUID4};
     use nautilus_model::{
         enums::{OrderSide, PositionSide},
         events::{PositionClosed, PositionEvent, PositionOpened},
@@ -750,7 +733,7 @@ mod tests {
     #[rstest]
     fn serialized_position_update_waits_for_resolution_owner_lock() {
         let owner_lock = Arc::new(Mutex::new(()));
-        let closed_condition_ids = Arc::new(Mutex::new(AHashSet::new()));
+        let resolved_instrument_ids = Arc::new(Mutex::new(AHashSet::new()));
         let watchlist = Arc::new(ResolveWatchlist::default());
         let instruments = Arc::new(AtomicMap::new());
         let instrument = seed_instrument_with_context(
@@ -767,16 +750,15 @@ mod tests {
         let event = stub_position_opened_event(instrument.id());
         let owner_lock_for_thread = owner_lock.clone();
         let watchlist_for_thread = watchlist.clone();
-        let instruments_for_thread = instruments;
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let guard = owner_lock.lock();
 
         let update_thread = std::thread::spawn(move || {
             update_resolve_watchlist_from_position_event_serialized(
                 &owner_lock_for_thread,
-                &closed_condition_ids,
+                &resolved_instrument_ids,
                 &watchlist_for_thread,
-                &instruments_for_thread,
+                &instrument,
                 &event,
             );
             done_tx.send(()).expect("report position update");
@@ -798,12 +780,10 @@ mod tests {
     }
 
     #[rstest]
-    fn position_event_does_not_recreate_terminal_watch() {
+    fn position_event_does_not_recreate_resolved_instrument_watch() {
         let owner_lock = Arc::new(Mutex::new(()));
         let watchlist = Arc::new(ResolveWatchlist::default());
         let instruments = Arc::new(AtomicMap::new());
-        let closed_condition_ids =
-            Arc::new(Mutex::new(AHashSet::from_iter(["0xCOND-BTC".to_string()])));
         let instrument = seed_instrument_with_context(
             &instruments,
             "0xTOKEN_YES",
@@ -816,18 +796,19 @@ mod tests {
             },
         );
 
+        let resolved_instrument_ids = Arc::new(Mutex::new(AHashSet::from_iter([instrument.id()])));
         update_resolve_watchlist_from_position_event_serialized(
             &owner_lock,
-            &closed_condition_ids,
+            &resolved_instrument_ids,
             &watchlist,
-            &instruments,
+            &instrument,
             &stub_position_opened_event(instrument.id()),
         );
 
-        assert!(closed_condition_ids.lock().contains("0xCOND-BTC"));
+        assert!(resolved_instrument_ids.lock().contains(&instrument.id()));
         assert!(
             !watchlist.read().contains_key(&"0xCOND-BTC".to_string()),
-            "a terminal condition must not regain resolution ownership",
+            "a resolved instrument must not regain resolution ownership",
         );
     }
 

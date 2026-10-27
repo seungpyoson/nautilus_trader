@@ -38,7 +38,7 @@ use std::{
 
 use dashmap::DashMap;
 use nautilus_common::{
-    cache::InstrumentLookupError,
+    cache::{CacheView, InstrumentLookupError},
     clients::{DataClient, execute_instrument_subscriptions},
     live::{dst::time::Instant, runner::get_data_event_sender, sender::EventSender},
     messages::{
@@ -111,6 +111,7 @@ pub(super) const NEW_MARKET_EMPTY_RECHECK_DELAY: Duration = Duration::from_milli
 /// - Automatic instrument discovery from the Gamma API
 #[derive(Debug)]
 pub struct PolymarketDataClient {
+    cache: CacheView,
     clock: &'static AtomicTime,
     client_id: ClientId,
     config: PolymarketDataClientConfig,
@@ -150,6 +151,7 @@ impl PolymarketDataClient {
     pub fn new(
         client_id: ClientId,
         config: PolymarketDataClientConfig,
+        cache: CacheView,
         gamma_client: PolymarketGammaHttpClient,
         clob_public_client: PolymarketClobPublicClient,
         data_api_client: PolymarketDataApiHttpClient,
@@ -158,6 +160,7 @@ impl PolymarketDataClient {
         Self::new_with_proxy(
             client_id,
             config,
+            cache,
             gamma_client,
             clob_public_client,
             data_api_client,
@@ -171,9 +174,11 @@ impl PolymarketDataClient {
     /// # Errors
     ///
     /// Returns an error if the configuration is invalid.
+    #[expect(clippy::too_many_arguments)]
     pub fn new_with_proxy(
         client_id: ClientId,
         mut config: PolymarketDataClientConfig,
+        cache: CacheView,
         gamma_client: PolymarketGammaHttpClient,
         clob_public_client: PolymarketClobPublicClient,
         data_api_client: PolymarketDataApiHttpClient,
@@ -230,6 +235,7 @@ impl PolymarketDataClient {
         );
 
         Ok(Self {
+            cache,
             clock,
             client_id,
             config,

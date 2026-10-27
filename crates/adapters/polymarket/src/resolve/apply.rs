@@ -715,6 +715,8 @@ async fn apply_condition_resolution_inner(
                 );
                 return ResolveApplyResult::Ignored;
             }
+            ctx.subscriptions
+                .record_instrument_close(tracked.instrument_id);
             emitted_closes += 1;
         }
 

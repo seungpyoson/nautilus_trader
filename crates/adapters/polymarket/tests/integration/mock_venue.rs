@@ -722,8 +722,19 @@ async fn handle_user_socket(mut socket: WebSocket, state: TestServerState) {
     loop {
         tokio::select! {
             inbound = socket.next() => {
-                if inbound.is_none() {
-                    break;
+                match inbound {
+                    Some(Ok(Message::Text(text))) if text == "PING" => {
+                        if socket.send(Message::Text("PONG".into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        if socket.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
                 }
             }
             frame = user_frames.recv() => {

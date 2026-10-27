@@ -19,9 +19,11 @@
 //! Gamma, CLOB public, and Data API endpoints.
 
 use std::{
+    cell::RefCell,
     net::SocketAddr,
     num::NonZeroUsize,
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
@@ -42,6 +44,7 @@ use axum::{
 use futures_util::StreamExt;
 use jiff::{SignedDuration, Timestamp, tz::Offset};
 use nautilus_common::{
+    cache::Cache,
     clients::DataClient,
     live::runner::{replace_data_event_sender, replace_system_event_sender},
     messages::{
@@ -671,6 +674,7 @@ fn create_test_data_client_with_resolution_options(
     let client = PolymarketDataClient::new(
         *POLYMARKET_CLIENT_ID,
         config,
+        Rc::new(RefCell::new(Cache::default())).into(),
         gamma,
         clob_public,
         data_api,
