@@ -938,6 +938,8 @@ pub enum HyperliquidInfoRequestType {
     AllPerpMetas,
     /// Get the account abstraction mode for a user.
     UserAbstraction,
+    /// Get the maximum builder fee a user has approved for a builder.
+    MaxBuilderFee,
 }
 
 impl HyperliquidInfoRequestType {
@@ -977,6 +979,7 @@ impl HyperliquidInfoRequestType {
             Self::PerpDexs => "perpDexs",
             Self::AllPerpMetas => "allPerpMetas",
             Self::UserAbstraction => "userAbstraction",
+            Self::MaxBuilderFee => "maxBuilderFee",
         }
     }
 }
@@ -1224,6 +1227,18 @@ mod tests {
         assert_eq!(
             HyperliquidInfoRequestType::RecentTrades.as_str(),
             "recentTrades"
+        );
+    }
+
+    #[rstest]
+    fn test_info_request_type_max_builder_fee_as_str() {
+        let request_type = HyperliquidInfoRequestType::MaxBuilderFee;
+
+        assert_eq!(request_type.as_str(), "maxBuilderFee");
+        assert_eq!(request_type.to_string(), "maxBuilderFee");
+        assert_eq!(
+            serde_json::to_string(&request_type).unwrap(),
+            "\"maxBuilderFee\""
         );
     }
 

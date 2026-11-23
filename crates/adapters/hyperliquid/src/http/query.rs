@@ -171,6 +171,20 @@ pub struct SpotClearinghouseStateParams {
     pub user: String,
 }
 
+/// Parameters for max builder fee request.
+#[derive(Debug, Clone, Serialize)]
+pub struct MaxBuilderFeeParams {
+    pub user: String,
+    pub builder: String,
+}
+
+/// Parameters for a request scoped to one perp dex.
+#[derive(Debug, Clone, Serialize)]
+pub struct PerpDexParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dex: Option<String>,
+}
+
 /// Parameters for candle snapshot request.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -209,6 +223,8 @@ pub enum InfoRequestParams {
     OpenOrders(OpenOrdersParams),
     ClearinghouseState(ClearinghouseStateParams),
     SpotClearinghouseState(SpotClearinghouseStateParams),
+    MaxBuilderFee(MaxBuilderFeeParams),
+    PerpDex(PerpDexParams),
     CandleSnapshot(CandleSnapshotParams),
     FundingHistory(FundingHistoryParams),
     None,
@@ -258,9 +274,18 @@ impl InfoRequest {
 
     /// Creates a request to get metadata with asset contexts (for price precision).
     pub fn meta_and_asset_ctxs() -> Self {
+        Self::meta_and_asset_ctxs_for_dex(None)
+    }
+
+    /// Creates a request to get metadata with asset contexts for a specific perp dex.
+    ///
+    /// `None` omits the `dex` field, which Hyperliquid reads as the first perp dex.
+    pub fn meta_and_asset_ctxs_for_dex(dex: Option<&str>) -> Self {
         Self {
             request_type: HyperliquidInfoRequestType::MetaAndAssetCtxs,
-            params: InfoRequestParams::None,
+            params: InfoRequestParams::PerpDex(PerpDexParams {
+                dex: dex.map(str::to_string),
+            }),
         }
     }
 
@@ -407,6 +432,17 @@ impl InfoRequest {
             request_type: HyperliquidInfoRequestType::UserAbstraction,
             params: InfoRequestParams::SpotClearinghouseState(SpotClearinghouseStateParams {
                 user: user.to_string(),
+            }),
+        }
+    }
+
+    /// Creates a request to get the maximum builder fee a user has approved for a builder.
+    pub fn max_builder_fee(user: &str, builder: &str) -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::MaxBuilderFee,
+            params: InfoRequestParams::MaxBuilderFee(MaxBuilderFeeParams {
+                user: user.to_string(),
+                builder: builder.to_string(),
             }),
         }
     }
@@ -742,6 +778,32 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&req).unwrap(),
             serde_json::json!({"type": "userAbstraction", "user": "0xabc"})
+        );
+    }
+
+    #[rstest]
+    fn test_info_request_max_builder_fee() {
+        let req = InfoRequest::max_builder_fee("0xabc", "0xdef");
+
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({"type": "maxBuilderFee", "user": "0xabc", "builder": "0xdef"})
+        );
+    }
+
+    #[rstest]
+    fn test_info_request_meta_and_asset_ctxs_dex_serialization() {
+        let default = serde_json::to_string(&InfoRequest::meta_and_asset_ctxs()).unwrap();
+        let first_dex =
+            serde_json::to_string(&InfoRequest::meta_and_asset_ctxs_for_dex(None)).unwrap();
+        let xyz =
+            serde_json::to_value(InfoRequest::meta_and_asset_ctxs_for_dex(Some("xyz"))).unwrap();
+
+        assert_eq!(default, r#"{"type":"metaAndAssetCtxs"}"#);
+        assert_eq!(first_dex, default);
+        assert_eq!(
+            xyz,
+            serde_json::json!({"type": "metaAndAssetCtxs", "dex": "xyz"})
         );
     }
 

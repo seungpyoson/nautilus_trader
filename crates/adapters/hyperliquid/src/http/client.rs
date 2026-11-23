@@ -626,6 +626,13 @@ impl HyperliquidRawHttpClient {
         self.send_info_request(&request).await
     }
 
+    /// Get the maximum builder fee a user has approved for a builder, in tenths of a basis point.
+    pub async fn info_max_builder_fee(&self, user: &str, builder: &str) -> Result<u32> {
+        let request = InfoRequest::max_builder_fee(user, builder);
+        let response = self.send_info_request(&request).await?;
+        serde_json::from_value(response).map_err(Error::Serde)
+    }
+
     /// Get candle/bar data for a coin.
     pub async fn info_candle_snapshot(
         &self,
@@ -2120,6 +2127,11 @@ impl HyperliquidHttpClient {
     /// Get user fee schedule and effective rates.
     pub async fn info_user_fees(&self, user: &str) -> Result<Value> {
         self.inner.info_user_fees(user).await
+    }
+
+    /// Get the maximum builder fee a user has approved for a builder, in tenths of a basis point.
+    pub async fn info_max_builder_fee(&self, user: &str, builder: &str) -> Result<u32> {
+        self.inner.info_max_builder_fee(user, builder).await
     }
 
     /// Get candle/bar data for a coin.

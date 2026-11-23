@@ -42,7 +42,7 @@ use nautilus_hyperliquid::{
         enums::{HyperliquidEnvironment, HyperliquidInfoRequestType},
     },
     http::{
-        client::HYPERLIQUID_FUNDING_HISTORY_MAX_LIMIT,
+        client::{HYPERLIQUID_FUNDING_HISTORY_MAX_LIMIT, HyperliquidRawHttpClient},
         error::Error,
         models::{
             Cloid, HyperliquidExchangeAction, HyperliquidExchangeResponse, HyperliquidFills,
@@ -84,6 +84,7 @@ struct TestServerState {
     historical_orders_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     spot_fails: Arc<std::sync::atomic::AtomicBool>,
     user_abstraction_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    max_builder_fee_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     funding_history_rows: Arc<tokio::sync::Mutex<Vec<Value>>>,
     funding_history_calls: Arc<AtomicUsize>,
 }
@@ -105,6 +106,7 @@ impl Default for TestServerState {
             historical_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
             spot_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             user_abstraction_response: Arc::new(tokio::sync::Mutex::new(None)),
+            max_builder_fee_response: Arc::new(tokio::sync::Mutex::new(None)),
             funding_history_rows: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             funding_history_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -298,6 +300,10 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
         "userAbstraction" => {
             let custom = state.user_abstraction_response.lock().await.clone();
             Json(custom.unwrap_or_else(|| json!("disabled"))).into_response()
+        }
+        "maxBuilderFee" => {
+            let custom = state.max_builder_fee_response.lock().await.clone();
+            Json(custom.unwrap_or_else(|| json!(0))).into_response()
         }
         "fundingHistory" => {
             state.funding_history_calls.fetch_add(1, Ordering::Relaxed);
@@ -1642,6 +1648,68 @@ async fn test_user_fills_request_includes_user_parameter() {
         "userFills"
     );
     assert_eq!(request_body.get("user").unwrap().as_str().unwrap(), user);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_info_max_builder_fee_returns_approved_tenths_bp() {
+    let state = TestServerState::default();
+    *state.max_builder_fee_response.lock().await = Some(json!(10));
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_domain_client(&addr);
+    let user = "0xabcdef1234567890abcdef1234567890abcdef12";
+    let builder = "0x0c8d970c462726e014ad36f6c5a63e99db48a8e7";
+
+    let max_fee = client.info_max_builder_fee(user, builder).await.unwrap();
+
+    assert_eq!(max_fee, 10);
+    let request_body = state.last_request_body.lock().await.clone().unwrap();
+    assert_eq!(
+        request_body,
+        json!({"type": "maxBuilderFee", "user": user, "builder": builder})
+    );
+}
+
+#[rstest]
+#[case(json!(-1))]
+#[case(json!("10"))]
+#[case(json!(null))]
+#[tokio::test]
+async fn test_info_max_builder_fee_rejects_non_integer_response(#[case] response: Value) {
+    let state = TestServerState::default();
+    *state.max_builder_fee_response.lock().await = Some(response);
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_domain_client(&addr);
+
+    let result = client
+        .info_max_builder_fee(
+            "0xabcdef1234567890abcdef1234567890abcdef12",
+            "0x0c8d970c462726e014ad36f6c5a63e99db48a8e7",
+        )
+        .await;
+
+    assert!(matches!(result, Err(Error::Serde(_))), "{result:?}");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_meta_and_asset_ctxs_for_dex_request_includes_dex_parameter() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let mut client =
+        HyperliquidRawHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+    client.set_base_info_url(format!("http://{addr}/info"));
+
+    client
+        .send_info_request_raw(&InfoRequest::meta_and_asset_ctxs_for_dex(Some("xyz")))
+        .await
+        .unwrap();
+
+    let request_body = state.last_request_body.lock().await.clone().unwrap();
+    assert_eq!(
+        request_body,
+        json!({"type": "metaAndAssetCtxs", "dex": "xyz"})
+    );
 }
 
 #[rstest]
