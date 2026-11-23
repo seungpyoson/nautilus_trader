@@ -267,6 +267,7 @@ impl PolymarketGammaRawHttpClient {
         let Some(query_params) = gamma_slug_query_params(slug) else {
             return Ok(Vec::new());
         };
+
         let raw: Box<RawValue> = self
             .send_get_query_map("/markets", Some(&query_params))
             .await?;
@@ -281,6 +282,7 @@ impl PolymarketGammaRawHttpClient {
         let Some(query_params) = gamma_slug_query_params(slug) else {
             return Ok(Vec::new());
         };
+
         self.send_get_query_map("/events", Some(&query_params))
             .await
     }
@@ -697,7 +699,8 @@ impl PolymarketGammaHttpClient {
     /// Fetches instruments for the given slugs concurrently.
     ///
     /// Each slug is queried individually via the Gamma API for markets of every
-    /// supported protocol. Blank, missing, or unparsable slugs are logged and skipped.
+    /// supported protocol. Blank slugs are skipped without a request, and missing
+    /// or unparsable slugs are logged and skipped.
     ///
     /// # Errors
     ///
@@ -707,9 +710,11 @@ impl PolymarketGammaHttpClient {
         &self,
         slugs: Vec<String>,
     ) -> anyhow::Result<Vec<InstrumentAny>> {
+        // A blank slug sends no request, so it must not count as a successful one
+        let slugs = slugs.into_iter().filter(|slug| !slug.trim().is_empty());
         let ts_init = self.clock.get_time_ns();
 
-        let futures = slugs.into_iter().map(|slug| {
+        let futures = slugs.map(|slug| {
             let inner = Arc::clone(&self.inner);
             async move {
                 match inner.get_gamma_markets_by_slug(&slug).await {
@@ -825,13 +830,18 @@ impl PolymarketGammaHttpClient {
     ///
     /// Each slug queries `GET /events?slug=`, extracts the markets array from
     /// the first matching event, and parses each market into instruments.
+    /// Blank slugs are skipped without a request.
     pub async fn request_instruments_by_event_slugs(
         &self,
         event_slugs: Vec<String>,
     ) -> anyhow::Result<Vec<InstrumentAny>> {
+        // A blank slug sends no request, so it must not count as a successful one
+        let event_slugs = event_slugs
+            .into_iter()
+            .filter(|slug| !slug.trim().is_empty());
         let ts_init = self.clock.get_time_ns();
 
-        let futures = event_slugs.into_iter().map(|slug| {
+        let futures = event_slugs.map(|slug| {
             let inner = Arc::clone(&self.inner);
             async move {
                 match inner.get_gamma_events_by_slug(&slug).await {

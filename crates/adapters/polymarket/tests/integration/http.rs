@@ -581,6 +581,7 @@ fn filter_gamma_versions(rows: &Value, pairs: &[(String, String)]) -> Value {
     let Some(rows) = rows.as_array() else {
         return rows.clone();
     };
+
     let mut versions = gamma_versions_sent(pairs);
 
     if versions.is_empty() {
@@ -2627,6 +2628,86 @@ async fn test_slug_lookups_skip_blank_slugs(#[values("", " ")] slug: &str) {
     assert!(events.is_empty());
     assert!(state.gamma_markets_query_pair_log.lock().await.is_empty());
     assert!(state.gamma_events_query_pair_log.lock().await.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_slug_batches_fail_when_every_sent_request_fails(
+    #[values("", " ")] blank: &str,
+    #[values(false, true)] event_slugs: bool,
+) {
+    // A blank slug sends no request, so it must not count as a successful one
+    let state = TestServerState::default();
+    state
+        .gamma_force_error
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state
+        .gamma_events_force_error
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_gamma_domain_client(&addr);
+    let slugs = vec![blank.to_string(), "failing-slug".to_string()];
+
+    let (result, expected) = if event_slugs {
+        (
+            client.request_instruments_by_event_slugs(slugs).await,
+            "All 1 event slug requests failed",
+        )
+    } else {
+        (
+            client.request_instruments_by_slugs(slugs).await,
+            "All 1 slug requests failed",
+        )
+    };
+
+    assert_eq!(result.unwrap_err().to_string(), expected);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_slug_batches_skip_blank_slug_beside_valid_slug(
+    #[values("", " ")] blank: &str,
+    #[values(false, true)] event_slugs: bool,
+) {
+    let state = TestServerState::default();
+    let market = gamma_market_with_slug(
+        "valid-market",
+        "0xcondition_valid",
+        ["79000000000000000001", "79000000000000000002"],
+    );
+    state
+        .gamma_slug_responses
+        .lock()
+        .await
+        .insert("valid-slug".to_string(), json!([market.clone()]));
+    state.gamma_event_slug_responses.lock().await.insert(
+        "valid-slug".to_string(),
+        json!([gamma_event_with_markets("valid-slug", &[market])]),
+    );
+
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_gamma_domain_client(&addr);
+    let slugs = vec![blank.to_string(), "valid-slug".to_string()];
+
+    let instruments = if event_slugs {
+        client.request_instruments_by_event_slugs(slugs).await
+    } else {
+        client.request_instruments_by_slugs(slugs).await
+    }
+    .unwrap();
+
+    assert_eq!(
+        sorted_instrument_ids(&instruments),
+        [
+            "0xcondition_valid-79000000000000000001.POLYMARKET",
+            "0xcondition_valid-79000000000000000002.POLYMARKET",
+        ]
+    );
+    let market_requests = state.gamma_markets_query_pair_log.lock().await.len();
+    let event_requests = state.gamma_events_query_pair_log.lock().await.len();
+    let expected_requests = if event_slugs { (0, 1) } else { (1, 0) };
+    assert_eq!((market_requests, event_requests), expected_requests);
 }
 
 #[rstest]
