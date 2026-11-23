@@ -258,6 +258,30 @@ fn gamma_market_with_slug(slug: &str, condition_id: &str, token_ids: [&str; 2]) 
     })
 }
 
+fn gamma_v2_market_with_slug(slug: &str, condition_id: &str, position_ids: [&str; 2]) -> Value {
+    let mut market = gamma_market_with_slug(slug, condition_id, ["101", "202"]);
+    market["id"] = json!("100002");
+    market["version"] = json!("v2");
+    market["positionIds"] = json!(position_ids);
+    market
+}
+
+fn gamma_versions_sent(pairs: &[(String, String)]) -> Vec<&str> {
+    pairs
+        .iter()
+        .filter_map(|(key, value)| (key == "version").then_some(value.as_str()))
+        .collect()
+}
+
+fn sorted_instrument_ids(instruments: &[InstrumentAny]) -> Vec<String> {
+    let mut ids: Vec<String> = instruments
+        .iter()
+        .map(|instrument| instrument.id().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
 fn extract_headers(headers: &HeaderMap) -> AHashMap<String, String> {
     headers
         .iter()
@@ -493,7 +517,7 @@ async fn handle_gamma_markets(
     if let Some(slug) = params.get("slug") {
         let slug_map = state.gamma_slug_responses.lock().await;
         if let Some(v) = slug_map.get(slug) {
-            return Json(v.clone()).into_response();
+            return Json(filter_gamma_versions(v, &query_pairs(&uri))).into_response();
         }
     }
 
@@ -551,6 +575,24 @@ fn query_pairs(uri: &Uri) -> Vec<(String, String)> {
     })
 }
 
+// Gamma's slug filters return only protocol `v1` rows unless `version` names the
+// protocols to include.
+fn filter_gamma_versions(rows: &Value, pairs: &[(String, String)]) -> Value {
+    let Some(rows) = rows.as_array() else {
+        return rows.clone();
+    };
+    let mut versions = gamma_versions_sent(pairs);
+
+    if versions.is_empty() {
+        versions.push("v1");
+    }
+
+    rows.iter()
+        .filter(|row| versions.contains(&row["version"].as_str().unwrap_or("v1")))
+        .cloned()
+        .collect()
+}
+
 async fn handle_gamma_markets_with_clob_tokens(
     state: &TestServerState,
     params: &HashMap<String, String>,
@@ -588,7 +630,7 @@ async fn handle_gamma_events(
     if let Some(slug) = params.get("slug") {
         let slug_map = state.gamma_event_slug_responses.lock().await;
         if let Some(v) = slug_map.get(slug) {
-            return Json(v.clone()).into_response();
+            return Json(filter_gamma_versions(v, &query_pairs(&uri))).into_response();
         }
     }
 
@@ -2180,6 +2222,69 @@ async fn test_request_instruments_by_slugs_partial_failure_succeeds() {
     );
 }
 
+#[rstest]
+#[case::direct(
+    false,
+    &["v1-slug", "v2-slug"],
+    &[
+        "0xcondition_v1-73000000000000000001.POLYMARKET",
+        "0xcondition_v1-73000000000000000002.POLYMARKET",
+        "0xcondition_v2-74000000000000000001.POLYMARKET",
+        "0xcondition_v2-74000000000000000002.POLYMARKET",
+    ],
+)]
+#[case::with_retry(
+    true,
+    &["v2-slug"],
+    &[
+        "0xcondition_v2-74000000000000000001.POLYMARKET",
+        "0xcondition_v2-74000000000000000002.POLYMARKET",
+    ],
+)]
+#[tokio::test]
+async fn test_request_instruments_by_slugs_includes_v2_markets(
+    #[case] with_retry: bool,
+    #[case] slugs: &[&str],
+    #[case] expected: &[&str],
+) {
+    let state = TestServerState::default();
+    let v1_market = gamma_market_with_slug(
+        "v1-slug",
+        "0xcondition_v1",
+        ["73000000000000000001", "73000000000000000002"],
+    );
+    let v2_market = gamma_v2_market_with_slug(
+        "v2-slug",
+        "0xcondition_v2",
+        ["74000000000000000001", "74000000000000000002"],
+    );
+    {
+        let mut slug_responses = state.gamma_slug_responses.lock().await;
+        slug_responses.insert("v1-slug".to_string(), json!([v1_market]));
+        slug_responses.insert("v2-slug".to_string(), json!([v2_market]));
+    }
+
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_gamma_domain_client(&addr);
+    let requested: Vec<String> = slugs.iter().map(ToString::to_string).collect();
+
+    let instruments = if with_retry {
+        client
+            .request_instruments_by_slugs_with_retry(requested)
+            .await
+    } else {
+        client.request_instruments_by_slugs(requested).await
+    }
+    .unwrap();
+
+    assert_eq!(sorted_instrument_ids(&instruments), expected);
+    let log = state.gamma_markets_query_pair_log.lock().await;
+    assert_eq!(log.len(), slugs.len());
+    for pairs in log.iter() {
+        assert_eq!(gamma_versions_sent(pairs), ["v1", "v2"]);
+    }
+}
+
 fn gamma_event_with_markets(slug: &str, markets: &[Value]) -> Value {
     json!({
         "id": "evt-test-001",
@@ -2395,6 +2500,133 @@ async fn test_load_all_with_event_slug_filter() {
     // 2 markets × 2 outcomes = 4 instruments
     assert_eq!(provider.store().count(), 4);
     assert!(provider.store().is_initialized());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_instruments_by_event_slugs_includes_v2_events() {
+    let state = TestServerState::default();
+    let v1_event = gamma_event_with_markets(
+        "v1-event",
+        &[gamma_market_with_slug(
+            "v1-event-market",
+            "0xcondition_event_v1",
+            ["75000000000000000001", "75000000000000000002"],
+        )],
+    );
+    let mut v2_event = gamma_event_with_markets(
+        "v2-event",
+        &[gamma_v2_market_with_slug(
+            "v2-event-market",
+            "0xcondition_event_v2",
+            ["76000000000000000001", "76000000000000000002"],
+        )],
+    );
+    v2_event["id"] = json!("evt-test-002");
+    v2_event["version"] = json!("v2");
+    {
+        let mut event_responses = state.gamma_event_slug_responses.lock().await;
+        event_responses.insert("v1-event".to_string(), json!([v1_event]));
+        event_responses.insert("v2-event".to_string(), json!([v2_event]));
+    }
+
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_gamma_domain_client(&addr);
+
+    let instruments = client
+        .request_instruments_by_event_slugs(vec!["v1-event".to_string(), "v2-event".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sorted_instrument_ids(&instruments),
+        [
+            "0xcondition_event_v1-75000000000000000001.POLYMARKET",
+            "0xcondition_event_v1-75000000000000000002.POLYMARKET",
+            "0xcondition_event_v2-76000000000000000001.POLYMARKET",
+            "0xcondition_event_v2-76000000000000000002.POLYMARKET",
+        ]
+    );
+    let log = state.gamma_events_query_pair_log.lock().await;
+    assert_eq!(log.len(), 2);
+    for pairs in log.iter() {
+        assert_eq!(gamma_versions_sent(pairs), ["v1", "v2"]);
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_instruments_by_event_query_includes_v2_event() {
+    let state = TestServerState::default();
+    let mut event = gamma_event_with_markets(
+        "v2-query-event",
+        &[gamma_v2_market_with_slug(
+            "v2-query-market",
+            "0xcondition_query_v2",
+            ["77000000000000000001", "77000000000000000002"],
+        )],
+    );
+    event["version"] = json!("v2");
+    state
+        .gamma_event_slug_responses
+        .lock()
+        .await
+        .insert("v2-query-event".to_string(), json!([event]));
+
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_gamma_domain_client(&addr);
+
+    let instruments = client
+        .request_instruments_by_event_query("v2-query-event", GetGammaMarketsParams::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sorted_instrument_ids(&instruments),
+        [
+            "0xcondition_query_v2-77000000000000000001.POLYMARKET",
+            "0xcondition_query_v2-77000000000000000002.POLYMARKET",
+        ]
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_slug_lookups_skip_blank_slugs(#[values("", " ")] slug: &str) {
+    // Gamma ignores an empty slug filter and lists unrelated markets and events
+    let state = TestServerState::default();
+    let unrelated_market = gamma_market_with_slug(
+        "unrelated-market",
+        "0xcondition_unrelated",
+        ["78000000000000000001", "78000000000000000002"],
+    );
+    *state.gamma_response.lock().await = Some(json!([unrelated_market.clone()]));
+    *state.gamma_events_response.lock().await = Some(json!([gamma_event_with_markets(
+        "unrelated-event",
+        &[unrelated_market],
+    )]));
+
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_gamma_domain_client(&addr);
+
+    let markets = client
+        .request_instruments_by_slugs(vec![slug.to_string()])
+        .await
+        .unwrap();
+    let retried = client
+        .request_instruments_by_slugs_with_retry(vec![slug.to_string()])
+        .await
+        .unwrap();
+    let events = client
+        .request_instruments_by_event_slugs(vec![slug.to_string()])
+        .await
+        .unwrap();
+
+    assert!(markets.is_empty());
+    assert!(retried.is_empty());
+    assert!(events.is_empty());
+    assert!(state.gamma_markets_query_pair_log.lock().await.is_empty());
+    assert!(state.gamma_events_query_pair_log.lock().await.is_empty());
 }
 
 #[rstest]

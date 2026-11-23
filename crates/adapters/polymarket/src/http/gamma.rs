@@ -51,7 +51,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, value::RawValue};
 
 use crate::{
-    common::{consts::MARKET_VERSION_V2, parse::validate_data_market_version, urls::gamma_api_url},
+    common::{
+        consts::{MARKET_VERSION_V2, SUPPORTED_MARKET_VERSION},
+        parse::validate_data_market_version,
+        urls::gamma_api_url,
+    },
     filters::set_market_closed,
     http::{
         error::{Error, Result, decode_response},
@@ -68,6 +72,10 @@ use crate::{
 
 const GAMMA_MARKETS_KEYSET_PAGE_LIMIT: u32 = 100;
 const GAMMA_EVENTS_KEYSET_PAGE_LIMIT: u32 = 500;
+
+// Gamma leaves protocol `v2` rows out of slug-filtered `/markets` and `/events`
+// results unless `version` names the protocols to include.
+const GAMMA_SLUG_LOOKUP_VERSIONS: [&str; 2] = [SUPPORTED_MARKET_VERSION, MARKET_VERSION_V2];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GammaStop {
@@ -254,14 +262,27 @@ impl PolymarketGammaRawHttpClient {
         self.send_get::<(), _>(&path, None::<&()>).await
     }
 
-    /// Fetches events from the Gamma API `GET /events?slug=`.
+    // Fetches markets of every supported protocol from `GET /markets?slug=`
+    async fn get_gamma_markets_by_slug(&self, slug: &str) -> Result<Vec<GammaMarket>> {
+        let Some(query_params) = gamma_slug_query_params(slug) else {
+            return Ok(Vec::new());
+        };
+        let raw: Box<RawValue> = self
+            .send_get_query_map("/markets", Some(&query_params))
+            .await?;
+        parse_gamma_markets_response(&raw)
+    }
+
+    /// Fetches events of every supported market protocol from the Gamma API `GET /events?slug=`.
+    ///
+    /// Returns no events for a blank slug without sending a request, since Gamma
+    /// ignores an empty `slug` filter.
     pub async fn get_gamma_events_by_slug(&self, slug: &str) -> Result<Vec<GammaEvent>> {
-        #[derive(Serialize)]
-        struct EventSlugParams<'a> {
-            slug: &'a str,
-        }
-        let params = EventSlugParams { slug };
-        self.send_get("/events", Some(&params)).await
+        let Some(query_params) = gamma_slug_query_params(slug) else {
+            return Ok(Vec::new());
+        };
+        self.send_get_query_map("/events", Some(&query_params))
+            .await
     }
 
     /// Fetches events from the Gamma API `GET /events` with full query params.
@@ -375,6 +396,23 @@ fn gamma_events_query_params(params: GetGammaEventsParams) -> Result<HashMap<Str
     insert_repeated_param(&mut params, "created_by", created_by);
 
     Ok(params)
+}
+
+// Returns `None` for a blank slug, which Gamma would treat as no filter
+fn gamma_slug_query_params(slug: &str) -> Option<HashMap<String, Vec<String>>> {
+    let slug = slug.trim();
+    if slug.is_empty() {
+        return None;
+    }
+
+    let mut params = HashMap::with_capacity(2);
+    insert_repeated_param(&mut params, "slug", Some(vec![slug]));
+    insert_repeated_param(
+        &mut params,
+        "version",
+        Some(GAMMA_SLUG_LOOKUP_VERSIONS.to_vec()),
+    );
+    Some(params)
 }
 
 fn insert_repeated_param<T: ToString>(
@@ -658,8 +696,8 @@ impl PolymarketGammaHttpClient {
 
     /// Fetches instruments for the given slugs concurrently.
     ///
-    /// Each slug is queried individually via the Gamma API. Missing or
-    /// unparsable slugs are logged and skipped.
+    /// Each slug is queried individually via the Gamma API for markets of every
+    /// supported protocol. Blank, missing, or unparsable slugs are logged and skipped.
     ///
     /// # Errors
     ///
@@ -674,12 +712,7 @@ impl PolymarketGammaHttpClient {
         let futures = slugs.into_iter().map(|slug| {
             let inner = Arc::clone(&self.inner);
             async move {
-                let params = GetGammaMarketsParams {
-                    slug: Some(vec![slug.clone()]),
-                    ..Default::default()
-                };
-
-                match inner.get_gamma_markets(params).await {
+                match inner.get_gamma_markets_by_slug(&slug).await {
                     Ok(markets) => Some((slug, markets)),
                     Err(e) => {
                         log::warn!("Failed to fetch slug '{slug}': {e}");
@@ -718,10 +751,20 @@ impl PolymarketGammaHttpClient {
     ///
     /// Uses exponential backoff for indexing lag. Each HTTP request independently
     /// retries transient failures, without retrying exhausted HTTP errors at the batch level.
+    /// Blank slugs are skipped, and no request is sent when every slug is blank.
     pub async fn request_instruments_by_slugs_with_retry(
         &self,
         slugs: Vec<String>,
     ) -> anyhow::Result<Vec<InstrumentAny>> {
+        let slugs: Vec<String> = slugs
+            .into_iter()
+            .filter(|slug| !slug.trim().is_empty())
+            .collect();
+
+        if slugs.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let inner = Arc::clone(&self.inner);
         let ts_init = self.clock.get_time_ns();
 
@@ -736,12 +779,8 @@ impl PolymarketGammaHttpClient {
                         let futures = slugs.into_iter().map(|slug| {
                             let inner = Arc::clone(&inner);
                             async move {
-                                let params = GetGammaMarketsParams {
-                                    slug: Some(vec![slug.clone()]),
-                                    ..Default::default()
-                                };
                                 inner
-                                    .get_gamma_markets(params)
+                                    .get_gamma_markets_by_slug(&slug)
                                     .await
                                     .map(|markets| (slug, markets))
                             }
